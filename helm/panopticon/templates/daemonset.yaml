@@ -1,0 +1,148 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "panopticon.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "panopticon.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "panopticon.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "panopticon.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "panopticon.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- range .Values.agent.interfaces }}
+            - "--interface"
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.agent.logEvents }}
+            - "--log-events"
+            {{- end }}
+            {{- if .Values.agent.jsonExportPath }}
+            - "--json-export"
+            - {{ .Values.agent.jsonExportPath | quote }}
+            {{- end }}
+            {{- if .Values.agent.metricsBind }}
+            - "--metrics-bind"
+            - {{ .Values.agent.metricsBind | quote }}
+            {{- end }}
+            {{- if .Values.agent.config }}
+            - "--config"
+            - "/etc/panopticon/config.toml"
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: PANOPTICON_MODEL_PATH
+              value: {{ .Values.onnx.modelPath | quote }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - NET_ADMIN
+                - BPF
+                - PERFMON
+                - SYS_PTRACE
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ (split ":" .Values.agent.metricsBind)._1 | default "9090" }}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ (split ":" .Values.agent.metricsBind)._1 | default "9090" }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: procfs
+              mountPath: /proc
+              readOnly: true
+            {{- if .Values.agent.config }}
+            - name: config
+              mountPath: /etc/panopticon
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: DirectoryOrCreate
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: procfs
+          hostPath:
+            path: /proc
+            type: Directory
+        {{- if .Values.agent.config }}
+        - name: config
+          configMap:
+            name: {{ include "panopticon.fullname" . }}-config
+        {{- end }}

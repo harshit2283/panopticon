@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BPF_TOOLCHAIN: nightly-2026-02-17
+  COVERAGE_MIN_LINES: "74"
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BPF_TOOLCHAIN }}
+          components: rust-src, rustfmt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev \
+            "linux-headers-$(uname -r)" pkg-config libssl-dev
+
+      - name: Format check
+        run: cargo +${{ env.BPF_TOOLCHAIN }} fmt --all -- --check
+
+      - name: Clippy (common + xtask)
+        run: cargo clippy -p panopticon-common -p xtask -- -D warnings
+
+      - name: Clippy (agent)
+        env:
+          AYA_BUILD_SKIP: "1"
+        run: cargo clippy -p panopticon-agent -- -D warnings
+
+      - name: Tests (common)
+        run: cargo test -p panopticon-common
+
+      - name: Tests (xtask)
+        run: cargo test -p xtask
+
+      - name: Tests (agent)
+        env:
+          AYA_BUILD_SKIP: "1"
+        run: cargo test -p panopticon-agent
+
+  build-ebpf:
+    name: Build eBPF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BPF_TOOLCHAIN }}
+          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev \
+            "linux-headers-$(uname -r)" pkg-config libssl-dev
+
+      - name: Install bpf-linker
+        run: cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked
+
+      - name: Build eBPF programs
+        run: cargo xtask build-ebpf
+
+      - name: Build agent (includes eBPF compilation)
+        run: cargo build -p panopticon-agent
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev \
+            "linux-headers-$(uname -r)" pkg-config libssl-dev
+
+      - name: Install cargo-llvm-cov
+        run: make coverage-install
+
+      - name: Run coverage check
+        id: coverage_check
+        continue-on-error: true
+        run: make coverage-check COVERAGE_MIN_LINES=${{ env.COVERAGE_MIN_LINES }}
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f target/coverage/summary.txt ]; then
+            {
+              echo "## Coverage Summary"
+              echo ""
+              echo "\`\`\`text"
+              cat target/coverage/summary.txt
+              echo "\`\`\`"
+              echo ""
+              echo "Threshold: line coverage >= ${{ env.COVERAGE_MIN_LINES }}%"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Coverage summary file not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail if threshold not met
+        if: steps.coverage_check.outcome == 'failure'
+        run: exit 1
+
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BPF_TOOLCHAIN }}
+          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev \
+            "linux-headers-$(uname -r)" pkg-config libssl-dev
+
+      - name: Install bpf-linker
+        run: cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked
+
+      - name: Run benchmarks (protocol detection)
+        run: cargo bench -p panopticon-agent --bench protocol_detect -- --output-format bencher
+
+      - name: Run benchmarks (PII regex)
+        run: cargo bench -p panopticon-agent --bench pii_regex -- --output-format bencher
+
+      - name: Run benchmarks (parser throughput)
+        run: cargo bench -p panopticon-agent --bench parser_throughput -- --output-format bencher
+
+  check-macos:
+    name: macOS check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check + test common
+        run: cargo check -p panopticon-common && cargo test -p panopticon-common
+
+      - name: Check xtask
+        run: cargo check -p xtask
+
+      - name: Tests (agent -- protocol parsers compile + run on macOS)
+        run: cargo test -p panopticon-agent

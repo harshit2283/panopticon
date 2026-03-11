@@ -1,0 +1,63 @@
+# Default values for panopticon.
+
+image:
+  repository: panopticon
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+agent:
+  # Network interfaces to attach TC classifiers to
+  interfaces:
+    - eth0
+  # Log raw events to stdout
+  logEvents: false
+  # Path to write JSON event export (empty = disabled)
+  jsonExportPath: ""
+  # Inline TOML config (rendered into a ConfigMap).
+  # Set to a raw TOML string, e.g.:
+  #   config: |
+  #     [pii]
+  #     mode = "regex"
+  #     [export]
+  #     json_path = "/var/log/panopticon/events.json"
+  # Leave as empty string or false to disable ConfigMap creation.
+  config: ""
+  # PII detection mode: regex | in-agent | external
+  piiMode: "regex"
+  # Address for metrics/health HTTP server
+  metricsBind: "0.0.0.0:9090"
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+tolerations:
+  - operator: Exists
+
+nodeSelector: {}
+
+priorityClassName: system-node-critical
+
+serviceAccount:
+  create: true
+  name: panopticon
+  annotations: {}
+
+rbac:
+  create: true
+
+mapPinPath: "/sys/fs/bpf/panopticon"
+
+onnx:
+  enabled: false
+  modelPath: /opt/panopticon/models/distilbert-ner
+
+imagePullSecrets: []
+
+podAnnotations: {}
+
+podLabels: {}

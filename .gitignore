@@ -1,0 +1,65 @@
+# Build artifacts
+debug/
+target/
+
+# Project-specific
+.claude/
+.dockerignore
+
+# Rust backup files
+**/*.rs.bk
+
+# Cargo lock is intentional for binaries — keep it tracked
+# (uncomment to ignore for libraries)
+# Cargo.lock
+
+# eBPF build artifacts
+*.o
+*.ll
+
+# Profiling & coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Documentation build
+/doc/
+
+# Benchmarks
+criterion/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+.project
+.classpath
+.settings/
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Logs
+*.log
+
+# Core dumps
+core
+vgcore.*

@@ -1,0 +1,79 @@
+name: Multi-Kernel eBPF Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'  # Weekly Monday 4am UTC
+
+env:
+  BPF_TOOLCHAIN: nightly-2026-02-17
+
+jobs:
+  kernel-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: "5.4"
+            expect_ringbuf: "false"
+            note: "Ubuntu 20.04 LTS — tests PerfEventArray fallback"
+          - kernel: "5.14"
+            expect_ringbuf: "true"
+            note: "CentOS Stream 9 — RHEL ecosystem"
+          - kernel: "5.15"
+            expect_ringbuf: "true"
+            note: "Ubuntu 22.04 LTS — production baseline"
+          - kernel: "6.1"
+            expect_ringbuf: "true"
+            note: "AL2023 / Debian 12"
+          - kernel: "6.8"
+            expect_ringbuf: "true"
+            note: "Ubuntu 24.04 — latest"
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: "Kernel ${{ matrix.kernel }} (${{ matrix.note }})"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust nightly (eBPF)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BPF_TOOLCHAIN }}
+          components: rust-src
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev pkg-config qemu-system-x86
+          pip install virtme-ng
+          cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked
+
+      - name: Download kernel
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+        run: bash .github/scripts/download-kernel.sh "$KERNEL_VERSION"
+
+      - name: Build eBPF programs
+        run: cargo xtask build-ebpf --release
+
+      - name: Build agent
+        run: cargo build -p panopticon-agent --release
+
+      - name: Run eBPF smoke tests under target kernel
+        run: |
+          vng --run /tmp/kernel/vmlinuz \
+            --disable-kvm \
+            --disable-microvm \
+            --verbose \
+            --exec \
+            "sh -lc 'set -e; uname -r; ./target/release/panopticon-agent --smoke-test --interface lo'"
+
+      - name: Verify RingBuf expectation
+        if: always()
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+          EXPECT_RINGBUF: ${{ matrix.expect_ringbuf }}
+        run: |
+          echo "Kernel $KERNEL_VERSION: expect_ringbuf=$EXPECT_RINGBUF"

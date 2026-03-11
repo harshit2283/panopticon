@@ -1,0 +1,25 @@
+Panopticon has been deployed as a DaemonSet.
+
+1. Check the rollout status:
+
+    kubectl rollout status daemonset/{{ include "panopticon.fullname" . }} -n {{ .Release.Namespace }}
+
+2. View agent logs on a specific node:
+
+    kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "panopticon.name" . }} --follow
+
+3. Verify health probes:
+
+    kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "panopticon.name" . }} -o wide
+
+4. Access Prometheus metrics:
+
+    The metrics service is available at:
+    {{ include "panopticon.fullname" . }}-metrics.{{ .Release.Namespace }}.svc:{{ (split ":" .Values.agent.metricsBind)._1 | default "9090" }}/metrics
+    The default chart bind is `0.0.0.0:9090` so probes and scraping work with `hostNetwork: true`.
+
+{{- if .Values.onnx.enabled }}
+
+5. ONNX ML inference is enabled. Ensure the model is available at:
+   {{ .Values.onnx.modelPath }}
+{{- end }}

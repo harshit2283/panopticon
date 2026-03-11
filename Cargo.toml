@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "panopticon-agent",
+    "panopticon-common",
+    "panopticon-ebpf",
+    "xtask",
+]
+default-members = ["panopticon-common", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aya = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f945739c8b8a6cab27421dfb0", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f945739c8b8a6cab27421dfb0", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f945739c8b8a6cab27421dfb0", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f945739c8b8a6cab27421dfb0", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f945739c8b8a6cab27421dfb0", default-features = false }
+
+anyhow = { version = "1", default-features = false, features = ["std"] }
+dashmap = { version = "6", default-features = false }
+cargo_metadata = { version = "0.23", default-features = false }
+clap = { version = "4", default-features = false, features = ["std", "derive", "env"] }
+libc = { version = "0.2", default-features = false }
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+which = { version = "6.0", default-features = false }
+
+# ELF parsing (Phase 4 — TLS interception)
+object = { version = "0.36", default-features = false, features = ["read", "elf"] }
+
+# Protocol parsing (Phase 3)
+nom = { version = "7", default-features = false, features = ["std"] }
+httparse = { version = "1", default-features = false }
+hpack = { package = "hpack-patched", version = "0.3.0", default-features = false }
+
+# Serialization (Phase 5 — JSON export)
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+# PII detection (Phase 5)
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+fxhash = { version = "0.2", default-features = false }
+
+# ML inference (Phase 5 — optional)
+ort = { version = "2.0.0-rc.11", default-features = false }
+tokenizers = { version = "0.20", default-features = false }
+
+# Service graph (Phase 6)
+petgraph = { version = "0.6", default-features = false }
+
+# Config & Observability (Phase 6)
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+arc-swap = { version = "1", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["tokio", "json", "http1"] }
+prometheus-client = { version = "0.23", default-features = false }
+
+# HTTP client for external PII service
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Benchmarking
+criterion = { version = "0.5", default-features = false }
+
+[profile.release]
+debug = 2
+codegen-units = 1
