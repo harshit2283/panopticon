@@ -1,0 +1,39 @@
+FROM rust:1.93-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    clang llvm libelf-dev \
+    pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV BPF_TOOLCHAIN=nightly-2026-02-17
+RUN rustup toolchain install nightly-2026-02-17 --component rust-src \
+    && cargo +nightly-2026-02-17 install bpf-linker --locked
+
+WORKDIR /build
+COPY . .
+
+RUN sed -i '/^\[target\."cfg(all())"\]/,/^runner/d' .cargo/config.toml
+
+RUN cargo xtask build-ebpf --release
+RUN cargo build -p panopticon-agent --release
+
+FROM debian:bookworm-slim as runtime
+RUN apt-get update && apt-get install -y \
+    libelf1 libssl3 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG INCLUDE_MODEL=false
+ARG MODEL_DIR=models/distilbert-ner
+
+COPY --from=builder /build/target/release/panopticon-agent /panopticon-agent
+
+RUN mkdir -p /opt/panopticon/models
+
+RUN if [ "$INCLUDE_MODEL" = "true" ] && [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/model.onnx" ]; then \
+        echo "Copying model from build context..."; \
+        cp -r $MODEL_DIR /opt/panopticon/models/distilbert-ner; \
+    fi
+
+ENV PANOPTICON_MODEL_PATH=/opt/panopticon/models/distilbert-ner
+
+ENTRYPOINT ["/panopticon-agent"]

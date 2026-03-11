@@ -1,0 +1,93 @@
+[package]
+name = "panopticon-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["compression"]
+ml = ["dep:ort", "dep:tokenizers"]
+compression = ["dep:flate2", "dep:snap", "dep:zstd"]
+
+[dependencies]
+panopticon-common = { path = "../panopticon-common" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "io-util", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Protocol parsing (pure Rust — compiles on all platforms)
+httparse = { workspace = true }
+hpack = { workspace = true }
+
+# ELF parsing for TLS library discovery (cross-platform, testable on macOS)
+object = { workspace = true }
+
+# Serialization (JSON export)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Stream buffer optimization
+bytes = "1"
+
+# Graceful shutdown
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# PII detection
+regex = { workspace = true }
+fxhash = { workspace = true }
+reqwest = { workspace = true }
+zeroize = { version = "1", features = ["derive"] }
+
+# ML inference (optional — requires ONNX Runtime)
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+# Service graph
+petgraph = { workspace = true }
+
+# Config & Observability (Phase 6)
+toml = { workspace = true }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+prometheus-client = { workspace = true }
+opentelemetry = { version = "0.28", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.28", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["trace", "grpc-tonic"] }
+
+# Compression support (optional)
+flate2 = { version = "1", optional = true }
+snap = { version = "1", optional = true }
+zstd = { version = "0.13", optional = true }
+
+# Linux-only dependencies (aya doesn't compile on macOS)
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+libc = { workspace = true }
+# Adds the `user` feature (aya::Pod impls + utility methods) only on Linux.
+# On macOS the base dep above is used without `user`, avoiding the aya transitive dep.
+panopticon-common = { path = "../panopticon-common", features = ["user"] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "protocol_detect"
+harness = false
+
+[[bench]]
+name = "parser_throughput"
+harness = false
+
+[[bench]]
+name = "pii_regex"
+harness = false

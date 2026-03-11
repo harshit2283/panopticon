@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y curl netcat-openbsd && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    requests \
+    kafka-python \
+    pymysql \
+    psycopg2-binary \
+    redis
+
+COPY traffic/ /traffic/
+
+ENTRYPOINT ["bash", "/traffic/run_all.sh"]

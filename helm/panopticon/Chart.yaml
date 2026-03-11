@@ -1,0 +1,16 @@
+apiVersion: v2
+name: panopticon
+description: eBPF-based network observability and PII detection agent
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ebpf
+  - observability
+  - network
+  - pii-detection
+  - security
+maintainers:
+  - name: harshit2283
+sources:
+  - https://github.com/harshit2283/panopticon
