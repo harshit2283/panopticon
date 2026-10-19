@@ -36,7 +36,7 @@ current release report.
 | Capability | MVP Status | Notes |
 |---|---|---|
 | Linux x86_64 on kernel 5.8+ | Supported | Primary development path with RingBuf support. |
-| Linux x86_64 on kernel 4.15-5.7 | Partial | Works through PerfEventArray fallback with higher overhead. |
+| Linux x86_64 on kernel 4.15-5.7 | Unsupported | A PerfEventArray fallback path exists, but the eBPF object always creates a RingBuf map and uses 5.5+ helpers, so it fails to load below 5.8. |
 | Linux ARM64 | Partial | Build/runtime path exists, but validation coverage is still limited. |
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |
 | Windows runtime | Unsupported | No Windows eBPF/runtime support. |
@@ -82,11 +82,34 @@ ABI types, but it does **not** validate live eBPF attachment.
 
 ### Linux build and smoke-test path
 
+Requires the pinned eBPF toolchain (`nightly-2026-02-17` with `rust-src`) and
+`bpf-linker` 0.10.3 (newer releases need a system LLVM 23):
+
 ```bash
+rustup toolchain install nightly-2026-02-17 --component rust-src
+cargo +nightly-2026-02-17 install bpf-linker --locked --version 0.10.3
 cargo xtask build-ebpf
 cargo build -p panopticon-agent
+# --smoke-test exits 0 on the first captured event, 1 after 30s without one.
 sudo ./target/debug/panopticon-agent --interface lo --log-events --smoke-test
 ```
+
+Without `--interface` (and no `interfaces` in the config file) the agent
+attaches to the host's IPv4 default-route interface(s).
+
+### Kubernetes (Helm)
+
+Releases publish a signed image to `ghcr.io/harshit2283/panopticon` and the
+chart as an OCI artifact:
+
+```bash
+helm install panopticon oci://ghcr.io/harshit2283/charts/panopticon \
+  --version 0.1.0 -n panopticon --create-namespace
+```
+
+The DaemonSet runs privileged with `hostNetwork`/`hostPID`, serves
+`/healthz`, `/readyz` and `/metrics` on the node IP at port 9435, and
+auto-detects each node's uplink interface. See `helm/panopticon/values.yaml`.
 
 For TLS or cleartext harnesses, see `tests/e2e/README.md` and
 `tests/integration/README.md`.
