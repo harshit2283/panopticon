@@ -16,7 +16,14 @@ enum State {
     InSimpleQuery,
     InExtendedQuery,
     InResponse,
+    /// SSL/GSS encryption was accepted: the rest of the stream is ciphertext.
+    Encrypted,
 }
+
+/// Special startup-phase request codes (in place of the protocol version).
+const CANCEL_REQUEST_CODE: u32 = 80877102;
+const SSL_REQUEST_CODE: u32 = 80877103;
+const GSSENC_REQUEST_CODE: u32 = 80877104;
 
 pub struct PostgresParser {
     state: State,
@@ -29,6 +36,22 @@ pub struct PostgresParser {
     pending_error: Option<String>,
     /// Non-zero status from `E`; overrides the default success status on emit.
     pending_status: Option<u32>,
+    /// An SSLRequest/GSSENCRequest was sent: the server answers with a single
+    /// unframed byte ('S'/'G' = encrypt, 'N' = no) before anything else.
+    awaiting_encryption_reply: bool,
+    /// Server bytes were lost mid-response (capture gap): discard until the
+    /// next ReadyForQuery, which ends every query cycle.
+    resync_server: bool,
+}
+
+/// ReadyForQuery header: 'Z', length 5; followed by the status byte.
+const READY_FOR_QUERY: &[u8] = b"Z\x00\x00\x00\x05";
+
+/// Offset of a ReadyForQuery message (header + I/T/E status) in `data`.
+fn find_ready_for_query(data: &[u8]) -> Option<usize> {
+    data.windows(READY_FOR_QUERY.len() + 1).position(|w| {
+        w.starts_with(READY_FOR_QUERY) && matches!(w[READY_FOR_QUERY.len()], b'I' | b'T' | b'E')
+    })
 }
 
 impl PostgresParser {
@@ -38,6 +61,8 @@ impl PostgresParser {
             client_buf: StreamBuffer::new(),
             server_buf: StreamBuffer::new(),
             server_version: None,
+            awaiting_encryption_reply: false,
+            resync_server: false,
             query_ts: None,
             query_text: None,
             pending_error: None,
@@ -104,6 +129,26 @@ impl PostgresParser {
                         break;
                     }
                 }
+                State::Encrypted => {
+                    self.client_buf.clear();
+                    self.server_buf.clear();
+                    break;
+                }
+                State::InSimpleQuery | State::InExtendedQuery | State::InResponse
+                    if self.resync_server
+                        && matches!(self.client_buf.data().first(), Some(b'Q' | b'P')) =>
+                {
+                    // Resyncing after a gap and the client already started the
+                    // next query: the previous cycle's ReadyForQuery was in the
+                    // bytes we never captured. Close the previous query now.
+                    let mut msg = self.build_msg(ts);
+                    msg.status = Some(self.pending_status.take().unwrap_or(0));
+                    self.pending_error = None;
+                    messages.push(msg);
+                    self.server_buf.clear();
+                    self.resync_server = false;
+                    self.state = State::Ready;
+                }
                 State::InSimpleQuery | State::InExtendedQuery | State::InResponse => {
                     match self.handle_response(ts) {
                         Some(msg) => {
@@ -123,6 +168,22 @@ impl PostgresParser {
     }
 
     fn handle_startup(&mut self) -> bool {
+        // libpq (sslmode=prefer, the default) and most drivers open with an
+        // SSLRequest; the server replies with ONE unframed byte. Reading that
+        // byte as a framed message misaligned every later server message.
+        if self.awaiting_encryption_reply {
+            let Some(&reply) = self.server_buf.data().first() else {
+                return false;
+            };
+            self.server_buf.consume(1);
+            self.awaiting_encryption_reply = false;
+            if reply == b'S' || reply == b'G' {
+                self.state = State::Encrypted;
+            }
+            // 'N': the real StartupMessage follows in cleartext.
+            return true;
+        }
+
         // Joined mid-connection (the agent started after the client connected —
         // the norm for pooled connections): there is no startup message, the
         // client is already sending typed messages. StartupMessage and
@@ -134,9 +195,16 @@ impl PostgresParser {
         }
 
         // Try reading startup from client
-        if let Some((_payload, consumed)) = Self::try_read_startup(&self.client_buf) {
+        if let Some((payload, consumed)) = Self::try_read_startup(&self.client_buf) {
             self.client_buf.consume(consumed);
-            self.state = State::InAuth;
+            let code = payload
+                .get(..4)
+                .map_or(0, |c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+            match code {
+                SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => self.awaiting_encryption_reply = true,
+                CANCEL_REQUEST_CODE => {} // one-shot connection, nothing follows
+                _ => self.state = State::InAuth,
+            }
             return true;
         }
         // Also check if server sends first (e.g., SSL response)
@@ -230,6 +298,22 @@ impl PostgresParser {
     }
 
     fn handle_response(&mut self, ts: u64) -> Option<L7Message> {
+        if self.resync_server {
+            let data = self.server_buf.data();
+            match find_ready_for_query(data) {
+                Some(off) => {
+                    self.server_buf.consume(off);
+                    self.resync_server = false;
+                }
+                None => {
+                    // Keep a tail in case the marker is split across packets.
+                    let keep = READY_FOR_QUERY.len();
+                    let drop = data.len().saturating_sub(keep);
+                    self.server_buf.consume(drop);
+                    return None;
+                }
+            }
+        }
         loop {
             let (msg_type, payload, consumed) = Self::try_read_backend_msg(&self.server_buf)?;
             self.server_buf.consume(consumed);
@@ -308,6 +392,7 @@ impl PostgresParser {
             State::InSimpleQuery => "in_simple_query",
             State::InExtendedQuery => "in_extended_query",
             State::InResponse => "in_response",
+            State::Encrypted => "encrypted",
         }
     }
 }
@@ -363,6 +448,24 @@ impl ProtocolParser for PostgresParser {
         }
         self.process(ts)
     }
+    fn skip(&mut self, direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<ParseResult> {
+        match (direction, &self.state) {
+            // Lost part of a response (typically a large result set in a
+            // GSO super-packet): the row data is not needed, so drop the
+            // partial message and resync on the closing ReadyForQuery.
+            (
+                Direction::Ingress,
+                State::InSimpleQuery | State::InExtendedQuery | State::InResponse,
+            ) => {
+                self.server_buf.clear();
+                self.resync_server = true;
+                Some(ParseResult::NeedMoreData)
+            }
+            (_, State::Encrypted) => Some(ParseResult::NeedMoreData),
+            _ => None,
+        }
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::Postgres
     }
@@ -418,6 +521,116 @@ mod tests {
         // Feed ReadyForQuery
         p.feed(&make_backend_msg(b'Z', b"I"), Direction::Ingress, 0);
         p
+    }
+
+    fn make_ssl_request() -> Vec<u8> {
+        let mut pkt = 8u32.to_be_bytes().to_vec();
+        pkt.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn test_ssl_request_declined_then_query() {
+        // libpq default (sslmode=prefer) against a server without SSL.
+        let mut p = PostgresParser::new();
+        p.feed(&make_ssl_request(), Direction::Egress, 0);
+        p.feed(b"N", Direction::Ingress, 0);
+        p.feed(&make_startup_msg(), Direction::Egress, 0);
+        let mut auth = make_backend_msg(b'R', &0u32.to_be_bytes());
+        auth.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        p.feed(&auth, Direction::Ingress, 0);
+        assert_eq!(p.state, State::Ready);
+
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT 1\0"),
+            Direction::Egress,
+            1000,
+        );
+        let mut resp = make_backend_msg(b'C', b"SELECT 1\0");
+        resp.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        match p.feed(&resp, Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => assert_eq!(msgs[0].method.as_deref(), Some("SELECT")),
+            other => panic!("expected a message after SSL negotiation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gap_in_large_result_resyncs_on_ready_for_query() {
+        let mut p = setup_ready_parser();
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT * FROM big\0"),
+            Direction::Egress,
+            1000,
+        );
+        // First captured part of the result: a partial DataRow stream...
+        let mut part = make_backend_msg(b'T', &[0, 1, b'c', 0]);
+        part.extend_from_slice(&make_backend_msg(b'D', &[0u8; 40])[..20]);
+        p.feed(&part, Direction::Ingress, 1500);
+        // ...then bytes the capture never saw.
+        assert!(matches!(
+            p.skip(Direction::Ingress, 60_000, 1600),
+            Some(ParseResult::NeedMoreData)
+        ));
+        // Tail of a row, CommandComplete, ReadyForQuery.
+        let mut tail = vec![7u8; 13];
+        tail.extend_from_slice(&make_backend_msg(b'C', b"SELECT 900\0"));
+        tail.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        match p.feed(&tail, Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs.len(), 1);
+                assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
+                assert_eq!(msgs[0].latency_ns, Some(1000));
+            }
+            other => panic!("expected the query's message after resync, got {other:?}"),
+        }
+        assert_eq!(p.state, State::Ready);
+    }
+
+    #[test]
+    fn test_gap_swallowing_ready_for_query_closes_on_next_query() {
+        // The ReadyForQuery was in the truncated tail: the next thing seen is
+        // the client's next query, which must pair with its own response.
+        let mut p = setup_ready_parser();
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT * FROM big\0"),
+            Direction::Egress,
+            1000,
+        );
+        p.feed(
+            &make_backend_msg(b'T', &[0, 1, b'c', 0]),
+            Direction::Ingress,
+            1500,
+        );
+        let _ = p.skip(Direction::Ingress, 60_000, 1600);
+        let first = p.feed(
+            &make_frontend_msg(b'Q', b"UPDATE t SET a = 1\0"),
+            Direction::Egress,
+            3000,
+        );
+        let ParseResult::Messages(msgs) = first else {
+            panic!("previous query must be closed, got {first:?}");
+        };
+        assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
+        let mut resp = make_backend_msg(b'C', b"UPDATE 1\0");
+        resp.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        match p.feed(&resp, Direction::Ingress, 3500) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].method.as_deref(), Some("UPDATE"));
+                assert_eq!(msgs[0].latency_ns, Some(500));
+            }
+            other => panic!("expected UPDATE paired with its own response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ssl_request_accepted_goes_encrypted() {
+        let mut p = PostgresParser::new();
+        p.feed(&make_ssl_request(), Direction::Egress, 0);
+        p.feed(b"S", Direction::Ingress, 0);
+        assert_eq!(p.state, State::Encrypted);
+        // TLS records afterwards are ignored, not misparsed.
+        let r = p.feed(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01], Direction::Egress, 1);
+        assert!(matches!(r, ParseResult::NeedMoreData));
     }
 
     #[test]
