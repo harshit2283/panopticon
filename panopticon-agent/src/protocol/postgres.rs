@@ -5,6 +5,8 @@
 //! Wire format: 1-byte message type + 4-byte length + payload.
 //! StartupMessage has no type byte (length + protocol version instead).
 
+use std::collections::HashMap;
+
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
 
@@ -42,6 +44,63 @@ pub struct PostgresParser {
     /// Server bytes were lost mid-response (capture gap): discard until the
     /// next ReadyForQuery, which ends every query cycle.
     resync_server: bool,
+    /// Named prepared statements seen in Parse messages: name -> SQL. Lets a
+    /// Bind/Execute cycle that reuses a statement (no Parse — what ORMs and
+    /// drivers do after preparing) be attributed to its query.
+    prepared: HashMap<String, String>,
+    /// Text-format parameter values from the current cycle's Bind message.
+    /// Applications send their data here, not in the SQL text.
+    bind_params: Option<String>,
+}
+
+/// Max named statements remembered per connection.
+const MAX_PREPARED_STATEMENTS: usize = 256;
+/// Max bytes of bind-parameter text kept per query.
+const MAX_BIND_TEXT: usize = 64 * 1024;
+
+/// Text-format parameter values of a Bind message, joined for PII scanning.
+/// Bind: portal\0 statement\0 i16 nfmt, i16 fmt[nfmt], i16 nparams,
+/// (i32 len, bytes)[nparams], ... Binary-format values are skipped.
+fn bind_param_text(payload: &[u8]) -> Option<String> {
+    let mut pos = payload.iter().position(|&b| b == 0)? + 1;
+    pos += payload[pos..].iter().position(|&b| b == 0)? + 1;
+    let i16_at = |p: usize| {
+        payload
+            .get(p..p + 2)
+            .map(|b| i16::from_be_bytes([b[0], b[1]]))
+    };
+    let nfmt = i16_at(pos)?.max(0) as usize;
+    let formats: Vec<i16> = (0..nfmt)
+        .map(|i| i16_at(pos + 2 + 2 * i))
+        .collect::<Option<_>>()?;
+    pos += 2 + 2 * nfmt;
+    let nparams = i16_at(pos)?.max(0) as usize;
+    pos += 2;
+    let mut values = Vec::new();
+    let mut total = 0;
+    for i in 0..nparams {
+        let len = payload
+            .get(pos..pos + 4)
+            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))?;
+        pos += 4;
+        if len < 0 {
+            continue; // NULL
+        }
+        let value = payload.get(pos..pos + len as usize)?;
+        pos += len as usize;
+        // One format code applies to all params; otherwise one per param.
+        let format = match formats.len() {
+            0 => 0,
+            1 => formats[0],
+            _ => *formats.get(i).unwrap_or(&0),
+        };
+        if format == 0 && total < MAX_BIND_TEXT {
+            let text = String::from_utf8_lossy(value);
+            total += text.len();
+            values.push(text.into_owned());
+        }
+    }
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 /// ReadyForQuery header: 'Z', length 5; followed by the status byte.
@@ -63,6 +122,8 @@ impl PostgresParser {
             server_version: None,
             awaiting_encryption_reply: false,
             resync_server: false,
+            prepared: HashMap::new(),
+            bind_params: None,
             query_ts: None,
             query_text: None,
             pending_error: None,
@@ -136,11 +197,13 @@ impl PostgresParser {
                 }
                 State::InSimpleQuery | State::InExtendedQuery | State::InResponse
                     if self.resync_server
-                        && matches!(self.client_buf.data().first(), Some(b'Q' | b'P')) =>
+                        && matches!(self.client_buf.data().first(), Some(b'Q' | b'P' | b'B')) =>
                 {
                     // Resyncing after a gap and the client already started the
-                    // next query: the previous cycle's ReadyForQuery was in the
-                    // bytes we never captured. Close the previous query now.
+                    // next query (Q, P, or B for a reused prepared statement —
+                    // the current cycle's own Bind was absorbed with its Parse):
+                    // the previous cycle's ReadyForQuery was in the bytes we
+                    // never captured. Close the previous query now.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
                     // Closed by the next query, not by ReadyForQuery: the real
@@ -264,6 +327,23 @@ impl PostgresParser {
         false
     }
 
+    /// Consume the rest of the current extended-protocol cycle that the client
+    /// sent along with Parse/Bind (Bind, Describe, Execute, Flush, Sync,
+    /// Close), recording Bind parameters. Stops at the next Parse/Query, which
+    /// starts another cycle.
+    fn absorb_extended_cycle(&mut self) {
+        while let Some((msg_type, payload, consumed)) =
+            Self::try_read_frontend_msg(&self.client_buf)
+        {
+            match msg_type {
+                b'B' => self.bind_params = bind_param_text(&payload),
+                b'D' | b'E' | b'H' | b'S' | b'C' => {}
+                _ => break,
+            }
+            self.client_buf.consume(consumed);
+        }
+    }
+
     fn handle_ready(&mut self, ts: u64) -> bool {
         let (msg_type, payload, consumed) = match Self::try_read_frontend_msg(&self.client_buf) {
             Some(m) => m,
@@ -282,17 +362,31 @@ impl PostgresParser {
             }
             b'P' => {
                 // Parse (extended query): name\0 + query\0 + param types
+                let name = extract_string(&payload);
                 let query = extract_second_string(&payload);
+                if !name.is_empty() && self.prepared.len() < MAX_PREPARED_STATEMENTS {
+                    self.prepared.insert(name, query.clone());
+                }
                 self.query_text = Some(query);
                 self.query_ts = Some(ts);
                 self.state = State::InExtendedQuery;
+                self.absorb_extended_cycle();
                 true
             }
-            b'B' | b'D' | b'E' | b'H' | b'S' => {
-                // Bind, Describe, Execute, Flush, Sync — part of extended query
-                if self.query_text.is_some() {
+            b'B' => {
+                // Bind without Parse: execution of an already-prepared statement.
+                let statement = extract_second_string(&payload);
+                if let Some(query) = self.prepared.get(&statement) {
+                    self.query_text = Some(query.clone());
+                    self.query_ts = Some(ts);
+                    self.bind_params = bind_param_text(&payload);
                     self.state = State::InExtendedQuery;
+                    self.absorb_extended_cycle();
                 }
+                true
+            }
+            b'D' | b'E' | b'H' | b'S' => {
+                // Describe, Execute, Flush, Sync outside a tracked cycle.
                 true
             }
             b'X' => false, // Terminate
@@ -384,6 +478,7 @@ impl PostgresParser {
         if let Some(t) = self.query_ts.take() {
             msg.latency_ns = Some(ts.saturating_sub(t));
         }
+        msg.request_text = self.bind_params.take();
         msg
     }
 
@@ -623,6 +718,90 @@ mod tests {
                 assert_eq!(msgs[0].latency_ns, Some(500));
             }
             other => panic!("expected UPDATE paired with its own response, got {other:?}"),
+        }
+    }
+
+    /// Bind for `statement` with text-format parameters.
+    fn make_bind(statement: &str, params: &[&str]) -> Vec<u8> {
+        let mut b = b"\0".to_vec(); // unnamed portal
+        b.extend_from_slice(statement.as_bytes());
+        b.push(0);
+        b.extend_from_slice(&0i16.to_be_bytes()); // all params text
+        b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for v in params {
+            b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        b.extend_from_slice(&0i16.to_be_bytes()); // result formats
+        make_frontend_msg(b'B', &b)
+    }
+
+    fn extended_cycle(parse: Option<(&str, &str)>, statement: &str, params: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some((name, sql)) = parse {
+            let mut body = format!("{name}\0{sql}\0").into_bytes();
+            body.extend_from_slice(&0i16.to_be_bytes());
+            out.extend(make_frontend_msg(b'P', &body));
+        }
+        out.extend(make_bind(statement, params));
+        out.extend(make_frontend_msg(b'E', b"\0\0\0\0\0"));
+        out.extend(make_frontend_msg(b'S', b""));
+        out
+    }
+
+    fn insert_done() -> Vec<u8> {
+        let mut r = make_backend_msg(b'1', b"");
+        r.extend(make_backend_msg(b'2', b""));
+        r.extend(make_backend_msg(b'C', b"INSERT 0 1\0"));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r
+    }
+
+    #[test]
+    fn test_bind_parameters_become_request_text() {
+        let mut p = setup_ready_parser();
+        let sql = "INSERT INTO users (email, name) VALUES ($1, $2)";
+        p.feed(
+            &extended_cycle(Some(("", sql)), "", &["jane@example.com", "Jane"]),
+            Direction::Egress,
+            1000,
+        );
+        match p.feed(&insert_done(), Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].method.as_deref(), Some("INSERT"));
+                assert_eq!(
+                    msgs[0].request_text.as_deref(),
+                    Some("jane@example.com, Jane")
+                );
+            }
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reused_prepared_statement_is_captured() {
+        // ORMs/drivers prepare once, then send only Bind/Execute/Sync.
+        let mut p = setup_ready_parser();
+        let sql = "INSERT INTO users (email) VALUES ($1)";
+        p.feed(
+            &extended_cycle(Some(("s1", sql)), "s1", &["a@example.com"]),
+            Direction::Egress,
+            1000,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 1500);
+        p.feed(
+            &extended_cycle(None, "s1", &["b@example.com"]),
+            Direction::Egress,
+            2000,
+        );
+        match p.feed(&insert_done(), Direction::Ingress, 2600) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].method.as_deref(), Some("INSERT"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some(sql));
+                assert_eq!(msgs[0].request_text.as_deref(), Some("b@example.com"));
+                assert_eq!(msgs[0].latency_ns, Some(600));
+            }
+            other => panic!("reused statement must produce a message, got {other:?}"),
         }
     }
 

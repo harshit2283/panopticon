@@ -82,11 +82,19 @@ def run_redis():
         i += 1
 
 
-def run_sql(execute, simple):
+def run_sql(execute, simple, prepared=None):
     """`execute(sql, params)` uses the protocol under test for parameters;
-    `simple(sql)` sends literal SQL only."""
+    `simple(sql)` sends literal SQL only; `prepared(sql, params)`, if given,
+    reuses a server-side prepared statement (constant SQL, so the token
+    travels as a parameter)."""
     for i in range(N):
         tok = f"tok_{i}_"
+        if prepared and rnd.random() < 0.25:
+            email = f"prep{i}@example.com"
+            via = prepared("INSERT INTO users (id, email, note) VALUES (%s, %s, %s)",
+                           (i, email, tok))
+            record(i, "INSERT", pii=[email], via=via)
+            continue
         op = rnd.random()
         if op < 0.30:
             email = f"user{i}@example.com"
@@ -133,7 +141,13 @@ def run_postgres():
             raise RuntimeError(res.error_message)
         return "simple"
 
-    run_sql(execute, simple)
+    def prepared(sql, params):
+        # prepare=True: Parse once into a named statement, then Bind/Execute
+        # only — what ORMs and pooled drivers do for hot queries.
+        conn.execute(sql, params, prepare=True)
+        return "prepared"
+
+    run_sql(execute, simple, prepared)
 
 
 def run_mysql():
