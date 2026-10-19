@@ -1,200 +1,105 @@
-//! Benchmark for `RegexPrefilter::scan()` on various payload types.
+//! Cost of the real PII engine (regex path, default config) on the agent's
+//! hot path.
 //!
-//! Measures:
-//! - Clean payload (no PII) -- fast rejection path
-//! - Payload with single email
-//! - Payload with mixed PII (email + SSN + credit card)
-//! - Large 4KB payload with PII scattered throughout
+//! The agent is a binary crate, so its `config`, `pii` and `protocol` modules
+//! are compiled into the benchmark directly. Benchmarks call the same
+//! `PiiEngine` the workers use:
+//! - `scan` on 4KB payloads with and without PII (most traffic has none);
+//! - `scan_message` on a typical HTTP exchange: path + headers + body,
+//!   including in-place redaction.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use regex::{Regex, RegexSet};
+use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-/// PII categories (matching the agent's PiiCategory enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PiiCategory {
-    Email,
-    PhoneUs,
-    PhoneIntl,
-    Ssn,
-    CreditCard,
-    IpV4,
-    Jwt,
-    ApiKey,
-    AwsKey,
-    Aadhaar,
-    Pan,
-}
+#[allow(dead_code, unused_imports)]
+#[path = "../src/config.rs"]
+mod config;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/pii/mod.rs"]
+mod pii;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/protocol/mod.rs"]
+mod protocol;
 
-/// Regex prefilter matching the agent's implementation.
-struct RegexPrefilter {
-    set: RegexSet,
-    patterns: Vec<(PiiCategory, Regex)>,
-}
+use config::PiiConfig;
+use pii::PiiEngine;
+use protocol::{Direction, L7Message, Protocol};
 
-impl RegexPrefilter {
-    fn new() -> Self {
-        let pattern_defs: Vec<(PiiCategory, &str)> = vec![
-            (
-                PiiCategory::Email,
-                r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
-            ),
-            (
-                PiiCategory::PhoneUs,
-                r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
-            ),
-            (
-                PiiCategory::PhoneIntl,
-                r"\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}",
-            ),
-            (PiiCategory::Ssn, r"\b\d{3}-\d{2}-\d{4}\b"),
-            (PiiCategory::CreditCard, r"\b(?:\d[ -]*?){13,19}\b"),
-            (
-                PiiCategory::IpV4,
-                r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
-            ),
-            (
-                PiiCategory::Jwt,
-                r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
-            ),
-            (
-                PiiCategory::ApiKey,
-                r#"(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token)[\s:="']+[A-Za-z0-9_\-]{20,}"#,
-            ),
-            (PiiCategory::AwsKey, r"(?:AKIA|ASIA)[A-Z0-9]{16}"),
-            (PiiCategory::Aadhaar, r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"),
-            (PiiCategory::Pan, r"\b[A-Z]{5}\d{4}[A-Z]\b"),
-        ];
-
-        let raw_patterns: Vec<&str> = pattern_defs.iter().map(|(_, p)| *p).collect();
-        let set = RegexSet::new(&raw_patterns).expect("invalid regex in PII pattern set");
-
-        let patterns: Vec<(PiiCategory, Regex)> = pattern_defs
-            .into_iter()
-            .map(|(cat, p)| (cat, Regex::new(p).expect("invalid regex in PII pattern")))
-            .collect();
-
-        Self { set, patterns }
-    }
-
-    fn has_pii(&self, text: &str) -> bool {
-        self.set.is_match(text)
-    }
-
-    fn scan(&self, text: &str) -> Vec<(PiiCategory, String)> {
-        let matches: Vec<usize> = self.set.matches(text).into_iter().collect();
-        if matches.is_empty() {
-            return Vec::new();
-        }
-
-        let mut entities = Vec::new();
-        for idx in matches {
-            let (category, regex) = &self.patterns[idx];
-            for m in regex.find_iter(text) {
-                entities.push((*category, m.as_str().to_string()));
-            }
-        }
-        entities
-    }
-}
-
-fn bench_pii_regex(c: &mut Criterion) {
-    let prefilter = RegexPrefilter::new();
-    let mut group = c.benchmark_group("pii_regex");
-
-    // 1. Clean payload (no PII) -- fast rejection path
-    let clean_payload = "The quick brown fox jumps over the lazy dog. \
-        This is a normal HTTP response body with no sensitive data. \
-        Status: 200 OK. Content-Type: application/json. \
-        {\"status\":\"healthy\",\"uptime\":\"42h\",\"version\":\"1.2.3\"}";
-
-    group.bench_function("clean_payload_has_pii", |b| {
-        b.iter(|| prefilter.has_pii(black_box(clean_payload)))
-    });
-
-    group.bench_function("clean_payload_scan", |b| {
-        b.iter(|| prefilter.scan(black_box(clean_payload)))
-    });
-
-    // 2. Payload with single email
-    let email_payload = "User profile: {\"name\": \"Alice Johnson\", \
-        \"email\": \"alice.johnson@example.com\", \"role\": \"admin\"}";
-
-    group.bench_function("email_payload_has_pii", |b| {
-        b.iter(|| prefilter.has_pii(black_box(email_payload)))
-    });
-
-    group.bench_function("email_payload_scan", |b| {
-        b.iter(|| prefilter.scan(black_box(email_payload)))
-    });
-
-    // 3. Mixed PII payload (email + SSN + credit card)
-    let mixed_pii_payload = "Customer record: \
-        email=john.doe@company.org, \
-        ssn=123-45-6789, \
-        card=4111111111111111, \
-        phone=(555) 123-4567, \
-        ip=192.168.1.100";
-
-    group.bench_function("mixed_pii_has_pii", |b| {
-        b.iter(|| prefilter.has_pii(black_box(mixed_pii_payload)))
-    });
-
-    group.bench_function("mixed_pii_scan", |b| {
-        b.iter(|| prefilter.scan(black_box(mixed_pii_payload)))
-    });
-
-    // 4. Large 4KB payload with PII scattered throughout
-    let mut large_payload = String::with_capacity(4096);
-    for i in 0..20 {
-        large_payload.push_str(&format!(
-            "Record {}: name=User{}, department=Engineering, location=Building-{}, \
-             status=active, created=2024-01-{:02}, updated=2024-06-{:02}. ",
-            i,
-            i,
-            i % 5,
-            (i % 28) + 1,
-            (i % 28) + 1,
+fn payload_4kb(with_pii: bool) -> String {
+    let mut s = String::with_capacity(4096);
+    let mut i = 0;
+    while s.len() < 4000 {
+        s.push_str(&format!(
+            "{{\"id\":{i},\"status\":\"active\",\"plan\":\"pro\",\"region\":\"eu-west\"}},"
         ));
+        if with_pii && i % 20 == 0 {
+            s.push_str(&format!(
+                "{{\"email\":\"user{i}@example.com\",\"ssn\":\"123-45-67{:02}\"}},",
+                i % 100
+            ));
+        }
+        i += 1;
     }
-    // Scatter some PII
-    large_payload.push_str("contact: admin@internal.example.com, ");
-    large_payload.push_str("backup-ssn: 987-65-4321, ");
-    large_payload
-        .push_str("token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123XYZdef456, ");
-    // Pad to ~4KB
-    while large_payload.len() < 4096 {
-        large_payload.push_str("padding data to reach 4KB target size. ");
-    }
-    large_payload.truncate(4096);
+    s
+}
 
-    group.bench_function("large_4kb_has_pii", |b| {
-        b.iter(|| prefilter.has_pii(black_box(&large_payload)))
+fn http_message() -> L7Message {
+    let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, 1);
+    msg.method = Some("GET".into());
+    msg.path = Some("/api/users?email=jane%40example.com&page=2".into());
+    msg.headers = vec![
+        ("host".into(), "api.example.com".into()),
+        (
+            "authorization".into(),
+            "Bearer eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl".into(),
+        ),
+        ("accept".into(), "application/json".into()),
+        ("content-type".into(), "application/json".into()),
+    ];
+    msg.payload_text = Some(
+        r#"{"users":[{"id":1,"name":"Alice","email":"alice@example.com"},{"id":2,"name":"Bob"}],"total":2}"#
+            .into(),
+    );
+    msg
+}
+
+fn bench_pii(c: &mut Criterion) {
+    let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+    let clean = payload_4kb(false);
+    let dirty = payload_4kb(true);
+    assert!(
+        engine.scan(&clean).is_none(),
+        "clean payload must have no findings"
+    );
+    assert!(
+        engine.scan(&dirty).is_some(),
+        "dirty payload must have findings"
+    );
+
+    let mut group = c.benchmark_group("pii_engine");
+    group.throughput(Throughput::Bytes(clean.len() as u64));
+    group.bench_function("scan_4kb_clean", |b| {
+        b.iter(|| engine.scan(black_box(&clean)))
+    });
+    group.throughput(Throughput::Bytes(dirty.len() as u64));
+    group.bench_function("scan_4kb_with_pii", |b| {
+        b.iter(|| engine.scan(black_box(&dirty)))
     });
 
-    group.bench_function("large_4kb_scan", |b| {
-        b.iter(|| prefilter.scan(black_box(&large_payload)))
+    let template = http_message();
+    assert!(
+        engine.scan_message(&mut template.clone()).is_some(),
+        "HTTP message must have findings"
+    );
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("scan_message_http_exchange", |b| {
+        b.iter_batched(
+            || template.clone(),
+            |mut msg| engine.scan_message(black_box(&mut msg)),
+            BatchSize::SmallInput,
+        )
     });
-
-    // 5. Large 4KB clean payload (no PII)
-    let mut large_clean = String::with_capacity(4096);
-    while large_clean.len() < 4096 {
-        large_clean.push_str(
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
-             Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ",
-        );
-    }
-    large_clean.truncate(4096);
-
-    group.bench_function("large_4kb_clean_has_pii", |b| {
-        b.iter(|| prefilter.has_pii(black_box(&large_clean)))
-    });
-
-    group.bench_function("large_4kb_clean_scan", |b| {
-        b.iter(|| prefilter.scan(black_box(&large_clean)))
-    });
-
     group.finish();
 }
 
-criterion_group!(benches, bench_pii_regex);
+criterion_group!(benches, bench_pii);
 criterion_main!(benches);

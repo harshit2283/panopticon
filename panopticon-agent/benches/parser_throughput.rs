@@ -1,123 +1,127 @@
-//! Benchmark for protocol parser `feed()` throughput on realistic payloads.
+//! Throughput of the real L7 parsers on complete request/response exchanges.
 //!
-//! Tests HTTP/1.1, MySQL, PostgreSQL, and Redis parsers with representative
-//! request/response pairs.
+//! The agent is a binary crate, so the protocol module is compiled into the
+//! benchmark directly (as the fuzz targets do). Each benchmark feeds one full
+//! exchange on a keep-alive connection through `ProtocolFsmAdapter` — the
+//! same path the agent's workers use — and asserts, before timing, that the
+//! exchange actually produces exactly one message.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-// For this benchmark, we measure the raw throughput of feeding data to parsers.
-// Since the parsers are internal to the binary crate, we benchmark the
-// protocol detection + parsing pipeline as end users would experience it.
-// We simulate the parsing by feeding realistic payloads through the detection
-// and measuring detection + allocation overhead.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/protocol/mod.rs"]
+mod protocol;
 
-fn bench_http1_parsing(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parser_throughput");
+use protocol::fsm::{FsmResult, ProtocolFsm, ProtocolFsmAdapter};
+use protocol::{Direction, Protocol};
 
-    // HTTP/1.1 GET request
-    let http_request = b"GET /api/users?page=1&limit=50 HTTP/1.1\r\n\
+/// One exchange: (direction, segment) pairs as they would arrive.
+type Exchange = Vec<(Direction, Vec<u8>)>;
+
+fn feed_exchange(fsm: &mut ProtocolFsmAdapter, exchange: &Exchange) -> usize {
+    let mut messages = 0;
+    for (dir, seg) in exchange {
+        match fsm.process_packet(*dir, seg, 1_000) {
+            FsmResult::MessageComplete(_) => messages += 1,
+            FsmResult::Messages(m) => messages += m.len(),
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn http1_exchange(body_len: usize) -> Exchange {
+    let req = b"GET /api/users?page=1&limit=50 HTTP/1.1\r\n\
         Host: api.example.com\r\n\
         Accept: application/json\r\n\
-        Authorization: Bearer token123\r\n\
         User-Agent: panopticon-bench/1.0\r\n\
-        Connection: keep-alive\r\n\
-        \r\n";
+        Connection: keep-alive\r\n\r\n"
+        .to_vec();
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+    )
+    .into_bytes();
+    resp.extend(std::iter::repeat_n(b'a', body_len));
+    vec![(Direction::Egress, req), (Direction::Ingress, resp)]
+}
 
-    // HTTP/1.1 200 response with JSON body
-    let http_response = b"HTTP/1.1 200 OK\r\n\
-        Content-Type: application/json; charset=utf-8\r\n\
-        Content-Length: 156\r\n\
-        X-Request-Id: abc-123-def\r\n\
-        \r\n\
-        {\"users\":[{\"id\":1,\"name\":\"Alice\",\"email\":\"alice@example.com\"},{\"id\":2,\"name\":\"Bob\",\"email\":\"bob@example.com\"}],\"total\":2,\"page\":1}";
+fn redis_exchange() -> Exchange {
+    vec![
+        (
+            Direction::Egress,
+            b"*3\r\n$3\r\nSET\r\n$9\r\nuser:1001\r\n$42\r\n{\"name\":\"Alice\",\"email\":\"alice@test.com\"}\r\n"
+                .to_vec(),
+        ),
+        (Direction::Ingress, b"+OK\r\n".to_vec()),
+    ]
+}
 
-    // Benchmark httparse request parsing (the core of HTTP/1.1 parsing)
-    group.bench_function("http1_request_parse", |b| {
-        b.iter(|| {
-            let mut headers = [httparse::EMPTY_HEADER; 16];
-            let mut req = httparse::Request::new(&mut headers);
-            req.parse(black_box(http_request)).unwrap()
-        })
-    });
+fn postgres_exchange() -> Exchange {
+    let query = b"SELECT id, name, email FROM users WHERE active = true LIMIT 100\0";
+    let mut q = vec![b'Q'];
+    q.extend(((4 + query.len()) as u32).to_be_bytes());
+    q.extend_from_slice(query);
+    // RowDescription (empty) + CommandComplete + ReadyForQuery
+    let mut resp = vec![b'T'];
+    resp.extend(6u32.to_be_bytes());
+    resp.extend([0, 0]);
+    let tag = b"SELECT 0\0";
+    resp.push(b'C');
+    resp.extend(((4 + tag.len()) as u32).to_be_bytes());
+    resp.extend_from_slice(tag);
+    resp.push(b'Z');
+    resp.extend(5u32.to_be_bytes());
+    resp.push(b'I');
+    vec![(Direction::Egress, q), (Direction::Ingress, resp)]
+}
 
-    // Benchmark httparse response parsing
-    group.bench_function("http1_response_parse", |b| {
-        b.iter(|| {
-            let mut headers = [httparse::EMPTY_HEADER; 16];
-            let mut resp = httparse::Response::new(&mut headers);
-            resp.parse(black_box(http_response)).unwrap()
-        })
-    });
-
-    // MySQL COM_QUERY packet
-    // [3-byte length][1-byte seq_id][1-byte command(0x03)][query bytes]
+fn mysql_exchange() -> Exchange {
     let query = b"SELECT id, name, email FROM users WHERE active = 1 ORDER BY id LIMIT 100";
-    let query_len = (query.len() + 1) as u32; // +1 for command byte
-    let mut mysql_query = Vec::new();
-    mysql_query.extend_from_slice(&(query_len as u32).to_le_bytes()[..3]);
-    mysql_query.push(0x00); // seq_id
-    mysql_query.push(0x03); // COM_QUERY
-    mysql_query.extend_from_slice(query);
+    let mut q = ((query.len() + 1) as u32).to_le_bytes()[..3].to_vec();
+    q.push(0x00); // sequence id
+    q.push(0x03); // COM_QUERY
+    q.extend_from_slice(query);
+    // OK packet: header, 0x00, affected rows, last insert id, status, warnings
+    let ok = vec![7, 0, 0, 1, 0x00, 0, 0, 2, 0, 0, 0];
+    vec![(Direction::Egress, q), (Direction::Ingress, ok)]
+}
 
-    group.bench_function("mysql_query_construct", |b| {
-        b.iter(|| {
-            // Simulate parsing: extract command byte and query text
-            let data = black_box(&mysql_query);
-            if data.len() >= 5 {
-                let _len = (data[0] as u32) | ((data[1] as u32) << 8) | ((data[2] as u32) << 16);
-                let _seq_id = data[3];
-                let _cmd = data[4];
-                let _query = std::str::from_utf8(&data[5..]).ok();
-            }
-        })
-    });
+fn bench_parsers(c: &mut Criterion) {
+    let cases: Vec<(&str, Protocol, Exchange)> = vec![
+        ("http1_get_156b_body", Protocol::Http1, http1_exchange(156)),
+        (
+            "http1_get_16kb_body",
+            Protocol::Http1,
+            http1_exchange(16 * 1024),
+        ),
+        ("redis_set", Protocol::Redis, redis_exchange()),
+        (
+            "postgres_simple_query",
+            Protocol::Postgres,
+            postgres_exchange(),
+        ),
+        ("mysql_com_query", Protocol::Mysql, mysql_exchange()),
+    ];
 
-    // PostgreSQL simple query message
-    // [1-byte type 'Q'][4-byte length][query string + NUL]
-    let pg_query_str = b"SELECT u.id, u.name, u.email, a.city FROM users u JOIN addresses a ON u.id = a.user_id WHERE u.active = true;\0";
-    let mut pg_query = Vec::new();
-    pg_query.push(b'Q');
-    let len = (pg_query_str.len() as u32) + 4;
-    pg_query.extend_from_slice(&len.to_be_bytes());
-    pg_query.extend_from_slice(pg_query_str);
-
-    group.bench_function("postgres_query_construct", |b| {
-        b.iter(|| {
-            let data = black_box(&pg_query);
-            if data.len() >= 5 && data[0] == b'Q' {
-                let _len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-                let _query = std::str::from_utf8(&data[5..]).ok();
-            }
-        })
-    });
-
-    // Redis RESP command: *3\r\n$3\r\nSET\r\n$9\r\nuser:1001\r\n$42\r\n{"name":"Alice","email":"alice@test.com"}\r\n
-    let redis_cmd = b"*3\r\n$3\r\nSET\r\n$9\r\nuser:1001\r\n$42\r\n{\"name\":\"Alice\",\"email\":\"alice@test.com\"}\r\n";
-
-    group.bench_function("redis_resp_parse", |b| {
-        b.iter(|| {
-            // Simulate RESP parsing: find array count, then bulk strings
-            let data = black_box(redis_cmd);
-            if !data.is_empty() && data[0] == b'*' {
-                // Find first \r\n
-                let _crlf_pos = data.windows(2).position(|w| w == b"\r\n");
-            }
-        })
-    });
-
-    // Redis RESP response: +OK\r\n
-    let redis_resp = b"+OK\r\n";
-    group.bench_function("redis_resp_simple_response", |b| {
-        b.iter(|| {
-            let data = black_box(redis_resp);
-            if !data.is_empty() && data[0] == b'+' {
-                let _end = data.windows(2).position(|w| w == b"\r\n");
-            }
-        })
-    });
-
+    let mut group = c.benchmark_group("parser_exchange");
+    for (name, proto, exchange) in &cases {
+        let mut fsm = ProtocolFsmAdapter::new(*proto);
+        // Guard against benchmarking a parser that never completes a message.
+        for _ in 0..3 {
+            assert_eq!(
+                feed_exchange(&mut fsm, exchange),
+                1,
+                "{name}: exchange must yield exactly one message"
+            );
+        }
+        let bytes: usize = exchange.iter().map(|(_, s)| s.len()).sum();
+        group.throughput(Throughput::Bytes(bytes as u64));
+        group.bench_function(*name, |b| {
+            b.iter(|| black_box(feed_exchange(&mut fsm, black_box(exchange))))
+        });
+    }
     group.finish();
 }
 
-criterion_group!(benches, bench_http1_parsing);
+criterion_group!(benches, bench_parsers);
 criterion_main!(benches);

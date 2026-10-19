@@ -2,134 +2,14 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-// Re-use agent types. The agent is a binary crate, so we import protocol
-// detection via the module path by including the source directly.
-// Since panopticon-agent is a binary, we replicate the minimal types needed.
+// The agent is a binary crate, so the real protocol module is compiled into
+// the benchmark directly (no hand-copied detection code that can drift).
+#[allow(dead_code, unused_imports)]
+#[path = "../src/protocol/mod.rs"]
+mod protocol;
 
-// We need to access the protocol detection function. Since the agent is a binary
-// crate without a lib.rs, we test via the same approach as the unit tests:
-// include the modules directly.
-
-#[allow(dead_code)]
-mod protocol {
-    pub use panopticon_common::Direction;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum Protocol {
-        Http1,
-        Http2,
-        Grpc,
-        Mysql,
-        Postgres,
-        Redis,
-        Dns,
-        Kafka,
-        Amqp,
-        Unknown,
-    }
-
-    /// HTTP/2 connection preface (24 bytes), sent by client.
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-    pub fn detect_protocol(
-        payload: &[u8],
-        src_port: u16,
-        dst_port: u16,
-        _direction: Direction,
-    ) -> Option<Protocol> {
-        if payload.is_empty() {
-            return None;
-        }
-        if payload.len() >= HTTP2_PREFACE.len() && payload.starts_with(HTTP2_PREFACE) {
-            return Some(Protocol::Http2);
-        }
-        if is_http1_request(payload) || is_http1_response(payload) {
-            return Some(Protocol::Http1);
-        }
-        if payload.len() >= 5 && payload[3] == 0x00 && payload[4] == 0x0a {
-            return Some(Protocol::Mysql);
-        }
-        if is_postgres(payload) {
-            return Some(Protocol::Postgres);
-        }
-        if is_redis(payload) {
-            return Some(Protocol::Redis);
-        }
-        if payload.len() >= 8 && payload.starts_with(b"AMQP") {
-            return Some(Protocol::Amqp);
-        }
-        for &port in &[dst_port, src_port] {
-            match port {
-                3306 => return Some(Protocol::Mysql),
-                5432 => return Some(Protocol::Postgres),
-                6379 => return Some(Protocol::Redis),
-                50051 => return Some(Protocol::Grpc),
-                80 | 8080 | 8000 | 443 | 8443 => return Some(Protocol::Http1),
-                53 => return Some(Protocol::Dns),
-                9092 => return Some(Protocol::Kafka),
-                5672 => return Some(Protocol::Amqp),
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn is_http1_request(payload: &[u8]) -> bool {
-        payload.starts_with(b"GET ")
-            || payload.starts_with(b"POST ")
-            || payload.starts_with(b"PUT ")
-            || payload.starts_with(b"DELETE ")
-            || payload.starts_with(b"HEAD ")
-            || payload.starts_with(b"OPTIONS ")
-            || payload.starts_with(b"PATCH ")
-            || payload.starts_with(b"CONNECT ")
-    }
-
-    fn is_http1_response(payload: &[u8]) -> bool {
-        payload.starts_with(b"HTTP/1.")
-    }
-
-    fn is_postgres(payload: &[u8]) -> bool {
-        if payload.len() >= 8 {
-            let len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            if len == 8 && code == 80877103 {
-                return true;
-            }
-            if code == 196608 && (8..=10000).contains(&len) {
-                return true;
-            }
-        }
-        if payload.len() >= 5 {
-            let msg_type = payload[0];
-            if matches!(
-                msg_type,
-                b'R' | b'K' | b'Z' | b'T' | b'D' | b'C' | b'E' | b'N' | b'S'
-            ) {
-                let len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                if (4..=1_000_000).contains(&len) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn is_redis(payload: &[u8]) -> bool {
-        if payload.is_empty() {
-            return false;
-        }
-        let first = payload[0];
-        if !matches!(first, b'+' | b'-' | b':' | b'$' | b'*') {
-            return false;
-        }
-        let search_len = payload.len().min(128);
-        payload[..search_len].windows(2).any(|w| w == b"\r\n")
-    }
-}
-
-use panopticon_common::Direction;
-use protocol::detect_protocol;
+use protocol::Direction;
+use protocol::detect::detect_protocol;
 
 fn bench_protocol_detection(c: &mut Criterion) {
     let mut group = c.benchmark_group("protocol_detect");
