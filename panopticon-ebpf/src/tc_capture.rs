@@ -6,7 +6,11 @@
 //! and always returns TC_ACT_OK (passive observer, never drops packets).
 
 use aya_ebpf::{
-    bindings::TC_ACT_OK, cty::c_long, helpers::bpf_ktime_get_ns, macros::classifier,
+    EbpfContext,
+    bindings::TC_ACT_OK,
+    cty::c_long,
+    helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
+    macros::classifier,
     programs::TcContext,
 };
 use panopticon_common::{
@@ -74,7 +78,13 @@ const IP_PROTO_UDP: u8 = 17;
 const IPV4_HDR_MIN_LEN: usize = 20;
 const TCP_HDR_MIN_LEN: usize = 20;
 const UDP_HDR_LEN: usize = 8;
-const TC_CAPTURE_COPY_MAX: u32 = 1024;
+/// Max payload bytes copied per packet. Equal to the DataEvent payload size;
+/// the copy is a single `bpf_skb_load_bytes` call, so the cap no longer has
+/// to be kept small for verifier/instruction-count reasons.
+const TC_CAPTURE_COPY_MAX: u32 = MAX_PAYLOAD_SIZE as u32;
+const _: () = assert!(TC_CAPTURE_COPY_MAX.is_power_of_two());
+/// IPv4 fragment offset mask (low 13 bits of the flags/frag_off field).
+const IPV4_FRAG_OFFSET_MASK: u16 = 0x1FFF;
 
 // ── TC entry points ────────────────────────────────────────────────────────
 
@@ -138,6 +148,13 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
         return Ok(TC_ACT_OK);
     }
 
+    // Non-first IPv4 fragments carry no L4 header: parsing them as TCP/UDP
+    // would produce garbage ports and inject payload into the wrong stream.
+    let frag_off = u16::from_be(ctx.load::<u16>(ip_offset + 6)?);
+    if frag_off & IPV4_FRAG_OFFSET_MASK != 0 {
+        return Ok(TC_ACT_OK);
+    }
+
     let ip_proto: u8 = ctx.load(ip_offset + 9)?;
     let total_len = u16::from_be(ctx.load::<u16>(ip_offset + 2)?) as usize;
     let src_addr = u32::from_be(ctx.load::<u32>(ip_offset + 12)?);
@@ -153,6 +170,10 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             let dport = u16::from_be(ctx.load::<u16>(transport_offset + 2)?);
             let data_off: u8 = ctx.load(transport_offset + 12)?;
             let tcp_hdr_len = ((data_off >> 4) as usize) * 4;
+            if tcp_hdr_len < TCP_HDR_MIN_LEN {
+                // Malformed (doff < 5): header bytes would be read as payload.
+                return Ok(TC_ACT_OK);
+            }
             (sport, dport, transport_offset + tcp_hdr_len)
         }
         IP_PROTO_UDP => {
@@ -277,25 +298,31 @@ fn populate_tc_event(
         } else {
             load_len
         };
-        (*event).payload_len = copy_len;
 
-        let mut i: u32 = 0;
-        while i < TC_CAPTURE_COPY_MAX {
-            if i >= copy_len {
-                break;
-            }
-
-            match ctx.load::<u8>(payload_offset + i as usize) {
-                Ok(byte) => {
-                    (*event).payload[i as usize] = byte;
-                }
-                Err(_) => {
-                    (*event).payload_len = i;
-                    break;
-                }
-            }
-            i += 1;
+        if copy_len == 0 {
+            (*event).payload_len = 0;
+            return;
         }
+        // One helper call instead of a per-byte loop (previously up to 1024
+        // bpf_skb_load_bytes calls per packet in softirq context);
+        // bpf_skb_load_bytes also handles non-linear skbs.
+        //
+        // The verifier needs the length provably in [1, MAX_PAYLOAD_SIZE].
+        // LLVM knows copy_len is already in that range, so any plain bounds
+        // check or mask is optimised away and the verifier is handed a
+        // register whose lower bound it never learned ("R4 invalid
+        // zero-sized read"). A volatile read hides the value from LLVM; the
+        // mask + 1 then gives the verifier [1, MAX] directly. For copy_len in
+        // [1, MAX] (MAX a power of two) this is the identity.
+        let opaque = core::ptr::read_volatile(&copy_len);
+        let copy_len = (opaque.wrapping_sub(1) & (TC_CAPTURE_COPY_MAX - 1)) + 1;
+        let ret = bpf_skb_load_bytes(
+            ctx.as_ptr() as *const _,
+            payload_offset as u32,
+            (*event).payload.as_mut_ptr() as *mut _,
+            copy_len,
+        );
+        (*event).payload_len = if ret == 0 { copy_len } else { 0 };
     }
 }
 

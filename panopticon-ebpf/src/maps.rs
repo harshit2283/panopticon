@@ -5,15 +5,16 @@
 //! agent. HashMaps track per-connection and per-process state in the kernel.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, PerfEventArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, ConnInfo, DataEvent, MAX_CONNECTIONS, MAX_PID_FILTER, TLS_SCRATCH_SIZE,
 };
 
 /// Primary event channel for network data (TC captures + TLS intercepts).
-/// 256KB ring buffer — sized for ~60 DataEvents in flight.
+/// 16MB ring buffer — ~4000 fixed-size DataEvents (~4.2KB each) in flight, so
+/// a short user-space stall or traffic burst does not immediately drop events.
 #[map]
-pub static DATA_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub static DATA_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
 /// Fallback event channel for kernels < 5.8 that lack RingBuf support.
 #[map]
@@ -25,12 +26,15 @@ pub static DATA_EVENTS_PERF: PerfEventArray<DataEvent> = PerfEventArray::new(0);
 pub static PROCESS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 /// Active connection tracking. Key: socket_cookie (u64).
+/// LRU so that closes we never observe (missed kprobes, close on another
+/// thread) age out instead of permanently filling the map.
 #[map]
-pub static CONN_MAP: HashMap<u64, ConnInfo> = HashMap::with_max_entries(MAX_CONNECTIONS, 0);
+pub static CONN_MAP: LruHashMap<u64, ConnInfo> = LruHashMap::with_max_entries(MAX_CONNECTIONS, 0);
 
 /// PID → cgroup_id mapping for container identity resolution.
+/// LRU for the same reason as CONN_MAP (missed exit events).
 #[map]
-pub static PID_CGROUP_MAP: HashMap<u32, u64> = HashMap::with_max_entries(MAX_CONNECTIONS, 0);
+pub static PID_CGROUP_MAP: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_CONNECTIONS, 0);
 
 /// Runtime configuration array. Indices defined by CONFIG_* constants.
 #[map]
@@ -40,11 +44,15 @@ pub static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_ENTRIES, 0);
 #[map]
 pub static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
 
-/// Per-CPU scratch space for TLS probe state (stores buf pointers between
-/// SSL_read entry and return probes). Key: pid_tgid.
+/// TLS probe state (stores buf pointers between SSL_read entry and return
+/// probes). Key: pid_tgid.
+///
+/// Must NOT be per-CPU: SSL_read blocks, and the thread is frequently
+/// rescheduled onto another CPU before the uretprobe fires, which made the
+/// lookup miss and silently dropped inbound TLS plaintext. LRU so entries
+/// whose return probe never fires (thread killed mid-read) are reclaimed.
 #[map]
-pub static TLS_SCRATCH: PerCpuHashMap<u64, u64> =
-    PerCpuHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+pub static TLS_SCRATCH: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.

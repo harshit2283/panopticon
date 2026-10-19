@@ -627,6 +627,20 @@ fn try_attach_tc(
     direction: TcAttachType,
 ) -> Result<aya::programs::tc::SchedClassifierLinkId> {
     let _ = aya::programs::tc::qdisc_add_clsact(iface);
+    // On kernels < 6.6 aya attaches via netlink clsact filters, which outlive
+    // the process. After a crash/SIGKILL the old classifier keeps running, and
+    // a fresh attach would stack a second one (duplicating every packet).
+    // Remove stale filters with our program name first; NotFound is the
+    // normal case (clean start, or TCX links on 6.6+ which die with the fd).
+    match aya::programs::tc::qdisc_detach_program(iface, direction, prog_name) {
+        Ok(()) => warn!(
+            prog = prog_name,
+            iface, "Removed stale TC classifier left by a previous agent instance"
+        ),
+        Err(aya::programs::tc::TcError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+        }
+        Err(e) => warn!(prog = prog_name, iface, error = %e, "Stale TC classifier cleanup failed"),
+    }
     let prog: &mut SchedClassifier = ebpf
         .program_mut(prog_name)
         .context(format!("program '{prog_name}' not found"))?
