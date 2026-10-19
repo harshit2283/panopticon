@@ -14,7 +14,9 @@ hardening work.
 ## What Panopticon Does
 
 - Captures cleartext traffic with TC eBPF hooks.
-- Captures some TLS plaintext paths through targeted uprobes.
+- Captures TLS plaintext through uprobes: OpenSSL (shared `libssl`, including
+  the `SSL_read_ex`/`SSL_write_ex` API used by OpenSSL 3 applications) and Go
+  `crypto/tls` writes.
 - Parses HTTP/1.1, HTTP/2, gRPC, MySQL, PostgreSQL, Redis, Kafka, DNS, and AMQP.
 - Runs regex-first PII detection with optional ONNX-backed ML inference.
 - Builds a DNS/IP-based service graph.
@@ -58,7 +60,7 @@ current release report.
 | Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |
 | AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
 | DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |
-| OpenSSL TLS plaintext capture | Partial | Targeted path support with runtime-specific caveats. |
+| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Statically linked OpenSSL/BoringSSL is not found; TLS exchanges are not yet linked to IPs in the service graph. |
 | Go TLS plaintext capture | Partial | Write-path capture only. |
 | Regex-first PII detection | Supported | Baseline detection path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
@@ -70,6 +72,8 @@ current release report.
 - Kubernetes pod/service identity resolution is not implemented; graph identity
   is DNS/IP-based today.
 - Go TLS read-path capture is not implemented.
+- TLS exchanges are exported without peer addresses and are left out of the
+  service graph.
 - Broad TLS library coverage beyond the current OpenSSL and partial Go paths is
   not implemented.
 - Full runtime hot-reload is not implemented end to end.

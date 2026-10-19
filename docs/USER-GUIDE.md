@@ -268,8 +268,9 @@ Each decoded line is one captured packet or TLS buffer:
   startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
   agent logs a warning at startup whenever raw capture is on.
 - Group packets of one connection by `connection_id`; `direction` and the
-  addresses tell you which side sent each one. TLS events have no addresses
-  (`pid` identifies the process).
+  addresses tell you which side sent each one. TLS events have no addresses:
+  `pid` identifies the process, and `connection_id` is the TLS library's
+  connection object (unique per open connection within that process).
 - **At most 4096 bytes per packet or TLS buffer are captured.** When
   `truncated` is `true`, the original was `orig_len` bytes and the rest was
   not captured (large GSO/TSO packets, big TLS writes).
@@ -289,7 +290,7 @@ access, encrypt at rest, and delete them when done.
 | Fails to start below kernel 5.8 | Not supported in this release. |
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
 | `Failed to attach kprobe` | Socket lifecycle events unavailable on this kernel/VM; HTTP/DB capture via TC still works. |
-| HTTPS traffic not decoded | TLS is decoded only for processes using OpenSSL (`SSL_read`/`SSL_write`) or Go's `crypto/tls` (writes only). Other TLS stacks appear as unknown traffic. |
+| HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (writes only). Statically linked or other TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
 | Each exchange appears twice on `-i lo` | Loopback shows every packet on both directions; capture a real interface instead. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
 

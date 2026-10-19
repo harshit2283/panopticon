@@ -18,7 +18,7 @@ use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
 #[cfg(target_os = "linux")]
-use panopticon_common::{DataEvent, EventType, parse_data_event_bytes};
+use panopticon_common::{DataEvent, Direction, EventType, parse_data_event_bytes};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]
@@ -600,14 +600,8 @@ fn drain_ringbuf(
             continue;
         }
 
-        // Route to worker by socket_cookie (deterministic affinity).
-        // TLS events have socket_cookie=0 (unavailable in uprobe context),
-        // so we generate a synthetic cookie from PID to distribute them.
-        let routing_cookie = if event.socket_cookie == 0 && event.event_type == EventType::TlsData {
-            tls_synthetic_cookie(event.pid, event.tgid)
-        } else {
-            event.socket_cookie
-        };
+        // Route to worker by connection key (deterministic affinity).
+        let routing_cookie = connection_key(&event);
 
         let num_workers = senders.len();
         let worker_idx = if num_workers > 0 {
@@ -680,11 +674,7 @@ async fn consume_perf_array(
             continue;
         }
 
-        let routing_cookie = if event.socket_cookie == 0 && event.event_type == EventType::TlsData {
-            tls_synthetic_cookie(event.pid, event.tgid)
-        } else {
-            event.socket_cookie
-        };
+        let routing_cookie = connection_key(&event);
 
         let num_workers = senders.len();
         let worker_idx = if num_workers > 0 {
@@ -768,13 +758,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
             raw.record(&event);
         }
 
-        // TLS events have socket_cookie=0 — use synthetic cookie from PID
-        // so each PID gets its own ConnectionState + parser.
-        let cookie = if event.socket_cookie == 0 && event.event_type == EventType::TlsData {
-            tls_synthetic_cookie(event.pid, event.tgid)
-        } else {
-            event.socket_cookie
-        };
+        let cookie = connection_key(&event);
 
         ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -804,7 +788,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
                     detect_protocol(payload, event.src_port, event.dst_port, event.direction)
             {
                 use crate::protocol::fsm::CreateResult;
-                let server = tc_server_endpoint(&event, proto, payload);
+                let server = server_endpoint(&event, proto, payload);
                 let result = manager.get_or_create_with_server(cookie, proto, server);
                 match result {
                     CreateResult::Created => {
@@ -824,7 +808,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
                 }
             }
 
-            let src = (event.src_addr, event.src_port);
+            let src = sender_endpoint(&event);
             let first = manager.process_packet_from(
                 cookie,
                 src,
@@ -1017,8 +1001,10 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             }
         }
 
-        // Service graph: record observation
-        if let Some(gb) = ctx.graph_builder.as_ref() {
+        // Service graph: record observation. TLS uprobe events carry no
+        // addresses yet; recording them would add a fake 0.0.0.0 node.
+        let has_addresses = ctx.event.src_addr != 0 || ctx.event.dst_addr != 0;
+        if let Some(gb) = ctx.graph_builder.as_ref().filter(|_| has_addresses) {
             let conn_tuple = ConnectionTuple {
                 src_addr: ctx.event.src_addr,
                 dst_addr: ctx.event.dst_addr,
@@ -1051,24 +1037,53 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
     }
 }
 
-/// Server endpoint of a newly detected TC connection.
+/// Stand-in endpoints for TLS uprobe events, which carry no addresses: the
+/// observed process and whoever it is talking to.
+const TLS_LOCAL: crate::protocol::fsm::Endpoint = (0, 1);
+const TLS_PEER: crate::protocol::fsm::Endpoint = (0, 2);
+
+/// Who sent this event's payload. For TLS events the direction is relative
+/// to the observed process: it wrote (`Egress`) or read (`Ingress`).
+fn sender_endpoint(event: &DataEvent) -> crate::protocol::fsm::Endpoint {
+    match event.event_type {
+        EventType::TlsData if event.direction == Direction::Egress => TLS_LOCAL,
+        EventType::TlsData => TLS_PEER,
+        _ => (event.src_addr, event.src_port),
+    }
+}
+
+/// Which endpoint of a new connection is the server, so parsers always see
+/// client→server as `Egress` whatever hook captured the bytes.
 ///
 /// Decided from the detection payload's content where possible (an HTTP
 /// request line came from the client, a MySQL greeting from the server...),
 /// then from well-known service ports, then by assuming the lower port is the
-/// server's. `None` for non-TC events (TLS uprobe events carry no addresses
-/// and keep their process-relative direction).
-fn tc_server_endpoint(
+/// server's. TLS events have no ports: if the content doesn't say, the
+/// process-relative direction is kept (writes treated as requests), which is
+/// right for clients.
+fn server_endpoint(
     event: &DataEvent,
     proto: crate::protocol::Protocol,
     payload: &[u8],
 ) -> Option<crate::protocol::fsm::Endpoint> {
     use crate::protocol::detect::{is_service_port, sent_by_client};
 
-    if event.event_type != EventType::TcPacket {
-        return None;
+    let src = sender_endpoint(event);
+    match event.event_type {
+        EventType::TcPacket => {}
+        EventType::TlsData => {
+            let other = if src == TLS_LOCAL {
+                TLS_PEER
+            } else {
+                TLS_LOCAL
+            };
+            return match sent_by_client(proto, payload)? {
+                true => Some(other),
+                false => Some(src),
+            };
+        }
+        _ => return None,
     }
-    let src = (event.src_addr, event.src_port);
     let dst = (event.dst_addr, event.dst_port);
     Some(match sent_by_client(proto, payload) {
         Some(true) => dst,
@@ -1080,7 +1095,26 @@ fn tc_server_endpoint(
     })
 }
 
-/// Generate a synthetic cookie for TLS events (socket_cookie=0).
+/// Key identifying the connection an event belongs to.
+///
+/// TC and socket events carry the kernel socket cookie. TLS events carry the
+/// library's connection object pointer (`SSL*`, `*tls.Conn`), unique only
+/// within a process, so it is combined with the PID; the high bit keeps
+/// these keys apart from kernel cookies. Events without one fall back to a
+/// per-thread key.
+#[cfg(target_os = "linux")]
+fn connection_key(event: &DataEvent) -> u64 {
+    if event.event_type != EventType::TlsData {
+        return event.socket_cookie;
+    }
+    if event.socket_cookie == 0 {
+        return tls_synthetic_cookie(event.pid, event.tgid);
+    }
+    0x8000_0000_0000_0000 | fxhash::hash64(&(event.pid, event.socket_cookie))
+}
+
+/// Generate a synthetic per-thread cookie for TLS events without a
+/// connection pointer.
 ///
 /// Uses PID + TGID to create a unique key that won't collide with real socket cookies.
 /// Real socket cookies are kernel-assigned, typically < 2^32.
@@ -1305,6 +1339,123 @@ mod tests {
             unique_workers.len() > 1,
             "all PIDs routed to same worker — broken distribution"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tls_event(pid: u32, ssl: u64, direction: Direction, payload: &[u8]) -> DataEvent {
+        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
+        let mut event: DataEvent = unsafe { std::mem::zeroed() };
+        event.event_type = EventType::TlsData;
+        event.direction = direction;
+        event.pid = pid;
+        event.tgid = pid;
+        event.socket_cookie = ssl;
+        event.tls_library = panopticon_common::TlsLibrary::OpenSsl;
+        event.payload[..payload.len()].copy_from_slice(payload);
+        event.payload_len = payload.len() as u32;
+        event.orig_len = payload.len() as u32;
+        event
+    }
+
+    /// The worker's detect → create → parse steps for one event.
+    #[cfg(target_os = "linux")]
+    fn feed(manager: &ConnectionFsmManager, event: &DataEvent) -> Vec<crate::protocol::L7Message> {
+        let key = connection_key(event);
+        let payload = event.payload_bytes();
+        if !manager.contains(key)
+            && let Some(proto) = crate::protocol::detect::detect_protocol(
+                payload,
+                event.src_port,
+                event.dst_port,
+                event.direction,
+            )
+        {
+            manager.get_or_create_with_server(key, proto, server_endpoint(event, proto, payload));
+        }
+        match manager.process_packet_from(
+            key,
+            sender_endpoint(event),
+            event.direction,
+            payload,
+            event.timestamp_ns,
+        ) {
+            Some(FsmResult::Messages(m)) => m,
+            Some(FsmResult::MessageComplete(m)) => vec![m],
+            _ => vec![],
+        }
+    }
+
+    const REQ: &[u8] = b"GET /orders/7 HTTP/1.1\r\nHost: shop\r\n\r\n";
+    const RESP: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_exchange_parses_from_client_and_server_process() {
+        // Client process: writes the request, reads the response.
+        let m = ConnectionFsmManager::new(16);
+        assert!(feed(&m, &tls_event(10, 0x5000, Direction::Egress, REQ)).is_empty());
+        let msgs = feed(&m, &tls_event(10, 0x5000, Direction::Ingress, RESP));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].path.as_deref(), Some("/orders/7"));
+        assert_eq!(msgs[0].status, Some(404));
+
+        // Server process: reads the request, writes the response. Process-
+        // relative directions are the opposite of the client's.
+        let m = ConnectionFsmManager::new(16);
+        assert!(feed(&m, &tls_event(20, 0x6000, Direction::Ingress, REQ)).is_empty());
+        let msgs = feed(&m, &tls_event(20, 0x6000, Direction::Egress, RESP));
+        assert_eq!(msgs.len(), 1, "server-side TLS exchange must parse");
+        assert_eq!(msgs[0].path.as_deref(), Some("/orders/7"));
+        assert_eq!(msgs[0].status, Some(404));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_server_process_direction_is_normalised() {
+        // A Redis server over TLS reads the command (Ingress) and writes the
+        // reply (Egress); the parser must still see a command and a reply.
+        let m = ConnectionFsmManager::new(16);
+        let cmd = b"*2\r\n$3\r\nGET\r\n$4\r\nuser\r\n";
+        assert!(feed(&m, &tls_event(40, 0xC000, Direction::Ingress, cmd)).is_empty());
+        let msgs = feed(
+            &m,
+            &tls_event(40, 0xC000, Direction::Egress, b"$3\r\nbob\r\n"),
+        );
+        assert_eq!(msgs.len(), 1, "server-side TLS Redis exchange must parse");
+        assert_eq!(msgs[0].method.as_deref(), Some("GET"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_connections_on_one_thread_stay_separate() {
+        // An event-loop server interleaves connections on one thread; each
+        // SSL* must get its own parser.
+        let m = ConnectionFsmManager::new(16);
+        let req_b = b"GET /b HTTP/1.1\r\nHost: shop\r\n\r\n";
+        assert!(feed(&m, &tls_event(30, 0xA000, Direction::Ingress, REQ)).is_empty());
+        assert!(feed(&m, &tls_event(30, 0xB000, Direction::Ingress, req_b)).is_empty());
+        let b = feed(&m, &tls_event(30, 0xB000, Direction::Egress, RESP));
+        let a = feed(&m, &tls_event(30, 0xA000, Direction::Egress, RESP));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].path.as_deref(), Some("/b"));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].path.as_deref(), Some("/orders/7"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connection_key_scopes_tls_pointers_to_process() {
+        let a = tls_event(1, 0x7f00_0000_1000, Direction::Egress, REQ);
+        let same_conn = tls_event(1, 0x7f00_0000_1000, Direction::Ingress, RESP);
+        let other_proc = tls_event(2, 0x7f00_0000_1000, Direction::Egress, REQ);
+        assert_eq!(connection_key(&a), connection_key(&same_conn));
+        assert_ne!(connection_key(&a), connection_key(&other_proc));
+        assert!(connection_key(&a) & 0x8000_0000_0000_0000 != 0);
+
+        let mut tc = a;
+        tc.event_type = EventType::TcPacket;
+        tc.socket_cookie = 42;
+        assert_eq!(connection_key(&tc), 42);
     }
 
     // ── ConnectionFsmManager Integration Tests ──────────────────────────────

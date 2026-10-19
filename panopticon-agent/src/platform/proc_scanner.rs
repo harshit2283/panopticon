@@ -32,6 +32,10 @@ pub enum TlsType {
     OpenSsl {
         ssl_write_offset: u64,
         ssl_read_offset: u64,
+        /// `SSL_write_ex` / `SSL_read_ex` (OpenSSL 1.1.1+). Applications that
+        /// use them never call `SSL_write` / `SSL_read`.
+        ssl_write_ex_offset: Option<u64>,
+        ssl_read_ex_offset: Option<u64>,
     },
     GoTls {
         write_offset: u64,
@@ -272,7 +276,10 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
 
         // Check for OpenSSL
         if is_openssl_library(path)
-            && let Ok(syms) = resolve_elf_symbols(&namespace_path, &["SSL_write", "SSL_read"])
+            && let Ok(syms) = resolve_elf_symbols(
+                &namespace_path,
+                &["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"],
+            )
             && let (Some(&write_off), Some(&read_off)) =
                 (syms.get("SSL_write"), syms.get("SSL_read"))
         {
@@ -282,6 +289,8 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
                 tls_type: TlsType::OpenSsl {
                     ssl_write_offset: write_off,
                     ssl_read_offset: read_off,
+                    ssl_write_ex_offset: syms.get("SSL_write_ex").copied(),
+                    ssl_read_ex_offset: syms.get("SSL_read_ex").copied(),
                 },
             });
             debug!(pid, path, target = %namespace_path, "Found OpenSSL library");

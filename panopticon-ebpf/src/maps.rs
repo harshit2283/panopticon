@@ -65,7 +65,19 @@ pub static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_ENTRIES, 0);
 #[map]
 pub static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
 
-/// TLS probe state (stores buf pointers between SSL_read entry and return
+/// Arguments of an in-flight `SSL_read` / `SSL_read_ex`, saved by the entry
+/// probe for the return probe.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsReadArgs {
+    pub buf: u64,
+    pub ssl: u64,
+    /// `SSL_read_ex`'s `size_t *readbytes`; 0 for `SSL_read`, whose return
+    /// value is the byte count.
+    pub readbytes: u64,
+}
+
+/// TLS probe state (read arguments between SSL_read entry and return
 /// probes). Key: pid_tgid.
 ///
 /// Must NOT be per-CPU: SSL_read blocks, and the thread is frequently
@@ -73,7 +85,8 @@ pub static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILT
 /// lookup miss and silently dropped inbound TLS plaintext. LRU so entries
 /// whose return probe never fires (thread killed mid-read) are reclaimed.
 #[map]
-pub static TLS_SCRATCH: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+pub static TLS_SCRATCH: LruHashMap<u64, TlsReadArgs> =
+    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.

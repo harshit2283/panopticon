@@ -233,6 +233,8 @@ pub fn attach_tls_uprobes(
         TlsType::OpenSsl {
             ssl_write_offset,
             ssl_read_offset,
+            ssl_write_ex_offset,
+            ssl_read_ex_offset,
         } => {
             // SSL_write — uprobe (pid=None for system-wide shared lib coverage)
             if attach_uprobe(
@@ -268,6 +270,42 @@ pub fn attach_tls_uprobes(
                 links,
             ) {
                 attached += 1;
+            }
+
+            // SSL_write_ex / SSL_read_ex. SSL_read_ex shares the return probe.
+            if let Some(offset) = *ssl_write_ex_offset
+                && attach_uprobe(
+                    ebpf,
+                    "ssl_write_ex_entry",
+                    &target.library_path,
+                    offset,
+                    None,
+                    links,
+                )
+            {
+                attached += 1;
+            }
+            if let Some(offset) = *ssl_read_ex_offset {
+                if attach_uprobe(
+                    ebpf,
+                    "ssl_read_ex_entry",
+                    &target.library_path,
+                    offset,
+                    None,
+                    links,
+                ) {
+                    attached += 1;
+                }
+                if attach_uretprobe(
+                    ebpf,
+                    "ssl_read_ret",
+                    &target.library_path,
+                    offset,
+                    None,
+                    links,
+                ) {
+                    attached += 1;
+                }
             }
         }
         TlsType::GoTls {

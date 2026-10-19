@@ -37,8 +37,13 @@ production-hardened compliance platform.
     but the object always creates a RingBuf map and uses 5.5+ helpers.
   - ARM64 support exists but validation remains limited; no arm64 image yet.
 - TLS plaintext capture:
-  - OpenSSL is supported on targeted attach paths.
-  - Go TLS is write-path only.
+  - OpenSSL via a shared `libssl` (including the `_ex` API) is validated
+    against ground truth: 100% recall from both client and server processes
+    (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
+    found.
+  - TLS exchanges carry no peer addresses yet, so they are exported but not
+    added to the service graph.
+  - Go TLS is write-path only and not scored against ground truth.
 - Protocol depth:
   - MySQL binary (prepared-statement) protocol, PostgreSQL COPY, gRPC
     schema decoding and compressed messages are not parsed.

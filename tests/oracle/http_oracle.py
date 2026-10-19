@@ -5,11 +5,16 @@ requests over keep-alive connections: small/large Content-Length bodies,
 chunked responses, POST bodies, 204/404. Every exchange the client actually
 completed is written to truth.jsonl — the oracle the agent's JSONL export is
 scored against (score.py).
+
+TLS=1 serves and connects over TLS (server needs TLS_CERT / TLS_KEY; the
+client does not verify), which exercises the agent's OpenSSL uprobes instead
+of packet capture.
 """
 import http.client
 import json
 import os
 import random
+import ssl
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +26,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 OUT = sys.argv[3] if len(sys.argv) > 3 else "truth.jsonl"
 SEED = int(os.environ.get("SEED", "1234"))
+TLS = os.environ.get("TLS") == "1"
 
 
 class H(BaseHTTPRequestHandler):
@@ -75,13 +81,31 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
 
+def make_server():
+    srv = ThreadingHTTPServer((HOST, PORT), H)
+    if TLS:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(os.environ["TLS_CERT"], os.environ["TLS_KEY"])
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    return srv
+
+
+def connect():
+    if not TLS:
+        return http.client.HTTPConnection(HOST, PORT)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return http.client.HTTPSConnection(HOST, PORT, context=ctx)
+
+
 def main():
     if MODE == "server":
-        ThreadingHTTPServer((HOST, PORT), H).serve_forever()
+        make_server().serve_forever()
         return
     srv = None
     if MODE == "both":
-        srv = ThreadingHTTPServer((HOST, PORT), H)
+        srv = make_server()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     rnd = random.Random(SEED)
     out = open(OUT, "w")
@@ -91,7 +115,7 @@ def main():
         if conn is None or rnd.random() < 0.15:  # new connection sometimes
             if conn:
                 conn.close()
-            conn = http.client.HTTPConnection(HOST, PORT)
+            conn = connect()
             conn_no, pos = conn_no + 1, 0
         else:
             pos += 1

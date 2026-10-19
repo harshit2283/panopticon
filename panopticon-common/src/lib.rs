@@ -137,6 +137,10 @@ impl core::fmt::Debug for DataEvent {
 pub struct DataEvent {
     // 8-byte aligned fields first
     pub timestamp_ns: u64,
+    /// Kernel socket cookie for TC/socket events. For `TlsData` events, which
+    /// have no socket in uprobe context, the address of the library's
+    /// per-connection object (OpenSSL `SSL*`, Go `*tls.Conn`): unique per live
+    /// connection within the process and shared by its reads and writes.
     pub socket_cookie: u64,
     // 4-byte aligned fields
     pub event_type: EventType,
