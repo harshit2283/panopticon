@@ -244,7 +244,7 @@ fn try_udp_recvmsg(ctx: &ProbeContext) -> Result<(), ()> {
 /// Note: These offsets are for modern kernels (4.x+). If supporting older
 /// kernels, use CO-RE (Compile Once Run Everywhere) via BTF in Phase 2.
 #[inline(always)]
-fn read_sock_tuple(sk: *const u8) -> Result<(u32, u32, u16, u16), ()> {
+pub(crate) fn read_sock_tuple(sk: *const u8) -> Result<(u32, u32, u16, u16), ()> {
     // SAFETY: reading from struct sock fields at known offsets.
     // The sock pointer is provided by the kernel and is valid during kprobe execution.
     unsafe {

@@ -60,7 +60,7 @@ current release report.
 | Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |
 | AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
 | DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |
-| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Statically linked OpenSSL/BoringSSL is not found; TLS exchanges are not yet linked to IPs in the service graph. |
+| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
 | Go TLS plaintext capture | Partial | Write-path capture only. |
 | Regex-first PII detection | Supported | Baseline detection path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
@@ -72,8 +72,8 @@ current release report.
 - Kubernetes pod/service identity resolution is not implemented; graph identity
   is DNS/IP-based today.
 - Go TLS read-path capture is not implemented.
-- TLS exchanges are exported without peer addresses and are left out of the
-  service graph.
+- On kernels older than 6.3, TLS socket addresses come from an fentry/kprobe
+  fallback that has not been validated yet.
 - Broad TLS library coverage beyond the current OpenSSL and partial Go paths is
   not implemented.
 - Full runtime hot-reload is not implemented end to end.

@@ -268,9 +268,11 @@ Each decoded line is one captured packet or TLS buffer:
   startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
   agent logs a warning at startup whenever raw capture is on.
 - Group packets of one connection by `connection_id`; `direction` and the
-  addresses tell you which side sent each one. TLS events have no addresses:
-  `pid` identifies the process, and `connection_id` is the TLS library's
-  connection object (unique per open connection within that process).
+  addresses tell you which side sent each one. For TLS events, `pid`
+  identifies the process and `connection_id` is the TLS library's connection
+  object (unique per open connection within that process); addresses are
+  filled in once the connection has done socket I/O inside a captured call,
+  and are zero before that.
 - **At most 4096 bytes per packet or TLS buffer are captured.** When
   `truncated` is `true`, the original was `orig_len` bytes and the rest was
   not captured (large GSO/TSO packets, big TLS writes).

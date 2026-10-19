@@ -88,6 +88,49 @@ pub struct TlsReadArgs {
 pub static TLS_SCRATCH: LruHashMap<u64, TlsReadArgs> =
     LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
+/// The TLS call in progress on this CPU: which thread, and its connection
+/// object (`SSL*`, `*tls.Conn`). Set by the TLS entry probes and consumed by
+/// the socket send/receive hooks inside that call, which is how a TLS
+/// connection learns its socket's addresses.
+///
+/// Per-CPU rather than a hash keyed by thread: the socket hooks run on every
+/// TCP send/receive on the node, and a hash miss cost ~250ns each there. A
+/// thread migrating mid-call only means that call learns nothing; the
+/// connection's addresses are picked up on a later call.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsActive {
+    pub pid_tgid: u64,
+    pub conn: u64,
+}
+
+#[map]
+pub static TLS_ACTIVE: PerCpuArray<TlsActive> = PerCpuArray::with_max_entries(1, 0);
+
+/// A TLS connection object, scoped to its process.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsConnKey {
+    pub conn: u64,
+    pub pid: u32,
+    pub _pad: u32,
+}
+
+/// Socket 4-tuple (host byte order) as seen from the observed process.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockTuple {
+    pub local_addr: u32,
+    pub remote_addr: u32,
+    pub local_port: u16,
+    pub remote_port: u16,
+}
+
+/// Addresses of each TLS connection, learned on its first socket I/O.
+#[map]
+pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
+    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE * 2, 0);
+
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.
 #[map]

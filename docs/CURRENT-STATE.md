@@ -41,8 +41,9 @@ production-hardened compliance platform.
     against ground truth: 100% recall from both client and server processes
     (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
     found.
-  - TLS exchanges carry no peer addresses yet, so they are exported but not
-    added to the service graph.
+  - TLS exchanges carry their socket addresses and join the service graph:
+    validated via the `sock_send/recv_length` tracepoints (kernel 6.3+); the
+    fentry/kprobe fallback for older kernels is not validated yet.
   - Go TLS is write-path only and not scored against ground truth.
 - Protocol depth:
   - MySQL binary (prepared-statement) protocol, PostgreSQL COPY, gRPC

@@ -6,7 +6,8 @@
 # module uses the system libssl (SSL_read_ex / SSL_write_ex on OpenSSL 3).
 # The uprobes see both ends, so every exchange is exported twice: once from
 # the client process and once from the server process. Each view is scored
-# separately and must reach MIN_RECALL.
+# separately and must reach MIN_RECALL, as must the share of its exchanges
+# that carry the socket's addresses.
 #
 # Usage: sudo tests/oracle/run_tls.sh [requests=500] [seed=1234] [min_recall=0.99]
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
@@ -45,16 +46,10 @@ sleep 1
 kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
 
 echo "uprobes attached: $(grep -c 'uprobe attached' "$OUT/agent.log")"
-python3 -I - "$OUT" "$SP" "$CP" <<'EOF'
-import json, sys
-out, views = sys.argv[1], {sys.argv[2]: "server", sys.argv[3]: "client"}
-files = {name: open(f"{out}/{name}.jsonl", "w") for name in views.values()}
-for line in open(f"{out}/agent.jsonl"):
-    view = views.get(str(json.loads(line).get("pid")))
-    if view:
-        files[view].write(line)
-EOF
 status=0
+# Split the export by process and check addresses: the server endpoint
+# (127.0.0.1:PORT) must be one side of each exchange.
+python3 -I "$HERE/split_tls.py" "$OUT" "$SP" "$CP" "$PORT" "$MIN_RECALL" || status=1
 for view in client server; do
   echo "== $view process view"
   python3 -I "$HERE/score.py" "$OUT/truth.jsonl" "$OUT/$view.jsonl" "$MIN_RECALL" || status=1

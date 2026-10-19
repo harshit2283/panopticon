@@ -8,7 +8,7 @@ use aya::{
     maps::Array,
     programs::{KProbe, ProgramError, SchedClassifier, TracePoint, UProbe, tc::TcAttachType},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
@@ -137,6 +137,39 @@ pub fn load_and_attach(
     attach_kprobe(&mut ebpf, "tcp_close", "tcp_close", &mut links);
     attach_kprobe(&mut ebpf, "udp_sendmsg", "udp_sendmsg", &mut links);
     attach_kprobe(&mut ebpf, "udp_recvmsg", "udp_recvmsg", &mut links);
+    if config.tls_scan_enabled {
+        // Give TLS connections their socket addresses (see tls_probes.rs):
+        // sock tracepoints (6.3+), else fentry where the kernel has BTF,
+        // else kprobes.
+        for (tracepoint, fentry_prog, kprobe_prog, function) in [
+            (
+                "sock_send_length",
+                "tls_tcp_sendmsg_fentry",
+                "tls_tcp_sendmsg",
+                "tcp_sendmsg",
+            ),
+            (
+                "sock_recv_length",
+                "tls_tcp_recvmsg_fentry",
+                "tls_tcp_recvmsg",
+                "tcp_recvmsg",
+            ),
+        ] {
+            let tp_prog = format!("tls_{tracepoint}");
+            match try_attach_tracepoint(&mut ebpf, &tp_prog, "sock", tracepoint) {
+                Ok(link) => {
+                    info!(prog = %tp_prog, "tracepoint attached");
+                    links.push(Box::new(link));
+                }
+                Err(e) => {
+                    debug!(prog = %tp_prog, error = %e, "tracepoint unavailable, falling back");
+                    if !attach_fentry(&mut ebpf, fentry_prog, function, &mut links) {
+                        attach_kprobe(&mut ebpf, kprobe_prog, function, &mut links);
+                    }
+                }
+            }
+        }
+    }
 
     // ── Tracepoints for process monitoring ────────────────────────────
     attach_tracepoint(
@@ -691,6 +724,36 @@ fn try_attach_tc(
         .try_into()?;
     let link_id = prog.attach(iface, direction)?;
     Ok(link_id)
+}
+
+/// Attach an fentry program; `false` (logged at debug) if the kernel lacks
+/// BTF or trampoline support, so the caller can fall back to a kprobe.
+fn attach_fentry(
+    ebpf: &mut Ebpf,
+    prog_name: &str,
+    fn_name: &str,
+    links: &mut Vec<Box<dyn std::any::Any + Send>>,
+) -> bool {
+    let result = (|| -> Result<_> {
+        let btf = aya::Btf::from_sys_fs().context("kernel BTF not available")?;
+        let prog: &mut aya::programs::FEntry = ebpf
+            .program_mut(prog_name)
+            .context(format!("program '{prog_name}' not found"))?
+            .try_into()?;
+        prog.load(fn_name, &btf)?;
+        Ok(prog.attach()?)
+    })();
+    match result {
+        Ok(link) => {
+            info!(prog = prog_name, function = fn_name, "fentry attached");
+            links.push(Box::new(link));
+            true
+        }
+        Err(e) => {
+            debug!(prog = prog_name, function = fn_name, error = %e, "fentry unavailable, falling back");
+            false
+        }
+    }
 }
 
 fn attach_kprobe(

@@ -14,15 +14,141 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_user, bpf_probe_read_user_buf,
     },
-    macros::{uprobe, uretprobe},
-    programs::{ProbeContext, RetProbeContext},
+    macros::{fentry, kprobe, tracepoint, uprobe, uretprobe},
+    programs::{FEntryContext, ProbeContext, RetProbeContext, TracePointContext},
 };
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, TLS_SCRATCH, TlsReadArgs,
-    data_events_submit_flags,
+    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, SockTuple, TLS_ACTIVE, TLS_CONN_ADDR,
+    TLS_SCRATCH, TlsConnKey, TlsReadArgs, data_events_submit_flags,
 };
+use crate::sock_monitor::read_sock_tuple;
+
+/// Mark `conn` as the TLS connection this thread is doing I/O for, so the
+/// socket hooks below can attach its addresses.
+#[inline(always)]
+fn mark_active(conn: u64) {
+    if conn == 0 {
+        return;
+    }
+    if let Some(slot) = TLS_ACTIVE.get_ptr_mut(0) {
+        unsafe {
+            (*slot).pid_tgid = bpf_get_current_pid_tgid();
+            (*slot).conn = conn;
+        }
+    }
+}
+
+// ── Socket kprobes: TLS connection → addresses ─────────────────────────────
+
+/// `tcp_sendmsg(sk, msg, size)` / `tcp_recvmsg(sk, ...)`: when called from
+/// inside a hooked TLS call, record that connection's socket tuple. The
+/// marker is consumed so later plain-TCP I/O on the same thread is not
+/// attributed to it. Overwrites, so a connection object reused for a new
+/// connection (same `SSL*` after free/alloc) gets the new addresses.
+///
+/// Hooked through the `sock:sock_send_length` / `sock:sock_recv_length`
+/// tracepoints where available (stable ABI, kernel 6.3+), else fentry (BTF
+/// trampolines), else kprobes.
+#[tracepoint]
+pub fn tls_sock_send_length(ctx: TracePointContext) {
+    let _ = try_tls_sock_length(&ctx);
+}
+
+#[tracepoint]
+pub fn tls_sock_recv_length(ctx: TracePointContext) {
+    let _ = try_tls_sock_length(&ctx);
+}
+
+/// Both tracepoints share one layout (see
+/// /sys/kernel/tracing/events/sock/sock_send_length/format):
+/// `void *sk` at 8, `u16 family` at 16, `u16 protocol` at 18.
+///
+/// These fire for every socket send/receive on the node, so the cheap
+/// "is this thread inside a TLS call" lookup comes before any field read.
+#[inline(always)]
+fn try_tls_sock_length(ctx: &TracePointContext) -> Result<(), ()> {
+    const AF_INET: u16 = 2;
+    const IPPROTO_TCP: u16 = 6;
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(conn) = take_active(pid_tgid) else {
+        return Ok(());
+    };
+    let family: u16 = unsafe { ctx.read_at(16) }.map_err(|_| ())?;
+    let protocol: u16 = unsafe { ctx.read_at(18) }.map_err(|_| ())?;
+    if family != AF_INET || protocol != IPPROTO_TCP {
+        return Ok(());
+    }
+    let sk: u64 = unsafe { ctx.read_at(8) }.map_err(|_| ())?;
+    record_conn_addr(pid_tgid, conn, sk as *const u8)
+}
+
+#[fentry(function = "tcp_sendmsg")]
+pub fn tls_tcp_sendmsg_fentry(ctx: FEntryContext) -> u32 {
+    let _ = try_tls_tcp_io(ctx.arg(0));
+    0
+}
+
+#[fentry(function = "tcp_recvmsg")]
+pub fn tls_tcp_recvmsg_fentry(ctx: FEntryContext) -> u32 {
+    let _ = try_tls_tcp_io(ctx.arg(0));
+    0
+}
+
+#[kprobe]
+pub fn tls_tcp_sendmsg(ctx: ProbeContext) {
+    if let Some(sk) = ctx.arg(0) {
+        let _ = try_tls_tcp_io(sk);
+    }
+}
+
+#[kprobe]
+pub fn tls_tcp_recvmsg(ctx: ProbeContext) {
+    if let Some(sk) = ctx.arg(0) {
+        let _ = try_tls_tcp_io(sk);
+    }
+}
+
+#[inline(always)]
+fn try_tls_tcp_io(sk: *const u8) -> Result<(), ()> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    match take_active(pid_tgid) {
+        Some(conn) => record_conn_addr(pid_tgid, conn, sk),
+        None => Ok(()),
+    }
+}
+
+/// The TLS connection this thread is inside a call for, if any; consumed.
+#[inline(always)]
+fn take_active(pid_tgid: u64) -> Option<u64> {
+    let slot = TLS_ACTIVE.get_ptr_mut(0)?;
+    unsafe {
+        if (*slot).conn == 0 || (*slot).pid_tgid != pid_tgid {
+            return None;
+        }
+        let conn = (*slot).conn;
+        (*slot).conn = 0;
+        Some(conn)
+    }
+}
+
+#[inline(always)]
+fn record_conn_addr(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
+    let (local_addr, remote_addr, local_port, remote_port) = read_sock_tuple(sk)?;
+    let key = TlsConnKey {
+        conn,
+        pid: (pid_tgid >> 32) as u32,
+        _pad: 0,
+    };
+    let tuple = SockTuple {
+        local_addr,
+        remote_addr,
+        local_port,
+        remote_port,
+    };
+    TLS_CONN_ADDR.insert(&key, &tuple, 0).map_err(|_| ())
+}
 
 // ── OpenSSL: SSL_write ─────────────────────────────────────────────────────
 
@@ -41,6 +167,7 @@ fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if num <= 0 {
         return Ok(());
     }
+    mark_active(ssl);
 
     emit_tls_event(
         ctx,
@@ -68,6 +195,7 @@ fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if num == 0 || num > u32::MAX as u64 {
         return Ok(());
     }
+    mark_active(ssl);
 
     emit_tls_event(
         ctx,
@@ -96,6 +224,7 @@ fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
         buf: ctx.arg(1).ok_or(())?,
         readbytes: 0,
     };
+    mark_active(args.ssl);
     TLS_SCRATCH
         .insert(bpf_get_current_pid_tgid(), args, 0)
         .map_err(|_| ())
@@ -119,6 +248,7 @@ fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if args.readbytes == 0 {
         return Ok(());
     }
+    mark_active(args.ssl);
     TLS_SCRATCH
         .insert(bpf_get_current_pid_tgid(), args, 0)
         .map_err(|_| ())
@@ -144,8 +274,10 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         }
     };
 
-    // Clean up scratch space
+    // Clean up scratch space (and the marker, if the read was served from
+    // already-buffered TLS records without touching the socket)
     let _ = TLS_SCRATCH.remove(pid_tgid);
+    let _ = take_active(pid_tgid);
 
     let ret = ctx.ret::<i32>();
     if ret <= 0 {
@@ -191,6 +323,7 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     if len == 0 {
         return Ok(());
     }
+    mark_active(conn);
 
     emit_tls_event(ctx, conn, buf, len, Direction::Egress, TlsLibrary::GoTls)
 }
@@ -284,11 +417,31 @@ fn populate_tls_event(
         (*event).direction = direction;
         (*event).pid = pid;
         (*event).tgid = tgid;
-        (*event).src_addr = 0; // Not available in uprobe context
-        (*event).dst_addr = 0;
-        (*event).src_port = 0;
-        (*event).dst_port = 0;
-        (*event).ip_proto = 0;
+        // Addresses are known once this connection has done socket I/O
+        // inside a hooked call (see try_tls_tcp_io); zero until then.
+        let key = TlsConnKey { conn, pid, _pad: 0 };
+        match TLS_CONN_ADDR.get(&key) {
+            Some(t) => {
+                let (src, dst) = match direction {
+                    Direction::Egress => {
+                        ((t.local_addr, t.local_port), (t.remote_addr, t.remote_port))
+                    }
+                    _ => ((t.remote_addr, t.remote_port), (t.local_addr, t.local_port)),
+                };
+                (*event).src_addr = src.0;
+                (*event).src_port = src.1;
+                (*event).dst_addr = dst.0;
+                (*event).dst_port = dst.1;
+                (*event).ip_proto = 6;
+            }
+            None => {
+                (*event).src_addr = 0;
+                (*event).dst_addr = 0;
+                (*event).src_port = 0;
+                (*event).dst_port = 0;
+                (*event).ip_proto = 0;
+            }
+        }
         (*event).tls_library = tls_lib;
         (*event)._pad = [0; 7];
         (*event).orig_len = len as u32;
