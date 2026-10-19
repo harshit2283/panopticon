@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Score the agent's Redis / PostgreSQL / MySQL capture against ground truth.
+# Score the agent's Redis / PostgreSQL / MySQL / gRPC capture against ground
+# truth.
 #
-# Starts the three servers in Docker on the host network, puts a client in a
-# netns behind a veth (the agent attaches to the host end, server side), runs
-# db_oracle.py per protocol with a fresh agent, and scores with score_db.py.
+# Starts the three database servers in Docker on the host network and a gRPC
+# server (grpc_oracle.py) on a non-standard port, puts a client in a netns
+# behind a veth (the agent attaches to the host end, server side), runs each
+# oracle with a fresh agent, and scores with score_db.py / score_h2.py.
 # Exits non-zero if any protocol's recall is below MIN_RECALL.
 #
-# Usage: sudo tests/oracle/run_db.sh [ops=500] [seed=7] [min_recall=0.99]
+# Usage: sudo tests/oracle/run_protocols.sh [ops=500] [seed=7] [min_recall=0.99]
 # Needs: root, docker, a built agent, python3 with pyroute2, redis,
-# psycopg[binary], pymysql, cryptography (MySQL 8 full auth over plaintext):
-#   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography
+# psycopg[binary], pymysql, cryptography (MySQL 8 full auth over plaintext),
+# grpcio:
+#   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio
 # Images can be overridden, e.g. REDIS_IMAGE=mirror.gcr.io/library/redis:7.4.
 set -euo pipefail
 N=${1:-500}
@@ -26,6 +29,7 @@ OUT=$(mktemp -d)
 
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
+  [[ -n ${GP:-} ]] && kill "$GP" 2>/dev/null || true
   docker rm -f o-redis o-pg o-mysql >/dev/null 2>&1 || true
   "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true
 }
@@ -68,5 +72,18 @@ for proto in redis postgres mysql; do
     "$MIN_RECALL" || status=1
   echo
 done
+# gRPC on a non-standard port: identified by the HTTP/2 preface, not the port.
+"$PY" "$HERE/grpc_oracle.py" server 10.99.0.1:9443 >"$OUT/grpc-server.log" 2>&1 &
+GP=$!
+"$AGENT" -i pv0 --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
+AP=$!
+sleep 4
+nsenter --net=/var/run/netns/pclient "$PY" "$HERE/grpc_oracle.py" \
+  client 10.99.0.1:9443 "$N" "$OUT/grpc-truth.jsonl" "$SEED"
+sleep 3
+kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
+python3 -I "$HERE/score_h2.py" "$OUT/grpc-truth.jsonl" "$OUT/grpc-agent.jsonl" \
+  "$MIN_RECALL" || status=1
+echo
 echo "artifacts: $OUT"
 exit $status

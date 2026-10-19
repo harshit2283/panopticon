@@ -62,6 +62,16 @@ impl ProtocolParser for GrpcParser {
         }
     }
 
+    fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
+        match self.inner.skip(direction, n, timestamp_ns)? {
+            ParseResult::Messages(mut msgs) => {
+                Self::enrich_grpc_messages(&mut msgs);
+                Some(ParseResult::Messages(msgs))
+            }
+            other => Some(other),
+        }
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::Grpc
     }
@@ -136,8 +146,20 @@ mod tests {
         grpc_frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         grpc_frame.extend_from_slice(body);
         data.extend_from_slice(&make_frame(0x0, 0x1, 1, &grpc_frame)); // DATA + END_STREAM
+        assert!(matches!(
+            parser.feed(&data, Direction::Egress, 1000),
+            ParseResult::NeedMoreData
+        ));
 
-        let result = parser.feed(&data, Direction::Egress, 1000);
+        // Response: trailers-only OK (HEADERS + END_STREAM). The stream is
+        // complete when the server ends it.
+        let resp = make_frame(
+            0x1,
+            0x4 | 0x1,
+            1,
+            &encode_headers(&[(":status", "200"), ("grpc-status", "0")]),
+        );
+        let result = parser.feed(&resp, Direction::Ingress, 2000);
         match result {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -146,6 +168,7 @@ mod tests {
                     msgs[0].method.as_deref(),
                     Some("mypackage.MyService/GetUser")
                 );
+                assert_eq!(msgs[0].status, Some(0));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
