@@ -472,8 +472,7 @@ impl PostgresParser {
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
             }
-            let cap = q.len().min(4096);
-            msg.payload_text = Some(q[..cap].to_string());
+            msg.payload_text = Some(super::truncate_utf8(&q, 4096).to_string());
         }
         if let Some(t) = self.query_ts.take() {
             msg.latency_ns = Some(ts.saturating_sub(t));
@@ -802,6 +801,24 @@ mod tests {
                 assert_eq!(msgs[0].latency_ns, Some(600));
             }
             other => panic!("reused statement must produce a message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_long_query_with_multibyte_text_does_not_panic() {
+        // 4096 lands inside a 2-byte character: byte slicing panicked.
+        let mut p = setup_ready_parser();
+        let mut q = "INSERT INTO t VALUES ('ab".to_string(); // odd length
+        while q.len() < 5000 {
+            q.push('é');
+        }
+        q.push_str("')\0");
+        p.feed(&make_frontend_msg(b'Q', q.as_bytes()), Direction::Egress, 1);
+        let mut resp = make_backend_msg(b'C', b"INSERT 0 1\0");
+        resp.extend(make_backend_msg(b'Z', b"I"));
+        match p.feed(&resp, Direction::Ingress, 2) {
+            ParseResult::Messages(m) => assert!(m[0].payload_text.as_ref().unwrap().len() <= 4096),
+            other => panic!("expected INSERT, got {other:?}"),
         }
     }
 

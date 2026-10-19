@@ -329,8 +329,7 @@ impl MysqlParser {
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
             }
-            let cap = q.len().min(4096);
-            msg.payload_text = Some(q[..cap].to_string());
+            msg.payload_text = Some(super::truncate_utf8(&q, 4096).to_string());
         }
         if let Some(t) = self.query_ts.take() {
             msg.latency_ns = Some(ts.saturating_sub(t));
@@ -414,6 +413,26 @@ impl ProtocolParser for MysqlParser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_long_query_with_multibyte_text_does_not_panic() {
+        let mut q = vec![0x03u8];
+        q.extend_from_slice(b"INSERT INTO t VALUES ('ab"); // odd length
+        while q.len() < 5000 {
+            q.extend_from_slice("é".as_bytes());
+        }
+        q.extend_from_slice(b"')");
+        let mut pkt = (q.len() as u32).to_le_bytes()[..3].to_vec();
+        pkt.push(0);
+        pkt.extend(q);
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        p.feed(&pkt, Direction::Egress, 1);
+        match p.feed(&[7, 0, 0, 1, 0, 1, 0, 2, 0, 0, 0], Direction::Ingress, 2) {
+            ParseResult::Messages(m) => assert!(m[0].payload_text.as_ref().unwrap().len() <= 4096),
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_gap_in_result_set_closes_on_next_command() {
         fn pkt(seq: u8, body: &[u8]) -> Vec<u8> {

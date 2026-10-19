@@ -106,6 +106,19 @@ impl L7Message {
     }
 }
 
+/// `s` cut to at most `max` bytes, on a character boundary (slicing a
+/// `&str` at an arbitrary byte index panics inside a multi-byte character).
+pub fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ── ParseResult ──────────────────────────────────────────────────────────
 
 /// Result of feeding data to a protocol parser.
