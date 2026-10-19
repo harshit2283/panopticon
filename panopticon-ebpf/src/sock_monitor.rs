@@ -369,5 +369,7 @@ unsafe fn populate_sock_event(
         (*event).ip_proto = ip_proto;
         (*event).tls_library = TlsLibrary::None;
         (*event).payload_len = 0;
+        (*event).orig_len = 0;
+        (*event)._pad = [0; 7];
     }
 }

@@ -86,6 +86,8 @@ pub struct EventStats {
     pub evictions_idle: AtomicU64,
     /// Total PII entities detected across all fields of all messages.
     pub pii_detections: AtomicU64,
+    /// Events whose payload was cut at the capture cap (orig_len > payload_len).
+    pub truncated_events: AtomicU64,
 }
 
 impl EventStats {
@@ -102,6 +104,7 @@ impl EventStats {
             evictions_capacity: AtomicU64::new(0),
             evictions_idle: AtomicU64::new(0),
             pii_detections: AtomicU64::new(0),
+            truncated_events: AtomicU64::new(0),
         }
     }
 }
@@ -719,7 +722,8 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
                     detect_protocol(payload, event.src_port, event.dst_port, event.direction)
             {
                 use crate::protocol::fsm::CreateResult;
-                let result = manager.get_or_create(cookie, proto);
+                let server = tc_server_endpoint(&event, proto, payload);
+                let result = manager.get_or_create_with_server(cookie, proto, server);
                 match result {
                     CreateResult::Created => {
                         ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -738,9 +742,25 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
                 }
             }
 
-            if let Some(result) =
-                manager.process_packet(cookie, event.direction, payload, event.timestamp_ns)
-            {
+            let src = (event.src_addr, event.src_port);
+            let first = manager.process_packet_from(
+                cookie,
+                src,
+                event.direction,
+                payload,
+                event.timestamp_ns,
+            );
+            // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
+            // writes) were never seen: let the parser count them instead of
+            // desynchronising on the next message.
+            let truncated = event.truncated_bytes() as usize;
+            let after_gap = if truncated > 0 {
+                ctx.stats.truncated_events.fetch_add(1, Ordering::Relaxed);
+                manager.skip_from(cookie, src, event.direction, truncated, event.timestamp_ns)
+            } else {
+                None
+            };
+            for result in [first, after_gap].into_iter().flatten() {
                 match result {
                     FsmResult::Messages(msgs) => {
                         handle_messages(
@@ -947,6 +967,35 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             }
         }
     }
+}
+
+/// Server endpoint of a newly detected TC connection.
+///
+/// Decided from the detection payload's content where possible (an HTTP
+/// request line came from the client, a MySQL greeting from the server...),
+/// then from well-known service ports, then by assuming the lower port is the
+/// server's. `None` for non-TC events (TLS uprobe events carry no addresses
+/// and keep their process-relative direction).
+fn tc_server_endpoint(
+    event: &DataEvent,
+    proto: crate::protocol::Protocol,
+    payload: &[u8],
+) -> Option<crate::protocol::fsm::Endpoint> {
+    use crate::protocol::detect::{is_service_port, sent_by_client};
+
+    if event.event_type != EventType::TcPacket {
+        return None;
+    }
+    let src = (event.src_addr, event.src_port);
+    let dst = (event.dst_addr, event.dst_port);
+    Some(match sent_by_client(proto, payload) {
+        Some(true) => dst,
+        Some(false) => src,
+        None if is_service_port(event.dst_port) => dst,
+        None if is_service_port(event.src_port) => src,
+        None if event.dst_port <= event.src_port => dst,
+        None => src,
+    })
 }
 
 /// Generate a synthetic cookie for TLS events (socket_cookie=0).

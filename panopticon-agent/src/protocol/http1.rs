@@ -51,6 +51,48 @@ pub struct Http1Parser {
     response_content_type: Option<String>,
 }
 
+/// Request-line prefixes; anything else at the start of the client buffer is
+/// junk (e.g. body bytes we lost track of after a capture gap).
+const REQUEST_STARTS: [&[u8]; 8] = [
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"CONNECT ",
+];
+const RESPONSE_START: &[u8] = b"HTTP/1.";
+
+/// Offset of the earliest occurrence of any of `starts` in `data`.
+fn find_start(data: &[u8], starts: &[&[u8]]) -> Option<usize> {
+    (0..data.len()).find(|&i| starts.iter().any(|s| data[i..].starts_with(s)))
+}
+
+/// Drop leading junk so `buf` begins at the next plausible message start.
+/// Keeps a short tail if no start is found, in case a start token is split
+/// across packets. Returns true if anything was dropped.
+fn resync(buf: &mut StreamBuffer, starts: &[&[u8]]) -> bool {
+    let data = buf.data();
+    if data.is_empty()
+        || starts
+            .iter()
+            .any(|s| data.starts_with(s) || s.starts_with(data))
+    {
+        return false;
+    }
+    let drop = match find_start(data, starts) {
+        Some(off) => off,
+        None => data.len().saturating_sub(8),
+    };
+    if drop == 0 {
+        return false;
+    }
+    buf.consume(drop);
+    true
+}
+
 /// Max response body bytes retained for payload_text / PII scanning.
 const MAX_CAPTURED_BODY: usize = 64 * 1024;
 
@@ -164,8 +206,12 @@ impl Http1Parser {
     /// Try to parse an HTTP request from the client buffer.
     /// Returns true if a request was successfully parsed (state advanced).
     fn try_parse_request(&mut self, timestamp_ns: u64) -> bool {
+        // httparse accepts any token as a method, so leftover body bytes glued
+        // to the next request line ("pppGET /x") would parse as a bogus
+        // request. Only parse from a real request-line start.
+        resync(&mut self.client_buf, &REQUEST_STARTS);
         let data = self.client_buf.data();
-        if data.is_empty() {
+        if data.is_empty() || !REQUEST_STARTS.iter().any(|s| data.starts_with(s)) {
             return false;
         }
 
@@ -216,15 +262,21 @@ impl Http1Parser {
                 true
             }
             Ok(httparse::Status::Partial) => false,
-            Err(_) => false,
+            Err(_) => {
+                // Malformed request line: drop its first byte so resync moves
+                // on to the next candidate instead of blocking forever.
+                self.client_buf.consume(1);
+                false
+            }
         }
     }
 
     /// Try to parse an HTTP response from the server buffer.
     /// Returns true if response headers were successfully parsed (state advanced).
     fn try_parse_response(&mut self, _timestamp_ns: u64) -> bool {
+        resync(&mut self.server_buf, &[RESPONSE_START]);
         let data = self.server_buf.data();
-        if data.is_empty() {
+        if data.is_empty() || !data.starts_with(RESPONSE_START) {
             return false;
         }
 
@@ -279,7 +331,10 @@ impl Http1Parser {
                 true
             }
             Ok(httparse::Status::Partial) => false,
-            Err(_) => false,
+            Err(_) => {
+                self.server_buf.consume(1);
+                false
+            }
         }
     }
 
@@ -436,6 +491,51 @@ impl ProtocolParser for Http1Parser {
             }
         }
         self.process(timestamp_ns)
+    }
+
+    fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
+        match (direction, self.state.clone()) {
+            // Gap inside a request body of known length: just count it.
+            (Direction::Egress, State::ReadingRequestBody { remaining })
+                if n <= remaining && self.client_buf.is_empty() =>
+            {
+                self.state = if n == remaining {
+                    State::WaitingForResponse
+                } else {
+                    State::ReadingRequestBody {
+                        remaining: remaining - n,
+                    }
+                };
+                Some(ParseResult::NeedMoreData)
+            }
+            // Gap inside a response body of known length: count it, and emit
+            // the message if the gap finished the body.
+            (Direction::Ingress, State::ReadingResponseBody { remaining })
+                if n <= remaining && self.server_buf.is_empty() =>
+            {
+                self.response_size += n as u64;
+                if n == remaining {
+                    let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
+                    self.reset_for_next_transaction();
+                    Some(ParseResult::Messages(msgs))
+                } else {
+                    self.state = State::ReadingResponseBody {
+                        remaining: remaining - n,
+                    };
+                    Some(ParseResult::NeedMoreData)
+                }
+            }
+            // Chunk framing is lost: emit what we have (status, headers,
+            // partial body), then resync on the next response line.
+            (Direction::Ingress, State::ReadingChunkedResponse) => {
+                self.response_size += n as u64;
+                let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
+                self.reset_for_next_transaction();
+                self.server_buf.clear();
+                Some(ParseResult::Messages(msgs))
+            }
+            _ => None,
+        }
     }
 
     fn protocol(&self) -> Protocol {

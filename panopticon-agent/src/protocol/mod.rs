@@ -133,6 +133,20 @@ pub trait ProtocolParser: Send {
     /// Human-readable FSM state name (for debugging/logging).
     fn state_name(&self) -> &'static str;
 
+    /// `n` bytes of the stream in `direction` were never captured (the packet
+    /// or TLS buffer was larger than the capture cap). Account for them if the
+    /// parser can stay in sync — e.g. by counting them against a known body
+    /// length — and return the result. `None` means the parser cannot resync
+    /// and must be replaced with a fresh one.
+    fn skip(
+        &mut self,
+        _direction: Direction,
+        _n: usize,
+        _timestamp_ns: u64,
+    ) -> Option<ParseResult> {
+        None
+    }
+
     /// Protocol version string, if detected (e.g., "8.0.32" for MySQL).
     fn protocol_version(&self) -> Option<&str> {
         None

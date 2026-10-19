@@ -29,6 +29,7 @@ pub struct AgentMetrics {
     pub drops_channel_full: Counter<u64>,
     pub drops_parser_error: Counter<u64>,
     pub pii_detections: Counter<u64>,
+    pub truncated_events: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -96,6 +97,13 @@ impl AgentMetrics {
             pii_detections.clone(),
         );
 
+        let truncated_events = Counter::<u64>::default();
+        registry.register(
+            "panopticon_capture_truncated",
+            "Events whose payload exceeded the capture cap (parsers skip the gap)",
+            truncated_events.clone(),
+        );
+
         // Parse latency histogram with buckets from 1µs to 100ms
         let parse_latency = Histogram::new(exponential_buckets(0.000_001, 10.0, 6));
         registry.register(
@@ -120,6 +128,7 @@ impl AgentMetrics {
             drops_channel_full,
             drops_parser_error,
             pii_detections,
+            truncated_events,
             parse_latency,
             ringbuf_approx_pending,
         };
@@ -172,6 +181,10 @@ impl AgentMetrics {
 
         let pii = stats.pii_detections.load(Ordering::Relaxed);
         self.pii_detections.inner().store(pii, Ordering::Relaxed);
+        let truncated = stats.truncated_events.load(Ordering::Relaxed);
+        self.truncated_events
+            .inner()
+            .store(truncated, Ordering::Relaxed);
 
         // Approximate RingBuf pending = received - processed
         let pending = received.saturating_sub(processed) as i64;

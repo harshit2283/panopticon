@@ -100,13 +100,17 @@ fn test_data_event_specific_byte_offsets() {
     let mut event: DataEvent = unsafe { core::mem::zeroed() };
     event.src_port = 0x1F90; // 8080
     event.ip_proto = 6;
+    event.orig_len = 65_000;
 
     let bytes = as_bytes(&event);
-    // src_port is at offset 48 (2 bytes, little-endian on LE platforms)
-    let src_port = u16::from_ne_bytes([bytes[48], bytes[49]]);
+    // orig_len at offset 44
+    let orig_len = u32::from_ne_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]);
+    assert_eq!(orig_len, 65_000);
+    // src_port is at offset 52 (2 bytes, little-endian on LE platforms)
+    let src_port = u16::from_ne_bytes([bytes[52], bytes[53]]);
     assert_eq!(src_port, 0x1F90);
-    // ip_proto at offset 52
-    assert_eq!(bytes[52], 6);
+    // ip_proto at offset 56
+    assert_eq!(bytes[56], 6);
 }
 
 #[test]
@@ -116,6 +120,6 @@ fn test_max_payload_event() {
     event.payload.fill(0xAA);
 
     let bytes = as_bytes(&event);
-    // Payload starts at offset 56
-    assert!(bytes[56..56 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
+    // Payload starts at offset 64
+    assert!(bytes[64..64 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
 }

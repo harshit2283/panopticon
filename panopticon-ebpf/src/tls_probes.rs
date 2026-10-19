@@ -210,7 +210,8 @@ fn populate_tls_event(
         (*event).dst_port = 0;
         (*event).ip_proto = 0;
         (*event).tls_library = tls_lib;
-        (*event)._pad = [0; 3];
+        (*event)._pad = [0; 7];
+        (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE
         let copy_len = if len > MAX_PAYLOAD_SIZE {

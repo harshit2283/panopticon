@@ -225,6 +225,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             ip_proto,
             payload_offset,
             capture_len,
+            payload_len as u32,
             true,
         );
 
@@ -251,6 +252,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             ip_proto,
             payload_offset,
             capture_len,
+            payload_len as u32,
             false,
         );
 
@@ -272,6 +274,7 @@ fn populate_tc_event(
     ip_proto: u8,
     payload_offset: usize,
     load_len: u32,
+    orig_len: u32,
     capture_payload: bool,
 ) {
     unsafe {
@@ -291,7 +294,8 @@ fn populate_tc_event(
         (*event).dst_port = dst_port;
         (*event).ip_proto = ip_proto;
         (*event).tls_library = TlsLibrary::None;
-        (*event)._pad = [0; 3];
+        (*event)._pad = [0; 7];
+        (*event).orig_len = orig_len;
 
         if !capture_payload {
             (*event).payload_len = 0;

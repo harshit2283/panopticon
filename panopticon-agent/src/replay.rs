@@ -30,8 +30,8 @@ use panopticon_common::{Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 /// Magic bytes identifying a Panopticon capture file.
 const MAGIC: &[u8; 6] = b"PNCAP\x01";
 
-/// Current file format version.
-const FORMAT_VERSION: u32 = 1;
+/// Current file format version. v2: DataEvent gained `orig_len` (4160 bytes).
+const FORMAT_VERSION: u32 = 2;
 
 #[cfg(not(target_os = "linux"))]
 #[repr(C)]
@@ -46,11 +46,12 @@ struct RawDataEvent {
     pub src_addr: u32,
     pub dst_addr: u32,
     pub payload_len: u32,
+    pub orig_len: u32,
     pub tls_library: u32,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 7],
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -67,6 +68,7 @@ impl RawDataEvent {
             src_addr: self.src_addr,
             dst_addr: self.dst_addr,
             payload_len: self.payload_len,
+            orig_len: self.orig_len,
             tls_library: TlsLibrary::from_u32(self.tls_library)?,
             src_port: self.src_port,
             dst_port: self.dst_port,

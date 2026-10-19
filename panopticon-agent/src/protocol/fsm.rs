@@ -114,6 +114,11 @@ pub trait ProtocolFsm: Send {
     }
 
     fn reset_for_next_transaction(&mut self);
+
+    /// See [`ProtocolParser::skip`]. `None` = cannot resync.
+    fn skip(&mut self, _direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<FsmResult> {
+        None
+    }
 }
 
 pub struct ProtocolFsmAdapter {
@@ -161,12 +166,43 @@ impl ProtocolFsm for ProtocolFsmAdapter {
     }
 
     fn reset_for_next_transaction(&mut self) {}
+
+    fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<FsmResult> {
+        self.parser
+            .skip(direction, n, timestamp_ns)
+            .map(|r| match r {
+                ParseResult::NeedMoreData => FsmResult::WaitingForMore,
+                ParseResult::Messages(msgs) => FsmResult::Messages(msgs),
+                ParseResult::Error(e) => FsmResult::Error(e),
+            })
+    }
 }
+
+/// An `(IPv4 address, port)` pair as carried in `DataEvent`.
+pub type Endpoint = (u32, u16);
 
 /// Unified entry combining the FSM instance and last-seen timestamp.
 struct ConnectionEntry {
     fsm: Box<dyn ProtocolFsm>,
     last_seen: Instant,
+    /// The server side of the connection, when known. Used to turn capture
+    /// direction (TC ingress/egress, which depends on which node the agent
+    /// runs on) into the client→server / server→client direction parsers
+    /// expect.
+    server: Option<Endpoint>,
+}
+
+impl ConnectionEntry {
+    /// Client→server is `Egress`, server→client is `Ingress`, regardless of
+    /// which TC hook saw the packet (falls back to that when the server
+    /// endpoint is unknown).
+    fn direction_of(&self, src: Endpoint, capture_direction: Direction) -> Direction {
+        match self.server {
+            Some(server) if src == server => Direction::Ingress,
+            Some(_) => Direction::Egress,
+            None => capture_direction,
+        }
+    }
 }
 
 pub struct ConnectionFsmManager {
@@ -183,6 +219,17 @@ impl ConnectionFsmManager {
     }
 
     pub fn get_or_create(&self, conn_id: u64, protocol: Protocol) -> CreateResult {
+        self.get_or_create_with_server(conn_id, protocol, None)
+    }
+
+    /// Like [`get_or_create`](Self::get_or_create), pinning the connection's
+    /// server endpoint for [`process_packet_from`](Self::process_packet_from).
+    pub fn get_or_create_with_server(
+        &self,
+        conn_id: u64,
+        protocol: Protocol,
+        server: Option<Endpoint>,
+    ) -> CreateResult {
         if let Some(mut entry) = self.connections.get_mut(&conn_id) {
             entry.last_seen = Instant::now();
             return CreateResult::AlreadyExists;
@@ -227,6 +274,7 @@ impl ConnectionFsmManager {
             ConnectionEntry {
                 fsm,
                 last_seen: Instant::now(),
+                server,
             },
         );
 
@@ -247,6 +295,47 @@ impl ConnectionFsmManager {
         let mut entry = self.connections.get_mut(&conn_id)?;
         entry.last_seen = Instant::now();
         Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+    }
+
+    /// Feed a packet sent by `src`. If the connection's server endpoint is
+    /// known, direction is derived from it (from server ⇒ `Ingress`,
+    /// otherwise `Egress`); else `capture_direction` is used as-is.
+    pub fn process_packet_from(
+        &self,
+        conn_id: u64,
+        src: Endpoint,
+        capture_direction: Direction,
+        data: &[u8],
+        timestamp_ns: u64,
+    ) -> Option<FsmResult> {
+        let mut entry = self.connections.get_mut(&conn_id)?;
+        entry.last_seen = Instant::now();
+        let direction = entry.direction_of(src, capture_direction);
+        Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+    }
+
+    /// `n` bytes sent by `src` were not captured. Lets the parser account for
+    /// them; if it cannot resync, the connection's parser is replaced with a
+    /// fresh one so the gap costs one exchange instead of the whole
+    /// connection. Returns any messages completed by the skip.
+    pub fn skip_from(
+        &self,
+        conn_id: u64,
+        src: Endpoint,
+        capture_direction: Direction,
+        n: usize,
+        timestamp_ns: u64,
+    ) -> Option<FsmResult> {
+        let mut entry = self.connections.get_mut(&conn_id)?;
+        let direction = entry.direction_of(src, capture_direction);
+        match entry.fsm.skip(direction, n, timestamp_ns) {
+            Some(result) => Some(result),
+            None => {
+                let protocol = entry.fsm.protocol();
+                entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol));
+                None
+            }
+        }
     }
 
     /// Close a connection and return whether it existed.

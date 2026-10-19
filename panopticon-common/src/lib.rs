@@ -145,14 +145,20 @@ pub struct DataEvent {
     pub tgid: u32,
     pub src_addr: u32,
     pub dst_addr: u32,
+    /// Bytes actually copied into `payload` (≤ MAX_PAYLOAD_SIZE).
     pub payload_len: u32,
+    /// Original payload length of the packet / TLS buffer. Larger than
+    /// `payload_len` when the capture was truncated (e.g. GSO/TSO
+    /// super-packets up to 64KB); parsers use the difference to skip the
+    /// bytes they never saw instead of silently losing stream sync.
+    pub orig_len: u32,
     pub tls_library: TlsLibrary,
     // 2-byte aligned fields
     pub src_port: u16,
     pub dst_port: u16,
     // 1-byte aligned fields
     pub ip_proto: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 7],
     // Payload last (largest field)
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
@@ -208,6 +214,11 @@ impl DataEvent {
         let len = (self.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         &self.payload[..len]
     }
+
+    /// Bytes of the original payload that were not captured (0 if complete).
+    pub fn truncated_bytes(&self) -> u32 {
+        self.orig_len.saturating_sub(self.payload_len)
+    }
 }
 
 #[cfg(feature = "user")]
@@ -237,11 +248,12 @@ struct RawDataEvent {
     pub src_addr: u32,
     pub dst_addr: u32,
     pub payload_len: u32,
+    pub orig_len: u32,
     pub tls_library: u32,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 7],
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -258,6 +270,7 @@ impl RawDataEvent {
             src_addr: self.src_addr,
             dst_addr: self.dst_addr,
             payload_len: self.payload_len,
+            orig_len: self.orig_len,
             tls_library: TlsLibrary::from_u32(self.tls_library)?,
             src_port: self.src_port,
             dst_port: self.dst_port,
@@ -296,7 +309,7 @@ mod tests {
     fn test_data_event_size() {
         assert_eq!(
             size_of::<DataEvent>(),
-            4152,
+            4160,
             "DataEvent size changed! This breaks kernel↔userspace ABI."
         );
     }
@@ -349,12 +362,13 @@ mod tests {
         assert_eq!(offset_of!(DataEvent, src_addr), 32);
         assert_eq!(offset_of!(DataEvent, dst_addr), 36);
         assert_eq!(offset_of!(DataEvent, payload_len), 40);
-        assert_eq!(offset_of!(DataEvent, tls_library), 44);
-        assert_eq!(offset_of!(DataEvent, src_port), 48);
-        assert_eq!(offset_of!(DataEvent, dst_port), 50);
-        assert_eq!(offset_of!(DataEvent, ip_proto), 52);
-        assert_eq!(offset_of!(DataEvent, _pad), 53);
-        assert_eq!(offset_of!(DataEvent, payload), 56);
+        assert_eq!(offset_of!(DataEvent, orig_len), 44);
+        assert_eq!(offset_of!(DataEvent, tls_library), 48);
+        assert_eq!(offset_of!(DataEvent, src_port), 52);
+        assert_eq!(offset_of!(DataEvent, dst_port), 54);
+        assert_eq!(offset_of!(DataEvent, ip_proto), 56);
+        assert_eq!(offset_of!(DataEvent, _pad), 57);
+        assert_eq!(offset_of!(DataEvent, payload), 64);
     }
 
     #[test]
@@ -467,9 +481,10 @@ mod tests {
             + 4 + 4           // event_type, direction
             + 4 + 4           // pid, tgid
             + 4 + 4           // src_addr, dst_addr
-            + 4 + 4           // payload_len, tls_library
+            + 4 + 4           // payload_len, orig_len
+            + 4               // tls_library
             + 2 + 2           // src_port, dst_port
-            + 1 + 3           // ip_proto, _pad
+            + 1 + 7           // ip_proto, _pad
             + MAX_PAYLOAD_SIZE;
         assert_eq!(
             size_of::<DataEvent>(),

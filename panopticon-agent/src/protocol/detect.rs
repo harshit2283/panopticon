@@ -75,6 +75,53 @@ pub fn detect_protocol(
     None
 }
 
+/// Whether the payload that triggered detection was sent by the *client*
+/// (`Some(true)`), by the *server* (`Some(false)`), or cannot tell (`None`).
+///
+/// TC hook direction says nothing about role: on the node hosting a server,
+/// requests arrive on ingress and responses leave on egress — the opposite of
+/// the client's node. Parsers expect `Egress` = client→server, so the caller
+/// uses this to pin which endpoint is the server.
+pub fn sent_by_client(protocol: Protocol, payload: &[u8]) -> Option<bool> {
+    match protocol {
+        Protocol::Http1 if is_http1_request(payload) => Some(true),
+        Protocol::Http1 if is_http1_response(payload) => Some(false),
+        Protocol::Http2 | Protocol::Grpc if payload.starts_with(HTTP2_PREFACE) => Some(true),
+        // MySQL is server-first: detection keys on the server greeting.
+        Protocol::Mysql if payload.len() >= 5 && payload[3] == 0x00 && payload[4] == 0x0a => {
+            Some(false)
+        }
+        Protocol::Postgres if payload.len() >= 8 => {
+            let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            if code == 80877103 || code == 196608 {
+                Some(true) // SSLRequest / StartupMessage
+            } else if matches!(
+                payload[0],
+                b'R' | b'K' | b'Z' | b'T' | b'D' | b'C' | b'E' | b'N' | b'S'
+            ) {
+                Some(false) // backend message
+            } else {
+                None
+            }
+        }
+        // Clients send commands as RESP arrays; servers reply with scalars.
+        Protocol::Redis if payload.first() == Some(&b'*') => Some(true),
+        Protocol::Redis if matches!(payload.first(), Some(b'+' | b'-' | b':' | b'$')) => {
+            Some(false)
+        }
+        Protocol::Amqp if payload.starts_with(b"AMQP") => Some(true),
+        _ => None,
+    }
+}
+
+/// Well-known service ports used by the port-based detection fallback.
+pub fn is_service_port(port: u16) -> bool {
+    matches!(
+        port,
+        3306 | 5432 | 6379 | 50051 | 80 | 8080 | 8000 | 443 | 8443 | 53 | 9092 | 5672
+    )
+}
+
 /// Check for HTTP/1.x request method prefixes.
 fn is_http1_request(payload: &[u8]) -> bool {
     payload.starts_with(b"GET ")
