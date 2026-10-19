@@ -1,0 +1,127 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (matching Cargo.toml version and Chart.yaml appVersion)
+# to publish:
+#   - ghcr.io/<owner>/panopticon:X.Y.Z (+ :sha-<commit>), with SBOM +
+#     provenance attestations, signed keylessly with cosign
+#   - Helm chart as OCI artifact: oci://ghcr.io/<owner>/charts/panopticon
+#   - GitHub Release with the stripped linux-amd64 binary + SHA256SUMS
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write # GitHub Release
+  packages: write # GHCR image + chart
+  id-token: write # cosign keyless signing (OIDC)
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/panopticon
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+
+jobs:
+  verify-version:
+    name: Verify tag matches versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' panopticon-agent/Cargo.toml | cut -d'"' -f2)
+          app_version=$(grep '^appVersion' helm/panopticon/Chart.yaml | cut -d'"' -f2)
+          chart_version=$(grep '^version' helm/panopticon/Chart.yaml | awk '{print $2}')
+          echo "tag=$tag cargo=$cargo_version appVersion=$app_version chart=$chart_version"
+          for v in "$cargo_version" "$app_version" "$chart_version"; do
+            if [ "$v" != "$tag" ]; then
+              echo "::error::tag v$tag does not match Cargo/Chart versions"; exit 1
+            fi
+          done
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Build, push and sign image
+    needs: verify-version
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # arm64 is not published yet: the Go TLS uprobe path is x86_64-only
+          # and arm64 runtime validation is still limited.
+          platforms: linux/amd64
+          push: true
+          build-args: VERSION=${{ needs.verify-version.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image (keyless)
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+  chart:
+    name: Publish Helm chart
+    needs: [verify-version, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint
+        run: helm lint helm/panopticon
+      - name: Package and push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package helm/panopticon --destination dist
+          helm push dist/panopticon-${{ needs.verify-version.outputs.version }}.tgz "${CHART_REPO}"
+
+  github-release:
+    name: GitHub Release
+    needs: [verify-version, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract binary from the published image
+        run: |
+          version="${{ needs.verify-version.outputs.version }}"
+          cid=$(docker create "${IMAGE}@${{ needs.image.outputs.digest }}")
+          mkdir -p dist
+          docker cp "$cid:/panopticon-agent" "dist/panopticon-agent-${version}-linux-amd64"
+          docker rm "$cid"
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: true
+          body: |
+            **Experimental / not production ready** — see docs/CURRENT-STATE.md.
+
+            Image: `${{ env.IMAGE }}@${{ needs.image.outputs.digest }}`
+            Chart: `helm install panopticon ${{ env.CHART_REPO }}/panopticon --version ${{ needs.verify-version.outputs.version }} -n panopticon --create-namespace`

@@ -1,31 +1,52 @@
 # Default values for panopticon.
 
 image:
-  repository: panopticon
-  tag: "0.1.0"
+  repository: ghcr.io/harshit2283/panopticon
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  # Pin by digest for reproducible rollouts (overrides tag), e.g. "sha256:abc...".
+  digest: ""
   pullPolicy: IfNotPresent
 
+nameOverride: ""
+fullnameOverride: ""
+
 agent:
-  # Network interfaces to attach TC classifiers to
-  interfaces:
-    - eth0
-  # Log raw events to stdout
+  # Network interfaces to attach TC classifiers to. Empty = the agent
+  # auto-detects the node's IPv4 default-route interface(s) (ens5, enp*, bond0...).
+  interfaces: []
+  # Log level (RUST_LOG filter).
+  logLevel: info
+  # Log every captured event to stdout (very verbose; development only).
   logEvents: false
-  # Path to write JSON event export (empty = disabled)
-  jsonExportPath: ""
-  # Inline TOML config (rendered into a ConfigMap).
-  # Set to a raw TOML string, e.g.:
+  # Inline TOML config file (see panopticon-agent/src/config.rs for the schema).
+  # Example:
   #   config: |
+  #     max_events_per_sec = 200000
   #     [pii]
-  #     mode = "regex"
-  #     [export]
-  #     json_path = "/var/log/panopticon/events.json"
-  # Leave as empty string or false to disable ConfigMap creation.
+  #     redact = true
   config: ""
-  # PII detection mode: regex | in-agent | external
-  piiMode: "regex"
-  # Address for metrics/health HTTP server
-  metricsBind: "0.0.0.0:9090"
+
+metrics:
+  # Port for /healthz, /readyz, /metrics. 9435 avoids the common clash with a
+  # host-network Prometheus or node-exporter on 9090/9100.
+  port: 9435
+  # Bind address. Default: the pod IP, which with hostNetwork is the node IP —
+  # reachable by Prometheus and the kubelet, but not every host interface.
+  # Set to "0.0.0.0" to listen on all interfaces.
+  bindAddress: "$(POD_IP)"
+  serviceMonitor:
+    # Create a prometheus-operator ServiceMonitor.
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# Exported data (JSONL events, PII audit log) on the host. Treat as sensitive.
+export:
+  # Host directory mounted at /var/lib/panopticon; empty disables file export.
+  hostPath: ""
+  jsonEvents: true
+  piiAuditLog: true
 
 resources:
   requests:
@@ -35,26 +56,42 @@ resources:
     cpu: "1"
     memory: 512Mi
 
+# Loading eBPF and attaching uprobes into other containers needs broad kernel
+# privileges. `privileged: true` is the compatible default. On kernels >= 5.8
+# you can instead drop privileged and grant only:
+#   capabilities: { add: [BPF, PERFMON, NET_ADMIN, SYS_PTRACE, SYS_RESOURCE, SYS_ADMIN] }
+#   seccompProfile: { type: Unconfined }
+#   appArmorProfile: { type: Unconfined }
+securityContext:
+  privileged: true
+
 tolerations:
   - operator: Exists
 
 nodeSelector: {}
 
-priorityClassName: system-node-critical
+affinity: {}
+
+# "system-node-critical" is only admitted in kube-system (unless a
+# ResourceQuota allows it elsewhere); set it when installing there.
+priorityClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
 
 serviceAccount:
   create: true
-  name: panopticon
+  name: ""
   annotations: {}
+  # The agent does not use the Kubernetes API today.
+  automountToken: false
 
 rbac:
   create: true
-
-mapPinPath: "/sys/fs/bpf/panopticon"
-
-onnx:
-  enabled: false
-  modelPath: /opt/panopticon/models/distilbert-ner
 
 imagePullSecrets: []
 

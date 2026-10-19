@@ -186,3 +186,23 @@ jobs:
 
       - name: Tests (agent -- protocol parsers compile + run on macOS)
         run: cargo test -p panopticon-agent
+
+  helm-chart:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint
+        run: helm lint helm/panopticon
+      - name: Validate rendered manifests (default + all options)
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+          {
+            helm template t helm/panopticon
+            helm template t helm/panopticon \
+              --set agent.config='max_events_per_sec = 1000' \
+              --set export.hostPath=/var/lib/panopticon \
+              --set 'agent.interfaces={ens5}' \
+              --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          } | "$(go env GOPATH)/bin/kubeconform" -strict -summary -
