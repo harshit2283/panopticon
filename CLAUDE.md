@@ -1,5 +1,16 @@
 # Panopticon-rs
 
+## Repository Owner Preferences (always apply)
+
+- **Commit attribution**: end commit messages with exactly
+  `Co-Authored-By: Claude <noreply@anthropic.com>`. No model names or
+  versions, and no `Claude-Session:` (or other session/link) trailers.
+- **Docs in commits**: only commit documentation that is user-facing
+  (README, install/usage docs, `docs/CURRENT-STATE.md`) or proper
+  architecture docs where the repo already has them (`docs/adr/`). Do not
+  commit audit reports, plans, scratch notes or other internal write-ups;
+  share those outside the repo.
+
 > Historical/internal engineering reference. For the current open-source MVP
 > status, use `README.md` and `docs/CURRENT-STATE.md`. This file still contains
 > planning notes and should not be treated as the public release report.
