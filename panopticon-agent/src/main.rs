@@ -26,8 +26,9 @@ mod util;
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Network interfaces to attach TC classifiers to (repeatable, e.g. -i eth0 -i wlan0)
-    #[arg(short, long, default_value = "eth0")]
+    /// Network interfaces to attach TC classifiers to (repeatable, e.g. -i eth0 -i wlan0).
+    /// Default: the config file's `interfaces`, else the default-route interface(s).
+    #[arg(short, long)]
     interface: Vec<String>,
 
     /// Enable verbose (debug-level) logging
@@ -124,6 +125,17 @@ async fn main() -> Result<()> {
             agent_config.metrics_bind = Some(bind.clone());
         }
         agent_config.smoke_test = args.smoke_test;
+        if agent_config.interfaces.is_empty() {
+            let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+            agent_config.interfaces = util::default_route_interfaces(&route);
+            if agent_config.interfaces.is_empty() {
+                anyhow::bail!(
+                    "No --interface given and no IPv4 default route found in /proc/net/route; \
+                     pass --interface or set `interfaces` in the config file"
+                );
+            }
+            info!(interfaces = ?agent_config.interfaces, "Auto-detected default-route interface(s)");
+        }
 
         let caps = loader::detect_kernel_caps()?;
         info!(
@@ -274,7 +286,11 @@ async fn main() -> Result<()> {
             graph_builder,
         );
 
-        // 8. HTTP server (health, metrics, debug endpoints)
+        // 8. HTTP server (health, metrics, debug endpoints).
+        //    Probes are attached at this point, so the agent is ready; the flag
+        //    is cleared again as soon as shutdown begins.
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let event_stats = event_loop.stats().clone();
         let http_handle = if let Some(ref bind) = agent_config.metrics_bind {
             let (metrics, registry) = export::metrics::AgentMetrics::new();
             let state = export::http_server::AppState {
@@ -282,6 +298,7 @@ async fn main() -> Result<()> {
                 stats: event_loop.stats().clone(),
                 metrics,
                 worker_count: agent_config.max_worker_count,
+                ready: Arc::clone(&ready),
             };
             let bind = bind.clone();
             Some(tokio::spawn(async move {
@@ -292,6 +309,8 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+
+        let smoke_test = agent_config.smoke_test;
 
         // 9. SIGHUP config hot-reload
         let shared_config = Arc::new(ArcSwap::from_pointee(agent_config));
@@ -319,18 +338,31 @@ async fn main() -> Result<()> {
             }
         });
 
+        // Kubernetes stops pods with SIGTERM (SIGINT only for interactive use).
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to register SIGTERM handler")?;
+
         // Consume events from the kernel and route to workers.
         // This is the main blocking task that drives the system.
+        let mut exit_result: Result<()> = Ok(());
         tokio::select! {
             result = event_loop.run(event_source, tls_rescan_tx) => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Event loop exited with error");
+                    exit_result = Err(e.context("event loop failed"));
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down...");
+                info!("SIGINT received, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, shutting down...");
+            }
+            outcome = smoke_test_wait(smoke_test, &event_stats) => {
+                exit_result = outcome;
             }
         }
+        ready.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // 10. Cleanup — abort background tasks, wait for JSON writer drain
         sighup_handle.abort();
@@ -347,10 +379,40 @@ async fn main() -> Result<()> {
         if let Some(h) = otlp_writer_handle {
             let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
         }
-    }
 
-    #[cfg(target_os = "linux")]
-    Ok(())
+        exit_result
+    }
+}
+
+/// `--smoke-test`: succeed as soon as the attached programs deliver at least
+/// one event, fail after a timeout. Never resolves when smoke testing is off.
+#[cfg(target_os = "linux")]
+async fn smoke_test_wait(enabled: bool, stats: &event_loop::EventStats) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    if !enabled {
+        return std::future::pending().await;
+    }
+    info!(
+        timeout_secs = SMOKE_TIMEOUT.as_secs(),
+        "Smoke test: waiting for first event"
+    );
+    let deadline = tokio::time::Instant::now() + SMOKE_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        let received = stats.events_received.load(Ordering::Relaxed);
+        if received > 0 {
+            info!(received, "Smoke test passed: events are flowing");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!(
+        "Smoke test failed: no events received within {}s",
+        SMOKE_TIMEOUT.as_secs()
+    )
 }
 
 #[cfg(test)]
@@ -362,7 +424,7 @@ mod tests {
     #[test]
     fn test_cli_default_args() {
         let args = Args::parse_from(["panopticon-agent"]);
-        assert_eq!(args.interface, vec!["eth0"]);
+        assert!(args.interface.is_empty());
         assert!(!args.verbose);
         assert!(!args.log_events);
         assert!(args.json_export.is_none());

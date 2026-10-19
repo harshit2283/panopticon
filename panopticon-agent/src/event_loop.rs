@@ -84,6 +84,8 @@ pub struct EventStats {
     // Eviction counters (7.4)
     pub evictions_capacity: AtomicU64,
     pub evictions_idle: AtomicU64,
+    /// Total PII entities detected across all fields of all messages.
+    pub pii_detections: AtomicU64,
 }
 
 impl EventStats {
@@ -99,6 +101,7 @@ impl EventStats {
             backpressure_events: AtomicU64::new(0),
             evictions_capacity: AtomicU64::new(0),
             evictions_idle: AtomicU64::new(0),
+            pii_detections: AtomicU64::new(0),
         }
     }
 }
@@ -323,11 +326,10 @@ impl EventLoop {
 
                 if let Some(gb) = graph_for_stats.as_ref() {
                     let flows = gb.flush();
-                    let now_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    gb.prune(now_ns);
+                    // Edge timestamps come from bpf_ktime_get_ns (monotonic,
+                    // since boot); wall-clock time here wiped the whole graph
+                    // on every flush.
+                    gb.prune(crate::util::monotonic_now_ns());
                     if let Ok(dag) = gb.dag().lock() {
                         info!(
                             received,
@@ -816,6 +818,21 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
 #[cfg(target_os = "linux")]
 fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>) {
     for msg in msgs {
+        // PII scan + in-place redaction happens FIRST, so that logging, the
+        // audit log, every exporter and the service graph only ever see the
+        // sanitized message (path/query, headers and payload).
+        let mut msg = msg.clone();
+        let pii_report = ctx
+            .pii_engine
+            .as_ref()
+            .and_then(|e| e.scan_message(&mut msg));
+        if let Some(report) = pii_report.as_ref() {
+            ctx.stats
+                .pii_detections
+                .fetch_add(report.entities.len() as u64, Ordering::Relaxed);
+        }
+        let msg = &msg;
+
         if ctx.log_events {
             info!(
                 worker = ctx.worker_id,
@@ -830,11 +847,6 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                 "L7Message"
             );
         }
-
-        let pii_report = msg
-            .payload_text
-            .as_deref()
-            .and_then(|text| ctx.pii_engine.as_ref().and_then(|e| e.scan(text)));
 
         // PII auditing
         if let Some(report) = pii_report.as_ref()

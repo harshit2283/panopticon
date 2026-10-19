@@ -25,6 +25,9 @@ pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
 pub const CONFIG_USE_RINGBUF: u32 = 2;
 pub const CONFIG_PID_FILTER_ON: u32 = 3;
+/// TCP/UDP port whose traffic TC capture ignores (0 = none). Set to the
+/// agent's own metrics/health port so scrapes and probes are not captured.
+pub const CONFIG_IGNORE_PORT: u32 = 4;
 
 // ── Enums ──────────────────────────────────────────────────────────────────
 
@@ -453,6 +456,7 @@ mod tests {
         assert!(CONFIG_MAX_PAYLOAD < CONFIG_ENTRIES);
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
+        assert!(CONFIG_IGNORE_PORT < CONFIG_ENTRIES);
     }
 
     // ── No Implicit Padding ────────────────────────────────────────────

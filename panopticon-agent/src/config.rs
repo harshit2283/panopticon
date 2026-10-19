@@ -91,7 +91,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             capture_enabled: true,
-            interfaces: vec!["eth0".to_string()],
+            // Empty = auto-detect default-route interface(s) at startup.
+            interfaces: Vec::new(),
             pid_filter: None,
 
             max_events_per_sec: 500_000,
@@ -574,7 +575,7 @@ mod tests {
         assert_eq!(config.metrics_bind.as_deref(), Some("127.0.0.1:8080"));
         // Defaults preserved
         assert!(config.capture_enabled);
-        assert_eq!(config.interfaces, vec!["eth0"]);
+        assert!(config.interfaces.is_empty());
         assert_eq!(config.max_worker_count, num_cpus());
         assert!(!config.otlp.enabled);
         assert!(config.pii.enabled);
@@ -609,7 +610,7 @@ mod tests {
         assert!(!config.capture_enabled);
         // Everything else untouched
         assert_eq!(config.max_events_per_sec, 500_000);
-        assert_eq!(config.interfaces, vec!["eth0"]);
+        assert!(config.interfaces.is_empty());
         assert!(config.pii.enabled);
     }
 

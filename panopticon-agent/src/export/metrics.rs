@@ -170,6 +170,9 @@ impl AgentMetrics {
             .inner()
             .store(parser, Ordering::Relaxed);
 
+        let pii = stats.pii_detections.load(Ordering::Relaxed);
+        self.pii_detections.inner().store(pii, Ordering::Relaxed);
+
         // Approximate RingBuf pending = received - processed
         let pending = received.saturating_sub(processed) as i64;
         self.ringbuf_approx_pending

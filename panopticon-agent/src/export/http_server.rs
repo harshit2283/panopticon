@@ -2,14 +2,14 @@
 //!
 //! Serves on `metrics_bind` address (e.g. "0.0.0.0:9090"):
 //! - `/healthz`  — liveness probe (always 200)
-//! - `/readyz`   — readiness probe (200 if events flowing, 503 otherwise)
+//! - `/readyz`   — readiness probe (200 once probes are attached, 503 during shutdown)
 //! - `/metrics`  — Prometheus text exposition format
 //! - `/debug/state` — JSON dump of internal state
 
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -28,6 +28,8 @@ pub struct AppState {
     pub stats: Arc<EventStats>,
     pub metrics: AgentMetrics,
     pub worker_count: usize,
+    /// True once eBPF programs are attached; cleared when shutdown begins.
+    pub ready: Arc<AtomicBool>,
 }
 
 /// Start the HTTP server on the given bind address.
@@ -52,10 +54,13 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness probe — 200 if we've received any events (RingBuf attached and producing),
-/// 503 otherwise.
+/// Readiness probe — 200 once programs are attached, 503 otherwise.
+///
+/// Deliberately not tied to "events seen": a quiet node would otherwise never
+/// become Ready and would stall DaemonSet rolling updates. Traffic volume is
+/// observable via `panopticon_events_received_total` instead.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.stats.events_received.load(Ordering::Relaxed) > 0 {
+    if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
@@ -114,6 +119,7 @@ mod tests {
             stats: Arc::new(EventStats::new()),
             metrics,
             worker_count: 4,
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -151,8 +157,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_readyz_ready() {
+        // Ready as soon as probes are attached, even with zero traffic.
         let state = make_test_state();
-        state.stats.events_received.fetch_add(1, Ordering::Relaxed);
+        state.ready.store(true, Ordering::Relaxed);
+        assert_eq!(state.stats.events_received.load(Ordering::Relaxed), 0);
         let app = make_app(state);
         let resp = app
             .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())

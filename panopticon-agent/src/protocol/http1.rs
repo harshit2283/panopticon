@@ -41,11 +41,23 @@ pub struct Http1Parser {
     client_buf: StreamBuffer,
     server_buf: StreamBuffer,
     pending_request: Option<PendingRequest>,
-    /// Accumulated response body (for payload_text).
+    /// Accumulated response body (for payload_text), capped at
+    /// `MAX_CAPTURED_BODY` so a large download is never held in memory.
     response_body: Vec<u8>,
+    /// Full response body size, including bytes beyond the capture cap.
+    response_size: u64,
     response_headers: Vec<(String, String)>,
     response_status: Option<u32>,
     response_content_type: Option<String>,
+}
+
+/// Max response body bytes retained for payload_text / PII scanning.
+const MAX_CAPTURED_BODY: usize = 64 * 1024;
+
+/// Append to the captured body without exceeding `MAX_CAPTURED_BODY`.
+fn append_capped(body: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_CAPTURED_BODY.saturating_sub(body.len());
+    body.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
 impl Http1Parser {
@@ -56,6 +68,7 @@ impl Http1Parser {
             server_buf: StreamBuffer::new(),
             pending_request: None,
             response_body: Vec::new(),
+            response_size: 0,
             response_headers: Vec::new(),
             response_status: None,
             response_content_type: None,
@@ -111,7 +124,8 @@ impl Http1Parser {
                 State::ReadingResponseBody { remaining } => {
                     let data = self.server_buf.data();
                     let to_read = data.len().min(remaining);
-                    self.response_body.extend_from_slice(&data[..to_read]);
+                    append_capped(&mut self.response_body, &data[..to_read]);
+                    self.response_size += to_read as u64;
                     self.server_buf.consume(to_read);
 
                     if to_read >= remaining {
@@ -242,6 +256,7 @@ impl Http1Parser {
 
                 self.server_buf.consume(header_len);
                 self.response_body.clear();
+                self.response_size = 0;
 
                 if is_chunked {
                     self.state = State::ReadingChunkedResponse;
@@ -303,15 +318,22 @@ impl Http1Parser {
                 return ChunkResult::NeedMoreData;
             }
 
-            // Need: chunk_size_line + chunk_data + trailing \r\n
-            let total = crlf_pos + 2 + chunk_size + 2;
+            // Need: chunk_size_line + chunk_data + trailing \r\n.
+            // chunk_size is peer-controlled: a size like FFFFFFFFFFFFFFFF must
+            // not overflow (debug panic / release wrap + slice panic).
+            let Some(total) = chunk_size.checked_add(crlf_pos + 4) else {
+                return ChunkResult::Error(format!("chunk size overflow: {size_str}"));
+            };
             if data.len() < total {
                 return ChunkResult::NeedMoreData;
             }
 
             let chunk_start = crlf_pos + 2;
-            self.response_body
-                .extend_from_slice(&data[chunk_start..chunk_start + chunk_size]);
+            append_capped(
+                &mut self.response_body,
+                &data[chunk_start..chunk_start + chunk_size],
+            );
+            self.response_size += chunk_size as u64;
             self.server_buf.consume(total);
         }
     }
@@ -322,7 +344,7 @@ impl Http1Parser {
 
         msg.status = self.response_status;
         msg.content_type = self.response_content_type.clone();
-        msg.response_size_bytes = self.response_body.len() as u64;
+        msg.response_size_bytes = self.response_size;
 
         if let Some(req) = self.pending_request.as_ref() {
             msg.method = Some(req.method.clone());
@@ -339,13 +361,17 @@ impl Http1Parser {
             msg.headers = self.response_headers.clone();
         }
 
-        // Attempt UTF-8 decode for PII scanning
-        if !self.response_body.is_empty()
-            && let Ok(text) = std::str::from_utf8(&self.response_body)
-        {
-            // Cap at 64KB for PII scanning
-            let cap = text.len().min(65536);
-            msg.payload_text = Some(text[..cap].to_string());
+        // Attempt UTF-8 decode for PII scanning. The capture cap can split a
+        // multi-byte character at the end: keep the valid prefix in that case.
+        let text = match std::str::from_utf8(&self.response_body) {
+            Ok(t) => Some(t),
+            Err(e) if e.error_len().is_none() => {
+                std::str::from_utf8(&self.response_body[..e.valid_up_to()]).ok()
+            }
+            Err(_) => None,
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            msg.payload_text = Some(text.to_string());
         }
 
         Some(msg)
@@ -366,6 +392,7 @@ impl Http1Parser {
         self.state = State::WaitingForRequest;
         self.pending_request = None;
         self.response_body.clear();
+        self.response_size = 0;
         self.response_headers.clear();
         self.response_status = None;
         self.response_content_type = None;
@@ -501,6 +528,73 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_chunked_size_overflow_does_not_panic() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        let resp =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n";
+        // Must not panic (previously integer overflow / out-of-bounds slice).
+        let _ = parser.feed(resp, Direction::Ingress, 2000);
+    }
+
+    #[test]
+    fn test_large_body_capped_but_size_counted() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        let body_len = MAX_CAPTURED_BODY + 10_000;
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n");
+        parser.feed(header.as_bytes(), Direction::Ingress, 2000);
+        let body = vec![b'a'; body_len];
+        let mut msgs = Vec::new();
+        for chunk in body.chunks(4096) {
+            if let ParseResult::Messages(m) = parser.feed(chunk, Direction::Ingress, 3000) {
+                msgs.extend(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].response_size_bytes, body_len as u64);
+        assert_eq!(
+            msgs[0].payload_text.as_ref().unwrap().len(),
+            MAX_CAPTURED_BODY
+        );
+    }
+
+    #[test]
+    fn test_body_cap_splitting_utf8_char_keeps_prefix() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET /u HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        // Two ASCII bytes then 3-byte chars: 65536 - 2 is not a multiple of
+        // 3, so the 64KB cap lands mid-char.
+        let mut body = vec![b'a', b'a'];
+        while body.len() < MAX_CAPTURED_BODY + 3 {
+            body.extend_from_slice("€".as_bytes());
+        }
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        parser.feed(header.as_bytes(), Direction::Ingress, 2000);
+        let mut msgs = Vec::new();
+        for chunk in body.chunks(4096) {
+            if let ParseResult::Messages(m) = parser.feed(chunk, Direction::Ingress, 3000) {
+                msgs.extend(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1);
+        let text = msgs[0].payload_text.as_ref().expect("valid prefix kept");
+        assert!(text.len() < MAX_CAPTURED_BODY && text.len() > MAX_CAPTURED_BODY - 4);
     }
 
     #[test]

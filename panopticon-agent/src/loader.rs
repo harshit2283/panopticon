@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON, CONFIG_USE_RINGBUF,
-    MAX_PAYLOAD_SIZE,
+    CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
+    CONFIG_USE_RINGBUF, MAX_PAYLOAD_SIZE,
 };
 
 const PINNED_MAP_NAMES: [&str; 12] = [
@@ -208,6 +208,12 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
+    let ignore_port = config
+        .metrics_bind
+        .as_deref()
+        .and_then(|b| b.parse::<std::net::SocketAddr>().ok())
+        .map_or(0, |a| a.port());
+    cfg_map.set(CONFIG_IGNORE_PORT, ignore_port as u64, 0)?;
 
     Ok(())
 }
