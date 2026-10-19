@@ -17,7 +17,7 @@ For day-to-day usage and output formats see [`USER-GUIDE.md`](USER-GUIDE.md).
 | Privileges | Root/privileged, or `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE` (+ `CAP_SYS_ADMIN` for some tracefs/debugfs setups). |
 | Host namespaces | Host network (TC hooks on node interfaces) and host PID (finding TLS libraries via `/proc/<pid>/root`). |
 | Mounts | `/sys/fs/bpf`, `/sys/kernel/tracing` (process events), `/sys/kernel/debug` (older kernels' tracefs location). |
-| Resources | Default request 200m CPU / 256Mi, limit 1 CPU / 512Mi. Kernel-side cost is ~1.3µs per captured packet (see [`BENCHMARKS.md`](BENCHMARKS.md)). |
+| Resources | Default request 200m CPU / 256Mi, limit 1 CPU / 512Mi. Measured: ~1.2-2µs kernel time per captured packet, ~120 MiB peak RSS under load (see [`BENCHMARKS.md`](BENCHMARKS.md)). |
 
 ## 2. Get the image
 

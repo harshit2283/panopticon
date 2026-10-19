@@ -49,12 +49,12 @@ current release report.
 | Linux ARM64 | Partial | Build/runtime path exists, but validation coverage is still limited. |
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |
 | Windows runtime | Unsupported | No Windows eBPF/runtime support. |
-| HTTP/1.1 parsing | Supported | FSM parser with multi-packet handling. |
-| HTTP/2 parsing | Supported | Stream handling works; some edge cases remain. |
-| gRPC parsing | Partial | Compression and schema-dependent decoding gaps remain. |
-| MySQL parsing | Partial | Core query flows supported; binary protocol gaps remain. |
-| PostgreSQL parsing | Partial | Core query flows supported; COPY and large-object paths remain incomplete. |
-| Redis parsing | Partial | RESP core supported; advanced command families remain incomplete. |
+| HTTP/1.1 parsing | Supported | 100% recall against ground truth, incl. keep-alive, chunked and >4KB bodies ([benchmarks](docs/BENCHMARKS.md)). |
+| HTTP/2 parsing | Supported | Per-direction HPACK; headers are lost when the agent joins an existing connection. |
+| gRPC parsing | Supported | 100% recall, method path and `grpc-status` against ground truth; payloads shown as printable strings (no schema decoding, no compressed messages). |
+| MySQL parsing | Partial | Text protocol at 100% recall on plaintext connections; prepared-statement (binary) protocol not parsed. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. |
+| PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall; COPY and large objects not parsed. |
+| Redis parsing | Supported | RESP2 and RESP3, pipelining; 100% recall against ground truth. |
 | Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |
 | AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
 | DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |

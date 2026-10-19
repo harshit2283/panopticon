@@ -29,10 +29,10 @@ sizes, headers and (for text payloads) the body — after PII redaction.
 | Console | `--log-events` | Every packet and exchange (development only, very verbose) |
 | Raw capture | `--capture-raw <file>` | Every captured payload, **unredacted**, for your own analysis (§5.5) |
 
-Protocols: HTTP/1.1 (validated against ground truth, see
-[`BENCHMARKS.md`](BENCHMARKS.md)), HTTP/2, gRPC, MySQL, PostgreSQL, Redis,
-Kafka, AMQP, DNS (parsers exist; depth varies — see the support matrix in the
-[README](../README.md)).
+Protocols: HTTP/1.1, HTTP/2, gRPC, PostgreSQL, MySQL and Redis are validated
+against ground truth (see [`BENCHMARKS.md`](BENCHMARKS.md)); Kafka, AMQP and
+DNS parsers exist with unit coverage only. Depth varies — see the support
+matrix in the [README](../README.md).
 
 ## 2. Requirements
 

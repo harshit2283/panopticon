@@ -19,8 +19,14 @@ production-hardened compliance platform.
 - Host-mode TLS E2E exists for local Linux debugging.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
-  across 5,400 exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- All parsers are fuzzed with libFuzzer (`fuzz/`): 12M+ executions without a
+  across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
+- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol,
+  plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
+  every request that carried it, and no raw PII values in the export
+  (`tests/oracle/run_protocols.sh`).
+- Agent overhead is measured: about 1.2-2µs of kernel time per captured
+  packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run.
+- All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 
 ## Partial
@@ -34,8 +40,12 @@ production-hardened compliance platform.
   - OpenSSL is supported on targeted attach paths.
   - Go TLS is write-path only.
 - Protocol depth:
-  - HTTP/2, gRPC, MySQL, PostgreSQL, Redis, AMQP, and DNS still have feature
-    gaps even where parsing exists.
+  - MySQL binary (prepared-statement) protocol, PostgreSQL COPY, gRPC
+    schema decoding and compressed messages are not parsed.
+  - HTTP/2 headers cannot be decoded when the agent joins a connection that
+    was already open (HPACK state is lost).
+  - Kafka, AMQP and DNS have unit coverage but are not scored against ground
+    truth yet.
 - PII detection:
   - Regex-first scanning is the stable baseline.
   - ONNX-backed ML inference is optional and throughput-sensitive.
