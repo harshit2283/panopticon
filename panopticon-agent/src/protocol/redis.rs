@@ -93,6 +93,10 @@ impl RedisParser {
             }
 
             match parse_resp_value(data) {
+                RespParse::Complete(RespValue::Push(_), consumed) => {
+                    // Out-of-band push: answers no command, keep the queue.
+                    self.server_buf.consume(consumed);
+                }
                 RespParse::Complete(value, consumed) => {
                     self.server_buf.consume(consumed);
 
@@ -102,6 +106,11 @@ impl RedisParser {
                         msg.method = Some(parts[0].to_uppercase());
                         if parts.len() > 1 {
                             msg.path = Some(parts[1].clone());
+                        }
+                        // Arguments after the key (SET value, HSET field/value
+                        // pairs, ...) carry the data written: scan it for PII.
+                        if parts.len() > 2 {
+                            msg.request_text = Some(parts[2..].join(" "));
                         }
                         msg.latency_ns = Some(timestamp_ns.saturating_sub(req_ts));
                     }
@@ -184,6 +193,9 @@ enum RespValue {
     Integer(i64),
     BulkString(Option<Vec<u8>>),   // None = null bulk string
     Array(Option<Vec<RespValue>>), // None = null array
+    /// RESP3 out-of-band push (pub/sub, client-side caching invalidation):
+    /// not a reply to any pending command.
+    Push(Vec<RespValue>),
 }
 
 enum RespParse {
@@ -214,10 +226,53 @@ fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
         b'-' => parse_error(data),
         b':' => parse_integer(data),
         b'$' => parse_bulk_string(data),
-        b'*' if depth >= MAX_RESP_DEPTH => {
+        b'*' | b'%' | b'~' | b'>' | b'|' if depth >= MAX_RESP_DEPTH => {
             RespParse::Error(format!("RESP nesting deeper than {MAX_RESP_DEPTH}"))
         }
         b'*' => parse_array(data, depth),
+        // ── RESP3 (negotiated with HELLO 3; default in current clients) ──
+        b'_' => match find_crlf(data) {
+            Some(pos) => RespParse::Complete(RespValue::BulkString(None), pos + 2),
+            None => RespParse::Incomplete,
+        },
+        b'#' | b',' | b'(' => match find_crlf(data) {
+            // boolean / double / big number: keep the literal text
+            Some(pos) => RespParse::Complete(
+                RespValue::SimpleString(String::from_utf8_lossy(&data[1..pos]).into_owned()),
+                pos + 2,
+            ),
+            None => RespParse::Incomplete,
+        },
+        b'!' => match parse_bulk_string(data) {
+            RespParse::Complete(RespValue::BulkString(b), n) => RespParse::Complete(
+                RespValue::Error(String::from_utf8_lossy(&b.unwrap_or_default()).into_owned()),
+                n,
+            ),
+            other => other,
+        },
+        b'=' => match parse_bulk_string(data) {
+            // verbatim string: "txt:" / "mkd:" format prefix
+            RespParse::Complete(RespValue::BulkString(Some(b)), n) => RespParse::Complete(
+                RespValue::BulkString(Some(b.get(4..).unwrap_or_default().to_vec())),
+                n,
+            ),
+            other => other,
+        },
+        b'%' => parse_aggregate(data, depth, 2, |v| RespValue::Array(Some(v))),
+        b'~' => parse_aggregate(data, depth, 1, |v| RespValue::Array(Some(v))),
+        b'>' => parse_aggregate(data, depth, 1, RespValue::Push),
+        b'|' => {
+            // Attribute: metadata map that precedes the actual reply.
+            match parse_aggregate(data, depth, 2, |v| RespValue::Array(Some(v))) {
+                RespParse::Complete(_, attr_len) => {
+                    match parse_resp_value_at(&data[attr_len..], depth + 1) {
+                        RespParse::Complete(value, n) => RespParse::Complete(value, attr_len + n),
+                        other => other,
+                    }
+                }
+                other => other,
+            }
+        }
         _ => RespParse::Error(format!("unknown RESP type byte: 0x{:02x}", data[0])),
     }
 }
@@ -294,6 +349,41 @@ fn parse_bulk_string(data: &[u8]) -> RespParse {
     RespParse::Complete(RespValue::BulkString(Some(bytes)), total)
 }
 
+/// RESP3 aggregate: `<type><count>\r\n` followed by `count * per_entry`
+/// values (2 per entry for maps and attributes, 1 for sets and pushes).
+fn parse_aggregate(
+    data: &[u8],
+    depth: usize,
+    per_entry: usize,
+    wrap: impl FnOnce(Vec<RespValue>) -> RespValue,
+) -> RespParse {
+    let crlf_pos = match find_crlf(data) {
+        Some(pos) => pos,
+        None => return RespParse::Incomplete,
+    };
+    let count_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
+    let count: usize = match count_str.parse() {
+        Ok(n) => n,
+        Err(_) => return RespParse::Error(format!("invalid RESP3 count: {count_str}")),
+    };
+    let total = count.saturating_mul(per_entry);
+    let mut offset = crlf_pos + 2;
+    let mut elements = Vec::with_capacity(total.min(MAX_PREALLOC_ELEMENTS));
+    for _ in 0..total {
+        if offset >= data.len() {
+            return RespParse::Incomplete;
+        }
+        match parse_resp_value_at(&data[offset..], depth + 1) {
+            RespParse::Complete(value, consumed) => {
+                elements.push(value);
+                offset += consumed;
+            }
+            other => return other,
+        }
+    }
+    RespParse::Complete(wrap(elements), offset)
+}
+
 /// Parse `*<count>\r\n<elements...>` or `*-1\r\n` (null)
 fn parse_array(data: &[u8], depth: usize) -> RespParse {
     let crlf_pos = match find_crlf(data) {
@@ -365,7 +455,7 @@ fn resp_value_to_text(value: &RespValue) -> Option<String> {
         RespValue::Integer(n) => Some(format!("(integer) {n}")),
         RespValue::Error(e) => Some(format!("(error) {e}")),
         RespValue::Array(None) => Some("(nil)".into()),
-        RespValue::Array(Some(elements)) => {
+        RespValue::Array(Some(elements)) | RespValue::Push(elements) => {
             let parts: Vec<String> = elements.iter().filter_map(resp_value_to_text).collect();
             Some(parts.join(", "))
         }
@@ -398,6 +488,80 @@ mod tests {
                 assert_eq!(msgs[0].latency_ns, Some(1000));
             }
             other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_get_missing_key_returns_null_bulk() {
+        let mut parser = RedisParser::new();
+        parser.feed(
+            b"*2\r\n$3\r\nGET\r\n$8\r\no:tok_5_\r\n",
+            Direction::Egress,
+            1000,
+        );
+        match parser.feed(b"$-1\r\n", Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].method.as_deref(), Some("GET"));
+                assert_eq!(msgs[0].path.as_deref(), Some("o:tok_5_"));
+            }
+            other => panic!("expected GET message for a null reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resp3_replies() {
+        // HELLO 3 map reply, RESP3 null, boolean, double, verbatim, blob error.
+        let mut parser = RedisParser::new();
+        let cmds = b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n\
+            *2\r\n$3\r\nGET\r\n$4\r\nnone\r\n\
+            *2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n\
+            *2\r\n$5\r\nSCORE\r\n$1\r\nk\r\n\
+            *2\r\n$4\r\nINFO\r\n$1\r\nk\r\n\
+            *2\r\n$4\r\nFAIL\r\n$1\r\nk\r\n";
+        parser.feed(cmds, Direction::Egress, 1000);
+        let replies = b"%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n\
+            _\r\n\
+            >2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n\
+            #t\r\n\
+            ,3.14\r\n\
+            |1\r\n$3\r\nttl\r\n:5\r\n=9\r\ntxt:hello\r\n\
+            !10\r\nERR boom!!\r\n";
+        match parser.feed(replies, Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                let got: Vec<_> = msgs
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.method.clone().unwrap(),
+                            m.status.unwrap(),
+                            m.payload_text.clone(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(got.len(), 6, "{got:?}"); // the push answers nothing
+                assert_eq!(got[1], ("GET".into(), 0, Some("(nil)".into())));
+                assert_eq!(got[2].2.as_deref(), Some("t"));
+                assert_eq!(got[3].2.as_deref(), Some("3.14"));
+                assert_eq!(got[4].2.as_deref(), Some("hello"));
+                assert_eq!(got[5].1, 1);
+            }
+            other => panic!("expected RESP3 replies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_value_is_request_text() {
+        let mut parser = RedisParser::new();
+        parser.feed(
+            b"*3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$17\r\nbob@example.com!!\r\n",
+            Direction::Egress,
+            1000,
+        );
+        match parser.feed(b"+OK\r\n", Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].request_text.as_deref(), Some("bob@example.com!!"));
+            }
+            other => panic!("expected SET message, got {other:?}"),
         }
     }
 

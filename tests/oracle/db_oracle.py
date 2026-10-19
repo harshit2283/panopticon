@@ -34,6 +34,7 @@ def run_redis():
     import redis
 
     r = redis.Redis(host=HOST, port=6379)
+    r.flushdb()  # keys from earlier runs would collide (WRONGTYPE)
     i = 0
     while i < N:
         if rnd.random() < 0.15:
@@ -67,8 +68,8 @@ def run_redis():
             r.lpush(key, "a", "b")
             record(i, "LPUSH")
         elif op < 0.82:
-            r.incr(key)
-            record(i, "INCR")
+            r.incr(key)  # redis-py sends INCRBY key 1
+            record(i, "INCRBY")
         elif op < 0.92:
             r.delete(key)
             record(i, "DEL")
