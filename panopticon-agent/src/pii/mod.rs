@@ -152,6 +152,9 @@ pub struct PiiReport {
     pub entities: Vec<PiiEntity>,
     pub redacted_text: Option<String>,
     pub scanned_bytes: usize,
+    /// True when the detected values were replaced in the message before it
+    /// was logged or exported (redaction enabled).
+    pub redacted: bool,
 }
 
 impl Drop for PiiReport {
@@ -338,6 +341,7 @@ impl PiiEngine {
         Some(PiiReport {
             scanned_bytes: text.len(),
             entities,
+            redacted: redacted_text.is_some(),
             redacted_text,
         })
     }
@@ -412,6 +416,7 @@ impl PiiEngine {
             entities,
             redacted_text: redacted_payload,
             scanned_bytes,
+            redacted: redact_enabled,
         })
     }
 
@@ -554,6 +559,7 @@ mod tests {
 
         assert!(!msg.payload_text.as_deref().unwrap().contains("4111"));
         assert_eq!(report.redacted_text.as_deref(), msg.payload_text.as_deref());
+        assert!(report.redacted);
         let cats: Vec<_> = report.entities.iter().map(|e| e.category).collect();
         assert!(cats.contains(&PiiCategory::Email));
         assert!(cats.contains(&PiiCategory::Ssn));
@@ -569,7 +575,7 @@ mod tests {
         let engine = PiiEngine::new(&config, &[]);
         let mut msg = http_msg();
         let original = msg.clone();
-        assert!(engine.scan_message(&mut msg).is_some());
+        assert!(!engine.scan_message(&mut msg).unwrap().redacted);
         assert_eq!(msg.path, original.path);
         assert_eq!(msg.headers, original.headers);
         assert_eq!(msg.payload_text, original.payload_text);

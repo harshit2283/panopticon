@@ -914,7 +914,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                     category: e.category,
                     source: e.source,
                     confidence: e.confidence,
-                    action: if report.redacted_text.is_some() {
+                    action: if report.redacted {
                         AuditAction::Redacted
                     } else {
                         AuditAction::Detected

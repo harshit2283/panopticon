@@ -440,6 +440,7 @@ mod tests {
             }],
             redacted_text: Some("contact <EMAIL> for details".to_string()),
             scanned_bytes: 35,
+            redacted: true,
         };
 
         let event = JsonEvent {
