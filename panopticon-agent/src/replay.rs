@@ -148,6 +148,11 @@ impl<W: Write> CaptureWriter<W> {
         Ok(())
     }
 
+    /// Flush buffered events to the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
     /// Returns the number of events written so far.
     pub fn event_count(&self) -> u64 {
         self.event_count

@@ -81,6 +81,12 @@ pub struct AgentConfig {
     /// Run smoke test (attach probes, verify events, exit).
     pub smoke_test: bool,
 
+    // ── Raw capture ─────────────────────────────────
+    /// If set, write every processed event, unredacted, to this PNCAP file.
+    pub capture_raw_path: Option<String>,
+    /// Stop raw capture once the file reaches this size.
+    pub capture_raw_max_bytes: u64,
+
     // ── Map pinning ─────────────────────────────────
     /// If set, pin eBPF maps to this bpffs directory for zero-gap restarts.
     /// Directory must exist and bpffs must be mounted (typically /sys/fs/bpf/).
@@ -122,6 +128,8 @@ impl Default for AgentConfig {
             smoke_test: false,
 
             map_pin_path: None,
+            capture_raw_path: None,
+            capture_raw_max_bytes: 1 << 30,
         }
     }
 }
@@ -251,6 +259,8 @@ pub struct AgentConfigFile {
     pub otlp: Option<OtlpConfigFile>,
     pub metrics_bind: Option<String>,
     pub map_pin_path: Option<String>,
+    pub capture_raw_path: Option<String>,
+    pub capture_raw_max_bytes: Option<u64>,
 }
 
 /// TOML-friendly PII config subset.
@@ -348,6 +358,12 @@ impl AgentConfigFile {
         }
         if let Some(v) = self.metrics_bind {
             base.metrics_bind = Some(v);
+        }
+        if let Some(v) = self.capture_raw_path {
+            base.capture_raw_path = Some(v);
+        }
+        if let Some(v) = self.capture_raw_max_bytes {
+            base.capture_raw_max_bytes = v;
         }
         if let Some(v) = self.map_pin_path {
             base.map_pin_path = Some(v);

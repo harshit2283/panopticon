@@ -79,6 +79,10 @@ spec:
             - "--pii-audit-log"
             - "/var/lib/panopticon/pii-audit.jsonl"
             {{- end }}
+            {{- if .Values.export.rawCapture }}
+            - "--capture-raw"
+            - "/var/lib/panopticon/raw.pncap"
+            {{- end }}
             {{- end }}
             {{- if .Values.agent.config }}
             - "--config"

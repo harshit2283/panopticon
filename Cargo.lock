@@ -1538,6 +1538,7 @@ dependencies = [
  "aya",
  "aya-build",
  "aya-log",
+ "base64 0.22.1",
  "bytes",
  "cargo_metadata",
  "clap",

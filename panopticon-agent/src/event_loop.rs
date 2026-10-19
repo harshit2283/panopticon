@@ -51,6 +51,7 @@ struct WorkerTaskContext {
     otlp_export: Option<OtlpExportHandle>,
     audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
     graph_builder: Option<Arc<GraphBuilder>>,
+    raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
 }
 
 #[cfg(target_os = "linux")]
@@ -187,6 +188,7 @@ pub struct EventLoop {
     otlp_export_handle: Option<OtlpExportHandle>,
     audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
     graph_builder: Option<Arc<GraphBuilder>>,
+    raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
 }
 
 #[cfg(target_os = "linux")]
@@ -207,7 +209,17 @@ impl EventLoop {
             otlp_export_handle,
             audit_log,
             graph_builder: graph_builder.map(Arc::new),
+            raw_capture: None,
         }
+    }
+
+    /// Record every processed event, unredacted, to a raw capture file.
+    pub fn with_raw_capture(
+        mut self,
+        handle: crate::export::raw_capture::RawCaptureHandle,
+    ) -> Self {
+        self.raw_capture = Some(handle);
+        self
     }
 
     pub fn stats(&self) -> &Arc<EventStats> {
@@ -259,6 +271,7 @@ impl EventLoop {
                 otlp_export: otlp_exporter,
                 audit_log,
                 graph_builder: graph,
+                raw_capture: self.raw_capture.clone(),
             };
             let handle = tokio::spawn(worker_task(worker_id, rx, worker_ctx));
             worker_handles.push(handle);
@@ -719,6 +732,10 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: W
     debug!(worker_id, "Worker started");
 
     while let Some(event) = rx.recv().await {
+        if let Some(raw) = ctx.raw_capture.as_ref() {
+            raw.record(&event);
+        }
+
         // TLS events have socket_cookie=0 — use synthetic cookie from PID
         // so each PID gets its own ConnectionState + parser.
         let cookie = if event.socket_cookie == 0 && event.event_type == EventType::TlsData {

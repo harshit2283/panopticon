@@ -8,7 +8,7 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../src/protocol/mod.rs"]
 mod protocol;
 

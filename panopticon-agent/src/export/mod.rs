@@ -5,3 +5,5 @@ pub mod http_server;
 pub mod json;
 pub mod metrics;
 pub mod otlp;
+#[cfg(unix)]
+pub mod raw_capture;

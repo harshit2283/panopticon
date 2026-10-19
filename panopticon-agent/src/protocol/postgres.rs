@@ -416,7 +416,7 @@ mod tests {
         param.extend_from_slice(b"15.4\0");
         p.feed(&make_backend_msg(b'S', &param), Direction::Ingress, 0);
         // Feed ReadyForQuery
-        p.feed(&make_backend_msg(b'Z', &[b'I']), Direction::Ingress, 0);
+        p.feed(&make_backend_msg(b'Z', b"I"), Direction::Ingress, 0);
         p
     }
 
@@ -445,7 +445,7 @@ mod tests {
         ));
         response.extend_from_slice(&make_backend_msg(b'D', &[0, 1, 0, 0, 0, 1, b'1']));
         response.extend_from_slice(&make_backend_msg(b'C', b"SELECT 1\0"));
-        response.extend_from_slice(&make_backend_msg(b'Z', &[b'I']));
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
 
         let result = p.feed(&response, Direction::Ingress, 2000);
         match result {
@@ -470,7 +470,7 @@ mod tests {
             1000,
         );
         let mut response = make_backend_msg(b'C', b"SELECT 1\0");
-        response.extend_from_slice(&make_backend_msg(b'Z', &[b'I']));
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
         match p.feed(&response, Direction::Ingress, 2000) {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -507,7 +507,7 @@ mod tests {
         ));
         response.extend_from_slice(&make_backend_msg(b'D', &[0, 1, 0, 0, 0, 1, b'1']));
         response.extend_from_slice(&make_backend_msg(b'C', b"SELECT 1\0"));
-        response.extend_from_slice(&make_backend_msg(b'Z', &[b'I']));
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
 
         let result = p.feed(&response, Direction::Ingress, 2000);
         match result {
@@ -540,7 +540,7 @@ mod tests {
 
         let mut response = Vec::new();
         response.extend_from_slice(&make_backend_msg(b'E', &err_payload));
-        response.extend_from_slice(&make_backend_msg(b'Z', &[b'I']));
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
 
         let result = p.feed(&response, Direction::Ingress, 2000);
         match result {

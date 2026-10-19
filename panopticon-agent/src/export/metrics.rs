@@ -30,6 +30,7 @@ pub struct AgentMetrics {
     pub drops_parser_error: Counter<u64>,
     pub pii_detections: Counter<u64>,
     pub truncated_events: Counter<u64>,
+    pub raw_capture_dropped: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -104,6 +105,13 @@ impl AgentMetrics {
             truncated_events.clone(),
         );
 
+        let raw_capture_dropped = Counter::<u64>::default();
+        registry.register(
+            "panopticon_raw_capture_dropped",
+            "Events not written to the raw capture file because its writer fell behind",
+            raw_capture_dropped.clone(),
+        );
+
         // Parse latency histogram with buckets from 1µs to 100ms
         let parse_latency = Histogram::new(exponential_buckets(0.000_001, 10.0, 6));
         registry.register(
@@ -129,6 +137,7 @@ impl AgentMetrics {
             drops_parser_error,
             pii_detections,
             truncated_events,
+            raw_capture_dropped,
             parse_latency,
             ringbuf_approx_pending,
         };

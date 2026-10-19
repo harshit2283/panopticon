@@ -47,6 +47,10 @@ export:
   hostPath: ""
   jsonEvents: true
   piiAuditLog: true
+  # Write every captured payload UNREDACTED to <hostPath>/raw.pncap
+  # (decode with `panopticon-agent --decode-capture`). Off by default.
+  # Size cap: `capture_raw_max_bytes` in agent.config (default 1 GiB).
+  rawCapture: false
 
 resources:
   requests:

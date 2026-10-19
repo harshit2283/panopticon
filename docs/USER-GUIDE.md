@@ -27,6 +27,7 @@ sizes, headers and (for text payloads) the body — after PII redaction.
 | Health endpoints | `--metrics-bind <addr:port>` | `/healthz`, `/readyz`, `/debug/state` |
 | OTLP spans | config file `[otlp]` | One span per exchange to an OTLP/gRPC collector |
 | Console | `--log-events` | Every packet and exchange (development only, very verbose) |
+| Raw capture | `--capture-raw <file>` | Every captured payload, **unredacted**, for your own analysis (§5.5) |
 
 Protocols: HTTP/1.1 (validated against ground truth, see
 [`BENCHMARKS.md`](BENCHMARKS.md)), HTTP/2, gRPC, MySQL, PostgreSQL, Redis,
@@ -85,6 +86,8 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 | `--metrics-bind <ADDR:PORT>` | Serve `/healthz`, `/readyz`, `/metrics`, `/debug/state`. Off by default. |
 | `--log-events` | Log every packet and exchange to stdout. Contains (redacted) traffic. |
 | `--smoke-test` | Exit 0 on the first captured event, 1 after 30s. |
+| `--capture-raw <FILE>` | Write every captured payload, unredacted, to a binary capture file (§5.5). |
+| `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root. |
 | `-v, --verbose` | Debug logging (otherwise `RUST_LOG`, default `info`). |
 
 ### 4.2 Config file reference
@@ -106,6 +109,8 @@ json_export_path = "/var/lib/panopticon/events.jsonl"     # default: unset (off)
 pii_audit_log_path = "/var/lib/panopticon/pii-audit.jsonl" # default: unset (off)
 metrics_bind = "127.0.0.1:9435"                           # default: unset (off)
 # map_pin_path = "/sys/fs/bpf/panopticon"                 # default: unset (no pinning)
+# capture_raw_path = "/var/lib/panopticon/raw.pncap"      # default: unset (off) — UNREDACTED
+capture_raw_max_bytes = 1073741824  # raw capture stops at this size (1 GiB)
 
 [pii]
 enabled = true
@@ -226,8 +231,52 @@ Detection is pattern-based. It will miss PII that does not match a pattern
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_active_connections` | Connections being parsed |
+| `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 
 The endpoints have no authentication: bind to loopback or a private address.
+
+### 5.5 Raw capture: the full, unredacted payloads
+
+Pattern-based PII detection misses things (names, free-text addresses,
+domain-specific identifiers) and flags others it should not. If you need to
+run your own classifiers, keep an evidence trail, or check what Panopticon
+reported, capture the raw bytes:
+
+```bash
+sudo panopticon-agent --capture-raw /var/lib/panopticon/raw.pncap
+# later, anywhere, without root:
+panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
+```
+
+Each decoded line is one captured packet or TLS buffer:
+
+```json
+{"timestamp_ns":1479319283059,"event_type":"TcPacket","direction":"Ingress",
+ "src":"10.99.0.2","src_port":48540,"dst":"10.99.0.1","dst_port":18090,
+ "ip_proto":6,"pid":0,"tid":0,"tls_library":"None",
+ "connection_id":1600164996631529749,
+ "payload_len":164,"orig_len":164,"truncated":false,
+ "payload_b64":"R0VUIC9sZW4vNTAwMD9lbWFpbD1hbGljZSU0MGV4YW1wbGUuY29t..."}
+```
+
+- **Nothing is redacted** — passwords, tokens and personal data are written
+  as they appeared on the wire (or as plaintext for TLS captured via
+  OpenSSL/Go). The JSON event log stays redacted at the same time.
+- The file is created readable by its owner only (`0600`), truncated at
+  startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
+  agent logs a warning at startup whenever raw capture is on.
+- Group packets of one connection by `connection_id`; `direction` and the
+  addresses tell you which side sent each one. TLS events have no addresses
+  (`pid` identifies the process).
+- **At most 4096 bytes per packet or TLS buffer are captured.** When
+  `truncated` is `true`, the original was `orig_len` bytes and the rest was
+  not captured (large GSO/TSO packets, big TLS writes).
+- If the disk cannot keep up, events are dropped from the file and counted in
+  `panopticon_raw_capture_dropped_total`; the rest of the agent is
+  unaffected.
+
+Treat raw capture files like a database dump of production data: restrict
+access, encrypt at rest, and delete them when done.
 
 ## 6. Troubleshooting
 

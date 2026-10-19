@@ -88,6 +88,7 @@ look for `Failed to attach TC classifier` in its logs.
 | `metrics.serviceMonitor.enabled` | `false` | Needs the prometheus-operator CRDs. |
 | `export.hostPath` | `""` | Host directory for `events.jsonl` / `pii-audit.jsonl`; empty disables file export. |
 | `export.jsonEvents` / `export.piiAuditLog` | `true` / `true` | Which files to write when `hostPath` is set. |
+| `export.rawCapture` | `false` | Also write `raw.pncap`: every captured payload, **unredacted** (USER-GUIDE §5.5). |
 | `securityContext` | `{privileged: true}` | See §6 for a reduced-capability profile. |
 | `priorityClassName` | `""` | `system-node-critical` is only admitted in `kube-system`. |
 | `tolerations` | `[{operator: Exists}]` | Runs on every node, including tainted ones. |

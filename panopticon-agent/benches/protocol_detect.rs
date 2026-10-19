@@ -4,7 +4,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 // The agent is a binary crate, so the real protocol module is compiled into
 // the benchmark directly (no hand-copied detection code that can drift).
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../src/protocol/mod.rs"]
 mod protocol;
 

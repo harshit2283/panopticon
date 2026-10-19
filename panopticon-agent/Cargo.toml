@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 
 # Stream buffer optimization
 bytes = "1"
+base64 = "0.22"
 
 # Graceful shutdown
 tokio-util = { version = "0.7", features = ["rt"] }

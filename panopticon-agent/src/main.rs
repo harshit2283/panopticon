@@ -58,11 +58,34 @@ struct Args {
     /// Run smoke test: attach probes, verify events, then exit
     #[arg(long)]
     smoke_test: bool,
+
+    /// Write every captured event, UNREDACTED, to this file (PNCAP format,
+    /// owner-only permissions, truncated at start). Decode with --decode-capture.
+    #[arg(long, value_name = "FILE")]
+    capture_raw: Option<String>,
+
+    /// Print a raw capture file as JSON lines (metadata + base64 payload), then exit.
+    /// Needs no privileges.
+    #[arg(long, value_name = "FILE")]
+    decode_capture: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    #[cfg(unix)]
+    if let Some(ref path) = args.decode_capture {
+        use anyhow::Context;
+        let file =
+            std::fs::File::open(path).with_context(|| format!("cannot open capture {path}"))?;
+        let stdout = std::io::stdout().lock();
+        export::raw_capture::decode_to_jsonl(
+            std::io::BufReader::new(file),
+            std::io::BufWriter::new(stdout),
+        )?;
+        return Ok(());
+    }
 
     // Initialize tracing subscriber with env filter
     let filter = if args.verbose {
@@ -125,6 +148,9 @@ async fn main() -> Result<()> {
             agent_config.metrics_bind = Some(bind.clone());
         }
         agent_config.smoke_test = args.smoke_test;
+        if let Some(ref path) = args.capture_raw {
+            agent_config.capture_raw_path = Some(path.clone());
+        }
         if agent_config.interfaces.is_empty() {
             let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
             agent_config.interfaces = util::default_route_interfaces(&route);
@@ -286,6 +312,29 @@ async fn main() -> Result<()> {
             graph_builder,
         );
 
+        // 7b. Raw capture (unredacted): opt-in only, loudly.
+        let (event_loop, raw_capture) = match &agent_config.capture_raw_path {
+            Some(path) => {
+                let (handle, thread) = export::raw_capture::spawn(
+                    path,
+                    agent_config.capture_raw_max_bytes,
+                    16_384,
+                    util::monotonic_now_ns(),
+                )?;
+                tracing::warn!(
+                    path = %path,
+                    max_bytes = agent_config.capture_raw_max_bytes,
+                    "RAW CAPTURE ENABLED: every captured payload is written UNREDACTED \
+                     (credentials, tokens, personal data). Protect and delete this file."
+                );
+                (
+                    event_loop.with_raw_capture(handle.clone()),
+                    Some((handle, thread)),
+                )
+            }
+            None => (event_loop, None),
+        };
+
         // 8. HTTP server (health, metrics, debug endpoints).
         //    Probes are attached at this point, so the agent is ready; the flag
         //    is cleared again as soon as shutdown begins.
@@ -299,6 +348,7 @@ async fn main() -> Result<()> {
                 metrics,
                 worker_count: agent_config.max_worker_count,
                 ready: Arc::clone(&ready),
+                raw_capture: raw_capture.as_ref().map(|(h, _)| h.clone()),
             };
             let bind = bind.clone();
             Some(tokio::spawn(async move {
@@ -378,6 +428,15 @@ async fn main() -> Result<()> {
         }
         if let Some(h) = otlp_writer_handle {
             let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        }
+        if let Some((handle, thread)) = raw_capture {
+            // Drain the queue and flush the file before the process exits.
+            handle.shutdown();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || thread.join()),
+            )
+            .await;
         }
 
         exit_result

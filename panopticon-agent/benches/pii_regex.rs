@@ -10,13 +10,13 @@
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../src/config.rs"]
 mod config;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../src/pii/mod.rs"]
 mod pii;
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 #[path = "../src/protocol/mod.rs"]
 mod protocol;
 
