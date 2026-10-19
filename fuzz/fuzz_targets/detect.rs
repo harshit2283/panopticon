@@ -21,5 +21,7 @@ fuzz_target!(|data: &[u8]| {
     } else {
         Direction::Ingress
     };
-    let _ = detect_protocol(&data[5..], sport, dport, dir);
+    // detect_protocol is pure: without black_box the optimiser deletes the
+    // call and the fuzzer exercises nothing.
+    std::hint::black_box(detect_protocol(&data[5..], sport, dport, dir));
 });
