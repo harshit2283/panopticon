@@ -20,6 +20,15 @@ hardening work.
 - Builds a DNS/IP-based service graph.
 - Exports JSONL, Prometheus metrics, OTLP spans, and a PII audit log.
 
+## Documentation
+
+- [User guide](docs/USER-GUIDE.md): first run, configuration, reading the
+  event log, PII audit log and metrics, troubleshooting.
+- [Deployment](docs/DEPLOYMENT.md): Kubernetes (Helm), Docker, systemd,
+  hardening, upgrades and releases.
+- [Benchmarks](docs/BENCHMARKS.md): measured capture accuracy, kernel and
+  agent overhead, parser/PII micro-benchmarks, fuzzing, and how to reproduce.
+
 ## Public Source Of Truth
 
 - Current status and explicit gaps: `docs/CURRENT-STATE.md`
@@ -118,6 +127,8 @@ For TLS or cleartext harnesses, see `tests/e2e/README.md` and
 
 - Fast correctness: `cargo test -p panopticon-common`, `cargo test -p xtask`,
   `cargo test -p panopticon-agent`
+- Capture accuracy against ground truth: `sudo tests/oracle/run.sh`
+- Parser robustness: `cd fuzz && cargo +nightly-2026-02-17 fuzz run parsers`
 - eBPF build correctness: `cargo xtask build-ebpf`
 - Cleartext integration: `tests/integration/`
 - TLS behavior: `tests/e2e/`

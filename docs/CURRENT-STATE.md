@@ -17,6 +17,11 @@ production-hardened compliance platform.
   and Kafka in the integration harness.
 - Prometheus and OTLP exporter behavior has unit-test coverage.
 - Host-mode TLS E2E exists for local Linux debugging.
+- HTTP/1.1 capture is scored against a ground-truth traffic generator on a
+  veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
+  across 5,400 exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
+- All parsers are fuzzed with libFuzzer (`fuzz/`): 12M+ executions without a
+  crash after the fixes in this release.
 
 ## Partial
 
