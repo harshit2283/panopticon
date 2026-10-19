@@ -41,6 +41,7 @@ docker run -d --name o-pg --network host -e POSTGRES_PASSWORD=oracle -e POSTGRES
   "$POSTGRES_IMAGE" >/dev/null
 docker run -d --name o-mysql --network host -e MYSQL_ROOT_PASSWORD=oracle \
   -e MYSQL_DATABASE=oracle "$MYSQL_IMAGE" >/dev/null
+"$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
 "$PY" "$HERE/netns.py" up
 
 wait_ready() {

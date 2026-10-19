@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
@@ -54,22 +54,30 @@ pub enum GoVersion {
 ///
 /// Returns a map of `symbol_name → file_offset` for each requested symbol
 /// that was found. Missing symbols are silently omitted from the result.
+///
+/// Reads only the ELF ranges that are needed (headers, symbol and string
+/// tables) instead of loading the whole file: every executable on the node is
+/// probed as a potential Go binary, and reading each one fully made the
+/// agent's peak RSS track the size of the largest binary on the host.
 pub fn resolve_elf_symbols(path: &str, symbols: &[&str]) -> Result<HashMap<String, u64>> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read ELF: {path}"))?;
-    resolve_elf_symbols_from_bytes(&data, symbols)
+    let file = std::fs::File::open(path).with_context(|| format!("failed to open ELF: {path}"))?;
+    let cache = ReadCache::new(file);
+    resolve_elf_symbols_from_bytes(&cache, symbols)
 }
 
-/// Inner implementation operating on bytes — easier to test with fixtures.
-pub fn resolve_elf_symbols_from_bytes(
-    data: &[u8],
+/// Inner implementation over any `ReadRef` (a byte slice in tests, a
+/// range-reading file cache in production).
+pub fn resolve_elf_symbols_from_bytes<'data, R: ReadRef<'data>>(
+    data: R,
     symbols: &[&str],
 ) -> Result<HashMap<String, u64>> {
     let mut result = HashMap::new();
 
     // Try 64-bit ELF first, then 32-bit
-    if let Ok(elf) = ElfFile::<object::elf::FileHeader64<object::Endianness>>::parse(data) {
+    if let Ok(elf) = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data) {
         collect_symbols(&elf, symbols, &mut result);
-    } else if let Ok(elf) = ElfFile::<object::elf::FileHeader32<object::Endianness>>::parse(data) {
+    } else if let Ok(elf) = ElfFile::<object::elf::FileHeader32<object::Endianness>, R>::parse(data)
+    {
         collect_symbols(&elf, symbols, &mut result);
     } else {
         anyhow::bail!("not a valid ELF file");
@@ -78,8 +86,8 @@ pub fn resolve_elf_symbols_from_bytes(
     Ok(result)
 }
 
-fn collect_symbols<'data, Elf: FileHeader>(
-    elf: &ElfFile<'data, Elf>,
+fn collect_symbols<'data, Elf: FileHeader, R: ReadRef<'data>>(
+    elf: &ElfFile<'data, Elf, R>,
     wanted: &[&str],
     result: &mut HashMap<String, u64>,
 ) {
@@ -112,7 +120,10 @@ fn collect_symbols<'data, Elf: FileHeader>(
 /// For shared libraries (.so), subtract the base virtual address of the first
 /// LOAD segment to get the offset relative to the library's load address.
 /// For executables, the address is typically usable directly.
-fn symbol_file_offset<'data, Elf: FileHeader>(elf: &ElfFile<'data, Elf>, sym_addr: u64) -> u64 {
+fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
+    elf: &ElfFile<'data, Elf, R>,
+    sym_addr: u64,
+) -> u64 {
     // Find the minimum virtual address across all LOAD segments.
     // This is the base address from which offsets are calculated.
     use object::read::elf::ProgramHeader;
@@ -139,23 +150,25 @@ fn symbol_file_offset<'data, Elf: FileHeader>(elf: &ElfFile<'data, Elf>, sym_add
 /// Returns the Go version string (e.g., `"go1.21.5"`) or `None` if
 /// not a Go binary or the version cannot be determined.
 pub fn detect_go_version(path: &str) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    detect_go_version_from_bytes(&data)
+    let cache = ReadCache::new(std::fs::File::open(path).ok()?);
+    detect_go_version_from_bytes(&cache)
 }
 
 /// Inner implementation for testability.
-pub fn detect_go_version_from_bytes(data: &[u8]) -> Option<String> {
+pub fn detect_go_version_from_bytes<'data, R: ReadRef<'data>>(data: R) -> Option<String> {
     // Try 64-bit first, then 32-bit
-    if let Ok(elf) = ElfFile::<object::elf::FileHeader64<object::Endianness>>::parse(data) {
+    if let Ok(elf) = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data) {
         return extract_go_version(&elf);
     }
-    if let Ok(elf) = ElfFile::<object::elf::FileHeader32<object::Endianness>>::parse(data) {
+    if let Ok(elf) = ElfFile::<object::elf::FileHeader32<object::Endianness>, R>::parse(data) {
         return extract_go_version(&elf);
     }
     None
 }
 
-fn extract_go_version<'data, Elf: FileHeader>(elf: &ElfFile<'data, Elf>) -> Option<String> {
+fn extract_go_version<'data, Elf: FileHeader, R: ReadRef<'data>>(
+    elf: &ElfFile<'data, Elf, R>,
+) -> Option<String> {
     // Look for .go.buildinfo section
     let section = elf.section_by_name(".go.buildinfo")?;
     let section_data = section.data().ok()?;
@@ -618,8 +631,24 @@ mod tests {
     #[test]
     fn test_resolve_elf_symbols_invalid_data() {
         let data = b"not an elf file";
-        let result = resolve_elf_symbols_from_bytes(data, &["SSL_write"]);
+        let result = resolve_elf_symbols_from_bytes(&data[..], &["SSL_write"]);
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_elf_symbols_from_file_matches_in_memory_parse() {
+        // The test binary itself is an ELF with a symbol table; the
+        // range-reading file path must agree with parsing the whole file.
+        let exe = std::env::current_exe().unwrap();
+        let path = exe.to_str().unwrap();
+        let wanted = ["main", "malloc", "rust_begin_unwind"];
+        let from_file = resolve_elf_symbols(path, &wanted).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let from_bytes = resolve_elf_symbols_from_bytes(&bytes[..], &wanted).unwrap();
+        assert!(!from_file.is_empty());
+        assert_eq!(from_file, from_bytes);
+        assert_eq!(detect_go_version(path), None);
     }
 
     #[test]
@@ -627,7 +656,7 @@ mod tests {
         // Even with invalid data, requesting no symbols should still fail
         // because we validate ELF format first
         let data = b"not an elf file";
-        let result = resolve_elf_symbols_from_bytes(data, &[]);
+        let result = resolve_elf_symbols_from_bytes(&data[..], &[]);
         assert!(result.is_err());
     }
 

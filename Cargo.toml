@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = { version = "6.0", default-features = false }
 
 # ELF parsing (Phase 4 — TLS interception)
-object = { version = "0.36", default-features = false, features = ["read", "elf"] }
+object = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
 
 # Protocol parsing (Phase 3)
 nom = { version = "7", default-features = false, features = ["std"] }

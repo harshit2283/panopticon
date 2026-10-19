@@ -460,23 +460,31 @@ async fn consume_ringbuf(
     // The kernel only wakes us once a batch is pending (see
     // data_events_submit_flags in the eBPF crate): a wakeup per event cost
     // ~90% of per-packet kernel time. The tick bounds delivery latency when
-    // traffic is too light to reach the wakeup threshold.
-    let mut drain_tick = tokio::time::interval(RINGBUF_DRAIN_INTERVAL);
-    drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // traffic is too light to reach the wakeup threshold; it backs off while
+    // the ring stays empty so an idle agent isn't woken 500 times a second.
+    let mut drain_interval = RINGBUF_DRAIN_INTERVAL;
+    let drain_tick = tokio::time::sleep(drain_interval);
+    tokio::pin!(drain_tick);
 
     loop {
         let woken = tokio::select! {
             ready = async_fd.readable_mut() => Some(ready),
-            _ = drain_tick.tick() => None,
+            _ = &mut drain_tick => None,
         };
         match woken {
-            None => drain_ringbuf(
-                async_fd.get_mut(),
-                senders,
-                rate_limiter,
-                stats,
-                tls_rescan_tx.as_ref(),
-            ),
+            None => {
+                let drained = drain_ringbuf(
+                    async_fd.get_mut(),
+                    senders,
+                    rate_limiter,
+                    stats,
+                    tls_rescan_tx.as_ref(),
+                );
+                drain_interval = next_drain_interval(drain_interval, drained);
+                drain_tick
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + drain_interval);
+            }
             Some(Ok(mut guard)) => {
                 consecutive_errors = 0;
                 drain_ringbuf(
@@ -488,6 +496,11 @@ async fn consume_ringbuf(
                 );
                 // Clear readiness so we wait for the next epoll notification
                 guard.clear_ready();
+                // Traffic is flowing: tighten the latency bound again.
+                drain_interval = RINGBUF_DRAIN_INTERVAL;
+                drain_tick
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + drain_interval);
             }
             Some(Err(e)) => {
                 consecutive_errors += 1;
@@ -516,6 +529,22 @@ async fn consume_ringbuf(
 #[cfg(target_os = "linux")]
 const RINGBUF_DRAIN_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Upper bound for the drain tick while the ring buffer stays empty: the
+/// first event after an idle period is delivered within this delay.
+#[cfg(target_os = "linux")]
+const RINGBUF_IDLE_DRAIN_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Next drain tick: back to the tight bound as soon as a drain finds events,
+/// doubling (up to the idle bound) after each empty drain.
+#[cfg(target_os = "linux")]
+fn next_drain_interval(current: Duration, drained: usize) -> Duration {
+    if drained > 0 {
+        RINGBUF_DRAIN_INTERVAL
+    } else {
+        (current * 2).min(RINGBUF_IDLE_DRAIN_INTERVAL)
+    }
+}
+
 /// Drain every pending event from the ring buffer and route it to workers.
 #[cfg(target_os = "linux")]
 fn drain_ringbuf(
@@ -524,8 +553,10 @@ fn drain_ringbuf(
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<&mpsc::Sender<u32>>,
-) {
+) -> usize {
+    let mut drained = 0;
     while let Some(item) = ring.next() {
+        drained += 1;
         let data: &[u8] = item.as_ref();
         let Some(event) = parse_data_event_bytes(data) else {
             continue; // Malformed event, skip
@@ -591,6 +622,7 @@ fn drain_ringbuf(
             stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
         }
     }
+    drained
 }
 
 /// Consume events from a PerfEventArray (kernel < 5.8 fallback).
@@ -1061,6 +1093,20 @@ fn tls_synthetic_cookie(pid: u32, tgid: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drain_interval_backs_off_when_idle_and_resets_on_traffic() {
+        let ms = Duration::from_millis;
+        let mut d = RINGBUF_DRAIN_INTERVAL;
+        let mut seen = vec![];
+        for _ in 0..5 {
+            d = next_drain_interval(d, 0);
+            seen.push(d);
+        }
+        assert_eq!(seen, vec![ms(4), ms(8), ms(16), ms(16), ms(16)]);
+        assert_eq!(next_drain_interval(d, 3), RINGBUF_DRAIN_INTERVAL);
+    }
+
     use super::*;
     use crate::protocol::Protocol;
     use std::sync::atomic::Ordering;
