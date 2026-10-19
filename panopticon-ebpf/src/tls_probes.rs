@@ -14,7 +14,9 @@ use aya_ebpf::{
 };
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
-use crate::maps::{CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, TLS_SCRATCH};
+use crate::maps::{
+    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, TLS_SCRATCH, data_events_submit_flags,
+};
 
 // ── OpenSSL: SSL_write ─────────────────────────────────────────────────────
 
@@ -167,7 +169,7 @@ fn emit_tls_event<C: EbpfContext>(
 
         let event = entry.as_mut_ptr();
         populate_tls_event(event, buf, len, direction, tls_lib, pid, tgid);
-        entry.submit(0);
+        entry.submit(data_events_submit_flags());
     } else {
         // PerfEventArray path: use per-CPU scratch map (DataEvent is ~4.2KB,
         // far exceeds the 512-byte BPF stack limit).

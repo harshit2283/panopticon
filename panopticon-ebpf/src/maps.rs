@@ -4,6 +4,7 @@
 //! user-space. RingBuf maps provide zero-copy, ordered event delivery to the
 //! agent. HashMaps track per-connection and per-process state in the kernel.
 
+use aya_ebpf::bindings::{BPF_RB_AVAIL_DATA, BPF_RB_FORCE_WAKEUP, BPF_RB_NO_WAKEUP};
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
@@ -15,6 +16,26 @@ use panopticon_common::{
 /// a short user-space stall or traffic burst does not immediately drop events.
 #[map]
 pub static DATA_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+
+/// Pending bytes in DATA_EVENTS at which a producer wakes the consumer.
+/// ~60 events: large enough to batch, small vs. the 16MB ring.
+const WAKEUP_THRESHOLD_BYTES: u64 = 256 * 1024;
+
+/// Submit flags for DATA_EVENTS records.
+///
+/// A wakeup per record (flags = 0) raises an irq_work self-interrupt on every
+/// event; measured on a VM it was ~90% of the TC program's per-packet cost
+/// (~10.4µs vs ~1.0µs without). Wake the consumer only once a batch is
+/// pending; user space also drains on a short timer, bounding latency when
+/// traffic stays below the threshold.
+#[inline(always)]
+pub fn data_events_submit_flags() -> u64 {
+    if DATA_EVENTS.query(BPF_RB_AVAIL_DATA as u64) >= WAKEUP_THRESHOLD_BYTES {
+        BPF_RB_FORCE_WAKEUP as u64
+    } else {
+        BPF_RB_NO_WAKEUP as u64
+    }
+}
 
 /// Fallback event channel for kernels < 5.8 that lack RingBuf support.
 #[map]

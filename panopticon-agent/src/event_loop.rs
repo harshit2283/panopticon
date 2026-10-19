@@ -444,14 +444,39 @@ async fn consume_ringbuf(
     let mut consecutive_errors: u32 = 0;
     const MAX_RETRIES: u32 = 3;
 
+    // The kernel only wakes us once a batch is pending (see
+    // data_events_submit_flags in the eBPF crate): a wakeup per event cost
+    // ~90% of per-packet kernel time. The tick bounds delivery latency when
+    // traffic is too light to reach the wakeup threshold.
+    let mut drain_tick = tokio::time::interval(RINGBUF_DRAIN_INTERVAL);
+    drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        // Wait for the ring buffer to become readable, with retry on transient errors
-        let mut guard = match async_fd.readable_mut().await {
-            Ok(g) => {
-                consecutive_errors = 0; // Reset on success
-                g
+        let woken = tokio::select! {
+            ready = async_fd.readable_mut() => Some(ready),
+            _ = drain_tick.tick() => None,
+        };
+        match woken {
+            None => drain_ringbuf(
+                async_fd.get_mut(),
+                senders,
+                rate_limiter,
+                stats,
+                tls_rescan_tx.as_ref(),
+            ),
+            Some(Ok(mut guard)) => {
+                consecutive_errors = 0;
+                drain_ringbuf(
+                    guard.get_inner_mut(),
+                    senders,
+                    rate_limiter,
+                    stats,
+                    tls_rescan_tx.as_ref(),
+                );
+                // Clear readiness so we wait for the next epoll notification
+                guard.clear_ready();
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 consecutive_errors += 1;
                 if consecutive_errors > MAX_RETRIES {
                     return Err(anyhow::anyhow!(
@@ -468,82 +493,90 @@ async fn consume_ringbuf(
                     "RingBuf readable_mut failed, retrying with backoff"
                 );
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                continue;
-            }
-        };
-
-        // Batch drain all available events
-        let ring = guard.get_inner_mut();
-        while let Some(item) = ring.next() {
-            let data: &[u8] = item.as_ref();
-            let Some(event) = parse_data_event_bytes(data) else {
-                continue; // Malformed event, skip
-            };
-
-            stats.events_received.fetch_add(1, Ordering::Relaxed);
-
-            // Handle ProcessEvent-typed events differently (they come through
-            // PROCESS_EVENTS in the kernel, but we handle routing here)
-            match event.event_type {
-                EventType::ProcessExec => {
-                    debug!(
-                        event_type = ?event.event_type,
-                        pid = event.pid,
-                        "Process exec event — triggering TLS rescan"
-                    );
-                    // 7.1: Send PID to TLS scanner for on-demand rescan
-                    if let Some(tx) = tls_rescan_tx.as_ref() {
-                        let _ = tx.try_send(event.pid);
-                    }
-                    continue;
-                }
-                EventType::ProcessExit => {
-                    debug!(
-                        event_type = ?event.event_type,
-                        pid = event.pid,
-                        "Process exit event"
-                    );
-                    // TODO: PID→connection cleanup requires PID tracking in ConnectionEntry.
-                    // Currently the FSM manager is keyed by socket_cookie, not PID.
-                    // A PID→cookie index in ConnectionFsmManager would enable cleanup here.
-                    continue;
-                }
-                _ => {}
-            }
-
-            // Rate limit check
-            if !rate_limiter.try_acquire() {
-                stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-                stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            // Route to worker by socket_cookie (deterministic affinity).
-            // TLS events have socket_cookie=0 (unavailable in uprobe context),
-            // so we generate a synthetic cookie from PID to distribute them.
-            let routing_cookie =
-                if event.socket_cookie == 0 && event.event_type == EventType::TlsData {
-                    tls_synthetic_cookie(event.pid, event.tgid)
-                } else {
-                    event.socket_cookie
-                };
-
-            let num_workers = senders.len();
-            let worker_idx = if num_workers > 0 {
-                (routing_cookie as usize) % num_workers
-            } else {
-                0
-            };
-
-            // try_send: never block the reader. Drop if worker is behind.
-            if senders[worker_idx].try_send(event).is_err() {
-                stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-                stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
 
-        // Clear readiness so we wait for next epoll notification
-        guard.clear_ready();
+/// Max delay before buffered ring-buffer events are drained without a kernel
+/// wakeup (kernel → user-space latency bound under light traffic).
+#[cfg(target_os = "linux")]
+const RINGBUF_DRAIN_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Drain every pending event from the ring buffer and route it to workers.
+#[cfg(target_os = "linux")]
+fn drain_ringbuf(
+    ring: &mut RingBuf<aya::maps::MapData>,
+    senders: &[mpsc::Sender<DataEvent>],
+    rate_limiter: &RateLimiter,
+    stats: &EventStats,
+    tls_rescan_tx: Option<&mpsc::Sender<u32>>,
+) {
+    while let Some(item) = ring.next() {
+        let data: &[u8] = item.as_ref();
+        let Some(event) = parse_data_event_bytes(data) else {
+            continue; // Malformed event, skip
+        };
+
+        stats.events_received.fetch_add(1, Ordering::Relaxed);
+
+        // Handle ProcessEvent-typed events differently (they come through
+        // PROCESS_EVENTS in the kernel, but we handle routing here)
+        match event.event_type {
+            EventType::ProcessExec => {
+                debug!(
+                    event_type = ?event.event_type,
+                    pid = event.pid,
+                    "Process exec event — triggering TLS rescan"
+                );
+                // 7.1: Send PID to TLS scanner for on-demand rescan
+                if let Some(tx) = tls_rescan_tx.as_ref() {
+                    let _ = tx.try_send(event.pid);
+                }
+                continue;
+            }
+            EventType::ProcessExit => {
+                debug!(
+                    event_type = ?event.event_type,
+                    pid = event.pid,
+                    "Process exit event"
+                );
+                // TODO: PID→connection cleanup requires PID tracking in ConnectionEntry.
+                // Currently the FSM manager is keyed by socket_cookie, not PID.
+                // A PID→cookie index in ConnectionFsmManager would enable cleanup here.
+                continue;
+            }
+            _ => {}
+        }
+
+        // Rate limit check
+        if !rate_limiter.try_acquire() {
+            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        // Route to worker by socket_cookie (deterministic affinity).
+        // TLS events have socket_cookie=0 (unavailable in uprobe context),
+        // so we generate a synthetic cookie from PID to distribute them.
+        let routing_cookie = if event.socket_cookie == 0 && event.event_type == EventType::TlsData {
+            tls_synthetic_cookie(event.pid, event.tgid)
+        } else {
+            event.socket_cookie
+        };
+
+        let num_workers = senders.len();
+        let worker_idx = if num_workers > 0 {
+            (routing_cookie as usize) % num_workers
+        } else {
+            0
+        };
+
+        // try_send: never block the reader. Drop if worker is behind.
+        if senders[worker_idx].try_send(event).is_err() {
+            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

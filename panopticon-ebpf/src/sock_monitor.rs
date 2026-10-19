@@ -15,7 +15,9 @@ use aya_ebpf::{
 };
 use panopticon_common::{ConnInfo, DataEvent, EventType, TlsLibrary};
 
-use crate::maps::{CONFIG, CONN_MAP, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH};
+use crate::maps::{
+    CONFIG, CONN_MAP, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, data_events_submit_flags,
+};
 
 // ── TCP Connect ────────────────────────────────────────────────────────────
 
@@ -319,7 +321,7 @@ fn emit_sock_event<C: EbpfContext>(
             );
         }
 
-        entry.submit(0);
+        entry.submit(data_events_submit_flags());
     } else {
         // PerfEventArray path for kernels < 5.8
         // Use per-CPU scratch map (DataEvent is ~4.2KB, exceeds 512-byte BPF stack limit).

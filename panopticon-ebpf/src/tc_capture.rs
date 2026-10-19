@@ -18,7 +18,9 @@ use panopticon_common::{
     TlsLibrary,
 };
 
-use crate::maps::{CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, IPV6_DROPS, PERF_SCRATCH};
+use crate::maps::{
+    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, IPV6_DROPS, PERF_SCRATCH, data_events_submit_flags,
+};
 
 // ── FNV-1a hash for connection cookie ──────────────────────────────────────
 
@@ -229,7 +231,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             true,
         );
 
-        entry.submit(0);
+        entry.submit(data_events_submit_flags());
     } else {
         // PerfEventArray path: use per-CPU scratch map (DataEvent is ~4.2KB,
         // far exceeds the 512-byte BPF stack limit).
