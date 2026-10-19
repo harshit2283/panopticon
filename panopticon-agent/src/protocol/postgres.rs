@@ -123,6 +123,16 @@ impl PostgresParser {
     }
 
     fn handle_startup(&mut self) -> bool {
+        // Joined mid-connection (the agent started after the client connected —
+        // the norm for pooled connections): there is no startup message, the
+        // client is already sending typed messages. StartupMessage and
+        // SSLRequest begin with a big-endian length whose first byte is 0;
+        // every later frontend message begins with a non-zero type byte.
+        if self.client_buf.data().first().is_some_and(|&b| b != 0) {
+            self.state = State::Ready;
+            return true;
+        }
+
         // Try reading startup from client
         if let Some((_payload, consumed)) = Self::try_read_startup(&self.client_buf) {
             self.client_buf.consume(consumed);
@@ -446,6 +456,27 @@ mod tests {
                 assert_eq!(msgs[0].latency_ns, Some(1000));
             }
             other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_joins_established_connection_mid_stream() {
+        // Agent started after the client connected (pooled connections):
+        // no startup/auth is ever seen, the first bytes are a query.
+        let mut p = PostgresParser::new();
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT 1\0"),
+            Direction::Egress,
+            1000,
+        );
+        let mut response = make_backend_msg(b'C', b"SELECT 1\0");
+        response.extend_from_slice(&make_backend_msg(b'Z', &[b'I']));
+        match p.feed(&response, Direction::Ingress, 2000) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs.len(), 1);
+                assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
+            }
+            other => panic!("expected a message from a mid-stream query, got {other:?}"),
         }
     }
 
