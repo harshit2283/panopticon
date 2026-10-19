@@ -13,6 +13,8 @@ const COM_STMT_PREPARE: u8 = 0x16;
 const ERR_MARKER: u8 = 0xFF;
 const OK_MARKER: u8 = 0x00;
 const EOF_MARKER: u8 = 0xFE;
+/// AuthMoreData packet header during authentication.
+const AUTH_MORE_DATA: u8 = 0x01;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -35,6 +37,10 @@ pub struct MysqlParser {
     auth_plugin: Option<String>,
     query_ts: Option<u64>,
     query_text: Option<String>,
+    /// Server bytes were lost mid-response (capture gap). Packets cannot be
+    /// re-framed, so the response is closed when the client sends its next
+    /// command (MySQL is strictly request/response).
+    resync_server: bool,
 }
 
 impl MysqlParser {
@@ -44,6 +50,7 @@ impl MysqlParser {
             client_buf: StreamBuffer::new(),
             server_buf: StreamBuffer::new(),
             server_version: None,
+            resync_server: false,
             auth_plugin: None,
             query_ts: None,
             query_text: None,
@@ -81,6 +88,22 @@ impl MysqlParser {
                     if !self.parse_command(ts) {
                         break;
                     }
+                }
+                State::InQuery | State::InResponse { .. } if self.resync_server => {
+                    self.server_buf.clear();
+                    let data = self.client_buf.data();
+                    // Next command packet: [len:3][seq=0][command byte].
+                    if data.len() < 5 || data[3] != 0 {
+                        break;
+                    }
+                    let mut msg = self.build_msg(ts);
+                    msg.status = Some(0);
+                    // Closed by the next command, not by the response end:
+                    // the real latency is unknown.
+                    msg.latency_ns = None;
+                    messages.push(msg);
+                    self.resync_server = false;
+                    self.state = State::Ready;
                 }
                 State::InQuery => match self.parse_response(ts) {
                     Some(msg) => {
@@ -179,6 +202,13 @@ impl MysqlParser {
         self.server_buf.consume(consumed);
         if !payload.is_empty() && (payload[0] == OK_MARKER || payload[0] == ERR_MARKER) {
             self.state = State::Ready;
+            return true;
+        }
+        // Auth continues: AuthMoreData (caching_sha2_password, MySQL 8's
+        // default: 0x01 0x03 = fast-auth ok, then an OK follows) or
+        // AuthSwitchRequest. Treating these as "auth done" left the real OK
+        // queued, so every later response paired with the previous query.
+        if !payload.is_empty() && (payload[0] == AUTH_MORE_DATA || payload[0] == EOF_MARKER) {
             return true;
         }
         // Recovery: if auth response shape is unexpected, avoid getting stuck in InAuth.
@@ -358,6 +388,19 @@ impl ProtocolParser for MysqlParser {
         }
         self.process(ts)
     }
+    fn skip(&mut self, direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<ParseResult> {
+        match (direction, &self.state) {
+            // Lost part of a response, typically a large result set in a
+            // GSO super-packet: rows are not needed, wait for the next command.
+            (Direction::Ingress, State::InQuery | State::InResponse { .. }) => {
+                self.server_buf.clear();
+                self.resync_server = true;
+                Some(ParseResult::NeedMoreData)
+            }
+            _ => None,
+        }
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::Mysql
     }
@@ -371,6 +414,148 @@ impl ProtocolParser for MysqlParser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_gap_in_result_set_closes_on_next_command() {
+        fn pkt(seq: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = (body.len() as u32).to_le_bytes()[..3].to_vec();
+            v.push(seq);
+            v.extend_from_slice(body);
+            v
+        }
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        p.feed(&pkt(0, b"\x03SELECT * FROM big"), Direction::Egress, 1000);
+        // Column count, then the capture loses most of the result set.
+        p.feed(&pkt(1, b"\x03"), Direction::Ingress, 1100);
+        assert!(p.skip(Direction::Ingress, 60_000, 1200).is_some());
+        p.feed(b"tail of some row bytes", Direction::Ingress, 1300);
+        let ParseResult::Messages(msgs) =
+            p.feed(&pkt(0, b"\x03UPDATE t SET a = 1"), Direction::Egress, 2000)
+        else {
+            panic!("next command must close the SELECT");
+        };
+        assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
+        assert_eq!(msgs[0].latency_ns, None);
+        match p.feed(
+            &pkt(1, b"\x00\x01\x00\x02\x00\x00\x00"),
+            Direction::Ingress,
+            2500,
+        ) {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(msgs[0].method.as_deref(), Some("UPDATE"));
+                assert_eq!(msgs[0].latency_ns, Some(500));
+            }
+            other => panic!("UPDATE must pair with its own OK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_caching_sha2_fast_auth_keeps_responses_aligned() {
+        fn pkt(seq: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = (body.len() as u32).to_le_bytes()[..3].to_vec();
+            v.push(seq);
+            v.extend_from_slice(body);
+            v
+        }
+        let mut greeting = vec![0x0a];
+        greeting.extend_from_slice(b"8.4.11\0");
+        greeting.extend_from_slice(&[0u8; 40]);
+        greeting.extend_from_slice(b"caching_sha2_password\0");
+        let ok = pkt(2, b"\x00\x00\x00\x02\x00\x00\x00");
+        let mut err_body = vec![0xff, 0x7a, 0x04];
+        err_body.extend_from_slice(b"#42S02Table 'db.missing' doesn't exist");
+
+        let mut p = MysqlParser::new();
+        let mut out = Vec::new();
+        let mut feed = |p: &mut MysqlParser, d: &[u8], dir| {
+            if let ParseResult::Messages(m) = p.feed(d, dir, 1) {
+                out.extend(m.into_iter().map(|m| (m.method, m.status)));
+            }
+        };
+        feed(&mut p, &pkt(0, &greeting), Direction::Ingress);
+        feed(
+            &mut p,
+            &pkt(1, b"\x00\x00\x00\x00root\0"),
+            Direction::Egress,
+        );
+        feed(&mut p, &pkt(2, b"\x01\x03"), Direction::Ingress); // AuthMoreData: fast auth ok
+        feed(&mut p, &ok, Direction::Ingress); // the real auth OK
+        feed(&mut p, &pkt(0, b"\x03SET NAMES utf8mb4"), Direction::Egress);
+        feed(
+            &mut p,
+            &pkt(1, b"\x00\x00\x00\x02\x00\x00\x00"),
+            Direction::Ingress,
+        );
+        feed(
+            &mut p,
+            &pkt(0, b"\x03SELECT * FROM missing"),
+            Direction::Egress,
+        );
+        feed(&mut p, &pkt(1, &err_body), Direction::Ingress);
+        assert_eq!(
+            out,
+            vec![
+                (Some("SET".to_string()), Some(0)),
+                (Some("SELECT".to_string()), Some(1146)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_error_reply_pairs_with_its_own_query() {
+        // Exact packets captured from MySQL 8.4 + PyMySQL: UPDATE -> OK,
+        // SELECT from a missing table -> ERR 1146, UPDATE -> OK.
+        fn pkt(seq: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = (body.len() as u32).to_le_bytes()[..3].to_vec();
+            v.push(seq);
+            v.extend_from_slice(body);
+            v
+        }
+        let ok = pkt(
+            1,
+            b"\x00\x00\x00\x22\x00\x00\x00(Rows matched: 0  Changed: 0  Warnings: 0",
+        );
+        let mut err_body = vec![0xff, 0x7a, 0x04];
+        err_body.extend_from_slice(b"#42S02Table 'oracle.missing_tok_17_' doesn't exist");
+        let err = pkt(1, &err_body);
+        let mut p = MysqlParser::new();
+        let mut out = Vec::new();
+        let mut feed = |p: &mut MysqlParser, d: &[u8], dir, ts| {
+            if let ParseResult::Messages(m) = p.feed(d, dir, ts) {
+                out.extend(m.into_iter().map(|m| (m.method, m.status)));
+            }
+        };
+        feed(
+            &mut p,
+            &pkt(0, b"\x03UPDATE users SET a = 1 WHERE note = 'tok_16_'"),
+            Direction::Egress,
+            1,
+        );
+        feed(&mut p, &ok, Direction::Ingress, 2);
+        feed(
+            &mut p,
+            &pkt(0, b"\x03SELECT * FROM missing_tok_17_"),
+            Direction::Egress,
+            3,
+        );
+        feed(&mut p, &err, Direction::Ingress, 4);
+        feed(
+            &mut p,
+            &pkt(0, b"\x03UPDATE users SET a = 2 WHERE note = 'tok_18_'"),
+            Direction::Egress,
+            5,
+        );
+        feed(&mut p, &ok, Direction::Ingress, 6);
+        assert_eq!(
+            out,
+            vec![
+                (Some("UPDATE".to_string()), Some(0)),
+                (Some("SELECT".to_string()), Some(1146)),
+                (Some("UPDATE".to_string()), Some(0)),
+            ]
+        );
+    }
+
     use super::*;
 
     fn make_packet(seq: u8, payload: &[u8]) -> Vec<u8> {

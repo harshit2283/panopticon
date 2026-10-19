@@ -143,6 +143,9 @@ impl PostgresParser {
                     // bytes we never captured. Close the previous query now.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
+                    // Closed by the next query, not by ReadyForQuery: the real
+                    // latency is unknown.
+                    msg.latency_ns = None;
                     self.pending_error = None;
                     messages.push(msg);
                     self.server_buf.clear();
@@ -611,6 +614,7 @@ mod tests {
             panic!("previous query must be closed, got {first:?}");
         };
         assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
+        assert_eq!(msgs[0].latency_ns, None);
         let mut resp = make_backend_msg(b'C', b"UPDATE 1\0");
         resp.extend_from_slice(&make_backend_msg(b'Z', b"I"));
         match p.feed(&resp, Direction::Ingress, 3500) {
