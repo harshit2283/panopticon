@@ -177,6 +177,7 @@ One JSON object per completed exchange. A real record (body shortened):
 | `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key |
 | `status` | HTTP status, or database error code |
 | `payload_text` | Response body as text, at most 64 KB, after redaction |
+| `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most 64 KB, after redaction |
 | `response_size_bytes` | Full body size, even when the body was larger than what was kept |
 | `src_*`, `dst_*` | Addresses of the packet that completed the exchange (usually the response). Addresses are IPv4 as a 32-bit integer (`2130706433` = `127.0.0.1`). |
 | `pii.entities` | What was found; offsets are relative to the field it was found in |
@@ -205,7 +206,8 @@ With `pii.redact = true` (the default), before anything is logged or exported:
   (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
   `X-Api-Key`, `X-Auth-Token`, `X-Amz-Security-Token`) are replaced entirely
   by `<REDACTED>`;
-- the **body text** is scanned and redacted.
+- the **request body** (e.g. POST JSON or form data) and the **response
+  body** are scanned and redacted.
 
 Detection is pattern-based. It will miss PII that does not match a pattern
 (names, free-text addresses) and has known false positives (any IPv4 address,

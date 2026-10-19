@@ -32,6 +32,8 @@ struct JsonEvent<'a> {
     content_type: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     headers: Vec<(&'a str, &'a str)>,
     request_size_bytes: u64,
@@ -193,6 +195,7 @@ impl JsonExporter {
             status: msg.status,
             content_type: msg.content_type.as_deref(),
             payload_text: msg.payload_text.as_deref(),
+            request_body: msg.request_text.as_deref(),
             headers: msg
                 .headers
                 .iter()
@@ -322,6 +325,7 @@ mod tests {
             status: msg.status,
             content_type: msg.content_type.as_deref(),
             payload_text: msg.payload_text.as_deref(),
+            request_body: msg.request_text.as_deref(),
             headers: vec![],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
@@ -356,6 +360,7 @@ mod tests {
             status: msg.status,
             content_type: msg.content_type.as_deref(),
             payload_text: msg.payload_text.as_deref(),
+            request_body: msg.request_text.as_deref(),
             headers: vec![],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
@@ -453,6 +458,7 @@ mod tests {
             status: msg.status,
             content_type: msg.content_type.as_deref(),
             payload_text: msg.payload_text.as_deref(),
+            request_body: msg.request_text.as_deref(),
             headers: vec![],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
@@ -488,6 +494,7 @@ mod tests {
             status: msg.status,
             content_type: msg.content_type.as_deref(),
             payload_text: msg.payload_text.as_deref(),
+            request_body: msg.request_text.as_deref(),
             headers: msg
                 .headers
                 .iter()

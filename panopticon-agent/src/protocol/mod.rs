@@ -74,8 +74,12 @@ pub struct L7Message {
     /// HTTP status code, MySQL/PG error code.
     pub status: Option<u32>,
     pub content_type: Option<String>,
-    /// Decoded payload text for PII scanning (Phase 5).
+    /// Decoded payload text for PII scanning (Phase 5). For HTTP this is the
+    /// response body.
     pub payload_text: Option<String>,
+    /// Decoded request body (e.g. HTTP POST/PUT payload, form data), when the
+    /// protocol has one. Scanned and redacted like `payload_text`.
+    pub request_text: Option<String>,
     pub headers: Vec<(String, String)>,
     pub request_size_bytes: u64,
     pub response_size_bytes: u64,
@@ -94,6 +98,7 @@ impl L7Message {
             status: None,
             content_type: None,
             payload_text: None,
+            request_text: None,
             headers: Vec::new(),
             request_size_bytes: 0,
             response_size_bytes: 0,

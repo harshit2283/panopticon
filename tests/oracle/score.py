@@ -58,6 +58,17 @@ for k in missing:
         prev_kind[prev["path"].split("?")[0]] += 1
 print("  missing (pos>0) by PREVIOUS request on same conn:", dict(prev_kind.most_common(8)))
 
+# Request bodies: every POST must carry its (redacted) body, and no raw PII
+# value from any request body may appear anywhere in the agent's export.
+posts = [k for k in found if truth[k]["method"] == "POST"]
+with_body = [k for k in posts if seen[k][0].get("request_body")]
+redacted = [k for k in with_body if "<EMAIL>" in seen[k][0]["request_body"]
+            and "<SSN>" in seen[k][0]["request_body"]]
+export_text = open(sys.argv[2]).read()
+leaks = [v for t in truth.values() for v in t.get("body_pii", []) if v in export_text]
+print(f"  request bodies: captured {len(with_body)}/{len(posts)} POSTs, "
+      f"PII redacted in {len(redacted)}/{len(with_body)}, raw PII values leaked: {len(leaks)}")
+
 # Optional gate: score.py truth agent MIN_RECALL (e.g. 0.99) exits 1 below it.
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):
     sys.exit(f"recall {len(found)/n:.1%} below required {float(sys.argv[3]):.1%}")

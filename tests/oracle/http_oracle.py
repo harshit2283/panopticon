@@ -105,7 +105,10 @@ def main():
             method, path, body = "GET", f"/chunked/{n}?id={tag}", None
         elif r < 0.75:
             n = rnd.choice([5, 800, 5000])
-            method, path, body = "POST", f"/submit?id={tag}", b"p" * n
+            # JSON body carrying PII, padded to roughly n bytes.
+            email, ssn = f"user{i}@example.com", f"123-45-{i % 10000:04d}"
+            body = json.dumps({"email": email, "ssn": ssn, "note": "p" * n}).encode()
+            method, path = "POST", f"/submit?id={tag}"
         elif r < 0.85:
             method, path, body = "GET", f"/empty?id={tag}", None
         else:
@@ -113,7 +116,8 @@ def main():
         conn.request(method, path, body=body)
         resp = conn.getresponse()
         data = resp.read()
-        out.write(json.dumps({"id": tag, "method": method, "path": path,
+        body_pii = [email, ssn] if method == "POST" else []
+        out.write(json.dumps({"id": tag, "method": method, "path": path, "body_pii": body_pii,
                               "status": resp.status, "response_size": len(data),
                               "conn": conn_no, "pos": pos}) + "\n")
     out.close()

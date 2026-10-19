@@ -33,6 +33,8 @@ struct PendingRequest {
     timestamp_ns: u64,
     request_size: u64,
     headers: Vec<(String, String)>,
+    /// Request body (POST/PUT/PATCH payload), capped at MAX_CAPTURED_BODY.
+    body: Vec<u8>,
 }
 
 /// HTTP/1.1 parser with Keep-Alive support.
@@ -96,6 +98,17 @@ fn resync(buf: &mut StreamBuffer, starts: &[&[u8]]) -> bool {
 /// Max response body bytes retained for payload_text / PII scanning.
 const MAX_CAPTURED_BODY: usize = 64 * 1024;
 
+/// Body as text for PII scanning: `None` if empty or not UTF-8. The capture
+/// cap can split a multi-byte character at the end; keep the valid prefix then.
+fn body_text(body: &[u8]) -> Option<String> {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => Some(t),
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&body[..e.valid_up_to()]).ok(),
+        Err(_) => None,
+    };
+    text.filter(|t| !t.is_empty()).map(str::to_string)
+}
+
 /// Append to the captured body without exceeding `MAX_CAPTURED_BODY`.
 fn append_capped(body: &mut Vec<u8>, bytes: &[u8]) {
     let room = MAX_CAPTURED_BODY.saturating_sub(body.len());
@@ -139,6 +152,10 @@ impl Http1Parser {
                 }
                 State::ReadingRequestBody { remaining } => {
                     let avail = self.client_buf.data().len();
+                    let take = avail.min(remaining);
+                    if let Some(req) = self.pending_request.as_mut() {
+                        append_capped(&mut req.body, &self.client_buf.data()[..take]);
+                    }
                     if avail >= remaining {
                         self.client_buf.consume(remaining);
                         self.state = State::WaitingForResponse;
@@ -241,6 +258,7 @@ impl Http1Parser {
                     timestamp_ns,
                     request_size: header_len as u64,
                     headers,
+                    body: Vec::new(),
                 });
 
                 self.client_buf.consume(header_len);
@@ -416,18 +434,11 @@ impl Http1Parser {
             msg.headers = self.response_headers.clone();
         }
 
-        // Attempt UTF-8 decode for PII scanning. The capture cap can split a
-        // multi-byte character at the end: keep the valid prefix in that case.
-        let text = match std::str::from_utf8(&self.response_body) {
-            Ok(t) => Some(t),
-            Err(e) if e.error_len().is_none() => {
-                std::str::from_utf8(&self.response_body[..e.valid_up_to()]).ok()
-            }
-            Err(_) => None,
-        };
-        if let Some(text) = text.filter(|t| !t.is_empty()) {
-            msg.payload_text = Some(text.to_string());
-        }
+        msg.payload_text = body_text(&self.response_body);
+        msg.request_text = self
+            .pending_request
+            .as_ref()
+            .and_then(|req| body_text(&req.body));
 
         Some(msg)
     }
@@ -597,7 +608,7 @@ mod tests {
     fn test_post_with_body() {
         let mut parser = Http1Parser::new();
 
-        let req = b"POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 13\r\n\r\n{\"name\":\"bob\"}";
+        let req = b"POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 14\r\n\r\n{\"name\":\"bob\"}";
         parser.feed(req, Direction::Egress, 1000);
 
         let resp = b"HTTP/1.1 201 Created\r\nContent-Length: 11\r\n\r\n{\"id\": 123}";
@@ -607,6 +618,30 @@ mod tests {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("POST"));
                 assert_eq!(msgs[0].status, Some(201));
+                assert_eq!(msgs[0].request_text.as_deref(), Some("{\"name\":\"bob\"}"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some("{\"id\": 123}"));
+            }
+            other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_body_across_packets_is_kept() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"POST /signup HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 38\r\n\r\nemail=jane%40example.com",
+            Direction::Egress,
+            1000,
+        );
+        parser.feed(b"&ssn=123-45-", Direction::Egress, 1001);
+        parser.feed(b"67", Direction::Egress, 1002);
+        let result = parser.feed(b"HTTP/1.1 204 No Content\r\n\r\n", Direction::Ingress, 2000);
+        match result {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(
+                    msgs[0].request_text.as_deref(),
+                    Some("email=jane%40example.com&ssn=123-45-67")
+                );
             }
             other => panic!("expected Messages, got {other:?}"),
         }

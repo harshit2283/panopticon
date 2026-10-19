@@ -396,6 +396,17 @@ impl PiiEngine {
             }
         }
 
+        if let Some(body) = msg.request_text.as_mut()
+            && let Some(mut report) = self.scan(body)
+        {
+            scanned_bytes += report.scanned_bytes;
+            if let Some(redacted) = report.redacted_text.take() {
+                body.zeroize();
+                *body = redacted;
+            }
+            entities.append(&mut report.entities);
+        }
+
         let mut redacted_payload = None;
         if let Some(text) = msg.payload_text.as_mut()
             && let Some(mut report) = self.scan(text)
@@ -564,6 +575,26 @@ mod tests {
         assert!(cats.contains(&PiiCategory::Email));
         assert!(cats.contains(&PiiCategory::Ssn));
         assert!(cats.contains(&PiiCategory::CreditCard));
+    }
+
+    #[test]
+    fn test_scan_message_redacts_request_body() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, 1);
+        msg.request_text =
+            Some(r#"{"email":"bob@example.com","card":"4111 1111 1111 1111"}"#.to_string());
+        let report = engine.scan_message(&mut msg).expect("PII in request body");
+        let body = msg.request_text.as_deref().unwrap();
+        assert!(
+            !body.contains("bob@example.com") && !body.contains("4111"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<EMAIL>") && body.contains("<CREDIT_CARD>"),
+            "{body}"
+        );
+        assert!(report.redacted);
     }
 
     #[test]
