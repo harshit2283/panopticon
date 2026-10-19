@@ -193,7 +193,18 @@ enum RespParse {
 }
 
 /// Parse a single RESP value from the beginning of `data`.
+/// Max nesting of RESP arrays. Parsing recurses per level and agent workers
+/// run on small (2MB) tokio stacks; real commands/replies nest 1–3 deep.
+const MAX_RESP_DEPTH: usize = 32;
+/// Upper bound on elements pre-allocated for an array. The count is
+/// peer-controlled: `Vec::with_capacity(huge)` aborts the whole process.
+const MAX_PREALLOC_ELEMENTS: usize = 1024;
+
 fn parse_resp_value(data: &[u8]) -> RespParse {
+    parse_resp_value_at(data, 0)
+}
+
+fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
     if data.is_empty() {
         return RespParse::Incomplete;
     }
@@ -203,7 +214,10 @@ fn parse_resp_value(data: &[u8]) -> RespParse {
         b'-' => parse_error(data),
         b':' => parse_integer(data),
         b'$' => parse_bulk_string(data),
-        b'*' => parse_array(data),
+        b'*' if depth >= MAX_RESP_DEPTH => {
+            RespParse::Error(format!("RESP nesting deeper than {MAX_RESP_DEPTH}"))
+        }
+        b'*' => parse_array(data, depth),
         _ => RespParse::Error(format!("unknown RESP type byte: 0x{:02x}", data[0])),
     }
 }
@@ -281,7 +295,7 @@ fn parse_bulk_string(data: &[u8]) -> RespParse {
 }
 
 /// Parse `*<count>\r\n<elements...>` or `*-1\r\n` (null)
-fn parse_array(data: &[u8]) -> RespParse {
+fn parse_array(data: &[u8], depth: usize) -> RespParse {
     let crlf_pos = match find_crlf(data) {
         Some(pos) => pos,
         None => return RespParse::Incomplete,
@@ -298,13 +312,14 @@ fn parse_array(data: &[u8]) -> RespParse {
     }
 
     let mut offset = crlf_pos + 2;
-    let mut elements = Vec::with_capacity(count as usize);
+    // Grow as elements actually arrive; never trust the declared count.
+    let mut elements = Vec::with_capacity((count as usize).min(MAX_PREALLOC_ELEMENTS));
 
     for _ in 0..count {
         if offset >= data.len() {
             return RespParse::Incomplete;
         }
-        match parse_resp_value(&data[offset..]) {
+        match parse_resp_value_at(&data[offset..], depth + 1) {
             RespParse::Complete(value, consumed) => {
                 elements.push(value);
                 offset += consumed;
@@ -384,6 +399,31 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_huge_array_count_does_not_abort() {
+        // Found by fuzzing: a peer-declared count was passed straight to
+        // Vec::with_capacity, aborting the whole agent process.
+        let mut parser = RedisParser::new();
+        let _ = parser.feed(b"*99999999999999\r\n$3\r\nGET\r\n", Direction::Egress, 1000);
+        let _ = parser.feed(b"*9223372036854775807\r\n", Direction::Ingress, 2000);
+    }
+
+    #[test]
+    fn test_deep_nesting_is_rejected_without_stack_overflow() {
+        // 100k nested arrays would recurse 100k frames; workers run on small
+        // stacks, so run on a 256KB thread to prove the depth limit holds.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let nested = b"*1\r\n".repeat(100_000);
+                assert!(matches!(parse_resp_value(&nested), RespParse::Error(_)));
+            })
+            .unwrap();
+        handle
+            .join()
+            .expect("deep RESP nesting must not overflow the stack");
     }
 
     #[test]
