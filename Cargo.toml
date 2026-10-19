@@ -22,7 +22,7 @@ aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f9
 anyhow = { version = "1", default-features = false, features = ["std"] }
 dashmap = { version = "6", default-features = false }
 cargo_metadata = { version = "0.23", default-features = false }
-clap = { version = "4", default-features = false, features = ["std", "derive", "env"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 libc = { version = "0.2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = "0.1"

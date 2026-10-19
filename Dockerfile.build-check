@@ -4,23 +4,16 @@
 # This image compiles, tests, and lints the workspace without producing a
 # deployable artifact.
 # =============================================================================
-FROM rust:1.93-bookworm AS builder
+FROM rust:1.93.0-bookworm AS builder
 
-RUN apt-get update && apt-get install -y \
-    clang llvm libelf-dev \
-    pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN rustup install nightly \
-    && rustup component add rust-src --toolchain nightly \
-    && cargo install bpf-linker
+ARG BPF_TOOLCHAIN=nightly-2026-02-17
+ARG BPF_LINKER_VERSION=0.10.3
+ENV BPF_TOOLCHAIN=${BPF_TOOLCHAIN}
+RUN rustup toolchain install ${BPF_TOOLCHAIN} --profile minimal --component rust-src \
+    && cargo +${BPF_TOOLCHAIN} install bpf-linker --locked --version ${BPF_LINKER_VERSION}
 
 WORKDIR /build
 COPY . .
-
-# Remove the sudo runner from .cargo/config.toml (not needed as root in Docker)
-# cfg(all()) runners can't be overridden via env vars, so we rewrite the config
-RUN sed -i '/^\[target\."cfg(all())"\]/,/^runner/d' .cargo/config.toml
 
 RUN cargo build -p panopticon-common
 RUN cargo build -p xtask

@@ -7,6 +7,9 @@ on:
 
 env:
   BPF_TOOLCHAIN: nightly-2026-02-17
+  # bpf-linker 0.10.3 uses the nightly toolchain's own LLVM 22 (rust-llvm-22);
+  # 0.11+ links against a system LLVM 23 and breaks on stock distros.
+  BPF_LINKER_VERSION: 0.10.3
 
 jobs:
   kernel-test:
@@ -48,7 +51,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-18 llvm-18 libelf-dev pkg-config qemu-system-x86
           pip install virtme-ng
-          cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked
+          cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked --version ${{ env.BPF_LINKER_VERSION }}
 
       - name: Download kernel
         env:

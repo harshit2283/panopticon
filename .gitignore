@@ -4,7 +4,6 @@ target/
 
 # Project-specific
 .claude/
-.dockerignore
 
 # Rust backup files
 **/*.rs.bk
