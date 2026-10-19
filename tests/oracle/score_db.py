@@ -69,5 +69,7 @@ for k in with_pii:
     pii_by_via[truth[k].get("via") or "-"][0] += k in pii_seen
 print("  PII visibility by transport:", {v: f"{a}/{b}" for v, (a, b) in sorted(pii_by_via.items())})
 
+if len(sys.argv) > 3 and leaks:
+    sys.exit(f"{len(leaks)} raw PII values reached the export")
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):
     sys.exit(f"recall {len(found)/n:.1%} below required {float(sys.argv[3]):.1%}")

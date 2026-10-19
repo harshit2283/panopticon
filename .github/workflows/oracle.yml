@@ -1,0 +1,54 @@
+name: Ground-truth accuracy
+
+# Runs the agent against the traffic oracles in tests/oracle/ on the runner's
+# own kernel and fails if capture recall drops below 99% for any protocol,
+# or if any raw PII value reaches the export. See docs/BENCHMARKS.md.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BPF_TOOLCHAIN: nightly-2026-02-17
+  # bpf-linker 0.10.3 uses the nightly toolchain's own LLVM 22 (rust-llvm-22);
+  # 0.11+ links against a system LLVM 23 and breaks on stock distros.
+  BPF_LINKER_VERSION: 0.10.3
+
+jobs:
+  oracle:
+    name: Oracle (HTTP, HTTPS, Redis, PostgreSQL, MySQL, gRPC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.BPF_TOOLCHAIN }}
+          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18 libelf-dev \
+            "linux-headers-$(uname -r)" pkg-config libssl-dev openssl
+          cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked --version ${{ env.BPF_LINKER_VERSION }}
+          python3 -m venv /tmp/oracle-venv
+          /tmp/oracle-venv/bin/pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio
+
+      - name: Build agent (release, with eBPF)
+        run: cargo build -p panopticon-agent --release
+
+      - name: HTTP/1.1 (TC capture)
+        run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run.sh 1000 1234 0.99
+
+      - name: HTTPS (OpenSSL uprobes, system python3)
+        run: sudo tests/oracle/run_tls.sh 500 42 0.99
+
+      - name: Redis, PostgreSQL, MySQL, gRPC
+        run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_protocols.sh 300 7 0.99

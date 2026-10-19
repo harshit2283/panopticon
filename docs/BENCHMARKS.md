@@ -227,6 +227,11 @@ cargo bench -p panopticon-agent --bench parser_throughput --bench pii_regex --be
 cd fuzz && cargo +nightly fuzz run parsers -- -max_total_time=600
 ```
 
+Each runner exits non-zero if recall is below the minimum or if any raw PII
+value appears in the export. The same three runs execute in CI on pull
+requests (`.github/workflows/oracle.yml`, also runnable by hand from the
+Actions tab).
+
 If Python is installed in a virtualenv, point the runners at it with
 `PYTHON=/path/to/venv/bin/python`. Benchmarks build with a stub eBPF object,
 so rebuild the release agent before running the oracles again.

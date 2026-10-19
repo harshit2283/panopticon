@@ -252,13 +252,27 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
         }
     }
 
-    // Deduplicate by library_path (multiple PIDs may load the same libssl.so)
-    // For uprobes attached globally (pid=None), we only need one attachment per library.
-    let mut seen_libs = std::collections::HashSet::new();
-    targets.retain(|t| seen_libs.insert(t.library_path.clone()));
+    dedup_targets(&mut targets, get_file_id);
 
     debug!(count = targets.len(), "TLS library scan complete");
     targets
+}
+
+/// Keep one target per library file. OpenSSL uprobes are attached without a
+/// PID filter, so they already cover every process mapping that file; each
+/// PID reaches it through a different `/proc/<pid>/root/...` path, and
+/// attaching once per path made every SSL call emit duplicate events. Go
+/// probes are attached per PID, so those stay one per process.
+fn dedup_targets(targets: &mut Vec<TlsTarget>, file_id: impl Fn(&str) -> Option<(u64, u64)>) {
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| {
+        let pid = match t.tls_type {
+            TlsType::OpenSsl { .. } => 0,
+            TlsType::GoTls { .. } => t.pid,
+        };
+        let file = file_id(&t.library_path).ok_or_else(|| t.library_path.clone());
+        seen.insert((file, pid))
+    });
 }
 
 /// Scan a single PID's `/proc/<pid>/maps` for TLS libraries.
@@ -633,6 +647,46 @@ mod tests {
             extract_go_version_string(data),
             Some("go1.19.3".to_string())
         );
+    }
+
+    #[test]
+    fn test_dedup_targets_by_file_not_path() {
+        let ssl = |pid: u32, path: &str| TlsTarget {
+            pid,
+            library_path: path.to_string(),
+            tls_type: TlsType::OpenSsl {
+                ssl_write_offset: 1,
+                ssl_read_offset: 2,
+                ssl_write_ex_offset: None,
+                ssl_read_ex_offset: None,
+            },
+        };
+        let go = |pid: u32, path: &str| TlsTarget {
+            pid,
+            library_path: path.to_string(),
+            tls_type: TlsType::GoTls {
+                write_offset: 3,
+                go_version: GoVersion::RegisterAbi,
+            },
+        };
+        let mut targets = vec![
+            ssl(10, "/proc/10/root/usr/lib/libssl.so.3"),
+            ssl(11, "/proc/11/root/usr/lib/libssl.so.3"), // same file
+            ssl(12, "/proc/12/root/usr/lib/libssl.so.3"), // container's own copy
+            go(20, "/proc/20/root/app"),
+            go(21, "/proc/21/root/app"), // same binary, other process
+            go(21, "/proc/21/root/app"),
+        ];
+        let id = |path: &str| {
+            Some(match path {
+                p if p.starts_with("/proc/12/") => (1, 99),
+                p if p.ends_with("libssl.so.3") => (1, 42),
+                _ => (1, 7),
+            })
+        };
+        dedup_targets(&mut targets, id);
+        let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
+        assert_eq!(kept, vec![10, 12, 20, 21]);
     }
 
     // ── resolve_elf_symbols_from_bytes ───────────────────────────────

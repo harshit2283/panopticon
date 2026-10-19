@@ -58,5 +58,7 @@ leaks = [v for k in with_pii for v in truth[k]["pii"] if v in export_text]
 print(f"  PII visibility: flagged in {len(pii_seen)}/{len(with_pii)} calls that sent PII; "
       f"raw PII values in export: {len(leaks)}")
 
+if len(sys.argv) > 3 and leaks:
+    sys.exit(f"{len(leaks)} raw PII values reached the export")
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):
     sys.exit(f"recall {len(found)/n:.1%} below required {float(sys.argv[3]):.1%}")

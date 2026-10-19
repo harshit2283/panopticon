@@ -70,5 +70,7 @@ print(f"  request bodies: captured {len(with_body)}/{len(posts)} POSTs, "
       f"PII redacted in {len(redacted)}/{len(with_body)}, raw PII values leaked: {len(leaks)}")
 
 # Optional gate: score.py truth agent MIN_RECALL (e.g. 0.99) exits 1 below it.
+if len(sys.argv) > 3 and leaks:
+    sys.exit(f"{len(leaks)} raw PII values reached the export")
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):
     sys.exit(f"recall {len(found)/n:.1%} below required {float(sys.argv[3]):.1%}")
