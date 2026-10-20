@@ -887,10 +887,16 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                         CreateResult::Created => {
                             ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
                         }
-                        CreateResult::CreatedWithEviction => {
-                            // New connection created but an old one was evicted at capacity
-                            ctx.stats.evictions_capacity.fetch_add(1, Ordering::Relaxed);
-                            // Net active count stays the same (one removed, one added)
+                        CreateResult::CreatedWithEviction(evicted) => {
+                            // Created after evicting the oldest connections at capacity
+                            let evicted = evicted as u64;
+                            ctx.stats
+                                .evictions_capacity
+                                .fetch_add(evicted, Ordering::Relaxed);
+                            ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats
+                                .active_connections
+                                .fetch_sub(evicted, Ordering::Relaxed);
                         }
                         CreateResult::AlreadyExists => {
                             // Race: another event created it between contains() and get_or_create()

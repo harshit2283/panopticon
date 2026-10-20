@@ -88,9 +88,13 @@ pub enum CreateResult {
     Created,
     /// The connection already existed; its timestamp was refreshed.
     AlreadyExists,
-    /// A new entry was created, but an old connection had to be evicted due to capacity.
-    CreatedWithEviction,
+    /// A new entry was created after evicting this many of the least
+    /// recently seen connections to stay within capacity.
+    CreatedWithEviction(usize),
 }
+
+/// Fraction of the table evicted at once when it is full (1/N).
+const EVICTION_BATCH_DIVISOR: usize = 16;
 
 #[derive(Debug)]
 pub enum FsmResult {
@@ -237,7 +241,7 @@ impl ConnectionFsmManager {
             return CreateResult::AlreadyExists;
         }
 
-        let mut evicted = false;
+        let mut evicted = 0;
 
         // Log capacity warnings at threshold levels
         let current_len = self.connections.len();
@@ -258,16 +262,7 @@ impl ConnectionFsmManager {
         }
 
         if self.connections.len() >= self.max_connections {
-            let oldest_id = self
-                .connections
-                .iter()
-                .min_by_key(|e| e.value().last_seen)
-                .map(|e| *e.key());
-
-            if let Some(id) = oldest_id {
-                self.connections.remove(&id);
-                evicted = true;
-            }
+            evicted = self.evict_oldest_batch();
         }
 
         let fsm: Box<dyn ProtocolFsm> = Box::new(ProtocolFsmAdapter::new(protocol));
@@ -281,11 +276,34 @@ impl ConnectionFsmManager {
             },
         );
 
-        if evicted {
-            CreateResult::CreatedWithEviction
+        if evicted > 0 {
+            CreateResult::CreatedWithEviction(evicted)
         } else {
             CreateResult::Created
         }
+    }
+
+    /// Evict the least recently seen 1/EVICTION_BATCH_DIVISOR of the table.
+    ///
+    /// Finding the oldest entry takes a scan of the whole table; doing that
+    /// for every new connection once full cost ~2.5ms per connection at the
+    /// default 65,536 entries (a table full of idle UDP flows, e.g. DNS,
+    /// capped a worker at ~400 new connections/s). One scan per batch keeps
+    /// the cost amortized O(EVICTION_BATCH_DIVISOR) per insert.
+    fn evict_oldest_batch(&self) -> usize {
+        let target = (self.max_connections / EVICTION_BATCH_DIVISOR).max(1);
+        let mut ages: Vec<(Instant, u64)> = self
+            .connections
+            .iter()
+            .map(|e| (e.value().last_seen, *e.key()))
+            .collect();
+        if ages.len() > target {
+            ages.select_nth_unstable_by_key(target - 1, |a| a.0);
+            ages.truncate(target);
+        }
+        ages.iter()
+            .filter(|(_, id)| self.connections.remove(id).is_some())
+            .count()
     }
 
     pub fn process_packet(
@@ -409,6 +427,24 @@ impl Default for ConnectionFsmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "timing probe, run by hand"]
+    fn probe_insert_cost_at_capacity() {
+        let cap = 65_536;
+        let m = ConnectionFsmManager::new(cap);
+        for id in 0..cap as u64 {
+            m.get_or_create(id, Protocol::Dns);
+        }
+        let t = std::time::Instant::now();
+        for id in 0..2_000u64 {
+            m.get_or_create(1_000_000 + id, Protocol::Dns);
+        }
+        eprintln!(
+            "PROBE insert at capacity: {:?} per new connection",
+            t.elapsed() / 2_000
+        );
+    }
 
     #[test]
     fn fin_from_both_sides_finishes_connection() {
@@ -698,8 +734,36 @@ mod tests {
 
         let result = manager.get_or_create(3, Protocol::Mysql);
 
-        assert_eq!(result, CreateResult::CreatedWithEviction);
+        assert_eq!(result, CreateResult::CreatedWithEviction(1));
         assert_eq!(manager.len(), 2);
         assert!(manager.contains(3));
+    }
+
+    #[test]
+    fn test_eviction_removes_least_recently_seen_in_batches() {
+        let cap = 64;
+        let manager = ConnectionFsmManager::new(cap);
+        for id in 0..cap as u64 {
+            manager.get_or_create(id, Protocol::Dns);
+        }
+        // Touch the first half so the second half is older.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for id in 0..32u64 {
+            manager.process_packet(id, Direction::Egress, b"", 0);
+        }
+        let result = manager.get_or_create(1000, Protocol::Dns);
+        assert_eq!(result, CreateResult::CreatedWithEviction(cap / 16));
+        assert_eq!(manager.len(), cap - cap / 16 + 1);
+        assert!(
+            (0..32u64).all(|id| manager.contains(id)),
+            "recent ones kept"
+        );
+        // The next inserts fit without another scan.
+        for id in 0..(cap / 16 - 1) as u64 {
+            assert_eq!(
+                manager.get_or_create(2000 + id, Protocol::Dns),
+                CreateResult::Created
+            );
+        }
     }
 }
