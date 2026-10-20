@@ -123,12 +123,14 @@ interface. It is not end-to-end latency.
 | Before this release | 12,500–15,000 |
 | Current, TCP packet with payload (captured) | 1,200–2,000 |
 | Current, packet that is not captured (e.g. ICMP) | ~85 |
+| Under sustained load (~40K packets/s), before the wakeup fix | 6,643 |
+| Under sustained load (~40K packets/s), current | 1,600–1,700 |
 
 With TLS capture on (`tls_scan_enabled`, the default), two more hooks run on
 **every TCP send and receive on the node**, not only TLS ones, to learn TLS
-connections' addresses. They cost 200–500 ns per call on this VM, against
-~100 ns for an empty program on the same hooks. Turn TLS capture off to
-remove them.
+connections' addresses. They cost 80–300 ns per call on this VM (about 80 ns
+under sustained load), against ~100 ns for an empty program on the same
+hooks. Turn TLS capture off to remove them.
 
 Two changes account for most of the gain. The payload is now copied with one
 `bpf_skb_load_bytes` instead of byte by byte. Ring-buffer wakeups are now
@@ -155,8 +157,63 @@ from a fixed 2 ms ring-buffer drain tick. Both are fixed: the scanner reads
 only ELF headers and symbol tables, and the tick backs off to 16 ms while
 idle and returns to 2 ms as soon as events arrive.
 
-Not measured yet: maximum sustained events/s, kernel-to-export latency
-percentiles, and memory with the ONNX model loaded.
+### Sustained load and connection churn
+
+`tests/load/run_load.sh` drives HTTP/1.1 through the same veth topology with
+a Go load generator (`tests/load/loadgen.go`), and reports the achieved
+rate, capture recall, drops by cause, agent CPU and peak RSS. The VM has 4
+vCPUs shared by the load generator, its server and the agent, so the rates
+below are limited by the generator, not by the agent.
+
+64 keep-alive connections, as fast as possible, 512 B responses, 20% POSTs
+with an email in the body (`run_load.sh 64 20s`):
+
+| | Before | Current |
+|---|---|---|
+| Achieved load | 17.7K req/s | 21.7–23.1K req/s |
+| Capture recall | 97.35% | 99.99–100% |
+| Events dropped | 2.5% (worker queues full) | 0–0.01% |
+| Kernel TC cost per packet | 7,453 ns | 1,599–1,693 ns |
+| Agent CPU | 78% of one core | 58–60% |
+| Peak RSS | 224 MiB | 97–101 MiB |
+
+Connection churn, one request per TCP connection (`run_load.sh 64 30s 0 1`):
+8.4K connections/s with 99.98% recall. Tracked connections stay at 0–36,
+because the parser state of a connection is dropped on its FIN/RST. Before
+that, about 14K stale entries waited for the 30 s idle timeout, and heavier
+churn would have hit the 65,536-entry table limit and evicted live
+connections. The service graph stays at one edge, where it used to gain a
+node and an edge per client connection.
+
+### Where the CPU goes
+
+`--replay-bench FILE` runs a raw capture (`--capture-raw`) through the same
+worker code as live traffic, on one core, without the kernel or scheduling
+noise. Here it is the 64-connection load above (43K events):
+
+| Pipeline | Before | Current | Events/s on one core |
+|---|---|---|---|
+| Parse only (PII and graph off) | 3.46 µs/event | 1.5–1.7 µs | ~600K |
+| Parse + PII + graph | 6.25 µs | 4.5–4.8 µs | ~210K |
+| Parse + PII + graph + JSON export | 14.64 µs | 6.5–7.6 µs | ~150K |
+
+The biggest gains came from three changes:
+
+- **Allocator.** glibc's malloc arena locks were about 20% of busy samples,
+  because workers allocate messages that the export thread frees. The agent
+  now uses mimalloc.
+- **JSON export.** It used to flush and `write(2)` after every exchange.
+- **Graph templates.** Every request with a unique query string became its own
+  graph template, which cost memory as well as CPU.
+
+Live, the agent spends about 15 µs of CPU per event at this load. The
+difference from the replay figure is the kernel-to-user hand-off and
+contention for the VM's 4 vCPUs. Plan on roughly one core per 60K
+captured packets per second with JSON export on.
+
+Not measured yet: throughput above ~25K requests/s (the load generator is the
+limit on this VM), kernel-to-export latency percentiles, and memory with the
+ONNX model loaded.
 
 ## 4. Micro-benchmarks
 
@@ -217,8 +274,8 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 
 Requirements: root on Linux 5.8+, a release build
 (`cargo build -p panopticon-agent --release`), Docker for the database run,
-and Python with `pip install pyroute2 redis 'psycopg[binary]' pymysql
-cryptography grpcio`.
+Python with `pip install pyroute2 redis 'psycopg[binary]' pymysql
+cryptography grpcio`, and Go for the load generator.
 
 ```bash
 # HTTP/1.1 accuracy, kernel cost, agent CPU/RSS. Fails below 99% recall.
@@ -230,6 +287,16 @@ sudo tests/oracle/run_tls.sh 1000 42
 
 # Redis, PostgreSQL, MySQL, gRPC. Fails if any protocol is below 99% recall.
 sudo tests/oracle/run_protocols.sh 500 7
+
+# Sustained load: concurrency, duration, rate (0 = max), newconn (1 = one
+# request per connection). Reports recall, drops by cause, CPU and RSS.
+sudo tests/load/run_load.sh 64 20s
+sudo tests/load/run_load.sh 64 30s 0 1
+
+# User-space cost per event, one core: record a capture, then replay it
+# (with your config; add --json-export /dev/null to include export).
+sudo ./target/release/panopticon-agent -i eth0 --capture-raw /tmp/load.pncap
+./target/release/panopticon-agent --replay-bench /tmp/load.pncap
 
 # Micro-benchmarks
 cargo bench -p panopticon-agent --bench parser_throughput --bench pii_regex --bench protocol_detect

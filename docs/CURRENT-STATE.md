@@ -24,6 +24,10 @@ production-hardened compliance platform.
   plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
   every request that carried it, and no raw PII values in the export
   (`tests/oracle/run_protocols.sh`).
+- Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
+  connections with 99.99% recall, and 8K new connections/s with 99.98%
+  recall and bounded connection state. Drops are counted per cause,
+  including in the kernel ring buffer.
 - Agent overhead is measured: about 1.2-2µs of kernel time per captured
   packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run.
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a

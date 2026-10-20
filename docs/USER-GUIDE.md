@@ -228,7 +228,9 @@ Detection is pattern-based. It will miss PII that does not match a pattern
 | `panopticon_events_processed_total` | Events handled by workers |
 | `panopticon_events_dropped_total` | All drops; should stay near 0 |
 | `panopticon_drops_rate_limit_total` | Over `max_events_per_sec` |
-| `panopticon_drops_channel_full_total` | Workers or exporters falling behind |
+| `panopticon_kernel_ringbuf_drops_total` | Lost in the kernel: the agent did not drain the ring buffer fast enough. Give it more CPU |
+| `panopticon_drops_channel_full_total` | Parser workers falling behind (bursts or too little CPU) |
+| `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
 | `panopticon_pii_detections_total` | PII values found |
