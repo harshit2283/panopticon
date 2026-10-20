@@ -286,60 +286,105 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
     };
 
     for (path, _base_addr) in &libs {
+        if !is_openssl_library(path) && !is_go_binary(path) {
+            continue;
+        }
         let namespace_path = namespace_resolved_path(pid, path);
-
-        // Check for OpenSSL
-        if is_openssl_library(path)
-            && let Ok(syms) = resolve_elf_symbols(
-                &namespace_path,
-                &["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"],
-            )
-            && let (Some(&write_off), Some(&read_off)) =
-                (syms.get("SSL_write"), syms.get("SSL_read"))
-        {
+        if let Some(tls_type) = examine_cached(path, &namespace_path) {
             targets.push(TlsTarget {
                 pid,
-                library_path: namespace_path.clone(),
-                tls_type: TlsType::OpenSsl {
-                    ssl_write_offset: write_off,
-                    ssl_read_offset: read_off,
-                    ssl_write_ex_offset: syms.get("SSL_write_ex").copied(),
-                    ssl_read_ex_offset: syms.get("SSL_read_ex").copied(),
-                },
+                library_path: namespace_path,
+                tls_type,
             });
-            debug!(pid, path, target = %namespace_path, "Found OpenSSL library");
-        }
-
-        // Check for Go binaries
-        if is_go_binary(path)
-            && let Some(version) = detect_go_version(&namespace_path)
-        {
-            let go_abi = parse_go_abi(&version);
-            if let Ok(syms) = resolve_elf_symbols(&namespace_path, &["crypto/tls.(*Conn).Write"])
-                && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
-            {
-                targets.push(TlsTarget {
-                    pid,
-                    library_path: namespace_path.clone(),
-                    tls_type: TlsType::GoTls {
-                        write_offset: write_off,
-                        go_version: go_abi,
-                    },
-                });
-                debug!(pid, path, target = %namespace_path, %version, "Found Go TLS binary");
-            } else {
-                debug!(
-                    pid,
-                    path,
-                    target = %namespace_path,
-                    %version,
-                    "Go binary detected but crypto/tls.(*Conn).Write was not found"
-                );
-            }
         }
     }
 
     targets
+}
+
+/// Identity of a file's contents for the verdict cache: device, inode,
+/// mtime and size, so a binary replaced in place is examined again.
+#[cfg(target_os = "linux")]
+type FileKey = (u64, u64, i64, u64);
+
+/// Bound on cached verdicts; the cache is cleared when it is reached.
+#[cfg(target_os = "linux")]
+const MAX_CACHED_VERDICTS: usize = 8192;
+
+/// TLS verdict for a mapped file, cached per file so each binary's ELF
+/// symbol tables are parsed once, not on every periodic rescan of every
+/// process that maps it. Negative verdicts (not TLS) are cached too: most
+/// files examined are executables without crypto/tls.
+#[cfg(target_os = "linux")]
+fn examine_cached(path: &str, namespace_path: &str) -> Option<TlsType> {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Mutex, OnceLock};
+
+    static VERDICTS: OnceLock<Mutex<HashMap<FileKey, Option<TlsType>>>> = OnceLock::new();
+    let key = std::fs::metadata(namespace_path)
+        .ok()
+        .map(|m| (m.dev(), m.ino(), m.mtime(), m.size()));
+    let cache = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(key) = key
+        && let Some(verdict) = cache.lock().ok()?.get(&key)
+    {
+        return verdict.clone();
+    }
+    let verdict = examine_binary(path, namespace_path);
+    if let Some(key) = key
+        && let Ok(mut cache) = cache.lock()
+    {
+        if cache.len() >= MAX_CACHED_VERDICTS {
+            cache.clear();
+        }
+        cache.insert(key, verdict.clone());
+    }
+    verdict
+}
+
+/// Parse a mapped file's ELF to see whether it is a TLS library we hook.
+#[cfg(target_os = "linux")]
+fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
+    // Check for OpenSSL
+    if is_openssl_library(path)
+        && let Ok(syms) = resolve_elf_symbols(
+            namespace_path,
+            &["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"],
+        )
+        && let (Some(&write_off), Some(&read_off)) = (syms.get("SSL_write"), syms.get("SSL_read"))
+    {
+        debug!(path, target = %namespace_path, "Found OpenSSL library");
+        return Some(TlsType::OpenSsl {
+            ssl_write_offset: write_off,
+            ssl_read_offset: read_off,
+            ssl_write_ex_offset: syms.get("SSL_write_ex").copied(),
+            ssl_read_ex_offset: syms.get("SSL_read_ex").copied(),
+        });
+    }
+
+    // Check for Go binaries
+    if is_go_binary(path)
+        && let Some(version) = detect_go_version(namespace_path)
+    {
+        let go_abi = parse_go_abi(&version);
+        if let Ok(syms) = resolve_elf_symbols(namespace_path, &["crypto/tls.(*Conn).Write"])
+            && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
+        {
+            debug!(path, target = %namespace_path, %version, "Found Go TLS binary");
+            return Some(TlsType::GoTls {
+                write_offset: write_off,
+                go_version: go_abi,
+            });
+        }
+        debug!(
+            path,
+            target = %namespace_path,
+            %version,
+            "Go binary detected but crypto/tls.(*Conn).Write was not found"
+        );
+    }
+    None
 }
 
 /// Parse `/proc/<pid>/maps` output, extract unique library paths.
@@ -477,8 +522,12 @@ pub async fn tls_scanner_task(
                 };
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
-                // ── IO + ELF parsing OUTSIDE the lock ────────────────
-                let targets = scan_all_processes();
+                // ── IO + ELF parsing OUTSIDE the lock, and off the async
+                //    runtime: a full scan blocks for long enough to stall the
+                //    packet workers sharing the runtime threads.
+                let Ok(targets) = tokio::task::spawn_blocking(scan_all_processes).await else {
+                    continue;
+                };
                 prune_attached_libs(&shared_ebpf, &targets);
                 let newly_attached = attach_new_targets(&shared_ebpf, targets);
                 if newly_attached > 0 {
@@ -492,7 +541,9 @@ pub async fn tls_scanner_task(
                 debug!(pid, "On-demand TLS rescan for new process");
                 // Small delay to let the process finish loading its libraries
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let targets = scan_pid(pid);
+                let Ok(targets) = tokio::task::spawn_blocking(move || scan_pid(pid)).await else {
+                    continue;
+                };
                 let newly_attached = attach_new_targets(&shared_ebpf, targets);
                 if newly_attached > 0 {
                     info!(

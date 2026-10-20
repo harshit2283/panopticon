@@ -65,12 +65,21 @@ pub struct AggregatedFlow {
 
 // ── Edge Aggregator ─────────────────────────────────────────────────────
 
+/// Most distinct flows (src, dst, protocol, template) kept per window. Past
+/// it, new templates are folded into [`OVERFLOW_TEMPLATE`] for their edge,
+/// so memory stays bounded whatever identifiers the normalizer misses.
+pub const MAX_FLOWS_PER_WINDOW: usize = 20_000;
+/// Template that absorbs flows beyond [`MAX_FLOWS_PER_WINDOW`].
+pub const OVERFLOW_TEMPLATE: &str = "<other>";
+
 /// Concurrent edge aggregator using a DashMap for lock-free per-key updates.
 pub struct EdgeAggregator {
     current_window: DashMap<FlowKey, FlowStats>,
     window_start: AtomicU64,
     window_duration: Duration,
     uuid_re: Regex,
+    /// Observations folded into OVERFLOW_TEMPLATE (cumulative).
+    overflowed: AtomicU64,
 }
 
 impl EdgeAggregator {
@@ -83,7 +92,13 @@ impl EdgeAggregator {
                 r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
             )
             .expect("UUID regex is valid"),
+            overflowed: AtomicU64::new(0),
         }
+    }
+
+    /// Observations folded into the overflow template so far.
+    pub fn overflowed(&self) -> u64 {
+        self.overflowed.load(Ordering::Relaxed)
     }
 
     /// Record a single request/response observation.
@@ -103,12 +118,20 @@ impl EdgeAggregator {
         timestamp_ns: u64,
     ) {
         let template = self.normalize_template(protocol, method, path);
-        let key = FlowKey {
+        let mut key = FlowKey {
             src: src.to_string(),
             dst: dst.to_string(),
             protocol,
             template,
         };
+        // Approximate under concurrency (len() and the insert race), which
+        // only lets the cap be exceeded by a few entries.
+        if self.current_window.len() >= MAX_FLOWS_PER_WINDOW
+            && !self.current_window.contains_key(&key)
+        {
+            key.template = OVERFLOW_TEMPLATE.to_string();
+            self.overflowed.fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut entry = self
             .current_window
@@ -190,8 +213,17 @@ impl EdgeAggregator {
                 // SQL normalization: replace literals with ?
                 normalize_sql(path_str)
             }
+            Protocol::Redis => {
+                // Keys usually embed ids (user:1234, session:9f86d081...)
+                let key = normalize_ids(path_str);
+                if method_str.is_empty() {
+                    key
+                } else {
+                    format!("{} {}", method_str, key)
+                }
+            }
             _ => {
-                // Redis keys, etc. — pass through
+                // Kafka topics, DNS names, etc. — pass through
                 if method_str.is_empty() {
                     path_str.to_string()
                 } else {
@@ -201,21 +233,43 @@ impl EdgeAggregator {
         }
     }
 
-    /// Replace UUIDs and numeric path segments in HTTP paths.
+    /// Replace UUIDs, numeric and long-hex path segments in HTTP paths, and
+    /// query values (keys kept): `/users/123/posts?page=2` ->
+    /// `/users/?/posts?page=?`. Query values left in made every request a
+    /// distinct template (cache-busters, request ids).
     fn normalize_http_path(&self, path: &str) -> String {
+        let (path, query) = match path.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (path, None),
+        };
         // Replace UUIDs
         let result = self.uuid_re.replace_all(path, "?");
 
-        // Replace pure-numeric path segments: /users/123/posts -> /users/?/posts
+        // Replace id-like path segments: /users/123/posts -> /users/?/posts
         let mut out = String::with_capacity(result.len());
         for (i, segment) in result.split('/').enumerate() {
             if i > 0 {
                 out.push('/');
             }
-            if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
+            if is_id_segment(segment) {
                 out.push('?');
             } else {
                 out.push_str(segment);
+            }
+        }
+        if let Some(query) = query {
+            out.push('?');
+            for (i, pair) in query.split('&').enumerate() {
+                if i > 0 {
+                    out.push('&');
+                }
+                match pair.split_once('=') {
+                    Some((k, _)) => {
+                        out.push_str(k);
+                        out.push_str("=?");
+                    }
+                    None => out.push_str(pair),
+                }
             }
         }
         out
@@ -225,6 +279,55 @@ impl EdgeAggregator {
     pub fn active_flows(&self) -> usize {
         self.current_window.len()
     }
+}
+
+/// A path segment that identifies an instance rather than a route: all
+/// digits, or a hex string of 12+ characters (hashes, object ids).
+fn is_id_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && (segment.bytes().all(|b| b.is_ascii_digit())
+            || (segment.len() >= 12 && segment.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
+/// Replace digit runs, and hex runs of 12+ characters, with `?`:
+/// `user:1234:cart` -> `user:?:cart`.
+fn normalize_ids(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex_end = bytes[i..]
+            .iter()
+            .position(|b| !b.is_ascii_hexdigit())
+            .map_or(bytes.len(), |n| i + n);
+        let run = &bytes[i..hex_end];
+        // A hex run is replaced if it is long, or if it is all digits.
+        if run.len() >= 12 || (!run.is_empty() && run.iter().all(u8::is_ascii_digit)) {
+            out.push('?');
+            i = hex_end;
+        } else if !run.is_empty() {
+            // Short alphanumeric run (e.g. "cafe1"): keep letters, mask digits.
+            let mut prev_digit = false;
+            for &b in run {
+                if b.is_ascii_digit() {
+                    if !prev_digit {
+                        out.push('?');
+                    }
+                    prev_digit = true;
+                } else {
+                    out.push(b as char);
+                    prev_digit = false;
+                }
+            }
+            i = hex_end;
+        } else {
+            // Not hex: copy the whole (possibly multi-byte) character.
+            let ch = s[i..].chars().next().expect("in bounds");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// Normalize SQL queries by replacing string literals and numeric constants with `?`.
@@ -275,6 +378,69 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_values_and_hex_ids_are_normalized() {
+        let agg = EdgeAggregator::new(Duration::from_secs(10));
+        let t = |p: &str| agg.normalize_template(Protocol::Http1, Some("GET"), Some(p));
+        assert_eq!(t("/len/512?id=r123"), "GET /len/??id=?");
+        assert_eq!(t("/a?x=1&y=two&flag"), "GET /a?x=?&y=?&flag");
+        assert_eq!(t("/blobs/9f86d081884c7d659a2feaa0"), "GET /blobs/?");
+        assert_eq!(t("/v1/users"), "GET /v1/users");
+        assert_eq!(t("/len/512?id=r1"), t("/len/9?id=r2"));
+    }
+
+    #[test]
+    fn redis_keys_are_normalized() {
+        let agg = EdgeAggregator::new(Duration::from_secs(10));
+        let t = |k: &str| agg.normalize_template(Protocol::Redis, Some("GET"), Some(k));
+        assert_eq!(t("user:1234:cart"), "GET user:?:cart");
+        assert_eq!(t("session:9f86d081884c7d65"), "GET session:?");
+        assert_eq!(t("cache:v2:éte"), "GET cache:v?:éte");
+    }
+
+    #[test]
+    fn flows_per_window_are_capped() {
+        let agg = EdgeAggregator::new(Duration::from_secs(10));
+        // Distinct templates the normalizer can't collapse (letters only).
+        let words: Vec<String> = (0..MAX_FLOWS_PER_WINDOW + 500)
+            .map(|n| {
+                let mut w = String::new();
+                let mut n = n;
+                loop {
+                    w.push((b'g' + (n % 20) as u8) as char);
+                    n /= 20;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                format!("/{w}")
+            })
+            .collect();
+        for w in &words {
+            agg.record(
+                "a",
+                "b",
+                Protocol::Http1,
+                Some("GET"),
+                Some(w),
+                Some(200),
+                None,
+                0,
+                0,
+                false,
+                1,
+            );
+        }
+        assert_eq!(agg.active_flows(), MAX_FLOWS_PER_WINDOW + 1);
+        assert_eq!(agg.overflowed(), 500);
+        let flows = agg.flush();
+        let other = flows
+            .iter()
+            .find(|f| f.key.template == OVERFLOW_TEMPLATE)
+            .unwrap();
+        assert_eq!(other.stats.request_count, 500);
+    }
 
     fn make_aggregator() -> EdgeAggregator {
         EdgeAggregator::new(Duration::from_secs(10))

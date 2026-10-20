@@ -51,7 +51,9 @@ struct RawDataEvent {
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
-    pub _pad: [u8; 7],
+    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
+    pub tcp_flags: u8,
+    pub _pad: [u8; 6],
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -73,6 +75,7 @@ impl RawDataEvent {
             src_port: self.src_port,
             dst_port: self.dst_port,
             ip_proto: self.ip_proto,
+            tcp_flags: self.tcp_flags,
             _pad: self._pad,
             payload: self.payload,
         })

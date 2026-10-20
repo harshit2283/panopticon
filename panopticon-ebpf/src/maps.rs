@@ -11,6 +11,19 @@ use panopticon_common::{
     CONFIG_ENTRIES, ConnInfo, DataEvent, MAX_CONNECTIONS, MAX_PID_FILTER, TLS_SCRATCH_SIZE,
 };
 
+/// Events lost because DATA_EVENTS was full (user space not keeping up).
+/// Per-CPU so the drop path needs no atomics; user space sums the CPUs.
+#[map]
+pub static KERNEL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Count one event lost to a full ring buffer.
+#[inline(always)]
+pub fn count_kernel_drop() {
+    if let Some(n) = KERNEL_DROPS.get_ptr_mut(0) {
+        unsafe { *n += 1 };
+    }
+}
+
 /// Primary event channel for network data (TC captures + TLS intercepts).
 /// 16MB ring buffer — ~4000 fixed-size DataEvents (~4.2KB each) in flight, so
 /// a short user-space stall or traffic burst does not immediately drop events.
@@ -25,12 +38,20 @@ const WAKEUP_THRESHOLD_BYTES: u64 = 256 * 1024;
 ///
 /// A wakeup per record (flags = 0) raises an irq_work self-interrupt on every
 /// event; measured on a VM it was ~90% of the TC program's per-packet cost
-/// (~10.4µs vs ~1.0µs without). Wake the consumer only once a batch is
-/// pending; user space also drains on a short timer, bounding latency when
-/// traffic stays below the threshold.
+/// (~10.4µs vs ~1.0µs without). Wake the consumer once per
+/// WAKEUP_THRESHOLD_BYTES of new data: when this record makes the pending
+/// bytes cross a multiple of the threshold. Waking on every record while
+/// pending was above the threshold (the earlier rule) did exactly the wrong
+/// thing under load: a lagging consumer made every packet pay for a wakeup,
+/// which left even less CPU to catch up (6.6µs/packet at ~40K packets/s).
+/// User space also drains on a short timer, so a missed crossing (racing
+/// producers) only delays delivery by one tick.
 #[inline(always)]
 pub fn data_events_submit_flags() -> u64 {
-    if DATA_EVENTS.query(BPF_RB_AVAIL_DATA as u64) >= WAKEUP_THRESHOLD_BYTES {
+    // Ring buffer record = 8-byte header + DataEvent, rounded up to 8.
+    const RECORD: u64 = ((core::mem::size_of::<DataEvent>() as u64 + 8) + 7) & !7;
+    let pending = DATA_EVENTS.query(BPF_RB_AVAIL_DATA as u64);
+    if pending / WAKEUP_THRESHOLD_BYTES != pending.saturating_sub(RECORD) / WAKEUP_THRESHOLD_BYTES {
         BPF_RB_FORCE_WAKEUP as u64
     } else {
         BPF_RB_NO_WAKEUP as u64

@@ -372,6 +372,7 @@ fn emit_tls_event<C: EbpfContext>(
     if use_ringbuf {
         // Reserve in RingBuf (DataEvent is ~4KB, too large for BPF stack)
         let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
+            crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
 
@@ -443,7 +444,8 @@ fn populate_tls_event(
             }
         }
         (*event).tls_library = tls_lib;
-        (*event)._pad = [0; 7];
+        (*event).tcp_flags = 0;
+        (*event)._pad = [0; 6];
         (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE

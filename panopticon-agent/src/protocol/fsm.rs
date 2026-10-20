@@ -190,6 +190,8 @@ struct ConnectionEntry {
     /// runs on) into the client→server / server→client direction parsers
     /// expect.
     server: Option<Endpoint>,
+    /// FIN seen from the client / from the server.
+    fin: [bool; 2],
 }
 
 impl ConnectionEntry {
@@ -275,6 +277,7 @@ impl ConnectionFsmManager {
                 fsm,
                 last_seen: Instant::now(),
                 server,
+                fin: [false; 2],
             },
         );
 
@@ -338,6 +341,25 @@ impl ConnectionFsmManager {
         }
     }
 
+    /// Record a FIN sent by `src`. Returns true once both sides have sent
+    /// one, i.e. the connection is finished and can be closed.
+    pub fn note_fin(&self, conn_id: u64, src: Endpoint, capture_direction: Direction) -> bool {
+        let Some(mut entry) = self.connections.get_mut(&conn_id) else {
+            return false;
+        };
+        let side = match entry.direction_of(src, capture_direction) {
+            Direction::Egress => 0,
+            Direction::Ingress => 1,
+        };
+        entry.fin[side] = true;
+        entry.fin == [true; 2]
+    }
+
+    /// The connection's server endpoint, if it was determined at creation.
+    pub fn server_of(&self, conn_id: u64) -> Option<Endpoint> {
+        self.connections.get(&conn_id)?.server
+    }
+
     /// Close a connection and return whether it existed.
     pub fn close_connection(&self, conn_id: u64) -> bool {
         self.connections.remove(&conn_id).is_some()
@@ -387,6 +409,22 @@ impl Default for ConnectionFsmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fin_from_both_sides_finishes_connection() {
+        let m = ConnectionFsmManager::new(16);
+        let client = (0x0A000002, 51000);
+        let server = (0x0A000001, 80);
+        m.get_or_create_with_server(7, Protocol::Http1, Some(server));
+        // Half-close: the server may still answer.
+        assert!(!m.note_fin(7, client, Direction::Ingress));
+        assert!(!m.note_fin(7, client, Direction::Ingress), "repeat FIN");
+        assert!(m.note_fin(7, server, Direction::Egress));
+        assert!(
+            !m.note_fin(99, client, Direction::Egress),
+            "unknown connection"
+        );
+    }
 
     #[test]
     fn test_new_buffer_is_empty() {

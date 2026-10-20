@@ -574,6 +574,22 @@ pub fn take_event_source(ebpf: &mut Ebpf, caps: &KernelCapabilities) -> Result<E
     }
 }
 
+/// Take the per-CPU counter of events the kernel dropped because the ring
+/// buffer was full. `None` on objects built without it.
+pub fn take_kernel_drops(
+    ebpf: &mut Ebpf,
+) -> Option<aya::maps::PerCpuArray<aya::maps::MapData, u64>> {
+    let map = ebpf.take_map("KERNEL_DROPS")?;
+    aya::maps::PerCpuArray::try_from(map)
+        .inspect_err(|e| warn!(error = %e, "KERNEL_DROPS map has an unexpected type"))
+        .ok()
+}
+
+/// Sum a per-CPU counter across CPUs.
+pub fn sum_per_cpu(map: &aya::maps::PerCpuArray<aya::maps::MapData, u64>) -> u64 {
+    map.get(&0, 0).map_or(0, |v| v.iter().sum())
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 fn load_ebpf_bytes(map_pin_path: Option<&str>) -> Result<Ebpf> {

@@ -307,6 +307,7 @@ fn emit_sock_event<C: EbpfContext>(
 
     if use_ringbuf {
         let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
+            crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
 
@@ -372,6 +373,7 @@ unsafe fn populate_sock_event(
         (*event).tls_library = TlsLibrary::None;
         (*event).payload_len = 0;
         (*event).orig_len = 0;
-        (*event)._pad = [0; 7];
+        (*event).tcp_flags = 0;
+        (*event)._pad = [0; 6];
     }
 }

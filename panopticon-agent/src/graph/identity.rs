@@ -87,9 +87,14 @@ impl IdentityResolver {
             };
         }
 
-        // 2. Format as IP string with port hint
+        // 2. Format as IP string, with the port for servers (port 0 = a
+        //    client, identified by address only)
         let ip_str = format_ipv4(ip);
-        let name = format!("{}:{}", ip_str, port);
+        let name = if port == 0 {
+            ip_str
+        } else {
+            format!("{}:{}", ip_str, port)
+        };
         ServiceIdentity {
             name,
             kind: ServiceKind::External,

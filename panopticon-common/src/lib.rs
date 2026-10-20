@@ -20,6 +20,10 @@ pub const MAX_PID_FILTER: u32 = 4096;
 /// Size of the per-CPU TLS scratch map.
 pub const TLS_SCRATCH_SIZE: u32 = 8192;
 
+/// `DataEvent::tcp_flags` bits.
+pub const TCP_FLAG_FIN: u8 = 0x01;
+pub const TCP_FLAG_RST: u8 = 0x04;
+
 // Config array indices
 pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
@@ -162,7 +166,9 @@ pub struct DataEvent {
     pub dst_port: u16,
     // 1-byte aligned fields
     pub ip_proto: u8,
-    pub _pad: [u8; 7],
+    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
+    pub tcp_flags: u8,
+    pub _pad: [u8; 6],
     // Payload last (largest field)
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
@@ -257,7 +263,9 @@ struct RawDataEvent {
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
-    pub _pad: [u8; 7],
+    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
+    pub tcp_flags: u8,
+    pub _pad: [u8; 6],
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -279,6 +287,7 @@ impl RawDataEvent {
             src_port: self.src_port,
             dst_port: self.dst_port,
             ip_proto: self.ip_proto,
+            tcp_flags: self.tcp_flags,
             _pad: self._pad,
             payload: self.payload,
         })
@@ -371,7 +380,8 @@ mod tests {
         assert_eq!(offset_of!(DataEvent, src_port), 52);
         assert_eq!(offset_of!(DataEvent, dst_port), 54);
         assert_eq!(offset_of!(DataEvent, ip_proto), 56);
-        assert_eq!(offset_of!(DataEvent, _pad), 57);
+        assert_eq!(offset_of!(DataEvent, tcp_flags), 57);
+        assert_eq!(offset_of!(DataEvent, _pad), 58);
         assert_eq!(offset_of!(DataEvent, payload), 64);
     }
 
@@ -488,7 +498,7 @@ mod tests {
             + 4 + 4           // payload_len, orig_len
             + 4               // tls_library
             + 2 + 2           // src_port, dst_port
-            + 1 + 7           // ip_proto, _pad
+            + 1 + 1 + 6       // ip_proto, tcp_flags, _pad
             + MAX_PAYLOAD_SIZE;
         assert_eq!(
             size_of::<DataEvent>(),

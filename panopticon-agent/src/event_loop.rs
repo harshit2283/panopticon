@@ -18,7 +18,9 @@ use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
 #[cfg(target_os = "linux")]
-use panopticon_common::{DataEvent, Direction, EventType, parse_data_event_bytes};
+use panopticon_common::{
+    DataEvent, Direction, EventType, TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes,
+};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]
@@ -65,6 +67,8 @@ struct MessageContext<'a> {
     audit_log: &'a Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
     graph_builder: &'a Option<Arc<GraphBuilder>>,
     event: &'a DataEvent,
+    /// Whether this event's sender is the connection's server, when known.
+    sender_is_server: Option<bool>,
 }
 
 // ── Event Statistics ──────────────────────────────────────────────────────
@@ -89,6 +93,11 @@ pub struct EventStats {
     pub pii_detections: AtomicU64,
     /// Events whose payload was cut at the capture cap (orig_len > payload_len).
     pub truncated_events: AtomicU64,
+    /// Events the kernel could not queue because the ring buffer was full
+    /// (summed from the eBPF KERNEL_DROPS map; never reach `events_received`).
+    pub kernel_drops: AtomicU64,
+    /// Parsed exchanges not exported because the JSON writer was behind.
+    pub drops_export_full: AtomicU64,
 }
 
 impl EventStats {
@@ -106,6 +115,8 @@ impl EventStats {
             evictions_idle: AtomicU64::new(0),
             pii_detections: AtomicU64::new(0),
             truncated_events: AtomicU64::new(0),
+            kernel_drops: AtomicU64::new(0),
+            drops_export_full: AtomicU64::new(0),
         }
     }
 }
@@ -222,6 +233,34 @@ impl EventLoop {
         self
     }
 
+    /// Feed recorded events through one worker: exactly the path live events
+    /// take after the ring buffer (parsing, PII, graph, export). For
+    /// measuring user-space throughput without kernel or scheduling noise.
+    pub async fn replay_through_worker(&self, events: Vec<DataEvent>) -> Result<()> {
+        let (tx, rx) = mpsc::channel::<EventBatch>(4);
+        let ctx = WorkerTaskContext {
+            stats: Arc::clone(&self.stats),
+            idle_timeout: self.config.idle_connection_timeout,
+            log_events: self.config.log_events,
+            max_connections_tracked: self.config.max_connections_tracked,
+            pii_engine: self.pii_engine.clone(),
+            json_export: self.json_export_handle.clone(),
+            otlp_export: self.otlp_export_handle.clone(),
+            audit_log: self.audit_log.clone(),
+            graph_builder: self.graph_builder.clone(),
+            raw_capture: None,
+        };
+        let worker = tokio::spawn(worker_task(0, rx, ctx));
+        for chunk in events.chunks(WORKER_BATCH) {
+            if tx.send(chunk.to_vec()).await.is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        worker.await?;
+        Ok(())
+    }
+
     pub fn stats(&self) -> &Arc<EventStats> {
         &self.stats
     }
@@ -251,8 +290,10 @@ impl EventLoop {
         let mut senders = Vec::with_capacity(num_workers);
         let mut worker_handles = Vec::with_capacity(num_workers);
 
+        // Capacity is configured in events; the channels carry batches.
+        let batch_cap = channel_cap.div_ceil(WORKER_BATCH);
         for worker_id in 0..num_workers {
-            let (tx, rx) = mpsc::channel::<DataEvent>(channel_cap);
+            let (tx, rx) = mpsc::channel::<EventBatch>(batch_cap);
             senders.push(tx);
 
             let stats = Arc::clone(&self.stats);
@@ -423,7 +464,7 @@ impl EventLoop {
 #[cfg(target_os = "linux")]
 async fn consume_data_events(
     event_source: EventSource,
-    senders: &[mpsc::Sender<DataEvent>],
+    senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
@@ -442,7 +483,7 @@ async fn consume_data_events(
 #[cfg(target_os = "linux")]
 async fn consume_ringbuf(
     ring_buf: RingBuf<aya::maps::MapData>,
-    senders: &[mpsc::Sender<DataEvent>],
+    senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
@@ -549,12 +590,13 @@ fn next_drain_interval(current: Duration, drained: usize) -> Duration {
 #[cfg(target_os = "linux")]
 fn drain_ringbuf(
     ring: &mut RingBuf<aya::maps::MapData>,
-    senders: &[mpsc::Sender<DataEvent>],
+    senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<&mpsc::Sender<u32>>,
 ) -> usize {
     let mut drained = 0;
+    let mut batcher = WorkerBatcher::new(senders, stats);
     while let Some(item) = ring.next() {
         drained += 1;
         let data: &[u8] = item.as_ref();
@@ -601,29 +643,77 @@ fn drain_ringbuf(
         }
 
         // Route to worker by connection key (deterministic affinity).
-        let routing_cookie = connection_key(&event);
+        batcher.push(connection_key(&event), event);
+    }
+    batcher.flush();
+    drained
+}
 
-        let num_workers = senders.len();
-        let worker_idx = if num_workers > 0 {
-            (routing_cookie as usize) % num_workers
-        } else {
-            0
-        };
+/// Events handed to a worker in one channel message.
+type EventBatch = Vec<DataEvent>;
 
-        // try_send: never block the reader. Drop if worker is behind.
-        if senders[worker_idx].try_send(event).is_err() {
-            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-            stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
+/// Most events per batch. One send (and at most one worker wakeup) per
+/// batch instead of per event: per-event sends woke a parked worker thread
+/// for almost every packet at moderate rates, which cost more CPU than
+/// parsing the packet.
+const WORKER_BATCH: usize = 64;
+
+/// Groups events per worker during one ring buffer drain.
+#[cfg(target_os = "linux")]
+struct WorkerBatcher<'a> {
+    senders: &'a [mpsc::Sender<EventBatch>],
+    pending: Vec<EventBatch>,
+    stats: &'a EventStats,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> WorkerBatcher<'a> {
+    fn new(senders: &'a [mpsc::Sender<EventBatch>], stats: &'a EventStats) -> Self {
+        Self {
+            senders,
+            pending: senders.iter().map(|_| Vec::new()).collect(),
+            stats,
         }
     }
-    drained
+
+    fn push(&mut self, routing_key: u64, event: DataEvent) {
+        if self.senders.is_empty() {
+            return;
+        }
+        let idx = (routing_key as usize) % self.senders.len();
+        self.pending[idx].push(event);
+        if self.pending[idx].len() >= WORKER_BATCH {
+            self.send(idx);
+        }
+    }
+
+    fn flush(&mut self) {
+        for idx in 0..self.pending.len() {
+            if !self.pending[idx].is_empty() {
+                self.send(idx);
+            }
+        }
+    }
+
+    /// try_send: never block the reader. Drop the batch if the worker is
+    /// behind.
+    fn send(&mut self, idx: usize) {
+        let batch = std::mem::replace(&mut self.pending[idx], Vec::with_capacity(WORKER_BATCH));
+        let n = batch.len() as u64;
+        if self.senders[idx].try_send(batch).is_err() {
+            self.stats.events_dropped.fetch_add(n, Ordering::Relaxed);
+            self.stats
+                .drops_channel_full
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Consume events from a PerfEventArray (kernel < 5.8 fallback).
 #[cfg(target_os = "linux")]
 async fn consume_perf_array(
     mut perf_array: PerfEventArray<aya::maps::MapData>,
-    senders: &[mpsc::Sender<DataEvent>],
+    senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
@@ -683,7 +773,7 @@ async fn consume_perf_array(
             0
         };
 
-        if senders[worker_idx].try_send(event).is_err() {
+        if senders[worker_idx].try_send(vec![event]).is_err() {
             stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
         }
@@ -746,140 +836,156 @@ async fn perf_reader_task(
 
 /// Worker task: receives events from its channel, maintains per-connection state.
 #[cfg(target_os = "linux")]
-async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<DataEvent>, ctx: WorkerTaskContext) {
+async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: WorkerTaskContext) {
     let manager = ConnectionFsmManager::new(ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(5);
 
     debug!(worker_id, "Worker started");
 
-    while let Some(event) = rx.recv().await {
-        if let Some(raw) = ctx.raw_capture.as_ref() {
-            raw.record(&event);
-        }
+    while let Some(batch) = rx.recv().await {
+        // By reference: each DataEvent is ~4KB, so moving it out of the
+        // batch would copy it again.
+        for event in &batch {
+            if let Some(raw) = ctx.raw_capture.as_ref() {
+                raw.record(event);
+            }
 
-        let cookie = connection_key(&event);
+            let cookie = connection_key(event);
 
-        ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+            ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
 
-        if ctx.log_events {
-            let src = format_ipv4(event.src_addr);
-            let dst = format_ipv4(event.dst_addr);
-            info!(
-                worker = worker_id,
-                event_type = ?event.event_type,
-                src = %format!("{}:{}", src, event.src_port),
-                dst = %format!("{}:{}", dst, event.dst_port),
-                payload_len = event.payload_len,
-                pid = event.pid,
-                tgid = event.tgid,
-                tls_library = ?event.tls_library,
-                cookie,
-                "Event"
-            );
-        }
+            if ctx.log_events {
+                let src = format_ipv4(event.src_addr);
+                let dst = format_ipv4(event.dst_addr);
+                info!(
+                    worker = worker_id,
+                    event_type = ?event.event_type,
+                    src = %format!("{}:{}", src, event.src_port),
+                    dst = %format!("{}:{}", dst, event.dst_port),
+                    payload_len = event.payload_len,
+                    pid = event.pid,
+                    tgid = event.tgid,
+                    tls_library = ?event.tls_library,
+                    cookie,
+                    "Event"
+                );
+            }
 
-        // ── Protocol detection + parsing (Phase 3) ───────────────────
-        let payload = event.payload_bytes();
-        if !payload.is_empty() {
-            // Detect protocol and create FSM if not exists
-            if !manager.contains(cookie)
-                && let Some(proto) =
-                    detect_protocol(payload, event.src_port, event.dst_port, event.direction)
-            {
-                use crate::protocol::fsm::CreateResult;
-                let server = server_endpoint(&event, proto, payload);
-                let result = manager.get_or_create_with_server(cookie, proto, server);
-                match result {
-                    CreateResult::Created => {
-                        ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            // ── Protocol detection + parsing (Phase 3) ───────────────────
+            let payload = event.payload_bytes();
+            if !payload.is_empty() {
+                // Detect protocol and create FSM if not exists
+                if !manager.contains(cookie)
+                    && let Some(proto) =
+                        detect_protocol(payload, event.src_port, event.dst_port, event.direction)
+                {
+                    use crate::protocol::fsm::CreateResult;
+                    let server = server_endpoint(event, proto, payload);
+                    let result = manager.get_or_create_with_server(cookie, proto, server);
+                    match result {
+                        CreateResult::Created => {
+                            ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                        }
+                        CreateResult::CreatedWithEviction => {
+                            // New connection created but an old one was evicted at capacity
+                            ctx.stats.evictions_capacity.fetch_add(1, Ordering::Relaxed);
+                            // Net active count stays the same (one removed, one added)
+                        }
+                        CreateResult::AlreadyExists => {
+                            // Race: another event created it between contains() and get_or_create()
+                        }
                     }
-                    CreateResult::CreatedWithEviction => {
-                        // New connection created but an old one was evicted at capacity
-                        ctx.stats.evictions_capacity.fetch_add(1, Ordering::Relaxed);
-                        // Net active count stays the same (one removed, one added)
-                    }
-                    CreateResult::AlreadyExists => {
-                        // Race: another event created it between contains() and get_or_create()
+                    if ctx.log_events {
+                        debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
                     }
                 }
-                if ctx.log_events {
-                    debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
+
+                let src = sender_endpoint(event);
+                let first = manager.process_packet_from(
+                    cookie,
+                    src,
+                    event.direction,
+                    payload,
+                    event.timestamp_ns,
+                );
+                // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
+                // writes) were never seen: let the parser count them instead of
+                // desynchronising on the next message.
+                let truncated = event.truncated_bytes() as usize;
+                let after_gap = if truncated > 0 {
+                    ctx.stats.truncated_events.fetch_add(1, Ordering::Relaxed);
+                    manager.skip_from(cookie, src, event.direction, truncated, event.timestamp_ns)
+                } else {
+                    None
+                };
+                let sender_is_server = manager.server_of(cookie).map(|s| s == src);
+                for result in [first, after_gap].into_iter().flatten() {
+                    match result {
+                        FsmResult::Messages(msgs) => {
+                            handle_messages(
+                                &msgs,
+                                &MessageContext {
+                                    worker_id,
+                                    log_events: ctx.log_events,
+                                    stats: ctx.stats.as_ref(),
+                                    pii_engine: &ctx.pii_engine,
+                                    json_export: &ctx.json_export,
+                                    otlp_export: &ctx.otlp_export,
+                                    audit_log: &ctx.audit_log,
+                                    graph_builder: &ctx.graph_builder,
+                                    event,
+                                    sender_is_server,
+                                },
+                            );
+                        }
+                        FsmResult::MessageComplete(msg) => {
+                            handle_messages(
+                                &[msg],
+                                &MessageContext {
+                                    worker_id,
+                                    log_events: ctx.log_events,
+                                    stats: ctx.stats.as_ref(),
+                                    pii_engine: &ctx.pii_engine,
+                                    json_export: &ctx.json_export,
+                                    otlp_export: &ctx.otlp_export,
+                                    audit_log: &ctx.audit_log,
+                                    graph_builder: &ctx.graph_builder,
+                                    event,
+                                    sender_is_server,
+                                },
+                            );
+                        }
+                        FsmResult::Error(e) => {
+                            debug!(worker = worker_id, cookie, error = %e, "Parser error, closing connection");
+                            ctx.stats.drops_parser_error.fetch_add(1, Ordering::Relaxed);
+                            if manager.close_connection(cookie) {
+                                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        FsmResult::WaitingForMore => {}
+                        FsmResult::ConnectionClosed => {
+                            if manager.close_connection(cookie) {
+                                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
             }
 
-            let src = sender_endpoint(&event);
-            let first = manager.process_packet_from(
-                cookie,
-                src,
-                event.direction,
-                payload,
-                event.timestamp_ns,
-            );
-            // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
-            // writes) were never seen: let the parser count them instead of
-            // desynchronising on the next message.
-            let truncated = event.truncated_bytes() as usize;
-            let after_gap = if truncated > 0 {
-                ctx.stats.truncated_events.fetch_add(1, Ordering::Relaxed);
-                manager.skip_from(cookie, src, event.direction, truncated, event.timestamp_ns)
-            } else {
-                None
+            // Handle connection close events: socket close, TCP RST, or FIN
+            // from both sides (after this packet's payload was parsed).
+            let closed = match event.event_type {
+                EventType::SockClose => true,
+                EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
+                EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
+                    manager.note_fin(cookie, sender_endpoint(event), event.direction)
+                }
+                _ => false,
             };
-            for result in [first, after_gap].into_iter().flatten() {
-                match result {
-                    FsmResult::Messages(msgs) => {
-                        handle_messages(
-                            &msgs,
-                            &MessageContext {
-                                worker_id,
-                                log_events: ctx.log_events,
-                                stats: ctx.stats.as_ref(),
-                                pii_engine: &ctx.pii_engine,
-                                json_export: &ctx.json_export,
-                                otlp_export: &ctx.otlp_export,
-                                audit_log: &ctx.audit_log,
-                                graph_builder: &ctx.graph_builder,
-                                event: &event,
-                            },
-                        );
-                    }
-                    FsmResult::MessageComplete(msg) => {
-                        handle_messages(
-                            &[msg],
-                            &MessageContext {
-                                worker_id,
-                                log_events: ctx.log_events,
-                                stats: ctx.stats.as_ref(),
-                                pii_engine: &ctx.pii_engine,
-                                json_export: &ctx.json_export,
-                                otlp_export: &ctx.otlp_export,
-                                audit_log: &ctx.audit_log,
-                                graph_builder: &ctx.graph_builder,
-                                event: &event,
-                            },
-                        );
-                    }
-                    FsmResult::Error(e) => {
-                        debug!(worker = worker_id, cookie, error = %e, "Parser error, closing connection");
-                        ctx.stats.drops_parser_error.fetch_add(1, Ordering::Relaxed);
-                        if manager.close_connection(cookie) {
-                            ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
-                    FsmResult::WaitingForMore => {}
-                    FsmResult::ConnectionClosed => {
-                        if manager.close_connection(cookie) {
-                            ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+            if closed && manager.close_connection(cookie) {
+                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
             }
-        }
-
-        // Handle connection close events
-        if event.event_type == EventType::SockClose && manager.close_connection(cookie) {
-            ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
         }
 
         // Periodic idle connection sweep
@@ -969,7 +1075,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                 crate::export::json::TransportContext::from_data_event(ctx.event),
             )
         {
-            ctx.stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
+            ctx.stats.drops_export_full.fetch_add(1, Ordering::Relaxed);
             debug!(
                 worker = ctx.worker_id,
                 "JSON export event dropped due to exporter backpressure"
@@ -1012,7 +1118,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                 dst_port: ctx.event.dst_port,
                 pid: ctx.event.pid,
             };
-            gb.record(&conn_tuple, msg, pii_report.as_ref());
+            gb.record_with_server(&conn_tuple, ctx.sender_is_server, msg, pii_report.as_ref());
 
             // DNS cache feeding (Option A): extract resolved A records from DNS messages
             if msg.protocol == crate::protocol::Protocol::Dns {

@@ -39,6 +39,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # PII detection
 regex = { workspace = true }
 fxhash = { workspace = true }
+mimalloc = { workspace = true }
 reqwest = { workspace = true }
 zeroize = { version = "1", features = ["derive"] }
 

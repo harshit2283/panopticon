@@ -31,6 +31,8 @@ pub struct AgentMetrics {
     pub pii_detections: Counter<u64>,
     pub truncated_events: Counter<u64>,
     pub raw_capture_dropped: Counter<u64>,
+    pub kernel_drops: Counter<u64>,
+    pub drops_export_full: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -84,6 +86,20 @@ impl AgentMetrics {
             drops_channel_full.clone(),
         );
 
+        let kernel_drops = Counter::<u64>::default();
+        registry.register(
+            "panopticon_kernel_ringbuf_drops",
+            "Events lost in the kernel because the ring buffer was full (agent not keeping up)",
+            kernel_drops.clone(),
+        );
+
+        let drops_export_full = Counter::<u64>::default();
+        registry.register(
+            "panopticon_drops_export_full",
+            "Parsed exchanges not written because the JSON exporter was behind",
+            drops_export_full.clone(),
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -123,7 +139,7 @@ impl AgentMetrics {
         let ringbuf_approx_pending: Gauge<i64, std::sync::atomic::AtomicI64> = Gauge::default();
         registry.register(
             "panopticon_ringbuf_approx_pending",
-            "Approximate pending events in RingBuf (received - processed)",
+            "Approximate events queued to workers but not yet processed",
             ringbuf_approx_pending.clone(),
         );
 
@@ -138,6 +154,8 @@ impl AgentMetrics {
             pii_detections,
             truncated_events,
             raw_capture_dropped,
+            kernel_drops,
+            drops_export_full,
             parse_latency,
             ringbuf_approx_pending,
         };
@@ -195,8 +213,18 @@ impl AgentMetrics {
             .inner()
             .store(truncated, Ordering::Relaxed);
 
-        // Approximate RingBuf pending = received - processed
-        let pending = received.saturating_sub(processed) as i64;
+        self.kernel_drops.inner().store(
+            stats.kernel_drops.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.drops_export_full.inner().store(
+            stats.drops_export_full.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        // Approximate queued-but-unprocessed events (dropped ones are gone,
+        // not pending)
+        let pending = received.saturating_sub(processed).saturating_sub(dropped) as i64;
         self.ringbuf_approx_pending
             .inner()
             .store(pending, Ordering::Relaxed);
@@ -266,9 +294,17 @@ mod tests {
         stats
             .active_connections
             .fetch_add(11, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .kernel_drops
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .drops_export_full
+            .store(4, std::sync::atomic::Ordering::Relaxed);
 
         metrics.sync_from_stats(&stats);
 
+        assert_eq!(metrics.kernel_drops.get(), 5);
+        assert_eq!(metrics.drops_export_full.get(), 4);
         assert_eq!(metrics.events_received.get(), 100);
         assert_eq!(metrics.events_processed.get(), 90);
         assert_eq!(metrics.events_dropped.get(), 10);
@@ -276,7 +312,8 @@ mod tests {
         assert_eq!(metrics.drops_channel_full.get(), 3);
         assert_eq!(metrics.drops_parser_error.get(), 2);
         assert_eq!(metrics.active_connections.get(), 11);
-        assert_eq!(metrics.ringbuf_approx_pending.get(), 10);
+        // 100 received = 90 processed + 10 dropped: nothing is pending.
+        assert_eq!(metrics.ringbuf_approx_pending.get(), 0);
     }
 
     #[test]

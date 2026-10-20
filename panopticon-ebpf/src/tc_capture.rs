@@ -15,7 +15,7 @@ use aya_ebpf::{
 };
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    TlsLibrary,
+    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary,
 };
 
 use crate::maps::{
@@ -164,7 +164,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     let dst_addr = u32::from_be(ctx.load::<u32>(ip_offset + 16)?);
 
     let transport_offset = ip_offset + ihl;
-    let (src_port, dst_port, payload_offset) = match ip_proto {
+    let (src_port, dst_port, payload_offset, tcp_flags) = match ip_proto {
         IP_PROTO_TCP => {
             if data + transport_offset + TCP_HDR_MIN_LEN > data_end {
                 return Ok(TC_ACT_OK);
@@ -177,7 +177,8 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
                 // Malformed (doff < 5): header bytes would be read as payload.
                 return Ok(TC_ACT_OK);
             }
-            (sport, dport, transport_offset + tcp_hdr_len)
+            let flags: u8 = ctx.load(transport_offset + 13)?;
+            (sport, dport, transport_offset + tcp_hdr_len, flags)
         }
         IP_PROTO_UDP => {
             if data + transport_offset + UDP_HDR_LEN > data_end {
@@ -185,7 +186,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             }
             let sport = u16::from_be(ctx.load::<u16>(transport_offset)?);
             let dport = u16::from_be(ctx.load::<u16>(transport_offset + 2)?);
-            (sport, dport, transport_offset + UDP_HDR_LEN)
+            (sport, dport, transport_offset + UDP_HDR_LEN, 0)
         }
         _ => return Ok(TC_ACT_OK),
     };
@@ -200,10 +201,15 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     }
 
     let ip_payload_end = ip_offset + total_len;
-    if payload_offset >= ip_payload_end {
+    let payload_len = ip_payload_end.saturating_sub(payload_offset);
+    // Empty segments are skipped, except FIN/RST: user space uses them to
+    // drop the connection's parser state at once instead of holding it
+    // until the idle timeout (which, under connection churn, filled the
+    // connection table). Same ring buffer as the data, so a close is never
+    // seen before the connection's last bytes.
+    if payload_len == 0 && tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST) == 0 {
         return Ok(TC_ACT_OK);
     }
-    let payload_len = ip_payload_end - payload_offset;
     let capture_len = if payload_len > MAX_PAYLOAD_SIZE {
         MAX_PAYLOAD_SIZE as u32
     } else {
@@ -212,6 +218,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
 
     if use_ringbuf {
         let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
+            crate::maps::count_kernel_drop();
             return Ok(TC_ACT_OK);
         };
 
@@ -228,6 +235,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             payload_offset,
             capture_len,
             payload_len as u32,
+            tcp_flags,
             true,
         );
 
@@ -255,6 +263,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             payload_offset,
             capture_len,
             payload_len as u32,
+            tcp_flags,
             false,
         );
 
@@ -277,6 +286,7 @@ fn populate_tc_event(
     payload_offset: usize,
     load_len: u32,
     orig_len: u32,
+    tcp_flags: u8,
     capture_payload: bool,
 ) {
     unsafe {
@@ -296,7 +306,8 @@ fn populate_tc_event(
         (*event).dst_port = dst_port;
         (*event).ip_proto = ip_proto;
         (*event).tls_library = TlsLibrary::None;
-        (*event)._pad = [0; 7];
+        (*event).tcp_flags = tcp_flags;
+        (*event)._pad = [0; 6];
         (*event).orig_len = orig_len;
 
         if !capture_payload {

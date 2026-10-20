@@ -215,7 +215,8 @@ impl JsonExporter {
         serde_json::to_writer(&mut self.writer, &event)
             .context("Failed to serialize JSON event")?;
         self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+        // No flush here: the writer task flushes once per drained batch.
+        // Flushing every event cost one write(2) per exchange.
         Ok(())
     }
 
@@ -235,6 +236,13 @@ pub struct ExportEvent {
     pub context: TransportContext,
 }
 
+/// How often the export writer drains its channel while events flow (bounds
+/// export latency).
+const EXPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+/// Poll interval ceiling while idle: the first event after a quiet period
+/// is written within this delay.
+const EXPORT_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Channel-based handle for sending events to a dedicated writer task.
 /// Eliminates per-event Mutex contention on the hot path.
 #[derive(Clone)]
@@ -243,34 +251,51 @@ pub struct JsonExportHandle {
 }
 
 impl JsonExportHandle {
-    /// Spawn a dedicated writer task and return the handle.
-    /// The writer task drains the channel and batches writes,
-    /// flushing only when the channel is empty (no more pending events).
+    /// Spawn a dedicated writer and return the handle.
+    /// The writer drains the channel and batches writes, flushing only when
+    /// the channel is empty (no more pending events). It runs on the
+    /// blocking pool: file writes on a runtime thread stalled the parser
+    /// workers sharing it. It polls every EXPORT_POLL_INTERVAL instead of
+    /// blocking on the channel, so workers' sends never have to wake it.
     pub fn spawn(path: &str, buffer_size: usize) -> Result<(Self, tokio::task::JoinHandle<()>)> {
         let mut exporter = JsonExporter::new(path)?;
         let (tx, mut rx) = mpsc::channel::<ExportEvent>(buffer_size);
 
-        let handle = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                if let Err(e) = exporter.emit(&event.msg, event.pii.as_ref(), Some(&event.context))
-                {
-                    tracing::warn!(error = %e, "JSON export write failed");
-                }
-                // Batch: drain any pending events before flushing
-                while let Ok(event) = rx.try_recv() {
-                    if let Err(e) =
-                        exporter.emit(&event.msg, event.pii.as_ref(), Some(&event.context))
-                    {
-                        tracing::warn!(error = %e, "JSON export write failed");
+        let handle = tokio::task::spawn_blocking(move || {
+            use tokio::sync::mpsc::error::TryRecvError;
+            let mut poll = EXPORT_POLL_INTERVAL;
+            loop {
+                let mut wrote = false;
+                let closed = loop {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            if let Err(e) =
+                                exporter.emit(&event.msg, event.pii.as_ref(), Some(&event.context))
+                            {
+                                tracing::warn!(error = %e, "JSON export write failed");
+                            }
+                            wrote = true;
+                        }
+                        Err(TryRecvError::Empty) => break false,
+                        Err(TryRecvError::Disconnected) => break true,
                     }
-                }
-                // Flush once after draining the batch
-                if let Err(e) = exporter.flush() {
+                };
+                // Flush once per drained batch
+                if wrote && let Err(e) = exporter.flush() {
                     tracing::warn!(error = %e, "JSON export flush failed");
                 }
+                if closed {
+                    break;
+                }
+                // Back off while idle (a fixed 5ms poll cost ~1% of a core
+                // with no traffic); tighten again as soon as events flow.
+                poll = if wrote {
+                    EXPORT_POLL_INTERVAL
+                } else {
+                    (poll * 2).min(EXPORT_IDLE_POLL_INTERVAL)
+                };
+                std::thread::sleep(poll);
             }
-            // Final flush on shutdown
-            let _ = exporter.flush();
         });
 
         Ok((Self { tx }, handle))

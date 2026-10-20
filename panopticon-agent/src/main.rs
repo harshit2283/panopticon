@@ -68,7 +68,20 @@ struct Args {
     /// Needs no privileges.
     #[arg(long, value_name = "FILE")]
     decode_capture: Option<String>,
+
+    /// Benchmark: run a raw capture file (from --capture-raw) through one
+    /// worker's parse/PII/graph/export path as fast as possible, print the
+    /// throughput, then exit. Uses the config file's settings; needs no
+    /// privileges and loads no eBPF.
+    #[arg(long, value_name = "FILE")]
+    replay_bench: Option<String>,
 }
+
+/// mimalloc instead of glibc malloc: parser workers allocate messages that
+/// the export thread frees, and glibc's arena locks serialized them (~20% of
+/// busy samples in the replay benchmark).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -151,6 +164,9 @@ async fn main() -> Result<()> {
         if let Some(ref path) = args.capture_raw {
             agent_config.capture_raw_path = Some(path.clone());
         }
+        if let Some(ref path) = args.replay_bench {
+            return replay_bench(&agent_config, path).await;
+        }
         if agent_config.interfaces.is_empty() {
             let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
             agent_config.interfaces = util::default_route_interfaces(&route);
@@ -189,6 +205,7 @@ async fn main() -> Result<()> {
         //    This breaks the borrow chain — event loop no longer needs &mut Ebpf.
         let event_source = loader::take_event_source(&mut programs.ebpf, &caps)
             .context("Failed to initialize event source from eBPF maps")?;
+        let kernel_drops = loader::take_kernel_drops(&mut programs.ebpf);
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
@@ -340,6 +357,19 @@ async fn main() -> Result<()> {
         //    is cleared again as soon as shutdown begins.
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let event_stats = event_loop.stats().clone();
+        if let Some(map) = kernel_drops {
+            let stats = event_stats.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    stats.kernel_drops.store(
+                        loader::sum_per_cpu(&map),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            });
+        }
         let http_handle = if let Some(ref bind) = agent_config.metrics_bind {
             let (metrics, registry) = export::metrics::AgentMetrics::new();
             let state = export::http_server::AppState {
@@ -559,4 +589,60 @@ mod tests {
         assert!(args.config.is_none());
         assert!(args.metrics_bind.is_none());
     }
+}
+
+/// `--replay-bench`: feed a capture through the production worker path.
+#[cfg(target_os = "linux")]
+async fn replay_bench(config: &config::AgentConfig, path: &str) -> Result<()> {
+    use anyhow::Context;
+    use std::sync::atomic::Ordering;
+
+    let file = std::fs::File::open(path).with_context(|| format!("cannot open capture {path}"))?;
+    let mut reader = replay::CaptureReader::new(std::io::BufReader::new(file))
+        .context("not a Panopticon capture (PNCAP)")?;
+    let mut events = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => break,
+            // The agent may have stopped mid-record.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("invalid capture record"),
+        }
+    }
+
+    let pii = config
+        .pii
+        .enabled
+        .then(|| pii::PiiEngine::new(&config.pii, &config.pii_external_url_allowlist));
+    let (json, writer) = match &config.json_export_path {
+        Some(p) => {
+            let (h, w) = export::json::JsonExportHandle::spawn(p, 4096)?;
+            (Some(h), Some(w))
+        }
+        None => (None, None),
+    };
+    let graph = config
+        .graph
+        .enabled
+        .then(|| graph::GraphBuilder::new(&config.graph));
+    let event_loop = event_loop::EventLoop::new(config.clone(), pii, json, None, None, graph);
+
+    let n = events.len();
+    let start = std::time::Instant::now();
+    event_loop.replay_through_worker(events).await?;
+    let elapsed = start.elapsed().as_secs_f64();
+    let stats = event_loop.stats().clone();
+    drop(event_loop);
+    if let Some(w) = writer {
+        w.await?;
+    }
+    println!(
+        "events={n} elapsed={elapsed:.3}s rate={:.0}/s per_event={:.2}us pii_detections={} parser_errors={}",
+        n as f64 / elapsed,
+        elapsed * 1e6 / n.max(1) as f64,
+        stats.pii_detections.load(Ordering::Relaxed),
+        stats.drops_parser_error.load(Ordering::Relaxed),
+    );
+    Ok(())
 }
