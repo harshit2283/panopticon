@@ -102,6 +102,7 @@ max_worker_count = 4                # default: number of CPUs
 worker_channel_capacity = 1024
 max_connections_tracked = 65536
 idle_connection_timeout_secs = 30
+max_body_bytes = 4096               # body text kept per exchange for PII scan + export (max 65536)
 tls_scan_enabled = true             # find OpenSSL/Go TLS libraries and attach uprobes
 tls_scan_interval_secs = 60
 log_events = false
@@ -176,8 +177,8 @@ One JSON object per completed exchange. A real record (body shortened):
 | `latency_ns` | Request → response time as observed on this host |
 | `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key |
 | `status` | HTTP status, or database error code |
-| `payload_text` | Response body as text, at most 64 KB, after redaction |
-| `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most 64 KB, after redaction |
+| `payload_text` | Response body as text, at most `max_body_bytes` (default 4 KB), after redaction |
+| `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most `max_body_bytes`, after redaction |
 | `response_size_bytes` | Full body size, even when the body was larger than what was kept |
 | `src_*`, `dst_*` | Addresses of the packet that completed the exchange (usually the response). Addresses are IPv4 as a 32-bit integer (`2130706433` = `127.0.0.1`). |
 | `pii.entities` | What was found; offsets are relative to the field it was found in |

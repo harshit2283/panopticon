@@ -81,6 +81,12 @@ pub struct AgentConfig {
     /// Run smoke test (attach probes, verify events, exit).
     pub smoke_test: bool,
 
+    // ── Message bodies ──────────────────────────────
+    /// Bytes of request/response body text kept per exchange; PII scanning,
+    /// redaction and export all see the same bounded text. Parsers buffer up
+    /// to 64 KiB; larger values are clamped to that.
+    pub max_body_bytes: usize,
+
     // ── Raw capture ─────────────────────────────────
     /// If set, write every processed event, unredacted, to this PNCAP file.
     pub capture_raw_path: Option<String>,
@@ -92,6 +98,13 @@ pub struct AgentConfig {
     /// Directory must exist and bpffs must be mounted (typically /sys/fs/bpf/).
     pub map_pin_path: Option<String>,
 }
+
+/// Default `max_body_bytes`: one capture window. Scanning and exporting up
+/// to 64 KiB per exchange made large-response traffic (e.g. 200 KB
+/// downloads at 1.5 GB/s) overload the PII scanner and the JSON writer.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 4096;
+/// Upper bound for `max_body_bytes` (what parsers buffer).
+pub const MAX_BODY_BYTES_LIMIT: usize = 64 * 1024;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -130,6 +143,7 @@ impl Default for AgentConfig {
             map_pin_path: None,
             capture_raw_path: None,
             capture_raw_max_bytes: 1 << 30,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -261,6 +275,7 @@ pub struct AgentConfigFile {
     pub map_pin_path: Option<String>,
     pub capture_raw_path: Option<String>,
     pub capture_raw_max_bytes: Option<u64>,
+    pub max_body_bytes: Option<usize>,
 }
 
 /// TOML-friendly PII config subset.
@@ -364,6 +379,9 @@ impl AgentConfigFile {
         }
         if let Some(v) = self.capture_raw_max_bytes {
             base.capture_raw_max_bytes = v;
+        }
+        if let Some(v) = self.max_body_bytes {
+            base.max_body_bytes = v.min(MAX_BODY_BYTES_LIMIT);
         }
         if let Some(v) = self.map_pin_path {
             base.map_pin_path = Some(v);

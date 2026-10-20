@@ -54,6 +54,7 @@ struct WorkerTaskContext {
     audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
     graph_builder: Option<Arc<GraphBuilder>>,
     raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
+    max_body_bytes: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -69,6 +70,7 @@ struct MessageContext<'a> {
     event: &'a DataEvent,
     /// Whether this event's sender is the connection's server, when known.
     sender_is_server: Option<bool>,
+    max_body_bytes: usize,
 }
 
 // ── Event Statistics ──────────────────────────────────────────────────────
@@ -249,6 +251,7 @@ impl EventLoop {
             audit_log: self.audit_log.clone(),
             graph_builder: self.graph_builder.clone(),
             raw_capture: None,
+            max_body_bytes: self.config.max_body_bytes,
         };
         let worker = tokio::spawn(worker_task(0, rx, ctx));
         for chunk in events.chunks(WORKER_BATCH) {
@@ -313,6 +316,7 @@ impl EventLoop {
                 audit_log,
                 graph_builder: graph,
                 raw_capture: self.raw_capture.clone(),
+                max_body_bytes: self.config.max_body_bytes,
             };
             let handle = tokio::spawn(worker_task(worker_id, rx, worker_ctx));
             worker_handles.push(handle);
@@ -942,6 +946,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     graph_builder: &ctx.graph_builder,
                                     event,
                                     sender_is_server,
+                                    max_body_bytes: ctx.max_body_bytes,
                                 },
                             );
                         }
@@ -959,6 +964,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     graph_builder: &ctx.graph_builder,
                                     event,
                                     sender_is_server,
+                                    max_body_bytes: ctx.max_body_bytes,
                                 },
                             );
                         }
@@ -1020,6 +1026,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         // audit log, every exporter and the service graph only ever see the
         // sanitized message (path/query, headers and payload).
         let mut msg = msg.clone();
+        cap_body_text(&mut msg, ctx.max_body_bytes);
         let pii_report = ctx
             .pii_engine
             .as_ref()
@@ -1145,6 +1152,19 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                     }
                 }
             }
+        }
+    }
+}
+
+/// Bound the body text a message carries before PII scanning and export.
+fn cap_body_text(msg: &mut crate::protocol::L7Message, max: usize) {
+    for text in [&mut msg.payload_text, &mut msg.request_text]
+        .into_iter()
+        .flatten()
+    {
+        if text.len() > max {
+            let keep = crate::protocol::truncate_utf8(text, max).len();
+            text.truncate(keep);
         }
     }
 }
@@ -1451,6 +1471,17 @@ mod tests {
             unique_workers.len() > 1,
             "all PIDs routed to same worker — broken distribution"
         );
+    }
+
+    #[test]
+    fn cap_body_text_bounds_both_bodies_on_char_boundaries() {
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.payload_text = Some("é".repeat(3000)); // 6000 bytes, 2-byte chars
+        msg.request_text = Some("short".to_string());
+        cap_body_text(&mut msg, 4095);
+        assert_eq!(msg.payload_text.as_deref().map(str::len), Some(4094));
+        assert_eq!(msg.request_text.as_deref(), Some("short"));
     }
 
     #[cfg(target_os = "linux")]

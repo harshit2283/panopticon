@@ -177,6 +177,25 @@ with an email in the body (`run_load.sh 64 20s`):
 | Agent CPU | 78% of one core | 58–60% |
 | Peak RSS | 224 MiB | 97–101 MiB |
 
+Large responses, 200 KB bodies over 200 connections
+(`run_load.sh 200 20s 0 0 200000`, about 1.8 GB/s through the veth):
+
+| | Before | Current |
+|---|---|---|
+| Achieved load | 7.5K req/s | 9.1K req/s |
+| Capture recall | 43.9% | 98.0–98.3% |
+| Drops (kernel / workers / export) | 90K / 34K / 63K | 0–16K / 0.5–16K / 0 |
+| Agent CPU | 116% of one core | 60–64% |
+| Peak RSS | 233 MiB | 114–137 MiB |
+
+Before, every exchange carried up to 64 KB of body text through PII
+scanning, the export queue and the JSON writer. Bodies are now cut to
+`max_body_bytes` (default 4 KB) before any of those stages, so the
+redaction still covers everything that is exported. The remaining drops
+come in bursts, while the load generator saturates the VM's 4 vCPUs.
+Running the ring buffer drain on its own thread (also tried at raised
+priority) did not reduce them measurably here, so that change was not kept.
+
 Connection churn, one request per TCP connection (`run_load.sh 64 30s 0 1`):
 8.4K connections/s with 99.98% recall. Tracked connections stay at 0–36,
 because the parser state of a connection is dropped on its FIN/RST. Before
