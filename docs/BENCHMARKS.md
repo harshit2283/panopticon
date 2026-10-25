@@ -21,8 +21,8 @@ here has not been measured.
 | Kernel | 6.18 (RingBuf, TCX attach) |
 | Agent | release build, default config, regex PII (no ONNX model) |
 | Topology | client in its own network namespace, connected by a veth pair; the agent attaches to the host end, so it sees the **server side** of every connection, which is how a pod's veth looks |
-| Clients | Python 3.13: `http.client`, redis-py 8.1, psycopg 3.3, PyMySQL 1.2, mysql-connector-python 26.10, grpcio 1.84 |
-| Servers | Python HTTP server, `redis:7.4`, `postgres:16`, `mysql:8.4` (Docker, host network), grpcio server |
+| Clients | Python 3.13: `http.client`, redis-py 8.1, psycopg 3.3, PyMySQL 1.2, mysql-connector-python 26.10, grpcio 1.84, confluent-kafka 2.16 (librdkafka), kafka-python 3.0, pika 1.4, dnspython 2.9; Go 1.24 `net/http` |
+| Servers | Python HTTP server, `redis:7.4`, `postgres:16`, `mysql:8.4` (Docker, host network), grpcio server, `apache/kafka:3.8.0` (KRaft), `rabbitmq:3.13` (Docker, published ports), a dnspython authoritative server, Go `net/http` TLS server |
 
 The figures are from a single VM, so expect variance between runs. Kernel
 per-packet cost in particular moves by ±20% between runs.
@@ -142,6 +142,46 @@ even for failed calls.
 
 The latest full runs (seeds 7 and 42) have every protocol at 100%; Redis was
 also checked with seeds 21 and 99.
+
+### Kafka, AMQP (RabbitMQ), DNS
+
+`tests/oracle/run_messaging.sh`: a fresh agent per protocol. Every operation
+puts its token in the record key/value, routing key, message body or query
+name; bodies carry an email. Besides the operations themselves, the truth
+includes every record a consumer received back, so 500 operations give
+about 740 Kafka and 910 AMQP truth entries.
+
+| Protocol | Traffic mix | Recall before → now | Field accuracy now | PII visibility before → now | Leaks |
+|---|---|---|---|---|---|
+| Kafka 3.8 | librdkafka Produce v10 (single records with and without headers, multi-record batches, `MESSAGE_TOO_LARGE` rejections), kafka-python Produce v8, concurrent consumer (Fetch v16, topic IDs), Metadata v1/v4/v9/v12 for missing topics | 0% → **100%** | topic, API, error code 100% | 0% → **100%** | 0 |
+| RabbitMQ 3.13 | Basic.Publish to topic, fanout, direct and default exchanges, publisher confirms, 6 KB bodies, unroutable mandatory publishes (Basic.Return 312), Basic.Get (also on missing queues: 404), Basic.Consume deliveries, Basic.Ack | 43.7% (Get, Return 0%) → **100%** | method, exchange/routing key or queue, reply code 100%; client acks 372/372 | 0% → **100%** | 0 |
+| DNS | A, AAAA, CNAME chains, NXDOMAIN, SERVFAIL, TXT; 10% over TCP | 90.2% (TCP 0%) → **100%** | query name, type, rcode, answers 100% | — | 0 |
+
+Measured with seed 7 (500 operations) and seed 42 (1,000 operations, also
+100% everywhere, 0 duplicates). What was wrong before:
+
+- **Kafka**: the topic was read at a fixed offset, wrong for every version
+  current clients send (Produce v3+ starts with `transactional_id`; v9+,
+  Fetch v12+ and Metadata v9+ use compact encodings and tagged fields;
+  Fetch v13+ names topics by ID), so no exchange had a topic. Records were
+  never decoded, so produced and fetched values (and the PII in them) were
+  invisible. The error code was read at a fixed offset (Produce responses
+  reported values like 29284). Requests and responses were exported
+  separately. A Fetch response larger than the 256 KB buffer closed the
+  connection's parser, and a capture gap reset it.
+- **AMQP**: message bodies were never read, Basic.Get and GetOk were
+  unrelated records with no queue or body, a Basic.Get on a missing queue
+  showed no error, Basic.Return had no reply code, and every method frame
+  (Channel.Open/OpenOk/CloseOk...) was a record of its own. A capture gap in
+  a large message desynchronised the stream.
+- **DNS**: queries and responses were exported as two records, the rcode
+  only on the second; DNS over TCP (length-prefixed) was not parsed; AAAA
+  answers were not in canonical form (`fd00:0:0:0:0:0:0:2a`).
+
+Exchanges are now one record each, exported at the response (Kafka, DNS,
+AMQP synchronous methods), or when the message content is complete (AMQP
+publish, deliver, return). IPv4 answers in DNS records are redacted to
+`<IP_V4>` by the default PII policy.
 
 ## 3. Overhead
 
@@ -300,6 +340,8 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
     parser driven by an attacker-chosen array length. That bug is fixed.
   - Since the fix: 16.8M executions across two runs with 0 crashes. The
     second run was after the HTTP/2 rewrite, with 3,501 coverage edges.
+  - After the Kafka, AMQP and DNS rewrites: 3.3M executions in 240 s, 0
+    crashes.
 - **`detect`** runs protocol detection and direction inference: 91M
   executions and 0 crashes.
 
@@ -324,13 +366,20 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   addresses and are left out of the service graph.
 - **Statically linked TLS** other than Go (BoringSSL in Envoy, rustls, Java)
   is not covered, nor are Go binaries stripped of their symbol table.
+- **Kafka is recognised by port 9092 only** (no magic bytes); brokers on other
+  ports are not parsed. Compressed record batches (gzip, snappy, lz4, zstd)
+  are framed and scored for topic and status, but their records are not
+  decoded, so PII inside them is not visible. Each messaging protocol is
+  scored against one server implementation (Kafka 3.8, RabbitMQ 3.13, a
+  dnspython server).
 
 ## 7. Reproducing
 
 Requirements: root on Linux 5.8+, a release build
-(`cargo build -p panopticon-agent --release`), Docker for the database run,
-Python with `pip install pyroute2 redis 'psycopg[binary]' pymysql mysql-connector-python
-cryptography grpcio`, and Go for the load generator.
+(`cargo build -p panopticon-agent --release`), Docker for the database and
+messaging runs, Python with `pip install pyroute2 redis 'psycopg[binary]'
+pymysql mysql-connector-python cryptography grpcio confluent-kafka kafka-python
+pika dnspython`, and Go for the load generator and the Go TLS oracle.
 
 ```bash
 # HTTP/1.1 accuracy, kernel cost, agent CPU/RSS. Fails below 99% recall.
@@ -343,6 +392,9 @@ sudo env PATH="$PATH" tests/oracle/run_tls.sh 1000 42   # OpenSSL and Go stacks
 
 # Redis, PostgreSQL, MySQL, gRPC. Fails if any protocol is below 99% recall.
 sudo tests/oracle/run_protocols.sh 500 7
+
+# Kafka, RabbitMQ (AMQP 0-9-1), DNS. Fails below 99% recall or on any leak.
+sudo tests/oracle/run_messaging.sh 500 7
 
 # Sustained load: concurrency, duration, rate (0 = max), newconn (1 = one
 # request per connection). Reports recall, drops by cause, CPU and RSS.

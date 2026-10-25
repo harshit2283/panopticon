@@ -57,8 +57,9 @@ production-hardened compliance platform.
     reported as `EXECUTE` without their SQL.
   - HTTP/2 headers cannot be decoded when the agent joins a connection that
     was already open (HPACK state is lost).
-  - Kafka, AMQP and DNS have unit coverage but are not scored against ground
-    truth yet.
+  - Kafka, AMQP and DNS are scored against ground truth
+    (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
+    not decoded, and Kafka is recognised on port 9092 only.
 - PII detection:
   - Regex-first scanning is the stable baseline.
   - ONNX-backed ML inference is optional and throughput-sensitive.

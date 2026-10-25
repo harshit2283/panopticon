@@ -17,9 +17,9 @@ env:
 
 jobs:
   oracle:
-    name: Oracle (HTTP, HTTPS, Redis, PostgreSQL, MySQL, gRPC)
+    name: Oracle (HTTP, HTTPS, databases, gRPC, Kafka, AMQP, DNS)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,8 @@ jobs:
             "linux-headers-$(uname -r)" pkg-config libssl-dev openssl
           cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked --version ${{ env.BPF_LINKER_VERSION }}
           python3 -m venv /tmp/oracle-venv
-          /tmp/oracle-venv/bin/pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio mysql-connector-python
+          /tmp/oracle-venv/bin/pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio mysql-connector-python \
+            confluent-kafka kafka-python pika dnspython
 
       - name: Build agent (release, with eBPF)
         run: cargo build -p panopticon-agent --release
@@ -52,3 +53,6 @@ jobs:
 
       - name: Redis, PostgreSQL, MySQL, gRPC
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_protocols.sh 300 7 0.99
+
+      - name: Kafka, AMQP, DNS
+        run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_messaging.sh 300 7 0.99
