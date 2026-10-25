@@ -94,7 +94,26 @@ look for `Failed to attach TC classifier` in its logs.
 | `tolerations` | `[{operator: Exists}]` | Runs on every node, including tainted ones. |
 | `nodeSelector` / `affinity` | `{}` | Limit to a subset of nodes. |
 | `resources` | see §1 | |
-| `serviceAccount.automountToken` | `false` | The agent does not call the Kubernetes API. |
+| `kubernetes.enabled` | `true` | Kubernetes identity: endpoints named `namespace/workload` (USER-GUIDE §5.6). Mounts the service account token and, with `rbac.create`, grants read-only `get/list/watch` on `pods` and `services` cluster-wide. `false`: no token, no ClusterRole, IP/DNS names only. |
+| `rbac.create` | `true` | Create the ClusterRole/ClusterRoleBinding for `kubernetes.enabled`. Set `false` to manage RBAC yourself. |
+| `serviceAccount.automountToken` | `false` | Mount the token even with `kubernetes.enabled=false`. |
+
+**RBAC.** With the defaults the chart creates one ClusterRole bound to the
+agent's service account:
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+```
+
+Nothing else is read or written. Each agent lists all pods and services
+every `relist_interval_secs` (default 300 s, pages of 500) and keeps one
+watch per resource open; on large clusters raise the interval via
+`agent.config` (`[kubernetes] relist_interval_secs = 900`). If the API is
+unreachable or access is denied, the agent logs a warning once and carries
+on with IP/DNS names.
 
 Example `values-prod.yaml`:
 

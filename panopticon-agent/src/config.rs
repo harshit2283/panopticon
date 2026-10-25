@@ -63,6 +63,11 @@ pub struct AgentConfig {
     /// Service dependency graph configuration.
     pub graph: GraphConfig,
 
+    // ── Kubernetes metadata ───────────────────────
+    /// Pod/Service metadata from the Kubernetes API, used to name graph
+    /// nodes and exported endpoints `namespace/workload`.
+    pub kubernetes: KubernetesConfig,
+
     // ── Export ──────────────────────────────────────
     /// Print events to stdout (dev/debug mode).
     pub log_events: bool,
@@ -130,6 +135,7 @@ impl Default for AgentConfig {
             pii_external_url_allowlist: vec![],
 
             graph: GraphConfig::default(),
+            kubernetes: KubernetesConfig::default(),
 
             log_events: false,
             json_export_path: None,
@@ -238,6 +244,40 @@ impl Default for GraphConfig {
     }
 }
 
+/// Whether to use Kubernetes metadata for endpoint identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubernetesMode {
+    /// On when the in-cluster environment is present
+    /// (`KUBERNETES_SERVICE_HOST`/`PORT` and a mounted service account token).
+    Auto,
+    /// Always try; logs a warning and falls back to DNS/IP names when the
+    /// in-cluster environment or the API server is not available.
+    Enabled,
+    /// Never contact the Kubernetes API.
+    Disabled,
+}
+
+/// Configuration for Kubernetes-aware endpoint identity.
+#[derive(Debug, Clone)]
+pub struct KubernetesConfig {
+    pub mode: KubernetesMode,
+    /// Full re-list period for pods and services. With `watch` on, changes
+    /// arrive in between as they happen; without it this is the refresh rate.
+    pub relist_interval: Duration,
+    /// Stream changes between re-lists (list + watch, like an informer).
+    pub watch: bool,
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self {
+            mode: KubernetesMode::Auto,
+            relist_interval: Duration::from_secs(300),
+            watch: true,
+        }
+    }
+}
+
 /// Returns available CPU count, falling back to 4.
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
@@ -267,6 +307,7 @@ pub struct AgentConfigFile {
     pub pii: Option<PiiConfigFile>,
     pub pii_external_url_allowlist: Option<Vec<String>>,
     pub graph: Option<GraphConfigFile>,
+    pub kubernetes: Option<KubernetesConfigFile>,
     pub log_events: Option<bool>,
     pub json_export_path: Option<String>,
     pub pii_audit_log_path: Option<String>,
@@ -296,6 +337,46 @@ pub struct GraphConfigFile {
     pub aggregation_window_secs: Option<u64>,
     pub stale_edge_timeout_secs: Option<u64>,
     pub identity_cache_ttl_secs: Option<u64>,
+}
+
+/// TOML-friendly Kubernetes config subset.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct KubernetesConfigFile {
+    /// `"auto"`, `true` or `false` (the strings `"true"`/`"false"` work too).
+    pub enabled: Option<KubernetesModeValue>,
+    pub relist_interval_secs: Option<u64>,
+    pub watch: Option<bool>,
+}
+
+/// `enabled = "auto" | true | false` in TOML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KubernetesModeValue(pub KubernetesMode);
+
+impl<'de> Deserialize<'de> for KubernetesModeValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Str(String),
+        }
+        let mode = match Raw::deserialize(d)? {
+            Raw::Bool(true) => KubernetesMode::Enabled,
+            Raw::Bool(false) => KubernetesMode::Disabled,
+            Raw::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "auto" => KubernetesMode::Auto,
+                "true" | "on" => KubernetesMode::Enabled,
+                "false" | "off" => KubernetesMode::Disabled,
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "kubernetes.enabled must be \"auto\", true or false, got \"{other}\""
+                    )));
+                }
+            },
+        };
+        Ok(Self(mode))
+    }
 }
 
 /// TOML-friendly OTLP config subset.
@@ -359,6 +440,9 @@ impl AgentConfigFile {
         if let Some(graph) = self.graph {
             graph.merge_into(&mut base.graph);
         }
+        if let Some(k8s) = self.kubernetes {
+            k8s.merge_into(&mut base.kubernetes);
+        }
         if let Some(v) = self.log_events {
             base.log_events = v;
         }
@@ -402,6 +486,20 @@ impl PiiConfigFile {
         }
         if let Some(v) = self.min_confidence {
             base.min_confidence = v;
+        }
+    }
+}
+
+impl KubernetesConfigFile {
+    fn merge_into(self, base: &mut KubernetesConfig) {
+        if let Some(v) = self.enabled {
+            base.mode = v.0;
+        }
+        if let Some(v) = self.relist_interval_secs {
+            base.relist_interval = Duration::from_secs(v);
+        }
+        if let Some(v) = self.watch {
+            base.watch = v;
         }
     }
 }
@@ -466,6 +564,11 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     }
     if !(0.0..=1.0).contains(&config.sample_rate) {
         return Err(anyhow::anyhow!("sample_rate must be between 0.0 and 1.0"));
+    }
+    if config.kubernetes.relist_interval < Duration::from_secs(5) {
+        return Err(anyhow::anyhow!(
+            "kubernetes.relist_interval_secs must be >= 5"
+        ));
     }
     Ok(())
 }
@@ -555,6 +658,11 @@ mod tests {
             aggregation_window_secs = 30
             stale_edge_timeout_secs = 600
             identity_cache_ttl_secs = 120
+
+            [kubernetes]
+            enabled = false
+            relist_interval_secs = 30
+            watch = false
         "#;
 
         let config = load_config_from_str(toml).unwrap();
@@ -594,6 +702,9 @@ mod tests {
         assert_eq!(config.graph.aggregation_window, Duration::from_secs(30));
         assert_eq!(config.graph.stale_edge_timeout, Duration::from_secs(600));
         assert_eq!(config.graph.identity_cache_ttl, Duration::from_secs(120));
+        assert_eq!(config.kubernetes.mode, KubernetesMode::Disabled);
+        assert_eq!(config.kubernetes.relist_interval, Duration::from_secs(30));
+        assert!(!config.kubernetes.watch);
     }
 
     #[test]
@@ -679,5 +790,45 @@ mod tests {
         "#;
         let err = load_config_from_str(toml).unwrap_err().to_string();
         assert!(err.contains("sample_rate must be between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn test_kubernetes_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.kubernetes.mode, KubernetesMode::Auto);
+        assert_eq!(config.kubernetes.relist_interval, Duration::from_secs(300));
+        assert!(config.kubernetes.watch);
+    }
+
+    #[test]
+    fn test_kubernetes_enabled_values() {
+        for (value, mode) in [
+            ("\"auto\"", KubernetesMode::Auto),
+            ("\"AUTO\"", KubernetesMode::Auto),
+            ("true", KubernetesMode::Enabled),
+            ("\"true\"", KubernetesMode::Enabled),
+            ("false", KubernetesMode::Disabled),
+            ("\"false\"", KubernetesMode::Disabled),
+        ] {
+            let toml = format!("[kubernetes]\nenabled = {value}\n");
+            let config = load_config_from_str(&toml).unwrap();
+            assert_eq!(config.kubernetes.mode, mode, "enabled = {value}");
+        }
+    }
+
+    #[test]
+    fn test_kubernetes_invalid_enabled_rejected() {
+        let err = load_config_from_str("[kubernetes]\nenabled = \"sometimes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kubernetes.enabled"), "{err}");
+    }
+
+    #[test]
+    fn test_kubernetes_relist_interval_too_small_rejected() {
+        let err = load_config_from_str("[kubernetes]\nrelist_interval_secs = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relist_interval_secs"), "{err}");
     }
 }

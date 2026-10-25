@@ -62,14 +62,16 @@ production-hardened compliance platform.
   - ONNX-backed ML inference is optional and throughput-sensitive.
 - Service graphing:
   - DNS/IP-based identity works.
-  - Kubernetes-aware identity does not.
+  - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,
+    `node:name`) is implemented and tested against a fake API server only;
+    not yet validated on a real cluster.
 - CI coverage:
   - Multi-kernel coverage is a smoke layer, not complete feature validation.
 
 ## Not Done
 
 - IPv6 capture
-- Kubernetes pod or service identity resolution
+- Kubernetes identity validated on a real cluster (and for IPv6 pods)
 - Go TLS read-path capture
 - Broad TLS library support beyond the current OpenSSL and partial Go paths
 - Full runtime hot-reload for all tunable settings

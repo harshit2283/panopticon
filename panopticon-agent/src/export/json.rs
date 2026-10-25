@@ -10,6 +10,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+use std::sync::Arc;
+
+use crate::k8s::K8sMetadata;
 use crate::pii::PiiReport;
 use crate::protocol::{Direction, L7Message, Protocol};
 use panopticon_common::{DataEvent, TlsLibrary};
@@ -46,6 +49,12 @@ struct JsonEvent<'a> {
     src_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dst_port: Option<u16>,
+    /// Kubernetes identity of `src_addr` / `dst_addr` (`namespace/workload`,
+    /// `svc:namespace/service`, `node:name`), when Kubernetes identity is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src_workload: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dst_workload: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +181,7 @@ impl From<TlsLibrary> for TlsLibraryStr {
 /// JSONL file writer. One JSON object per line.
 pub struct JsonExporter {
     writer: BufWriter<File>,
+    k8s: Option<Arc<K8sMetadata>>,
 }
 
 impl JsonExporter {
@@ -186,7 +196,15 @@ impl JsonExporter {
             .with_context(|| format!("Failed to open JSON export file: {}", path))?;
         Ok(Self {
             writer: BufWriter::new(file),
+            k8s: None,
         })
+    }
+
+    /// Add `src_workload` / `dst_workload` from Kubernetes metadata. The
+    /// lookups run here, on the writer thread, not on the workers.
+    pub fn with_k8s(mut self, k8s: Option<Arc<K8sMetadata>>) -> Self {
+        self.k8s = k8s;
+        self
     }
 
     /// Write an L7Message with optional PII report as a single JSON line.
@@ -196,6 +214,10 @@ impl JsonExporter {
         pii: Option<&PiiReport>,
         context: Option<&TransportContext>,
     ) -> Result<()> {
+        let workload =
+            |addr: Option<u32>| self.k8s.as_ref().zip(addr).and_then(|(k, a)| k.display(a));
+        let src_workload = workload(context.and_then(|ctx| ctx.src_addr));
+        let dst_workload = workload(context.and_then(|ctx| ctx.dst_addr));
         let event = JsonEvent {
             protocol: msg.protocol.into(),
             direction: msg.direction.into(),
@@ -218,6 +240,8 @@ impl JsonExporter {
             dst_addr: context.and_then(|ctx| ctx.dst_addr),
             src_port: context.and_then(|ctx| ctx.src_port),
             dst_port: context.and_then(|ctx| ctx.dst_port),
+            src_workload: src_workload.as_deref(),
+            dst_workload: dst_workload.as_deref(),
             pid: context.and_then(|ctx| ctx.pid),
             client_pid: context.and_then(|ctx| ctx.client_pid),
             server_pid: context.and_then(|ctx| ctx.server_pid),
@@ -271,7 +295,16 @@ impl JsonExportHandle {
     /// workers sharing it. It polls every EXPORT_POLL_INTERVAL instead of
     /// blocking on the channel, so workers' sends never have to wake it.
     pub fn spawn(path: &str, buffer_size: usize) -> Result<(Self, tokio::task::JoinHandle<()>)> {
-        let mut exporter = JsonExporter::new(path)?;
+        Self::spawn_with_k8s(path, buffer_size, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), adding Kubernetes workload names.
+    pub fn spawn_with_k8s(
+        path: &str,
+        buffer_size: usize,
+        k8s: Option<Arc<K8sMetadata>>,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
+        let mut exporter = JsonExporter::new(path)?.with_k8s(k8s);
         let (tx, mut rx) = mpsc::channel::<ExportEvent>(buffer_size);
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -373,6 +406,8 @@ mod tests {
             dst_addr: Some(0x0A000002),
             src_port: Some(54321),
             dst_port: Some(8080),
+            src_workload: None,
+            dst_workload: None,
             pid: Some(1234),
             client_pid: None,
             server_pid: None,
@@ -410,6 +445,8 @@ mod tests {
             dst_addr: None,
             src_port: None,
             dst_port: None,
+            src_workload: None,
+            dst_workload: None,
             pid: None,
             client_pid: None,
             server_pid: None,
@@ -510,6 +547,8 @@ mod tests {
             dst_addr: None,
             src_port: None,
             dst_port: None,
+            src_workload: None,
+            dst_workload: None,
             pid: None,
             client_pid: None,
             server_pid: None,
@@ -552,6 +591,8 @@ mod tests {
             dst_addr: None,
             src_port: None,
             dst_port: None,
+            src_workload: None,
+            dst_workload: None,
             pid: None,
             client_pid: None,
             server_pid: None,
@@ -591,5 +632,39 @@ mod tests {
         assert!(ctx.dst_port.is_none());
         assert!(ctx.pid.is_none());
         assert!(ctx.tls_library.is_none());
+    }
+
+    #[test]
+    fn test_json_exporter_adds_k8s_workloads() {
+        let meta = K8sMetadata::new("http://test");
+        let pods: Vec<crate::k8s::model::Pod> = vec![
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "web-0", "namespace": "shop",
+                    "ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": true}]},
+                "status": {"phase": "Running", "podIP": "10.0.0.1"}
+            }))
+            .unwrap(),
+        ];
+        meta.replace_pods(&pods);
+        meta.publish_if_dirty();
+
+        let path = std::env::temp_dir().join(format!(
+            "panopticon_test_export_k8s_{}.jsonl",
+            std::process::id()
+        ));
+        let path_str = path.to_str().unwrap();
+        {
+            let mut exporter = JsonExporter::new(path_str).unwrap().with_k8s(Some(meta));
+            exporter
+                .emit(&make_test_msg(), None, Some(&make_transport_context()))
+                .unwrap();
+            exporter.flush().unwrap();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(v["src_workload"], "shop/web");
+        // 10.0.0.2 is unknown to Kubernetes: no field.
+        assert!(v.get("dst_workload").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }

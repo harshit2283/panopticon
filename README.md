@@ -19,7 +19,8 @@ hardening work.
   `crypto/tls` writes.
 - Parses HTTP/1.1, HTTP/2, gRPC, MySQL, PostgreSQL, Redis, Kafka, DNS, and AMQP.
 - Runs regex-first PII detection with optional ONNX-backed ML inference.
-- Builds a DNS/IP-based service graph.
+- Builds a service graph named by Kubernetes workload (`namespace/workload`)
+  in a cluster, else by DNS name or IP.
 - Exports JSONL, Prometheus metrics, OTLP spans, and a PII audit log.
 
 ## Documentation
@@ -64,13 +65,14 @@ current release report.
 | Go TLS plaintext capture | Partial | Write-path capture only. |
 | Regex-first PII detection | Supported | Baseline detection path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
+| Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
 | Kubernetes deployment hardening | Out of scope | Helm chart exists, but production hardening is not part of this MVP. |
 
 ## Explicitly Not Done Yet
 
 - IPv6 capture is not implemented.
-- Kubernetes pod/service identity resolution is not implemented; graph identity
-  is DNS/IP-based today.
+- Kubernetes pod/service identity has not been validated on a real cluster
+  (only against a fake API server).
 - Go TLS read-path capture is not implemented.
 - On kernels older than 6.3, TLS socket addresses come from an fentry/kprobe
   fallback that has not been validated yet.

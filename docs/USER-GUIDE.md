@@ -86,6 +86,7 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 | `--metrics-bind <ADDR:PORT>` | Serve `/healthz`, `/readyz`, `/metrics`, `/debug/state`. Off by default. |
 | `--log-events` | Log every packet and exchange to stdout. Contains (redacted) traffic. |
 | `--smoke-test` | Exit 0 on the first captured event, 1 after 30s. |
+| `--kubernetes <auto\|true\|false>` | Kubernetes identity (§5.6); overrides `[kubernetes] enabled`. Also `PANOPTICON_KUBERNETES`. |
 | `--capture-raw <FILE>` | Write every captured payload, unredacted, to a binary capture file (§5.5). |
 | `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root. |
 | `-v, --verbose` | Debug logging (otherwise `RUST_LOG`, default `info`). |
@@ -129,6 +130,11 @@ identity_cache_ttl_secs = 300
 enabled = false
 endpoint = "http://127.0.0.1:4317"
 service_name = "panopticon-agent"
+
+[kubernetes]           # pod/service names for endpoints (§5.6)
+enabled = "auto"       # "auto" = on when running in a pod with a service account token; true; false
+relist_interval_secs = 300  # full re-list of pods and services (min 5)
+watch = true           # stream changes between re-lists; false = refresh only by re-listing
 ```
 
 Accepted but **not yet acted on** (so you are not surprised):
@@ -183,6 +189,7 @@ One JSON object per completed exchange. A real record (body shortened):
 | `src_*`, `dst_*` | Addresses of the packet that completed the exchange (usually the response). Addresses are IPv4 as a 32-bit integer (`2130706433` = `127.0.0.1`). |
 | `pid` | TLS exchanges: the process whose TLS calls were captured |
 | `client_pid`, `server_pid` | Packet-captured TCP exchanges: the local process that opened / accepted the connection, when it runs on this node. `server_pid` needs kprobes; on kernels built without them only `client_pid` is filled |
+| `src_workload`, `dst_workload` | Kubernetes identity of `src_addr` / `dst_addr` (§5.6), e.g. `payments/checkout`. Present only with Kubernetes identity on and the address known to the API. |
 | `pii.entities` | What was found; offsets are relative to the field it was found in |
 | `pii.redacted` | `true` if values were replaced before export |
 
@@ -288,6 +295,52 @@ Each decoded line is one captured packet or TLS buffer:
 Treat raw capture files like a database dump of production data: restrict
 access, encrypt at rest, and delete them when done.
 
+### 5.6 Kubernetes identity
+
+In a cluster, the agent lists and watches Pods and Services (cluster-wide,
+read-only) and names endpoints after what owns the IP, in the service graph
+and in the event log's `src_workload` / `dst_workload`:
+
+| IP belongs to | Name | Example |
+|---|---|---|
+| A pod | `namespace/workload` | `payments/checkout` |
+| A Service ClusterIP | `svc:namespace/service` | `svc:payments/checkout` |
+| A node (host-network pods, node processes) | `node:name` | `node:worker-1` |
+| Anything else | DNS name seen in traffic, else `ip:port` (servers) / `ip` (clients) | `10.0.0.9:5432` |
+
+The workload is the pod's controller: a ReplicaSet named
+`<deployment>-<pod-template-hash>` counts as its Deployment; StatefulSets,
+DaemonSets and Jobs as themselves; a Job named `<name>-<8+ digits>` as the
+CronJob `<name>` (a naming heuristic); static pods as their name without the
+`-<node>` suffix; a pod without a controller as the pod. Ports are not part
+of Kubernetes names — a workload is one graph node however many ports it
+serves.
+
+Details worth knowing:
+
+- Host-network pods share the node's IP, so their traffic shows as
+  `node:<name>`, never as one of the pods.
+- When a pod IP is reused, the new pod's name applies as soon as the API
+  reports it (seconds with `watch = true`; up to `relist_interval_secs`
+  without). Kubernetes names are not held by `identity_cache_ttl_secs`.
+- Only IPv4 addresses are mapped (like capture itself).
+- If the API is unreachable or access is denied, the agent logs one warning
+  (with an RBAC hint for 401/403), keeps retrying in the background, and
+  endpoints keep DNS/IP names; startup is never delayed. Names already
+  learned are dropped after twice the re-list interval (at least 60 s)
+  without an answer, since pod IPs get reused.
+- Each agent lists every pod and service in the cluster (pages of 500) once
+  per `relist_interval_secs`, and holds one watch per resource. Memory is on
+  the order of 1 KB per pod (estimated, not measured); at most 200,000 pods
+  and 100,000 services are indexed.
+- Needs `get`/`list`/`watch` on `pods` and `services` and a mounted service
+  account token; the Helm chart sets both up (`kubernetes.enabled`, see
+  [`DEPLOYMENT.md`](DEPLOYMENT.md)).
+
+Validated only against a fake API server in the unit tests (realistic
+PodList/ServiceList/watch responses, pagination, 403, outages); not yet on a
+real cluster.
+
 ## 6. Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -300,9 +353,10 @@ access, encrypt at rest, and delete them when done.
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (writes only). Statically linked or other TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
 | Each exchange appears twice on `-i lo` | Loopback shows every packet on both directions; capture a real interface instead. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
+| `Kubernetes API unavailable` warning, no `src_workload` | `hint` in the log line names the cause: 403 = the ClusterRole lacks `get/list/watch` on pods/services (`rbac.create=true`), 401 = token not mounted or rejected. Endpoints keep IP names meanwhile (§5.6). |
 
 ## 7. Limits worth knowing
 
-IPv4 only; no Kubernetes pod names yet (events carry IPs); HTTPS only via
+IPv4 only; Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
 OpenSSL/Go; PII detection is regex-based by default; see
 [`CURRENT-STATE.md`](CURRENT-STATE.md) for the full list.

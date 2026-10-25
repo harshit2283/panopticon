@@ -2,9 +2,16 @@
 
 //! IP-based service identity resolution.
 //!
-//! Maps raw IP addresses to human-readable service names using the DNS cache
-//! as the primary source. Falls back to IP:port strings for unknown addresses.
-//! K8s-based resolution (Pod IP -> Service name) is deferred to Phase 7.
+//! Resolution chain:
+//! 1. Kubernetes metadata, when enabled: `namespace/workload` for pod IPs,
+//!    `svc:namespace/service` for ClusterIPs, `node:name` for node IPs
+//!    (see [`crate::k8s`]). Never memoized here: the index is swapped
+//!    whenever pods change, so a reused pod IP gets its new owner's name as
+//!    soon as the API reports it, regardless of `identity_cache_ttl`.
+//! 2. Names observed in DNS answers.
+//! 3. The address itself: `ip:port` for servers, `ip` for clients.
+//!
+//! Results of steps 2–3 are memoized for `identity_cache_ttl`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +19,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 use super::dns_cache::DnsCache;
+use crate::k8s::{EndpointKind, K8sMetadata};
 use crate::util::format_ipv4;
 
 /// Resolved identity for a network endpoint.
@@ -26,6 +34,12 @@ pub struct ServiceIdentity {
 pub enum ServiceKind {
     /// Resolved via DNS cache to a known service name.
     Service,
+    /// A Kubernetes pod, named after its workload.
+    Workload,
+    /// A Kubernetes Service ClusterIP.
+    KubeService,
+    /// A Kubernetes node IP (host-network pods, node processes).
+    Node,
     /// Raw IP fallback — no DNS entry found.
     External,
 }
@@ -42,6 +56,7 @@ struct CachedIdentity {
 /// Results are memoized in a DashMap with configurable TTL.
 pub struct IdentityResolver {
     dns_cache: Arc<DnsCache>,
+    k8s: Option<Arc<K8sMetadata>>,
     cache: DashMap<(u32, u16), CachedIdentity>,
     cache_ttl: Duration,
 }
@@ -50,13 +65,34 @@ impl IdentityResolver {
     pub fn new(dns_cache: Arc<DnsCache>, cache_ttl: Duration) -> Self {
         Self {
             dns_cache,
+            k8s: None,
             cache: DashMap::new(),
             cache_ttl,
         }
     }
 
+    /// Consult Kubernetes metadata before DNS / IP fallback.
+    pub fn with_k8s(mut self, k8s: Option<Arc<K8sMetadata>>) -> Self {
+        self.k8s = k8s;
+        self
+    }
+
     /// Resolve an IP:port to a service identity.
     pub fn resolve(&self, ip: u32, port: u16) -> ServiceIdentity {
+        // Kubernetes first, unmemoized (a lock-free probe of the current
+        // index): the index is the source of truth for pod IPs and follows
+        // pod churn.
+        if let Some(ep) = self.k8s.as_ref().and_then(|k| k.lookup(ip)) {
+            return ServiceIdentity {
+                name: ep.display.to_string(),
+                kind: match ep.kind {
+                    EndpointKind::Pod => ServiceKind::Workload,
+                    EndpointKind::Service => ServiceKind::KubeService,
+                    EndpointKind::Node => ServiceKind::Node,
+                },
+            };
+        }
+
         let key = (ip, port);
 
         // Check memoized cache first
@@ -199,5 +235,69 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(resolver.evict_expired(), 1);
         assert_eq!(resolver.cache_len(), 0);
+    }
+
+    fn pods(pods: &[(&str, &str, &str)]) -> Vec<crate::k8s::model::Pod> {
+        pods.iter()
+            .map(|(ns, deploy, ip)| {
+                serde_json::from_value(serde_json::json!({
+                    "metadata": {"name": format!("{deploy}-6d5c4b3a2-abcde"), "namespace": ns,
+                        "labels": {"pod-template-hash": "6d5c4b3a2"},
+                        "ownerReferences": [{"kind": "ReplicaSet",
+                            "name": format!("{deploy}-6d5c4b3a2"), "controller": true}]},
+                    "spec": {"nodeName": "worker-1"},
+                    "status": {"phase": "Running", "podIP": ip, "hostIP": "192.168.0.1"}
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn k8s_with_pods(list: &[(&str, &str, &str)]) -> Arc<K8sMetadata> {
+        let meta = K8sMetadata::new("http://test");
+        meta.replace_pods(&pods(list));
+        meta.publish_if_dirty();
+        meta
+    }
+
+    #[test]
+    fn test_k8s_identity_before_dns_and_ip() {
+        let dns = Arc::new(DnsCache::new());
+        dns.insert_observed("checkout.example", 0x0AF40105, Duration::from_secs(60));
+        let k8s = k8s_with_pods(&[("payments", "checkout", "10.244.1.5")]);
+        let resolver =
+            IdentityResolver::new(Arc::clone(&dns), Duration::from_secs(300)).with_k8s(Some(k8s));
+
+        let id = resolver.resolve(0x0AF40105, 8080);
+        assert_eq!(id.name, "payments/checkout");
+        assert_eq!(id.kind, ServiceKind::Workload);
+        // Client side (port 0) gets the same workload name.
+        assert_eq!(resolver.resolve(0x0AF40105, 0).name, "payments/checkout");
+        // Node IP.
+        let node = resolver.resolve(0xC0A80001, 0);
+        assert_eq!(node.name, "node:worker-1");
+        assert_eq!(node.kind, ServiceKind::Node);
+        // Unknown to Kubernetes: unchanged fallback.
+        assert_eq!(resolver.resolve(0x08080808, 53).name, "8.8.8.8:53");
+    }
+
+    #[test]
+    fn test_k8s_ip_reuse_not_held_by_identity_cache() {
+        let dns = Arc::new(DnsCache::new());
+        let k8s = k8s_with_pods(&[("payments", "checkout", "10.244.1.5")]);
+        // Cache TTL of an hour: Kubernetes names must not be held by it.
+        let resolver = IdentityResolver::new(Arc::clone(&dns), Duration::from_secs(3600))
+            .with_k8s(Some(Arc::clone(&k8s)));
+        assert_eq!(resolver.resolve(0x0AF40105, 80).name, "payments/checkout");
+
+        // The pod is replaced; its IP goes to a workload in another namespace.
+        k8s.replace_pods(&pods(&[("search", "indexer", "10.244.1.5")]));
+        k8s.publish_if_dirty();
+        assert_eq!(resolver.resolve(0x0AF40105, 80).name, "search/indexer");
+
+        // Gone from Kubernetes: back to the address.
+        k8s.replace_pods(&[]);
+        k8s.publish_if_dirty();
+        assert_eq!(resolver.resolve(0x0AF40105, 80).name, "10.244.1.5:80");
     }
 }
