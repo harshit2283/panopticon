@@ -1,5 +1,7 @@
-{{- if .Values.rbac.create -}}
+{{- if and .Values.rbac.create .Values.kubernetes.enabled -}}
 ---
+# Read-only access for Kubernetes identity: pod IPs -> namespace/workload,
+# ClusterIPs -> namespace/service.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -8,15 +10,6 @@ metadata:
     {{- include "panopticon.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["get", "list"]
 {{- end }}

@@ -32,9 +32,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "panopticon.serviceAccountName" . }}
-      # The agent does not call the Kubernetes API; don't hand a privileged
-      # pod an API token it never uses.
-      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken | default false }}
+      # The token is only needed for Kubernetes identity (pod/service
+      # metadata); don't hand a privileged pod an API token it never uses.
+      automountServiceAccountToken: {{ or .Values.kubernetes.enabled .Values.serviceAccount.automountToken }}
       # hostNetwork: TC classifiers attach to the node's interfaces.
       # hostPID: /proc/<pid>/root is used to find TLS libraries in other containers.
       hostNetwork: true
@@ -91,6 +91,10 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.agent.logLevel | quote }}
+            {{- if not .Values.kubernetes.enabled }}
+            - name: PANOPTICON_KUBERNETES
+              value: "false"
+            {{- end }}
             - name: POD_IP
               valueFrom:
                 fieldRef:

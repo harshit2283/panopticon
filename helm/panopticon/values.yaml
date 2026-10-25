@@ -87,11 +87,22 @@ updateStrategy:
   rollingUpdate:
     maxUnavailable: 1
 
+# Kubernetes-aware identity: the agent lists and watches Pods and Services
+# cluster-wide so the service graph and exports name endpoints
+# `namespace/workload` (e.g. `payments/checkout`) instead of IPs. Enabling it
+# grants get/list/watch on pods and services (ClusterRole, when rbac.create)
+# and mounts the service account token. Disabled: no API access, no token,
+# endpoints keep DNS/IP names. Tune it with a [kubernetes] section in
+# agent.config (relist_interval_secs, watch).
+kubernetes:
+  enabled: true
+
 serviceAccount:
   create: true
   name: ""
   annotations: {}
-  # The agent does not use the Kubernetes API today.
+  # Mount the service account token even when kubernetes.enabled is false
+  # (the token is always mounted when it is true).
   automountToken: false
 
 rbac:
