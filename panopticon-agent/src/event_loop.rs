@@ -1124,6 +1124,26 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             && let Some(audit_arc) = ctx.audit_log.as_ref()
         {
             use crate::export::audit::{AuditAction, AuditEntry};
+            // The service the PII travelled to or from: the server end.
+            let service = if ctx.event.src_addr == 0 && ctx.event.dst_addr == 0 {
+                "unknown".to_string()
+            } else {
+                let conn = ConnectionTuple {
+                    src_addr: ctx.event.src_addr,
+                    dst_addr: ctx.event.dst_addr,
+                    src_port: ctx.event.src_port,
+                    dst_port: ctx.event.dst_port,
+                    pid: ctx.event.pid,
+                };
+                match ctx.graph_builder.as_ref() {
+                    Some(gb) => gb.server_identity(&conn, ctx.sender_is_server, msg.protocol),
+                    None => {
+                        let (_, (addr, port)) =
+                            crate::graph::orient(&conn, ctx.sender_is_server, msg.protocol);
+                        format!("{}:{}", format_ipv4(addr), port)
+                    }
+                }
+            };
             let entries: Vec<AuditEntry> = report
                 .entities
                 .iter()
@@ -1137,7 +1157,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                     } else {
                         AuditAction::Detected
                     },
-                    service_identity: "unknown".to_string(),
+                    service_identity: service.clone(),
                 })
                 .collect();
 

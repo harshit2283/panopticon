@@ -78,13 +78,7 @@ impl GraphBuilder {
         msg: &L7Message,
         pii_report: Option<&PiiReport>,
     ) {
-        let src_is_server = src_is_server
-            .unwrap_or_else(|| src_is_server_heuristic(conn.src_port, conn.dst_port, msg.protocol));
-        let (client_addr, server) = if src_is_server {
-            (conn.dst_addr, (conn.src_addr, conn.src_port))
-        } else {
-            (conn.src_addr, (conn.dst_addr, conn.dst_port))
-        };
+        let (client_addr, server) = orient(conn, src_is_server, msg.protocol);
         let src_id = self.identity.resolve(client_addr, 0);
         let dst_id = self.identity.resolve(server.0, server.1);
 
@@ -101,6 +95,18 @@ impl GraphBuilder {
             pii_report.is_some(),
             msg.timestamp_ns,
         );
+    }
+
+    /// Name of the server end of a connection, as the graph names it
+    /// (Kubernetes workload, DNS name, else `ip:port`).
+    pub fn server_identity(
+        &self,
+        conn: &ConnectionTuple,
+        src_is_server: Option<bool>,
+        protocol: Protocol,
+    ) -> String {
+        let (_, (addr, port)) = orient(conn, src_is_server, protocol);
+        self.identity.resolve(addr, port).name
     }
 
     /// Flush the current aggregation window, update the DAG, and return flows.
@@ -132,6 +138,22 @@ impl GraphBuilder {
 
     pub fn dag(&self) -> &Arc<Mutex<ServiceDag>> {
         &self.dag
+    }
+}
+
+/// Split a connection into (client address, server endpoint), using
+/// `src_is_server` when known and the port heuristic otherwise.
+pub fn orient(
+    conn: &ConnectionTuple,
+    src_is_server: Option<bool>,
+    protocol: Protocol,
+) -> (u32, (u32, u16)) {
+    let src_is_server = src_is_server
+        .unwrap_or_else(|| src_is_server_heuristic(conn.src_port, conn.dst_port, protocol));
+    if src_is_server {
+        (conn.dst_addr, (conn.src_addr, conn.src_port))
+    } else {
+        (conn.src_addr, (conn.dst_addr, conn.dst_port))
     }
 }
 
@@ -275,6 +297,27 @@ mod tests {
         assert_eq!(
             edges(&gb),
             vec![("10.99.0.2".to_string(), "10.99.0.1:18090".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_server_identity_names_the_server_end() {
+        let gb = make_builder();
+        let resp = ConnectionTuple {
+            src_addr: 0x0A630001, // 10.99.0.1 (server)
+            dst_addr: 0x0A630002,
+            src_port: 18090,
+            dst_port: 51000,
+            pid: 1,
+        };
+        assert_eq!(
+            gb.server_identity(&resp, Some(true), Protocol::Http1),
+            "10.99.0.1:18090"
+        );
+        // Unknown orientation: the port heuristic picks the lower port.
+        assert_eq!(
+            gb.server_identity(&resp, None, Protocol::Http1),
+            "10.99.0.1:18090"
         );
     }
 

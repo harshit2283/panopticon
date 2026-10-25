@@ -198,8 +198,12 @@ One JSON object per completed exchange. A real record (body shortened):
 One line per finding, with no values:
 
 ```json
-{"timestamp_ns":1805288389778,"category":"Email","source":"Regex","confidence":1.0,"action":"Redacted","service_identity":"unknown"}
+{"timestamp_ns":1805288389778,"category":"Email","source":"Regex","confidence":1.0,"action":"Redacted","service_identity":"payments/checkout"}
 ```
+
+`service_identity` is the server end of the exchange, named like the service
+graph names it: Kubernetes workload when known, else DNS name, else `ip:port`
+(`unknown` only for TLS exchanges whose socket addresses were not learned).
 
 `action` is `Redacted` when `pii.redact = true`, else `Detected`.
 Categories: `Email`, `PhoneUs`, `PhoneIntl`, `Ssn`, `CreditCard` (Luhn
