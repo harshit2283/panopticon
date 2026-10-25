@@ -39,7 +39,7 @@ jobs:
             "linux-headers-$(uname -r)" pkg-config libssl-dev openssl
           cargo +${{ env.BPF_TOOLCHAIN }} install bpf-linker --locked --version ${{ env.BPF_LINKER_VERSION }}
           python3 -m venv /tmp/oracle-venv
-          /tmp/oracle-venv/bin/pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio
+          /tmp/oracle-venv/bin/pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio mysql-connector-python
 
       - name: Build agent (release, with eBPF)
         run: cargo build -p panopticon-agent --release
