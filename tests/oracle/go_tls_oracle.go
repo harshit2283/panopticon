@@ -4,7 +4,8 @@
 //	go run tests/oracle/go_tls_oracle.go server ADDR
 //	go run tests/oracle/go_tls_oracle.go client ADDR N OUT [SEED]
 //
-// HTTP/1.1 over TLS (HTTP/2 disabled on both sides), keep-alive connections
+// HTTP/1.1 over TLS (HTTP/2 disabled on both sides; H2=1 in the environment
+// negotiates HTTP/2 via ALPN instead, as Go does by default), keep-alive connections
 // of up to 6 requests: GETs with 0 B to 70 KB bodies and POSTs whose JSON body
 // carries an email and an SSN. The server uses an in-memory self-signed
 // certificate; the client does not verify it. Build with symbols (the
@@ -91,8 +92,10 @@ func server(addr string) {
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{selfSigned()},
 		},
+	}
+	if os.Getenv("H2") != "1" {
 		// Non-nil, empty: no HTTP/2.
-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
@@ -119,8 +122,12 @@ func client(args []string) {
 	newClient := func() (*http.Client, *http.Transport) {
 		tr := &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 			MaxIdleConnsPerHost: 1,
+		}
+		if os.Getenv("H2") == "1" {
+			tr.ForceAttemptHTTP2 = true
+		} else {
+			tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 		}
 		return &http.Client{Transport: tr, Timeout: 10 * time.Second}, tr
 	}

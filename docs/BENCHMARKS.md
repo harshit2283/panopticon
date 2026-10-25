@@ -69,7 +69,20 @@ keyed by goroutine, because uretprobes break when Go moves goroutine stacks.
 | Run | Exchanges | Recall (client / server view) | Status / method / size | With socket addresses | Leaks |
 |---|---|---|---|---|---|
 | Before (writes only, PID-scoped probes) | 300 | 0% / 0% | — | — | — |
-| Current, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 99.4% | 0 |
+| Current, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 99.6% | 0 |
+| HTTP/2 (`go-h2` stack), before | 300 | 55–65% / 55–65% | — | — | 0 |
+| HTTP/2 (`go-h2` stack), current, seeds 7, 14, 42 | 300–500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
+
+HTTP/2 over TLS had two problems of its own:
+
+- **Connection keys were reused.** Go and OpenSSL reuse the memory of a closed
+  connection object, so a new connection can get the same `*tls.Conn` /
+  `SSL*` key. Its preface then landed in the old connection's parser, along
+  with its stale HPACK state. A client preface now restarts the parser.
+- **Large reads and writes were cut.** One TLS read or write often holds a
+  whole 16 KB record, which is several frames, while each event carries at
+  most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
+  so parsers see the stream contiguously.
 
 Before this fix, the client process was not hooked at all. The probes were
 PID-scoped, and a second process running an already-hooked binary was
@@ -300,9 +313,10 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   opened): HPACK state is lost, so most headers, including the path, cannot be
   decoded until a new connection is opened.
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
-  connection's parser. Gaps inside a single DATA frame are handled.
-- **Per-packet capture is truncated at 4 KB.** Larger messages are reassembled
-  where the protocol allows it. `panopticon_capture_truncated` counts what was
+  connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
+  gap only occurs past 16 KB per read/write call.
+- **Per-packet capture is truncated at 4 KB** (16 KB per TLS read/write, in
+  four events). Larger messages are reassembled where the protocol allows it. `panopticon_capture_truncated` counts what was
   cut.
 - **TLS addresses are learned on the connection's first socket I/O inside a
   hooked call.** Until then, and on kernels where neither the sock tracepoints

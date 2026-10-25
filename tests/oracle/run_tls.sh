@@ -4,13 +4,14 @@
 #   openssl  http_oracle.py over TLS with the system python3, whose ssl
 #            module uses the shared libssl (SSL_read_ex / SSL_write_ex)
 #   go       go_tls_oracle.go: Go net/http + crypto/tls, client and server
-#            (Conn.Write entry probe, Conn.Read entry + RET probes)
+#            (Conn.Write entry probe, Conn.Read entry + RET probes), HTTP/1.1
+#   go-h2    the same over HTTP/2 (ALPN h2, Go's default)
 # Each runs on loopback. The uprobes see both ends, so every exchange is
 # exported twice: once from the client process and once from the server.
 # Each view is scored separately and must reach MIN_RECALL, as must the
 # share of its exchanges that carry the socket's addresses.
 #
-# Usage: sudo tests/oracle/run_tls.sh [requests=500] [seed=1234] [min_recall=0.99] [stacks="openssl go"]
+# Usage: sudo tests/oracle/run_tls.sh [requests=500] [seed=1234] [min_recall=0.99] [stacks="openssl go go-h2"]
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
 # a python3 linked against a shared libssl, go for the go stack (sudo resets
 # PATH: use `sudo env PATH="$PATH" ...` or set GO=/path/to/go).
@@ -18,7 +19,7 @@ set -euo pipefail
 N=${1:-500}
 SEED=${2:-1234}
 MIN_RECALL=${3:-0.99}
-STACKS=${4:-openssl go}
+STACKS=${4:-openssl go go-h2}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 AGENT=${AGENT:-$ROOT/target/release/panopticon-agent}
@@ -45,12 +46,13 @@ for stack in $STACKS; do
       client=(env TLS=1 HOST=127.0.0.1 SEED="$SEED" MODE=client
               python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$D/truth.jsonl")
       ;;
-    go)
+    go | go-h2)
       PORT=18444
+      h2=0; [[ $stack == go-h2 ]] && h2=1
       GO=${GO:-$(command -v go || echo /usr/local/go/bin/go)}
-      "$GO" build -o "$OUT/go_tls_oracle" "$HERE/go_tls_oracle.go"
-      server=("$OUT/go_tls_oracle" server "127.0.0.1:$PORT")
-      client=("$OUT/go_tls_oracle" client "127.0.0.1:$PORT" "$N" "$D/truth.jsonl" "$SEED")
+      [[ -x $OUT/go_tls_oracle ]] || "$GO" build -o "$OUT/go_tls_oracle" "$HERE/go_tls_oracle.go"
+      server=(env H2=$h2 "$OUT/go_tls_oracle" server "127.0.0.1:$PORT")
+      client=(env H2=$h2 "$OUT/go_tls_oracle" client "127.0.0.1:$PORT" "$N" "$D/truth.jsonl" "$SEED")
       ;;
     *) echo "unknown stack $stack" >&2; exit 2 ;;
   esac

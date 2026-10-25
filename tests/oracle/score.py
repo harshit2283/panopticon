@@ -16,7 +16,7 @@ seen = collections.defaultdict(list)
 phantom = 0
 for line in open(sys.argv[2]):
     e = json.loads(line)
-    if e.get("protocol") != "http1":
+    if e.get("protocol") not in ("http1", "http2"):  # same HTTP semantics
         continue
     m = re.search(r"[?&]id=(q\d+)", e.get("path") or "")
     if not m or m.group(1) not in truth:

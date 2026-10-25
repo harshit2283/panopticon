@@ -8,7 +8,7 @@
 use super::{Direction, Protocol};
 
 /// HTTP/2 connection preface (24 bytes), sent by client.
-const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(crate) const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Detect the application-layer protocol from packet payload and port hints.
 ///

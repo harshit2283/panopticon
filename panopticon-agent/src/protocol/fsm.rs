@@ -332,6 +332,19 @@ impl ConnectionFsmManager {
         let mut entry = self.connections.get_mut(&conn_id)?;
         entry.last_seen = Instant::now();
         let direction = entry.direction_of(src, capture_direction);
+        // A connection key can be reused by a new connection: TLS keys are
+        // the library's connection object address, which the allocator hands
+        // to the next connection once the old one is freed. A client preface
+        // means a new HTTP/2 connection started; its frames and HPACK state
+        // must not be read as a continuation of the old one.
+        if direction == Direction::Egress
+            && matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc)
+            && data.starts_with(super::detect::HTTP2_PREFACE)
+        {
+            let protocol = entry.fsm.protocol();
+            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol));
+            entry.fin = [false; 2];
+        }
         Some(entry.fsm.process_packet(direction, data, timestamp_ns))
     }
 
@@ -427,6 +440,53 @@ impl Default for ConnectionFsmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reused_connection_key_restarts_http2_parsing() {
+        fn frame(t: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+            f.push(t);
+            f.push(flags);
+            f.extend(stream.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        }
+        let preface = |enc: &mut hpack::Encoder<'static>, path: &str| {
+            let mut d = super::super::detect::HTTP2_PREFACE.to_vec();
+            d.extend(frame(0x4, 0, 0, &[])); // SETTINGS
+            let h = enc.encode(
+                [(":method", "GET"), (":path", path), (":scheme", "https")]
+                    .iter()
+                    .map(|(k, v)| (k.as_bytes(), v.as_bytes())),
+            );
+            d.extend(frame(0x1, 0x4 | 0x1, 1, &h)); // HEADERS END_HEADERS|END_STREAM
+            d
+        };
+        let response = |enc: &mut hpack::Encoder<'static>| {
+            let h = enc.encode([(b":status".as_slice(), b"200".as_slice())]);
+            frame(0x1, 0x4 | 0x1, 1, &h)
+        };
+        let paths = |r: Option<FsmResult>| match r {
+            Some(FsmResult::Messages(m)) => m.into_iter().map(|m| m.path).collect::<Vec<_>>(),
+            Some(FsmResult::MessageComplete(m)) => vec![m.path],
+            _ => vec![],
+        };
+        let m = ConnectionFsmManager::new(16);
+        let (client, server) = ((0, 1), (0, 2));
+        m.get_or_create_with_server(9, Protocol::Http2, Some(server));
+        // First connection: one exchange, then it closes...
+        let (mut c1, mut s1) = (hpack::Encoder::new(), hpack::Encoder::new());
+        m.process_packet_from(9, client, Direction::Egress, &preface(&mut c1, "/one"), 1);
+        let first =
+            paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s1), 2));
+        assert_eq!(first, vec![Some("/one".to_string())]);
+        // ...and a new one gets the same key (freed and reallocated SSL*).
+        let (mut c2, mut s2) = (hpack::Encoder::new(), hpack::Encoder::new());
+        m.process_packet_from(9, client, Direction::Egress, &preface(&mut c2, "/two"), 3);
+        let second =
+            paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s2), 4));
+        assert_eq!(second, vec![Some("/two".to_string())]);
+    }
 
     #[test]
     #[ignore = "timing probe, run by hand"]

@@ -442,6 +442,54 @@ fn read_go_write_args(ctx: &ProbeContext) -> Result<(u64, *const u8, usize), ()>
 
 // ── Shared helper ──────────────────────────────────────────────────────────
 
+/// Fields shared by every event of one TLS read/write, computed once.
+#[derive(Clone, Copy)]
+struct TlsHeader {
+    conn: u64,
+    pid: u32,
+    tgid: u32,
+    src_addr: u32,
+    dst_addr: u32,
+    src_port: u16,
+    dst_port: u16,
+    ip_proto: u8,
+    direction: Direction,
+    tls_lib: TlsLibrary,
+}
+
+#[inline(always)]
+fn tls_header(conn: u64, direction: Direction, tls_lib: TlsLibrary) -> TlsHeader {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let mut h = TlsHeader {
+        conn,
+        pid,
+        tgid: pid_tgid as u32,
+        src_addr: 0,
+        dst_addr: 0,
+        src_port: 0,
+        dst_port: 0,
+        ip_proto: 0,
+        direction,
+        tls_lib,
+    };
+    // Addresses are known once this connection has done socket I/O inside a
+    // hooked call (see try_tls_tcp_io); zero until then.
+    let key = TlsConnKey { conn, pid, _pad: 0 };
+    if let Some(t) = unsafe { TLS_CONN_ADDR.get(&key) } {
+        let (src, dst) = match direction {
+            Direction::Egress => ((t.local_addr, t.local_port), (t.remote_addr, t.remote_port)),
+            _ => ((t.remote_addr, t.remote_port), (t.local_addr, t.local_port)),
+        };
+        h.src_addr = src.0;
+        h.src_port = src.1;
+        h.dst_addr = dst.0;
+        h.dst_port = dst.1;
+        h.ip_proto = 6;
+    }
+    h
+}
+
 #[inline(always)]
 fn emit_tls_event<C: EbpfContext>(
     ctx: &C,
@@ -451,90 +499,76 @@ fn emit_tls_event<C: EbpfContext>(
     direction: Direction,
     tls_lib: TlsLibrary,
 ) -> Result<(), ()> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
+    let h = tls_header(conn, direction, tls_lib);
     let use_ringbuf = match CONFIG.get(panopticon_common::CONFIG_USE_RINGBUF) {
         Some(&v) => v != 0,
         None => true,
     };
-
-    if use_ringbuf {
-        // Reserve in RingBuf (DataEvent is ~4KB, too large for BPF stack)
+    if !use_ringbuf {
+        // PerfEventArray path (kernels < 5.8): one event per call, on the
+        // per-CPU scratch map (DataEvent far exceeds the BPF stack).
+        let Some(event) = PERF_SCRATCH.get_ptr_mut(0) else {
+            return Ok(());
+        };
+        unsafe {
+            core::ptr::write_bytes(event as *mut u8, 0, core::mem::size_of::<DataEvent>());
+        }
+        populate_tls_event(event, &h, buf, len);
+        DATA_EVENTS_PERF.output(ctx, unsafe { &*event }, 0);
+        return Ok(());
+    }
+    // One TLS read/write routinely carries a full 16KB record or more, i.e.
+    // several protocol frames. Emit it as consecutive MAX_PAYLOAD_SIZE
+    // events (up to MAX_TLS_CHUNKS) so parsers see the stream contiguously;
+    // a single truncated event left a gap across frame boundaries, which
+    // e.g. HTTP/2 can only recover from by resetting (losing HPACK state).
+    // The last chunk's orig_len carries whatever is left uncaptured. The
+    // loop body is kept branch-light: the verifier walks every iteration.
+    let mut off = 0usize;
+    for i in 0..MAX_TLS_CHUNKS {
+        if off >= len {
+            break;
+        }
+        let remaining = len - off;
+        let chunk = if i == MAX_TLS_CHUNKS - 1 || remaining <= MAX_PAYLOAD_SIZE {
+            remaining
+        } else {
+            MAX_PAYLOAD_SIZE
+        };
         let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
             crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
-
-        let event = entry.as_mut_ptr();
-        populate_tls_event(event, conn, buf, len, direction, tls_lib, pid, tgid);
+        populate_tls_event(entry.as_mut_ptr(), &h, unsafe { buf.add(off) }, chunk);
         entry.submit(data_events_submit_flags());
-    } else {
-        // PerfEventArray path: use per-CPU scratch map (DataEvent is ~4.2KB,
-        // far exceeds the 512-byte BPF stack limit).
-        let Some(event) = PERF_SCRATCH.get_ptr_mut(0) else {
-            return Ok(());
-        };
-
-        unsafe {
-            core::ptr::write_bytes(event as *mut u8, 0, core::mem::size_of::<DataEvent>());
-        }
-        populate_tls_event(event, conn, buf, len, direction, tls_lib, pid, tgid);
-        DATA_EVENTS_PERF.output(ctx, unsafe { &*event }, 0);
+        off += MAX_PAYLOAD_SIZE;
     }
-
     Ok(())
 }
 
+/// Chunks emitted per TLS read/write (MAX_PAYLOAD_SIZE each): 16KB, one
+/// full TLS record. The verifier walks every chunk separately; 16 chunks
+/// made the TLS programs too complex to load.
+const MAX_TLS_CHUNKS: usize = 4;
+
 /// Populate a TLS DataEvent. Shared between RingBuf and PerfEventArray paths.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn populate_tls_event(
-    event: *mut DataEvent,
-    conn: u64,
-    buf: *const u8,
-    len: usize,
-    direction: Direction,
-    tls_lib: TlsLibrary,
-    pid: u32,
-    tgid: u32,
-) {
-    // SAFETY: writing to reserved RingBuf memory or stack-allocated event.
+fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len: usize) {
+    // SAFETY: writing to reserved RingBuf memory or the per-CPU scratch event.
     unsafe {
         (*event).timestamp_ns = bpf_ktime_get_ns();
         // No socket in uprobe context: the connection object stands in for it.
-        (*event).socket_cookie = conn;
+        (*event).socket_cookie = h.conn;
         (*event).event_type = EventType::TlsData;
-        (*event).direction = direction;
-        (*event).pid = pid;
-        (*event).tgid = tgid;
-        // Addresses are known once this connection has done socket I/O
-        // inside a hooked call (see try_tls_tcp_io); zero until then.
-        let key = TlsConnKey { conn, pid, _pad: 0 };
-        match TLS_CONN_ADDR.get(&key) {
-            Some(t) => {
-                let (src, dst) = match direction {
-                    Direction::Egress => {
-                        ((t.local_addr, t.local_port), (t.remote_addr, t.remote_port))
-                    }
-                    _ => ((t.remote_addr, t.remote_port), (t.local_addr, t.local_port)),
-                };
-                (*event).src_addr = src.0;
-                (*event).src_port = src.1;
-                (*event).dst_addr = dst.0;
-                (*event).dst_port = dst.1;
-                (*event).ip_proto = 6;
-            }
-            None => {
-                (*event).src_addr = 0;
-                (*event).dst_addr = 0;
-                (*event).src_port = 0;
-                (*event).dst_port = 0;
-                (*event).ip_proto = 0;
-            }
-        }
-        (*event).tls_library = tls_lib;
+        (*event).direction = h.direction;
+        (*event).pid = h.pid;
+        (*event).tgid = h.tgid;
+        (*event).src_addr = h.src_addr;
+        (*event).dst_addr = h.dst_addr;
+        (*event).src_port = h.src_port;
+        (*event).dst_port = h.dst_port;
+        (*event).ip_proto = h.ip_proto;
+        (*event).tls_library = h.tls_lib;
         (*event).tcp_flags = 0;
         (*event)._pad = [0; 6];
         (*event).orig_len = len as u32;
