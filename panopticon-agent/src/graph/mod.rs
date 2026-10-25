@@ -124,6 +124,12 @@ impl GraphBuilder {
         self.identity.evict_expired();
     }
 
+    /// Name endpoints from Kubernetes metadata when available.
+    pub fn with_k8s(mut self, k8s: Option<Arc<crate::k8s::K8sMetadata>>) -> Self {
+        self.identity = self.identity.with_k8s(k8s);
+        self
+    }
+
     pub fn dag(&self) -> &Arc<Mutex<ServiceDag>> {
         &self.dag
     }
@@ -288,5 +294,54 @@ mod tests {
         }
         assert_eq!(edges(&gb).len(), 1, "one client, one server: one edge");
         assert_eq!(gb.dag().lock().unwrap().node_count(), 2);
+    }
+
+    #[test]
+    fn test_graph_nodes_named_by_kubernetes_workload() {
+        let meta = crate::k8s::K8sMetadata::new("http://test");
+        let pod = |ns: &str, rs: &str, hash: &str, ip: &str| -> crate::k8s::model::Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": format!("{rs}-x"), "namespace": ns,
+                    "labels": {"pod-template-hash": hash},
+                    "ownerReferences": [{"kind": "ReplicaSet", "name": rs, "controller": true}]},
+                "spec": {"nodeName": "worker-1"},
+                "status": {"phase": "Running", "podIP": ip, "hostIP": "192.168.0.1"}
+            }))
+            .unwrap()
+        };
+        meta.replace_pods(&[
+            pod("payments", "web-5c6d7e8f9a", "5c6d7e8f9a", "10.0.0.1"),
+            pod("payments", "checkout-7d9f8b6c5d", "7d9f8b6c5d", "10.0.0.2"),
+        ]);
+        meta.publish_if_dirty();
+        let gb = make_builder().with_k8s(Some(meta));
+
+        let msg = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
+        for port in 40000..40010 {
+            let conn = ConnectionTuple {
+                src_addr: 0x0A000001,
+                dst_addr: 0x0A000002,
+                src_port: port,
+                dst_port: 8080,
+                pid: 1,
+            };
+            gb.record(&conn, &msg, None);
+        }
+        // An unknown peer keeps its address.
+        let ext = ConnectionTuple {
+            src_addr: 0x0A000001,
+            dst_addr: 0x08080808,
+            src_port: 40100,
+            dst_port: 443,
+            pid: 1,
+        };
+        gb.record(&ext, &msg, None);
+        assert_eq!(
+            edges(&gb),
+            vec![
+                ("payments/web".to_string(), "8.8.8.8:443".to_string()),
+                ("payments/web".to_string(), "payments/checkout".to_string()),
+            ]
+        );
     }
 }

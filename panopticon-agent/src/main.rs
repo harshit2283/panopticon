@@ -9,6 +9,7 @@ mod config;
 mod event_loop;
 mod export;
 mod graph;
+mod k8s;
 #[cfg(target_os = "linux")]
 mod loader;
 mod pii;
@@ -58,6 +59,12 @@ struct Args {
     /// Run smoke test: attach probes, verify events, then exit
     #[arg(long)]
     smoke_test: bool,
+
+    /// Kubernetes identity (name endpoints namespace/workload): `auto` (when
+    /// running in a pod), `true` or `false`. Overrides `[kubernetes] enabled`.
+    #[arg(long, env = "PANOPTICON_KUBERNETES", value_name = "auto|true|false",
+          value_parser = ["auto", "true", "false"])]
+    kubernetes: Option<String>,
 
     /// Write every captured event, UNREDACTED, to this file (PNCAP format,
     /// owner-only permissions, truncated at start). Decode with --decode-capture.
@@ -161,6 +168,13 @@ async fn main() -> Result<()> {
             agent_config.metrics_bind = Some(bind.clone());
         }
         agent_config.smoke_test = args.smoke_test;
+        if let Some(mode) = args.kubernetes.as_deref() {
+            agent_config.kubernetes.mode = match mode {
+                "true" => config::KubernetesMode::Enabled,
+                "false" => config::KubernetesMode::Disabled,
+                _ => config::KubernetesMode::Auto,
+            };
+        }
         if let Some(ref path) = args.capture_raw {
             agent_config.capture_raw_path = Some(path.clone());
         }
@@ -272,10 +286,18 @@ async fn main() -> Result<()> {
             None
         };
 
+        // Kubernetes metadata (pod/service names for graph nodes and exports).
+        // Starts a background sync and returns at once; never fails startup.
+        let k8s_metadata = k8s::K8sMetadata::start(&agent_config.kubernetes);
+
         let (json_export_handle, json_writer_handle) = match &agent_config.json_export_path {
             Some(path) => {
                 info!(path = %path, "JSON export enabled");
-                let (handle, writer) = export::json::JsonExportHandle::spawn(path, 4096)?;
+                let (handle, writer) = export::json::JsonExportHandle::spawn_with_k8s(
+                    path,
+                    4096,
+                    k8s_metadata.clone(),
+                )?;
                 (Some(handle), Some(writer))
             }
             None => (None, None),
@@ -314,7 +336,7 @@ async fn main() -> Result<()> {
         // 6. Construct graph builder
         let graph_builder = if agent_config.graph.enabled {
             info!("Service graph enabled");
-            Some(graph::GraphBuilder::new(&agent_config.graph))
+            Some(graph::GraphBuilder::new(&agent_config.graph).with_k8s(k8s_metadata.clone()))
         } else {
             None
         };
@@ -581,6 +603,15 @@ mod tests {
     fn test_cli_metrics_bind() {
         let args = Args::parse_from(["panopticon-agent", "--metrics-bind", "0.0.0.0:9090"]);
         assert_eq!(args.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
+    }
+
+    #[test]
+    fn test_cli_kubernetes_mode() {
+        let args = Args::parse_from(["panopticon-agent"]);
+        assert!(args.kubernetes.is_none());
+        let args = Args::parse_from(["panopticon-agent", "--kubernetes", "false"]);
+        assert_eq!(args.kubernetes.as_deref(), Some("false"));
+        assert!(Args::try_parse_from(["panopticon-agent", "--kubernetes", "maybe"]).is_err());
     }
 
     #[test]
