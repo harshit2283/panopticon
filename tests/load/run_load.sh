@@ -17,6 +17,11 @@
 #      without the JSON export (no recall score; isolates its cost).
 # Needs: root, go, a built agent, python3 with pyroute2.
 set -euo pipefail
+# Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
+# run several oracles at once.
+NS=${ORACLE_NS:-pclient}
+IFACE=${ORACLE_IF:-pv0}
+HOST_IP=10.99.${ORACLE_NET:-0}.1
 CONC=${1:-64}
 DUR=${2:-20s}
 RATE=${3:-0}
@@ -42,12 +47,12 @@ go build -o "$OUT/loadgen" "$HERE/loadgen.go"
 sysctl -qw kernel.bpf_stats_enabled=1
 "$PY" "$ORACLE/netns.py" down >/dev/null 2>&1 || true
 "$PY" "$ORACLE/netns.py" up
-"$OUT/loadgen" server -addr "10.99.0.1:$PORT" &
+"$OUT/loadgen" server -addr "$HOST_IP:$PORT" &
 SP=$!
 EXPORT=(--json-export "$OUT/agent.jsonl")
 [[ ${NO_EXPORT:-0} == 1 ]] && EXPORT=()
 # shellcheck disable=SC2086
-"$AGENT" -i pv0 "${EXPORT[@]}" --metrics-bind "$METRICS" \
+"$AGENT" -i "$IFACE" "${EXPORT[@]}" --metrics-bind "$METRICS" \
   ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
 AP=$!
 sleep 4
@@ -58,8 +63,8 @@ NC=()
 START=$(date +%s.%N)
 # CPU is counted from here: startup work (TLS scan, map setup) is excluded.
 read -r UT0 ST0 < <(awk '{print $14, $15}' "/proc/$AP/stat")
-nsenter --net=/var/run/netns/pclient "$OUT/loadgen" client \
-  -url "http://10.99.0.1:$PORT" -c "$CONC" -d "$DUR" -rate "$RATE" -size "$SIZE" \
+nsenter --net=/var/run/netns/$NS "$OUT/loadgen" client \
+  -url "http://$HOST_IP:$PORT" -c "$CONC" -d "$DUR" -rate "$RATE" -size "$SIZE" \
   "${NC[@]}" -out "$OUT/ids.txt" | tee "$OUT/client.txt"
 sleep 3  # let the agent drain
 

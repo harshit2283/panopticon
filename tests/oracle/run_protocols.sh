@@ -15,6 +15,11 @@
 #   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio
 # Images can be overridden, e.g. REDIS_IMAGE=mirror.gcr.io/library/redis:7.4.
 set -euo pipefail
+# Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
+# run several oracles at once.
+NS=${ORACLE_NS:-pclient}
+IFACE=${ORACLE_IF:-pv0}
+HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-500}
 SEED=${2:-7}
 MIN_RECALL=${3:-0.99}
@@ -46,11 +51,12 @@ docker run -d --name o-mysql --network host -e MYSQL_ROOT_PASSWORD=oracle \
 
 wait_ready() {
   for _ in $(seq 1 120); do
-    nsenter --net=/var/run/netns/pclient "$PY" - <<'EOF' 2>/dev/null && return 0
-import redis, psycopg, pymysql
-redis.Redis(host="10.99.0.1").ping()
-psycopg.connect(host="10.99.0.1", user="postgres", password="oracle", dbname="oracle").close()
-pymysql.connect(host="10.99.0.1", user="root", password="oracle", database="oracle",
+    HOST_IP=$HOST_IP nsenter --net=/var/run/netns/$NS "$PY" - <<'EOF' 2>/dev/null && return 0
+import os, redis, psycopg, pymysql
+host = os.environ["HOST_IP"]
+redis.Redis(host=host).ping()
+psycopg.connect(host=host, user="postgres", password="oracle", dbname="oracle").close()
+pymysql.connect(host=host, user="root", password="oracle", database="oracle",
                 ssl_disabled=True).close()
 EOF
     sleep 2
@@ -62,11 +68,11 @@ wait_ready
 
 status=0
 for proto in redis postgres mysql; do
-  "$AGENT" -i pv0 --json-export "$OUT/$proto-agent.jsonl" >"$OUT/$proto-agent.log" 2>&1 &
+  "$AGENT" -i "$IFACE" --json-export "$OUT/$proto-agent.jsonl" >"$OUT/$proto-agent.log" 2>&1 &
   AP=$!
   sleep 4
-  nsenter --net=/var/run/netns/pclient "$PY" "$HERE/db_oracle.py" \
-    "$proto" 10.99.0.1 "$N" "$OUT/$proto-truth.jsonl" "$SEED"
+  nsenter --net=/var/run/netns/$NS "$PY" "$HERE/db_oracle.py" \
+    "$proto" "$HOST_IP" "$N" "$OUT/$proto-truth.jsonl" "$SEED"
   sleep 3
   kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
   python3 -I "$HERE/score_db.py" "$OUT/$proto-truth.jsonl" "$OUT/$proto-agent.jsonl" \
@@ -74,13 +80,13 @@ for proto in redis postgres mysql; do
   echo
 done
 # gRPC on a non-standard port: identified by the HTTP/2 preface, not the port.
-"$PY" "$HERE/grpc_oracle.py" server 10.99.0.1:9443 >"$OUT/grpc-server.log" 2>&1 &
+"$PY" "$HERE/grpc_oracle.py" server "$HOST_IP:9443" >"$OUT/grpc-server.log" 2>&1 &
 GP=$!
-"$AGENT" -i pv0 --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
+"$AGENT" -i "$IFACE" --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
 AP=$!
 sleep 4
-nsenter --net=/var/run/netns/pclient "$PY" "$HERE/grpc_oracle.py" \
-  client 10.99.0.1:9443 "$N" "$OUT/grpc-truth.jsonl" "$SEED"
+nsenter --net=/var/run/netns/$NS "$PY" "$HERE/grpc_oracle.py" \
+  client "$HOST_IP:9443" "$N" "$OUT/grpc-truth.jsonl" "$SEED"
 sleep 3
 kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
 python3 -I "$HERE/score_h2.py" "$OUT/grpc-truth.jsonl" "$OUT/grpc-agent.jsonl" \

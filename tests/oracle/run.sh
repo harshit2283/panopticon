@@ -12,6 +12,11 @@
 # Needs: root, a built agent (target/release/panopticon-agent), python3 with
 # pyroute2 (pip install pyroute2), nsenter.
 set -euo pipefail
+# Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
+# run several oracles at once.
+NS=${ORACLE_NS:-pclient}
+IFACE=${ORACLE_IF:-pv0}
+HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-2000}
 SEED=${2:-1234}
 MIN_RECALL=${3:-0.99}
@@ -32,13 +37,13 @@ trap cleanup EXIT
 sysctl -qw kernel.bpf_stats_enabled=1
 "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
 "$PY" "$HERE/netns.py" up
-MODE=server HOST=10.99.0.1 python3 -I "$HERE/http_oracle.py" "$PORT" &
+MODE=server HOST=$HOST_IP python3 -I "$HERE/http_oracle.py" "$PORT" &
 SP=$!
-"$AGENT" -i pv0 --json-export "$OUT/agent.jsonl" >"$OUT/agent.log" 2>&1 &
+"$AGENT" -i "$IFACE" --json-export "$OUT/agent.jsonl" >"$OUT/agent.log" 2>&1 &
 AP=$!
 sleep 4
 START=$(date +%s.%N)  # seconds since epoch, compared with time.time()
-SEED=$SEED MODE=client HOST=10.99.0.1 nsenter --net=/var/run/netns/pclient \
+SEED=$SEED MODE=client HOST=$HOST_IP nsenter --net=/var/run/netns/$NS \
   python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$OUT/truth.jsonl"
 python3 -I "$HERE/bpf_cost.py" "$AP"
 sleep 1
