@@ -57,9 +57,9 @@ current release report.
 | MySQL parsing | Partial | Text protocol at 100% recall on plaintext connections; prepared-statement (binary) protocol not parsed. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. |
 | PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall; COPY and large objects not parsed. |
 | Redis parsing | Supported | RESP2 and RESP3, pipelining; 100% recall against ground truth. |
-| Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |
-| AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
-| DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |
+| Kafka parsing | Supported | Classic and flexible (KIP-482) versions, topic IDs; 100% recall, topic and error code against ground truth (librdkafka, kafka-python). Record keys/values of uncompressed batches are PII-scanned; compressed batches are not decoded. Detected on port 9092 only. |
+| AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. |
+| DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
 | Go TLS plaintext capture | Partial | Write-path capture only. |
 | Regex-first PII detection | Supported | Baseline detection path. |
