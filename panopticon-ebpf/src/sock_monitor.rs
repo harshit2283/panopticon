@@ -1,237 +1,154 @@
-//! Socket event monitoring via kprobes.
+//! TCP connection lifecycle → process attribution.
 //!
-//! Tracks TCP connection lifecycle (connect, accept, close) and UDP
-//! send/receive. Maintains `CONN_MAP` for active connection tracking
-//! and emits socket events to `DATA_EVENTS` RingBuf.
+//! TC sees packets but not which process owns a connection. These hooks
+//! report who opened (connect) or accepted (accept) each TCP connection,
+//! tagged with the same 5-tuple flow cookie the TC classifier uses, so user
+//! space can attach client/server PIDs to the exchanges it parses.
 //!
-//! All kprobes extract the 5-tuple (src_addr, dst_addr, src_port,
-//! dst_port, protocol) from `struct sock` for connection correlation.
+//! - `tcp_connect` kprobe and `inet_csk_accept` kretprobe run in the calling
+//!   process, so both PIDs are known.
+//! - Without kprobes (kernels built without CONFIG_KPROBES), the
+//!   `sock:inet_sock_set_state` tracepoint is the fallback: its
+//!   CLOSE → SYN_SENT transition runs in the connecting process; the
+//!   accepting side completes in softirq, so only client PIDs are known.
+//!
+//! Connection close is not hooked: user space drops a connection's state on
+//! the FIN/RST packets TC delivers in order with the data. Per-datagram UDP
+//! hooks were removed: they emitted a 4KB event per UDP send/receive on the
+//! node that nothing consumed.
 
 use aya_ebpf::{
     EbpfContext,
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
-    macros::{kprobe, kretprobe},
-    programs::{ProbeContext, RetProbeContext},
+    macros::{kprobe, kretprobe, tracepoint},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
-use panopticon_common::{ConnInfo, DataEvent, EventType, TlsLibrary};
+use panopticon_common::{DataEvent, EventType, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, CONN_MAP, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, data_events_submit_flags,
+    CONFIG, CONNECTING, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, data_events_submit_flags,
 };
+use crate::tc_capture::tc_connection_cookie;
 
-// ── TCP Connect ────────────────────────────────────────────────────────────
+const IP_PROTO_TCP: u8 = 6;
 
-/// Fires on `tcp_connect(struct sock *sk)` — outgoing TCP connection initiated.
-///
-/// Extracts the 5-tuple from the sock struct, stores in CONN_MAP,
-/// and emits a SockConnect event.
+/// `tcp_connect(struct sock *sk)`: outgoing connection, local port bound.
 #[kprobe]
 pub fn tcp_connect(ctx: ProbeContext) {
-    let _ = try_tcp_connect(&ctx);
+    let _ = try_sock_owner(&ctx, ctx.arg(0), EventType::SockConnect);
 }
 
-#[inline(always)]
-fn try_tcp_connect(ctx: &ProbeContext) -> Result<(), ()> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
-    // arg0: struct sock *sk
-    let sk: *const u8 = ctx.arg(0).ok_or(())?;
-
-    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk)?;
-    let cookie = gen_connection_key(pid_tgid, src_addr, dst_addr, src_port, dst_port);
-    let now = unsafe { bpf_ktime_get_ns() };
-
-    // Store connection info in CONN_MAP
-    let conn = ConnInfo {
-        socket_cookie: cookie,
-        connect_ts: now,
-        src_addr,
-        dst_addr,
-        pid,
-        tgid,
-        src_port,
-        dst_port,
-        _pad: [0; 4],
-    };
-    let _ = CONN_MAP.insert(cookie, conn, 0);
-
-    // Emit SockConnect event
-    emit_sock_event(
-        ctx,
-        EventType::SockConnect,
-        pid,
-        tgid,
-        cookie,
-        src_addr,
-        dst_addr,
-        src_port,
-        dst_port,
-        6, // TCP
-    )
-}
-
-// ── TCP Accept (return probe) ──────────────────────────────────────────────
-
-/// Fires on return from `inet_csk_accept()` — incoming TCP connection accepted.
-///
-/// The return value is the newly created `struct sock *` for the accepted
-/// connection. We extract the 5-tuple and emit a SockAccept event.
+/// Return of `inet_csk_accept()`: the accepted `struct sock *`, in the
+/// accepting process.
 #[kretprobe]
 pub fn inet_csk_accept_ret(ctx: RetProbeContext) {
-    let _ = try_inet_csk_accept_ret(&ctx);
+    let sk = ctx.ret::<*const u8>();
+    if !sk.is_null() {
+        let _ = try_sock_owner(&ctx, Some(sk), EventType::SockAccept);
+    }
 }
 
 #[inline(always)]
-fn try_inet_csk_accept_ret(ctx: &RetProbeContext) -> Result<(), ()> {
-    // Return value: struct sock *sk (the accepted socket)
-    let sk = ctx.ret::<*const u8>();
-    if sk.is_null() {
+fn try_sock_owner<C: EbpfContext>(
+    ctx: &C,
+    sk: Option<*const u8>,
+    event_type: EventType,
+) -> Result<(), ()> {
+    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk.ok_or(())?)?;
+    emit_owner(
+        ctx,
+        bpf_get_current_pid_tgid(),
+        event_type,
+        src_addr,
+        dst_addr,
+        src_port,
+        dst_port,
+    )
+}
+
+/// Fallback for kernels without kprobes. Field offsets from
+/// /sys/kernel/tracing/events/sock/inet_sock_set_state/format (stable since
+/// 4.16): skaddr@8 oldstate@16 newstate@20 sport@24 dport@26 family@28
+/// protocol@30 saddr@32 daddr@36; ports in host order, addresses in network
+/// order.
+///
+/// Two steps, because tcp_v4_connect enters SYN_SENT before it picks the
+/// source port: CLOSE → SYN_SENT (in the connecting process) remembers the
+/// socket's owner; SYN_SENT → ESTABLISHED (in softirq, full tuple known)
+/// emits it.
+#[tracepoint]
+pub fn sock_state_connect(ctx: TracePointContext) {
+    let _ = try_sock_state_connect(&ctx);
+}
+
+#[inline(always)]
+fn try_sock_state_connect(ctx: &TracePointContext) -> Result<(), ()> {
+    const TCP_ESTABLISHED: i32 = 1;
+    const TCP_SYN_SENT: i32 = 2;
+    const TCP_CLOSE: i32 = 7;
+    const AF_INET: u16 = 2;
+    let newstate: i32 = unsafe { ctx.read_at(20) }.map_err(|_| ())?;
+    let oldstate: i32 = unsafe { ctx.read_at(16) }.map_err(|_| ())?;
+    let opening = oldstate == TCP_CLOSE && newstate == TCP_SYN_SENT;
+    let established = oldstate == TCP_SYN_SENT && newstate == TCP_ESTABLISHED;
+    if !opening && !established {
         return Ok(());
     }
-
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
-    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk)?;
-    let cookie = gen_connection_key(pid_tgid, src_addr, dst_addr, src_port, dst_port);
-    let now = unsafe { bpf_ktime_get_ns() };
-
-    let conn = ConnInfo {
-        socket_cookie: cookie,
-        connect_ts: now,
-        src_addr,
-        dst_addr,
-        pid,
-        tgid,
-        src_port,
-        dst_port,
-        _pad: [0; 4],
+    let family: u16 = unsafe { ctx.read_at(28) }.map_err(|_| ())?;
+    let protocol: u16 = unsafe { ctx.read_at(30) }.map_err(|_| ())?;
+    if family != AF_INET || protocol != IP_PROTO_TCP as u16 {
+        return Ok(());
+    }
+    let skaddr: u64 = unsafe { ctx.read_at(8) }.map_err(|_| ())?;
+    if opening {
+        return CONNECTING
+            .insert(skaddr, bpf_get_current_pid_tgid(), 0)
+            .map_err(|_| ());
+    }
+    let pid_tgid = match unsafe { CONNECTING.get(skaddr) } {
+        Some(p) => *p,
+        None => return Ok(()),
     };
-    let _ = CONN_MAP.insert(cookie, conn, 0);
-
-    emit_sock_event(
+    let _ = CONNECTING.remove(skaddr);
+    let src_port: u16 = unsafe { ctx.read_at(24) }.map_err(|_| ())?;
+    let dst_port: u16 = unsafe { ctx.read_at(26) }.map_err(|_| ())?;
+    let src_addr = u32::from_be(unsafe { ctx.read_at::<u32>(32) }.map_err(|_| ())?);
+    let dst_addr = u32::from_be(unsafe { ctx.read_at::<u32>(36) }.map_err(|_| ())?);
+    emit_owner(
         ctx,
-        EventType::SockAccept,
-        pid,
-        tgid,
-        cookie,
+        pid_tgid,
+        EventType::SockConnect,
         src_addr,
         dst_addr,
         src_port,
         dst_port,
-        6, // TCP
     )
-}
-
-// ── TCP Close ──────────────────────────────────────────────────────────────
-
-/// Fires on `tcp_close(struct sock *sk)` — TCP connection being torn down.
-///
-/// Removes the connection from CONN_MAP and emits a SockClose event.
-#[kprobe]
-pub fn tcp_close(ctx: ProbeContext) {
-    let _ = try_tcp_close(&ctx);
 }
 
 #[inline(always)]
-fn try_tcp_close(ctx: &ProbeContext) -> Result<(), ()> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
-    let sk: *const u8 = ctx.arg(0).ok_or(())?;
-    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk)?;
-    let cookie = gen_connection_key(pid_tgid, src_addr, dst_addr, src_port, dst_port);
-
-    // Remove from connection tracking
-    let _ = CONN_MAP.remove(cookie);
-
+fn emit_owner<C: EbpfContext>(
+    ctx: &C,
+    pid_tgid: u64,
+    event_type: EventType,
+    src_addr: u32,
+    dst_addr: u32,
+    src_port: u16,
+    dst_port: u16,
+) -> Result<(), ()> {
+    let cookie = tc_connection_cookie(src_addr, dst_addr, src_port, dst_port, IP_PROTO_TCP);
     emit_sock_event(
         ctx,
-        EventType::SockClose,
-        pid,
-        tgid,
+        event_type,
+        (pid_tgid >> 32) as u32,
+        pid_tgid as u32,
         cookie,
         src_addr,
         dst_addr,
         src_port,
         dst_port,
-        6, // TCP
+        IP_PROTO_TCP,
     )
 }
-
-// ── UDP Send ───────────────────────────────────────────────────────────────
-
-/// Fires on `udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)`.
-///
-/// Tracks outgoing UDP datagrams for connection correlation.
-#[kprobe]
-pub fn udp_sendmsg(ctx: ProbeContext) {
-    let _ = try_udp_sendmsg(&ctx);
-}
-
-#[inline(always)]
-fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), ()> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
-    let sk: *const u8 = ctx.arg(0).ok_or(())?;
-    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk)?;
-    let cookie = gen_connection_key(pid_tgid, src_addr, dst_addr, src_port, dst_port);
-
-    emit_sock_event(
-        ctx,
-        EventType::SockConnect, // Reuse SockConnect for UDP send tracking
-        pid,
-        tgid,
-        cookie,
-        src_addr,
-        dst_addr,
-        src_port,
-        dst_port,
-        17, // UDP
-    )
-}
-
-// ── UDP Receive ────────────────────────────────────────────────────────────
-
-/// Fires on `udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)`.
-///
-/// Tracks incoming UDP datagrams for connection correlation.
-#[kprobe]
-pub fn udp_recvmsg(ctx: ProbeContext) {
-    let _ = try_udp_recvmsg(&ctx);
-}
-
-#[inline(always)]
-fn try_udp_recvmsg(ctx: &ProbeContext) -> Result<(), ()> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid >> 32) as u32;
-    let tgid = pid_tgid as u32;
-
-    let sk: *const u8 = ctx.arg(0).ok_or(())?;
-    let (src_addr, dst_addr, src_port, dst_port) = read_sock_tuple(sk)?;
-    let cookie = gen_connection_key(pid_tgid, src_addr, dst_addr, src_port, dst_port);
-
-    emit_sock_event(
-        ctx,
-        EventType::SockAccept, // Reuse SockAccept for UDP recv tracking
-        pid,
-        tgid,
-        cookie,
-        src_addr,
-        dst_addr,
-        src_port,
-        dst_port,
-        17, // UDP
-    )
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Reads the IPv4 5-tuple from `struct sock`.
 ///
@@ -267,24 +184,6 @@ pub(crate) fn read_sock_tuple(sk: *const u8) -> Result<(u32, u32, u16, u16), ()>
 /// Generate a connection key from pid_tgid, addresses, and ports.
 /// Includes src/dst addresses to avoid collisions between connections
 /// from the same PID to different hosts on the same port.
-#[inline(always)]
-fn gen_connection_key(
-    pid_tgid: u64,
-    src_addr: u32,
-    dst_addr: u32,
-    src_port: u16,
-    dst_port: u16,
-) -> u64 {
-    // FNV-1a-style hash combining all fields for uniqueness
-    let mut hash = pid_tgid;
-    hash ^= src_addr as u64;
-    hash = hash.wrapping_mul(0x00000100000001B3);
-    hash ^= dst_addr as u64;
-    hash = hash.wrapping_mul(0x00000100000001B3);
-    hash ^= (src_port as u64) << 16 | dst_port as u64;
-    hash
-}
-
 /// Emits a socket lifecycle event to the DATA_EVENTS RingBuf.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -312,10 +211,10 @@ fn emit_sock_event<C: EbpfContext>(
         };
 
         let event = entry.as_mut_ptr();
-        // SAFETY: writing to reserved RingBuf memory. Zero entire event first
-        // to prevent kernel memory leakage through the 4KB payload field.
+        // SAFETY: writing to reserved RingBuf memory. The payload is not
+        // zeroed: payload_len is 0, and the ring's memory only ever holds
+        // other events that user space can already read.
         unsafe {
-            core::ptr::write_bytes(event as *mut u8, 0, core::mem::size_of::<DataEvent>());
             populate_sock_event(
                 event, event_type, pid, tgid, cookie, src_addr, dst_addr, src_port, dst_port,
                 ip_proto,

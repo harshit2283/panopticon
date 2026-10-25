@@ -27,7 +27,7 @@ use crate::maps::{
 /// Compute a deterministic connection cookie from the 5-tuple using FNV-1a.
 /// Normalizes by ordering (addr, port) pairs so both directions get the same cookie.
 #[inline(always)]
-fn tc_connection_cookie(
+pub(crate) fn tc_connection_cookie(
     src_addr: u32,
     dst_addr: u32,
     src_port: u16,

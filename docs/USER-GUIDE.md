@@ -181,6 +181,8 @@ One JSON object per completed exchange. A real record (body shortened):
 | `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most `max_body_bytes`, after redaction |
 | `response_size_bytes` | Full body size, even when the body was larger than what was kept |
 | `src_*`, `dst_*` | Addresses of the packet that completed the exchange (usually the response). Addresses are IPv4 as a 32-bit integer (`2130706433` = `127.0.0.1`). |
+| `pid` | TLS exchanges: the process whose TLS calls were captured |
+| `client_pid`, `server_pid` | Packet-captured TCP exchanges: the local process that opened / accepted the connection, when it runs on this node. `server_pid` needs kprobes; on kernels built without them only `client_pid` is filled |
 | `pii.entities` | What was found; offsets are relative to the field it was found in |
 | `pii.redacted` | `true` if values were replaced before export |
 

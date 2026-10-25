@@ -43,8 +43,12 @@ SP=$!
 AP=$!
 sleep 4
 START=$(date +%s.%N)  # seconds since epoch, compared with time.time()
+# nsenter execs the client, so $! is the client's PID (checked against the
+# client_pid the agent attributes to each exchange).
 SEED=$SEED MODE=client HOST=$HOST_IP nsenter --net=/var/run/netns/$NS \
-  python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$OUT/truth.jsonl"
+  python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$OUT/truth.jsonl" &
+CP=$!
+wait "$CP"
 python3 -I "$HERE/bpf_cost.py" "$AP"
 sleep 1
 # utime+stime (fields 14/15) cover the whole run, startup included.
@@ -57,4 +61,12 @@ print(f"agent: cpu={cpu:.2f}s over {wall:.0f}s ({cpu / wall:.1%} of one core) pe
   "$UT" "$ST" "$(getconf CLK_TCK)" "$START" "$HWM"
 kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
 python3 -I "$HERE/score.py" "$OUT/truth.jsonl" "$OUT/agent.jsonl" "$MIN_RECALL"
+python3 -I - "$OUT/agent.jsonl" "$CP" "$SP" <<'EOF'
+import json, sys
+client, server = int(sys.argv[2]), int(sys.argv[3])
+recs = [json.loads(l) for l in open(sys.argv[1])]
+c = sum(r.get("client_pid") == client for r in recs)
+s = sum(r.get("server_pid") == server for r in recs)
+print(f"  process attribution: client_pid {c}/{len(recs)}, server_pid {s}/{len(recs)}")
+EOF
 echo "artifacts: $OUT"

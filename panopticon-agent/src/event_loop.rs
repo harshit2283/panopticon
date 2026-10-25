@@ -71,6 +71,63 @@ struct MessageContext<'a> {
     /// Whether this event's sender is the connection's server, when known.
     sender_is_server: Option<bool>,
     max_body_bytes: usize,
+    /// Local processes that opened / accepted the connection, if seen.
+    owners: Option<ConnOwners>,
+}
+
+/// PIDs of the local processes on either end of a TCP connection, from the
+/// connect / accept hooks (sock_monitor.rs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConnOwners {
+    client: Option<u32>,
+    server: Option<u32>,
+}
+
+/// Per-worker connection → owners map. Bounded: owners arrive for every TCP
+/// connection on the node, not only captured ones, so the map is cleared
+/// when it reaches its cap rather than growing without limit.
+#[derive(Default)]
+struct OwnerTable {
+    owners: fxhash::FxHashMap<u64, ConnOwners>,
+    cap: usize,
+}
+
+impl OwnerTable {
+    fn new(cap: usize) -> Self {
+        Self {
+            owners: Default::default(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record a SockConnect / SockAccept event; ignores other events.
+    fn observe(&mut self, event: &DataEvent) {
+        let is_client = match event.event_type {
+            EventType::SockConnect => true,
+            EventType::SockAccept => false,
+            _ => return,
+        };
+        if event.pid == 0 {
+            return;
+        }
+        if self.owners.len() >= self.cap && !self.owners.contains_key(&event.socket_cookie) {
+            self.owners.clear();
+        }
+        let entry = self.owners.entry(event.socket_cookie).or_default();
+        if is_client {
+            entry.client = Some(event.pid);
+        } else {
+            entry.server = Some(event.pid);
+        }
+    }
+
+    fn get(&self, cookie: u64) -> Option<ConnOwners> {
+        self.owners.get(&cookie).copied()
+    }
+
+    fn remove(&mut self, cookie: u64) {
+        self.owners.remove(&cookie);
+    }
 }
 
 // ── Event Statistics ──────────────────────────────────────────────────────
@@ -842,6 +899,7 @@ async fn perf_reader_task(
 #[cfg(target_os = "linux")]
 async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: WorkerTaskContext) {
     let manager = ConnectionFsmManager::new(ctx.max_connections_tracked);
+    let mut owners = OwnerTable::new(ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(5);
 
@@ -856,6 +914,9 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
             }
 
             let cookie = connection_key(event);
+            if event.event_type != EventType::TcPacket && event.event_type != EventType::TlsData {
+                owners.observe(event);
+            }
 
             ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -947,6 +1008,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     event,
                                     sender_is_server,
                                     max_body_bytes: ctx.max_body_bytes,
+                                    owners: owners.get(cookie),
                                 },
                             );
                         }
@@ -965,6 +1027,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     event,
                                     sender_is_server,
                                     max_body_bytes: ctx.max_body_bytes,
+                                    owners: owners.get(cookie),
                                 },
                             );
                         }
@@ -995,8 +1058,11 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                 }
                 _ => false,
             };
-            if closed && manager.close_connection(cookie) {
-                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+            if closed {
+                owners.remove(cookie);
+                if manager.close_connection(cookie) {
+                    ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1085,7 +1151,11 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             && !handle.try_send(
                 msg.clone(),
                 pii_report.clone(),
-                crate::export::json::TransportContext::from_data_event(ctx.event),
+                crate::export::json::TransportContext {
+                    client_pid: ctx.owners.and_then(|o| o.client),
+                    server_pid: ctx.owners.and_then(|o| o.server),
+                    ..crate::export::json::TransportContext::from_data_event(ctx.event)
+                },
             )
         {
             ctx.stats.drops_export_full.fetch_add(1, Ordering::Relaxed);
@@ -1471,6 +1541,39 @@ mod tests {
             unique_workers.len() > 1,
             "all PIDs routed to same worker — broken distribution"
         );
+    }
+
+    fn sock_event(kind: EventType, cookie: u64, pid: u32) -> DataEvent {
+        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
+        let mut event: DataEvent = unsafe { std::mem::zeroed() };
+        event.event_type = kind;
+        event.socket_cookie = cookie;
+        event.pid = pid;
+        event
+    }
+
+    #[test]
+    fn owner_table_tracks_both_ends_and_stays_bounded() {
+        let mut t = OwnerTable::new(2);
+        t.observe(&sock_event(EventType::SockConnect, 1, 100));
+        t.observe(&sock_event(EventType::SockAccept, 1, 200));
+        t.observe(&sock_event(EventType::SockAccept, 2, 0)); // no pid: ignored
+        t.observe(&sock_event(EventType::TcPacket, 2, 300)); // not an owner event
+        assert_eq!(
+            t.get(1),
+            Some(ConnOwners {
+                client: Some(100),
+                server: Some(200)
+            })
+        );
+        assert_eq!(t.get(2), None);
+        t.observe(&sock_event(EventType::SockConnect, 2, 101));
+        // Full: a third connection resets the table instead of growing it.
+        t.observe(&sock_event(EventType::SockConnect, 3, 102));
+        assert_eq!(t.owners.len(), 1);
+        assert_eq!(t.get(3).and_then(|o| o.client), Some(102));
+        t.remove(3);
+        assert_eq!(t.get(3), None);
     }
 
     #[test]

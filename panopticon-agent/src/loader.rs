@@ -126,17 +126,25 @@ pub fn load_and_attach(
         }
     }
 
-    // ── Kprobes for socket monitoring ─────────────────────────────────
-    attach_kprobe(&mut ebpf, "tcp_connect", "tcp_connect", &mut links);
+    // ── Connection owners (client/server PIDs) ────────────────────────
+    // kprobes where the kernel has them (both sides), else the
+    // inet_sock_set_state tracepoint (connecting side only).
+    let connect_kprobe = attach_kprobe(&mut ebpf, "tcp_connect", "tcp_connect", &mut links);
     attach_kretprobe(
         &mut ebpf,
         "inet_csk_accept_ret",
         "inet_csk_accept",
         &mut links,
     );
-    attach_kprobe(&mut ebpf, "tcp_close", "tcp_close", &mut links);
-    attach_kprobe(&mut ebpf, "udp_sendmsg", "udp_sendmsg", &mut links);
-    attach_kprobe(&mut ebpf, "udp_recvmsg", "udp_recvmsg", &mut links);
+    if !connect_kprobe {
+        attach_tracepoint(
+            &mut ebpf,
+            "sock_state_connect",
+            "sock",
+            "inet_sock_set_state",
+            &mut links,
+        );
+    }
     if config.tls_scan_enabled {
         // Give TLS connections their socket addresses (see tls_probes.rs):
         // sock tracepoints (6.3+), else fentry where the kernel has BTF,
@@ -777,14 +785,16 @@ fn attach_kprobe(
     prog_name: &str,
     fn_name: &str,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) {
+) -> bool {
     match try_attach_kprobe(ebpf, prog_name, fn_name) {
         Ok(link) => {
             info!(prog = prog_name, function = fn_name, "kprobe attached");
             links.push(Box::new(link));
+            true
         }
         Err(e) => {
-            warn!(prog = prog_name, function = fn_name, error = %e, "Failed to attach kprobe")
+            warn!(prog = prog_name, function = fn_name, error = %e, "Failed to attach kprobe");
+            false
         }
     }
 }

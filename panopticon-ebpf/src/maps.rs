@@ -152,6 +152,12 @@ pub struct SockTuple {
 pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
     LruHashMap::with_max_entries(TLS_SCRATCH_SIZE * 2, 0);
 
+/// Sockets between connect() and ESTABLISHED → owning pid_tgid, for the
+/// tracepoint fallback in sock_monitor.rs. LRU: connections that never
+/// complete are reclaimed.
+#[map]
+pub static CONNECTING: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.
 #[map]
