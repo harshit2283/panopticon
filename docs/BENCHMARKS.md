@@ -58,6 +58,27 @@ response-size misses are all large chunked responses where some packets were
 lost from capture. The exchange is still exported and the size is
 under-reported.
 
+### HTTPS, Go `crypto/tls`
+
+`tests/oracle/run_tls.sh` (go stack): a Go `net/http` client and server
+(`go_tls_oracle.go`, HTTP/1.1 over TLS, keep-alive, GETs up to 70 KB and POSTs
+with an email and an SSN). Writes are hooked at `(*Conn).Write`. Reads use
+an entry probe plus a uprobe on every `RET` instruction of `(*Conn).Read`,
+keyed by goroutine, because uretprobes break when Go moves goroutine stacks.
+
+| Run | Exchanges | Recall (client / server view) | Status / method / size | With socket addresses | Leaks |
+|---|---|---|---|---|---|
+| Before (writes only, PID-scoped probes) | 300 | 0% / 0% | — | — | — |
+| Current, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 99.4% | 0 |
+
+Before this fix, the client process was not hooked at all. The probes were
+PID-scoped, and a second process running an already-hooked binary was
+skipped. Every replica of a Go service on a node was affected. Probes now
+cover every process that runs the binary, as they do for `libssl`. POST
+bodies are cut at `max_body_bytes` (4 KB). Go's JSON encoder sorts keys, so
+in the 5 KB POSTs the SSN falls past the cut. It is then neither exported
+nor redacted, which is why only 75 of 117 bodies show redaction.
+
 ### HTTPS (OpenSSL uprobes)
 
 `tests/oracle/run_tls.sh`: the same HTTP/1.1 mix over TLS on loopback,
@@ -287,8 +308,8 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   hooked call.** Until then, and on kernels where neither the sock tracepoints
   nor fentry/kprobes are available, TLS exchanges are exported without
   addresses and are left out of the service graph.
-- **Statically linked TLS** (BoringSSL in Envoy, Go's TLS reads, rustls, Java)
-  is not covered. Go `crypto/tls` writes are hooked, but not scored here.
+- **Statically linked TLS** other than Go (BoringSSL in Envoy, rustls, Java)
+  is not covered, nor are Go binaries stripped of their symbol table.
 
 ## 7. Reproducing
 
@@ -302,8 +323,9 @@ cryptography grpcio`, and Go for the load generator.
 sudo tests/oracle/run.sh 2000 1234
 sudo tests/oracle/run.sh 5000 42          # load run
 
-# HTTPS through the OpenSSL uprobes (client and server views). Needs openssl.
-sudo tests/oracle/run_tls.sh 1000 42
+# HTTPS through the OpenSSL and Go TLS uprobes (client and server views).
+# Needs openssl and go.
+sudo env PATH="$PATH" tests/oracle/run_tls.sh 1000 42   # OpenSSL and Go stacks
 
 # Redis, PostgreSQL, MySQL, gRPC. Fails if any protocol is below 99% recall.
 sudo tests/oracle/run_protocols.sh 500 7

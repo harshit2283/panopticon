@@ -351,19 +351,33 @@ pub fn attach_tls_uprobes(
         }
         TlsType::GoTls {
             write_offset,
+            read,
             go_version,
         } => {
             match go_version {
                 GoVersion::RegisterAbi => {
-                    if attach_go_tls_uprobe(
-                        ebpf,
-                        "go_tls_write_entry",
-                        &target.library_path,
-                        *write_offset,
-                        target.pid as i32,
-                        links,
-                    ) {
+                    // No PID filter: like libssl, the probes cover every
+                    // process running this binary (every replica on the node).
+                    let path = &target.library_path;
+                    if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
                         attached += 1;
+                    }
+                    if let Some(read) = read
+                        && attach_uprobe(
+                            ebpf,
+                            "go_tls_read_entry",
+                            path,
+                            read.entry_offset,
+                            None,
+                            links,
+                        )
+                    {
+                        attached += 1;
+                        for &ret in &read.ret_offsets {
+                            if attach_uprobe(ebpf, "go_tls_read_ret", path, ret, None, links) {
+                                attached += 1;
+                            }
+                        }
                     }
                 }
                 GoVersion::StackAbi => {
@@ -394,64 +408,6 @@ pub fn attach_tls_uprobes(
 /// Caller is responsible for locking the mutex.
 pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) -> usize {
     attach_tls_uprobes(&mut state.ebpf, target, &mut state.links)
-}
-
-fn attach_go_tls_uprobe(
-    ebpf: &mut Ebpf,
-    prog_name: &str,
-    target_path: &str,
-    offset: u64,
-    pid: i32,
-    links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) -> bool {
-    match try_attach_uprobe(ebpf, prog_name, target_path, offset, Some(pid)) {
-        Ok(link) => {
-            info!(
-                prog = prog_name,
-                path = target_path,
-                offset,
-                pid,
-                "uprobe attached"
-            );
-            links.push(Box::new(link));
-            true
-        }
-        Err(err) => {
-            warn!(
-                prog = prog_name,
-                path = target_path,
-                offset,
-                pid,
-                error = %err,
-                "Failed to attach pid-scoped Go TLS uprobe; retrying without pid filter"
-            );
-
-            match try_attach_uprobe(ebpf, prog_name, target_path, offset, None) {
-                Ok(link) => {
-                    info!(
-                        prog = prog_name,
-                        path = target_path,
-                        offset,
-                        pid,
-                        "uprobe attached without pid filter"
-                    );
-                    links.push(Box::new(link));
-                    true
-                }
-                Err(retry_err) => {
-                    warn!(
-                        prog = prog_name,
-                        path = target_path,
-                        offset,
-                        pid,
-                        error = %retry_err,
-                        "Failed to attach Go TLS uprobe"
-                    );
-                    false
-                }
-            }
-        }
-    }
 }
 
 fn attach_uprobe(

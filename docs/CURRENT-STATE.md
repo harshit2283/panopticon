@@ -48,7 +48,9 @@ production-hardened compliance platform.
   - TLS exchanges carry their socket addresses and join the service graph:
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+); the
     fentry/kprobe fallback for older kernels is not validated yet.
-  - Go TLS is write-path only and not scored against ground truth.
+  - Go `crypto/tls` reads and writes (Go 1.17+ register ABI) are validated
+    the same way: 100% recall from both processes. Binaries built with `-s`
+    (no symbol table) are not found; arm64 is untested.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
@@ -72,7 +74,6 @@ production-hardened compliance platform.
 
 - IPv6 capture
 - Kubernetes identity validated on a real cluster (and for IPv6 pods)
-- Go TLS read-path capture
 - Broad TLS library support beyond the current OpenSSL and partial Go paths
 - Full runtime hot-reload for all tunable settings
 - Complete connection-state cleanup on process exit

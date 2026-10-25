@@ -16,7 +16,7 @@ hardening work.
 - Captures cleartext traffic with TC eBPF hooks.
 - Captures TLS plaintext through uprobes: OpenSSL (shared `libssl`, including
   the `SSL_read_ex`/`SSL_write_ex` API used by OpenSSL 3 applications) and Go
-  `crypto/tls` writes.
+  `crypto/tls` (reads and writes, Go 1.17+ binaries with symbols).
 - Parses HTTP/1.1, HTTP/2, gRPC, MySQL, PostgreSQL, Redis, Kafka, DNS, and AMQP.
 - Runs regex-first PII detection with optional ONNX-backed ML inference.
 - Builds a service graph named by Kubernetes workload (`namespace/workload`)
@@ -62,7 +62,7 @@ current release report.
 | AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
 | DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
-| Go TLS plaintext capture | Partial | Write-path capture only. |
+| Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes. |
 | Regex-first PII detection | Supported | Baseline detection path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
 | Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
@@ -73,7 +73,6 @@ current release report.
 - IPv6 capture is not implemented.
 - Kubernetes pod/service identity has not been validated on a real cluster
   (only against a fake API server).
-- Go TLS read-path capture is not implemented.
 - On kernels older than 6.3, TLS socket addresses come from an fentry/kprobe
   fallback that has not been validated yet.
 - Broad TLS library coverage beyond the current OpenSSL and partial Go paths is

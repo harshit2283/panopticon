@@ -39,9 +39,23 @@ pub enum TlsType {
     },
     GoTls {
         write_offset: u64,
+        /// `crypto/tls.(*Conn).Read` entry and the offset of every return
+        /// instruction in it. Go reads cannot use a uretprobe (the runtime
+        /// moves goroutine stacks, which corrupts the return address), so
+        /// the return value is read with a uprobe on each RET instead.
+        read: Option<GoReadProbes>,
         go_version: GoVersion,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoReadProbes {
+    pub entry_offset: u64,
+    pub ret_offsets: Vec<u64>,
+}
+
+/// Most return instructions accepted in one function (sanity bound).
+const MAX_GO_RETURNS: usize = 64;
 
 /// Go ABI version — determines how arguments are passed to functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +161,70 @@ fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
     }
 
     sym_addr
+}
+
+/// Entry and return-instruction offsets of the function `name` in an ELF.
+pub fn go_read_probes(path: &str, name: &str) -> Option<GoReadProbes> {
+    let file = std::fs::File::open(path).ok()?;
+    let cache = ReadCache::new(file);
+    go_read_probes_from(&cache, name)
+}
+
+fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Option<GoReadProbes> {
+    let elf = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data).ok()?;
+    let sym = elf
+        .symbols()
+        .find(|s| s.name().ok() == Some(name) && s.size() > 0)?;
+    let (addr, size) = (sym.address(), sym.size());
+    let code = elf
+        .sections()
+        .find(|s| s.address() <= addr && addr + size <= s.address() + s.size())?
+        .data_range(addr, size)
+        .ok()??;
+    let rets = return_addresses(elf.architecture(), addr, code)?;
+    if rets.is_empty() || rets.len() > MAX_GO_RETURNS {
+        return None;
+    }
+    Some(GoReadProbes {
+        entry_offset: symbol_file_offset(&elf, addr),
+        ret_offsets: rets
+            .into_iter()
+            .map(|a| symbol_file_offset(&elf, a))
+            .collect(),
+    })
+}
+
+/// Virtual addresses of the return instructions in `code` (loaded at
+/// `addr`). Decodes instructions rather than searching for the RET byte,
+/// which also occurs inside other instructions.
+fn return_addresses(arch: object::Architecture, addr: u64, code: &[u8]) -> Option<Vec<u64>> {
+    match arch {
+        object::Architecture::X86_64 => {
+            use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+            let mut decoder = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
+            let mut rets = Vec::new();
+            for insn in &mut decoder {
+                if insn.is_invalid() {
+                    return None; // not code we understand: don't guess
+                }
+                if insn.mnemonic() == Mnemonic::Ret {
+                    rets.push(insn.ip());
+                }
+            }
+            Some(rets)
+        }
+        object::Architecture::Aarch64 => {
+            const RET: u32 = 0xd65f_03c0; // ret (x30)
+            Some(
+                code.chunks_exact(4)
+                    .enumerate()
+                    .filter(|(_, w)| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == RET)
+                    .map(|(i, _)| addr + 4 * i as u64)
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Detect Go version from the `.go.buildinfo` ELF section.
@@ -258,20 +336,15 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
     targets
 }
 
-/// Keep one target per library file. OpenSSL uprobes are attached without a
+/// Keep one target per library file. TLS uprobes are attached without a
 /// PID filter, so they already cover every process mapping that file; each
 /// PID reaches it through a different `/proc/<pid>/root/...` path, and
-/// attaching once per path made every SSL call emit duplicate events. Go
-/// probes are attached per PID, so those stay one per process.
+/// attaching once per path made every SSL call emit duplicate events.
 fn dedup_targets(targets: &mut Vec<TlsTarget>, file_id: impl Fn(&str) -> Option<(u64, u64)>) {
     let mut seen = std::collections::HashSet::new();
     targets.retain(|t| {
-        let pid = match t.tls_type {
-            TlsType::OpenSsl { .. } => 0,
-            TlsType::GoTls { .. } => t.pid,
-        };
         let file = file_id(&t.library_path).ok_or_else(|| t.library_path.clone());
-        seen.insert((file, pid))
+        seen.insert(file)
     });
 }
 
@@ -371,9 +444,11 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
         if let Ok(syms) = resolve_elf_symbols(namespace_path, &["crypto/tls.(*Conn).Write"])
             && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
         {
-            debug!(path, target = %namespace_path, %version, "Found Go TLS binary");
+            let read = go_read_probes(namespace_path, "crypto/tls.(*Conn).Read");
+            debug!(path, target = %namespace_path, %version, read = read.is_some(), "Found Go TLS binary");
             return Some(TlsType::GoTls {
                 write_offset: write_off,
+                read,
                 go_version: go_abi,
             });
         }
@@ -701,6 +776,29 @@ mod tests {
     }
 
     #[test]
+    fn test_return_addresses_decodes_instructions_x86_64() {
+        let code = [
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0xb8, 0xc3, 0x00, 0x00, 0x00, // mov eax, 0xc3 (0xc3 byte, not a ret)
+            0xc3, // ret
+            0x48, 0x31, 0xc0, // xor rax, rax
+            0xc3, // ret
+        ];
+        let rets = return_addresses(object::Architecture::X86_64, 0x1000, &code).unwrap();
+        assert_eq!(rets, vec![0x1008, 0x100c]);
+    }
+
+    #[test]
+    fn test_return_addresses_aarch64() {
+        let mut code = Vec::new();
+        for w in [0xd503201fu32, 0xd65f03c0, 0xaa0003e1, 0xd65f03c0] {
+            code.extend(w.to_le_bytes()); // nop, ret, mov x1, x0, ret
+        }
+        let rets = return_addresses(object::Architecture::Aarch64, 0x4000, &code).unwrap();
+        assert_eq!(rets, vec![0x4004, 0x400c]);
+    }
+
+    #[test]
     fn test_dedup_targets_by_file_not_path() {
         let ssl = |pid: u32, path: &str| TlsTarget {
             pid,
@@ -717,6 +815,7 @@ mod tests {
             library_path: path.to_string(),
             tls_type: TlsType::GoTls {
                 write_offset: 3,
+                read: None,
                 go_version: GoVersion::RegisterAbi,
             },
         };
@@ -725,7 +824,7 @@ mod tests {
             ssl(11, "/proc/11/root/usr/lib/libssl.so.3"), // same file
             ssl(12, "/proc/12/root/usr/lib/libssl.so.3"), // container's own copy
             go(20, "/proc/20/root/app"),
-            go(21, "/proc/21/root/app"), // same binary, other process
+            go(21, "/proc/21/root/app"), // same binary, other process: covered
             go(21, "/proc/21/root/app"),
         ];
         let id = |path: &str| {
@@ -737,7 +836,7 @@ mod tests {
         };
         dedup_targets(&mut targets, id);
         let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
-        assert_eq!(kept, vec![10, 12, 20, 21]);
+        assert_eq!(kept, vec![10, 12, 20]);
     }
 
     // ── resolve_elf_symbols_from_bytes ───────────────────────────────

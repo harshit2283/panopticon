@@ -20,8 +20,8 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, PERF_SCRATCH, SockTuple, TLS_ACTIVE, TLS_CONN_ADDR,
-    TLS_SCRATCH, TlsConnKey, TlsReadArgs, data_events_submit_flags,
+    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, GO_READ_ARGS, GoReadKey, PERF_SCRATCH, SockTuple,
+    TLS_ACTIVE, TLS_CONN_ADDR, TLS_SCRATCH, TlsConnKey, TlsReadArgs, data_events_submit_flags,
 };
 use crate::sock_monitor::read_sock_tuple;
 
@@ -326,6 +326,97 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     mark_active(conn);
 
     emit_tls_event(ctx, conn, buf, len, Direction::Egress, TlsLibrary::GoTls)
+}
+
+// ── Go TLS: crypto/tls.(*Conn).Read ───────────────────────────────────────
+
+/// Entry of `(*Conn).Read(b []byte) (int, error)`: remember the buffer and
+/// connection for this goroutine.
+#[uprobe]
+pub fn go_tls_read_entry(ctx: ProbeContext) {
+    let _ = try_go_tls_read_entry(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    let (conn, buf, _len) = read_go_write_args(ctx)?; // same argument layout
+    let key = go_read_key(ctx)?;
+    mark_active(conn);
+    let args = TlsReadArgs {
+        buf: buf as u64,
+        ssl: conn,
+        readbytes: 0,
+    };
+    GO_READ_ARGS.insert(&key, &args, 0).map_err(|_| ())
+}
+
+/// A RET instruction of `(*Conn).Read` (attached at every one): the byte
+/// count is the first result register.
+#[uprobe]
+pub fn go_tls_read_ret(ctx: ProbeContext) {
+    let _ = try_go_tls_read_ret(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
+    let key = go_read_key(ctx)?;
+    let args = match unsafe { GO_READ_ARGS.get(&key) } {
+        Some(a) => *a,
+        None => return Ok(()), // missed the entry
+    };
+    let _ = GO_READ_ARGS.remove(&key);
+    let n = go_first_result(ctx) as i64;
+    if n <= 0 || n > u32::MAX as i64 {
+        return Ok(());
+    }
+    emit_tls_event(
+        ctx,
+        args.ssl,
+        args.buf as *const u8,
+        n as usize,
+        Direction::Ingress,
+        TlsLibrary::GoTls,
+    )
+}
+
+#[inline(always)]
+fn go_read_key(ctx: &ProbeContext) -> Result<GoReadKey, ()> {
+    let goroutine = go_g_register(ctx);
+    if goroutine == 0 {
+        return Err(());
+    }
+    Ok(GoReadKey {
+        tgid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        _pad: 0,
+        goroutine,
+    })
+}
+
+/// The current goroutine (`g`), pinned to a register in Go's ABIInternal:
+/// R14 on x86_64, X28 on arm64.
+#[inline(always)]
+#[cfg(bpf_target_arch = "x86_64")]
+fn go_g_register(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).r14 }
+}
+
+#[inline(always)]
+#[cfg(not(bpf_target_arch = "x86_64"))]
+fn go_g_register(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).regs[28] }
+}
+
+/// First integer result at a RET: RAX on x86_64, X0 on arm64.
+#[inline(always)]
+#[cfg(bpf_target_arch = "x86_64")]
+fn go_first_result(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).rax }
+}
+
+#[inline(always)]
+#[cfg(not(bpf_target_arch = "x86_64"))]
+fn go_first_result(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).regs[0] }
 }
 
 #[inline(always)]

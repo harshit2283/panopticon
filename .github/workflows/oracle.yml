@@ -47,8 +47,8 @@ jobs:
       - name: HTTP/1.1 (TC capture)
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run.sh 1000 1234 0.99
 
-      - name: HTTPS (OpenSSL uprobes, system python3)
-        run: sudo tests/oracle/run_tls.sh 500 42 0.99
+      - name: HTTPS (OpenSSL and Go crypto/tls uprobes)
+        run: sudo env PATH="$PATH" tests/oracle/run_tls.sh 500 42 0.99
 
       - name: Redis, PostgreSQL, MySQL, gRPC
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_protocols.sh 300 7 0.99

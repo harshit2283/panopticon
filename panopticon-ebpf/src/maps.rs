@@ -158,6 +158,22 @@ pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
 #[map]
 pub static CONNECTING: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
+/// A Go `crypto/tls.(*Conn).Read` call in flight: process + goroutine.
+/// Keyed by goroutine (the g register), not thread: a blocked Read parks
+/// the goroutine, which may resume on another OS thread before returning.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GoReadKey {
+    pub tgid: u32,
+    pub _pad: u32,
+    pub goroutine: u64,
+}
+
+/// Arguments of in-flight Go TLS reads (buf, conn), for the RET probes.
+#[map]
+pub static GO_READ_ARGS: LruHashMap<GoReadKey, TlsReadArgs> =
+    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.
 #[map]
