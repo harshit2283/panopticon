@@ -54,7 +54,7 @@ current release report.
 | HTTP/1.1 parsing | Supported | 100% recall against ground truth, incl. keep-alive, chunked and >4KB bodies ([benchmarks](docs/BENCHMARKS.md)). |
 | HTTP/2 parsing | Supported | Per-direction HPACK; headers are lost when the agent joins an existing connection. |
 | gRPC parsing | Supported | 100% recall, method path and `grpc-status` against ground truth; payloads shown as printable strings (no schema decoding, no compressed messages). |
-| MySQL parsing | Partial | Text protocol at 100% recall on plaintext connections; prepared-statement (binary) protocol not parsed. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. |
+| MySQL parsing | Supported | Text protocol (incl. MySQL 8 query attributes) and prepared statements (binary protocol, with bound parameter values) at 100% recall against ground truth on plaintext connections. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. |
 | PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall; COPY and large objects not parsed. |
 | Redis parsing | Supported | RESP2 and RESP3, pipelining; 100% recall against ground truth. |
 | Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |

@@ -12,9 +12,17 @@ PostgreSQL alternates the simple query protocol and the extended protocol
 extended case the token is in the SQL text but the PII travels as a bind
 parameter, which measures whether the agent sees parameter values.
 
+MySQL uses the text protocol (PyMySQL interpolates parameters client-side)
+unless MYSQL_MODE=prepared: then parameterised statements go through
+mysql-connector-python's prepared cursors (COM_STMT_PREPARE / EXECUTE /
+CLOSE, the binary protocol Go, JDBC and most ORMs use), PII travelling as
+bound parameters; literal SQL stays on the text protocol.
+
 Usage: python db_oracle.py {redis|postgres|mysql} HOST N OUT [SEED]
-Needs: redis, psycopg[binary], pymysql.
+Needs: redis, psycopg[binary], pymysql (mysql-connector-python for
+MYSQL_MODE=prepared).
 """
+import os
 import json
 import random
 import sys
@@ -151,6 +159,8 @@ def run_postgres():
 
 
 def run_mysql():
+    if os.environ.get("MYSQL_MODE") == "prepared":
+        return run_mysql_prepared()
     import pymysql
 
     # MySQL 8 clients negotiate TLS by default, which hides the protocol from
@@ -172,6 +182,39 @@ def run_mysql():
         return "text"
 
     run_sql(execute, simple)
+
+
+def run_mysql_prepared():
+    import mysql.connector
+
+    conn = mysql.connector.connect(host=HOST, user="root", password="oracle",
+                                   database="oracle", autocommit=True, ssl_disabled=True)
+    text = conn.cursor()
+    text.execute("DROP TABLE IF EXISTS users")
+    text.execute("CREATE TABLE users (id int, email varchar(200), note varchar(64))")
+    # One cursor re-prepares per distinct statement (PREPARE, EXECUTE, then
+    # CLOSE of the previous one); the other keeps one statement prepared and
+    # only re-executes it, like a pooled ORM.
+    varied = conn.cursor(prepared=True)
+    reused = conn.cursor(prepared=True)
+
+    def execute(sql, params):
+        varied.execute(sql, params)
+        if varied.with_rows:
+            varied.fetchall()
+        return "binary"
+
+    def simple(sql):
+        text.execute(sql)
+        if text.with_rows:
+            text.fetchall()
+        return "text"
+
+    def prepared(sql, params):
+        reused.execute(sql, params)
+        return "binary-reused"
+
+    run_sql(execute, simple, prepared)
 
 
 {"redis": run_redis, "postgres": run_postgres, "mysql": run_mysql}[PROTO]()

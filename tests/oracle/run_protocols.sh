@@ -12,7 +12,8 @@
 # Needs: root, docker, a built agent, python3 with pyroute2, redis,
 # psycopg[binary], pymysql, cryptography (MySQL 8 full auth over plaintext),
 # grpcio:
-#   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio
+#   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio \
+#     mysql-connector-python
 # Images can be overridden, e.g. REDIS_IMAGE=mirror.gcr.io/library/redis:7.4.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
@@ -67,15 +68,19 @@ EOF
 wait_ready
 
 status=0
-for proto in redis postgres mysql; do
-  "$AGENT" -i "$IFACE" --json-export "$OUT/$proto-agent.jsonl" >"$OUT/$proto-agent.log" 2>&1 &
+# mysql-prepared: MySQL through prepared statements (binary protocol).
+for run in redis postgres mysql mysql-prepared; do
+  proto=${run%-prepared}
+  mode=; [[ $run == *-prepared ]] && mode=prepared
+  echo "== $run"
+  "$AGENT" -i "$IFACE" --json-export "$OUT/$run-agent.jsonl" >"$OUT/$run-agent.log" 2>&1 &
   AP=$!
   sleep 4
-  nsenter --net=/var/run/netns/$NS "$PY" "$HERE/db_oracle.py" \
-    "$proto" "$HOST_IP" "$N" "$OUT/$proto-truth.jsonl" "$SEED"
+  MYSQL_MODE=$mode nsenter --net=/var/run/netns/$NS "$PY" "$HERE/db_oracle.py" \
+    "$proto" "$HOST_IP" "$N" "$OUT/$run-truth.jsonl" "$SEED"
   sleep 3
   kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
-  python3 -I "$HERE/score_db.py" "$OUT/$proto-truth.jsonl" "$OUT/$proto-agent.jsonl" \
+  python3 -I "$HERE/score_db.py" "$OUT/$run-truth.jsonl" "$OUT/$run-agent.jsonl" \
     "$MIN_RECALL" || status=1
   echo
 done

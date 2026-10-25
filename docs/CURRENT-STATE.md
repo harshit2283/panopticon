@@ -20,8 +20,8 @@ production-hardened compliance platform.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol,
-  plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
+- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol and
+  prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
   every request that carried it, and no raw PII values in the export
   (`tests/oracle/run_protocols.sh`).
 - Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
@@ -50,8 +50,9 @@ production-hardened compliance platform.
     fentry/kprobe fallback for older kernels is not validated yet.
   - Go TLS is write-path only and not scored against ground truth.
 - Protocol depth:
-  - MySQL binary (prepared-statement) protocol, PostgreSQL COPY, gRPC
-    schema decoding and compressed messages are not parsed.
+  - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
+    parsed. MySQL statements prepared before the agent started are
+    reported as `EXECUTE` without their SQL.
   - HTTP/2 headers cannot be decoded when the agent joins a connection that
     was already open (HPACK state is lost).
   - Kafka, AMQP and DNS have unit coverage but are not scored against ground

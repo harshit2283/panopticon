@@ -21,7 +21,7 @@ here has not been measured.
 | Kernel | 6.18 (RingBuf, TCX attach) |
 | Agent | release build, default config, regex PII (no ONNX model) |
 | Topology | client in its own network namespace, connected by a veth pair; the agent attaches to the host end, so it sees the **server side** of every connection, which is how a pod's veth looks |
-| Clients | Python 3.13: `http.client`, redis-py 8.1, psycopg 3.3, PyMySQL 1.2, grpcio 1.84 |
+| Clients | Python 3.13: `http.client`, redis-py 8.1, psycopg 3.3, PyMySQL 1.2, mysql-connector-python 26.10, grpcio 1.84 |
 | Servers | Python HTTP server, `redis:7.4`, `postgres:16`, `mysql:8.4` (Docker, host network), grpcio server |
 
 The figures are from a single VM, so expect variance between runs. Kernel
@@ -99,6 +99,7 @@ for each.
 | Redis 7.4 | SET/GET/HSET/LPUSH/INCRBY/DEL, errors, pipelined batches | 86.2% (GET 0%) → **100%** | 0% → **100%** | 0 |
 | PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **100%** | 0% → **100%** | 0 |
 | MySQL 8.4 | COM_QUERY text protocol, errors, `caching_sha2_password` auth | 0% (see below) → **100%** | 0% → **100%** | 0 |
+| MySQL 8.4, prepared statements | mysql-connector-python prepared cursors (COM_STMT_PREPARE / EXECUTE / CLOSE, statements re-executed with new values), mixed with text queries | 66.7% → **100%** (re-executed statements 0% → 100%; verb accuracy 49.5% → 100%) | 0% → **100%** | 0 |
 | gRPC (HTTP/2) | unary, server-streaming, trailers-only errors (`NOT_FOUND`) | 100% → **100%** | 65% → **100%** | 0 |
 
 gRPC field accuracy went from 21% to 100% for the method path and from 79% to
@@ -293,7 +294,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 
 Requirements: root on Linux 5.8+, a release build
 (`cargo build -p panopticon-agent --release`), Docker for the database run,
-Python with `pip install pyroute2 redis 'psycopg[binary]' pymysql
+Python with `pip install pyroute2 redis 'psycopg[binary]' pymysql mysql-connector-python
 cryptography grpcio`, and Go for the load generator.
 
 ```bash
