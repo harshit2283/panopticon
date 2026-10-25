@@ -2,9 +2,16 @@
 
 //! DNS protocol parser (RFC 1035).
 //!
-//! DNS uses UDP (port 53) — each packet is a complete message, no reassembly.
-//! Parses queries (egress) and responses (ingress), extracting domain names,
-//! record types (A, AAAA, CNAME, SRV), and response codes.
+//! Over UDP (port 53) each packet is a complete message. Over TCP (large
+//! responses, zone transfers, resolvers that prefer it) every message is
+//! prefixed with a 2-byte length (RFC 1035 §4.2.2) and is reassembled
+//! across segments; the transport is recognised from the first message.
+//!
+//! One message is exported per query/response exchange, when the response
+//! arrives: `method` "QUERY", `path` the query name, `status` the RCODE, the
+//! `qtype` header, resolved records (A, AAAA, CNAME, SRV) in `payload_text`.
+//! A response whose query was not seen is still exported, named from its
+//! own question section.
 //!
 //! DNS cache integration uses Option A: resolved records are returned in
 //! `L7Message.headers` as `("dns_a_record", "domain|ip_u32|ttl_secs")` tuples.
@@ -12,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -39,27 +47,73 @@ enum State {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Transport {
+    Udp,
+    /// Length-prefixed messages on a byte stream.
+    Tcp,
+}
+
+/// A query waiting for its response.
+struct PendingQuery {
+    qname: String,
+    qtype: u16,
+    timestamp_ns: u64,
+    size: u64,
+}
+
 /// DNS protocol parser.
 pub struct DnsParser {
     state: State,
-    /// Maps transaction ID → (qname, request_timestamp_ns).
-    pending_queries: HashMap<u16, (String, u64)>,
+    /// Decided on the first message; `None` until then.
+    transport: Option<Transport>,
+    /// TCP reassembly, client→server and server→client.
+    client_buf: StreamBuffer,
+    server_buf: StreamBuffer,
+    /// Maps transaction ID → the query.
+    pending_queries: HashMap<u16, PendingQuery>,
+}
+
+/// TCP if the first segment is a 2-byte length (sent on its own) or exactly
+/// one length-prefixed message with one question. A UDP message matches
+/// only if its transaction ID equals its length minus 2 and its QDCOUNT
+/// field (the TCP reading's flags) is right too.
+fn looks_like_tcp(data: &[u8]) -> bool {
+    if data.len() == 2 {
+        return true; // no UDP DNS message is this short
+    }
+    data.len() >= 14
+        && u16::from_be_bytes([data[0], data[1]]) as usize + 2 == data.len()
+        && u16::from_be_bytes([data[6], data[7]]) == 1
 }
 
 impl DnsParser {
     pub fn new() -> Self {
         Self {
             state: State::Idle,
+            transport: None,
+            client_buf: StreamBuffer::new(),
+            server_buf: StreamBuffer::new(),
             pending_queries: HashMap::new(),
         }
     }
 
-    /// Parse a DNS query (egress).
-    fn parse_query(&mut self, data: &[u8], timestamp_ns: u64) -> ParseResult {
+    /// One complete DNS message. The QR bit says whether it is a query or
+    /// a response, whichever hook captured it.
+    fn message(&mut self, data: &[u8], timestamp_ns: u64) -> ParseResult {
         if data.len() < 12 {
-            return ParseResult::Error("DNS packet too short for header".into());
+            return ParseResult::Error("DNS packet too short".into());
         }
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        if (flags >> 15) & 1 == 1 {
+            self.parse_response(data, timestamp_ns)
+        } else {
+            self.parse_query(data, timestamp_ns)
+        }
+    }
 
+    /// Record a query until its response arrives.
+    fn parse_query(&mut self, data: &[u8], timestamp_ns: u64) -> ParseResult {
         let id = u16::from_be_bytes([data[0], data[1]]);
         let qdcount = u16::from_be_bytes([data[4], data[5]]);
 
@@ -84,55 +138,67 @@ impl DnsParser {
             && let Some(&oldest_id) = self
                 .pending_queries
                 .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
+                .min_by_key(|(_, q)| q.timestamp_ns)
                 .map(|(id, _)| id)
         {
             self.pending_queries.remove(&oldest_id);
         }
 
-        self.pending_queries
-            .insert(id, (qname.clone(), timestamp_ns));
-
-        let mut msg = L7Message::new(Protocol::Dns, Direction::Egress, timestamp_ns);
-        msg.method = Some("QUERY".into());
-        msg.path = Some(qname);
-        msg.headers
-            .push(("qtype".into(), qtype_to_string(qtype).into()));
-        msg.request_size_bytes = data.len() as u64;
-
-        ParseResult::Messages(vec![msg])
+        self.pending_queries.insert(
+            id,
+            PendingQuery {
+                qname,
+                qtype,
+                timestamp_ns,
+                size: data.len() as u64,
+            },
+        );
+        ParseResult::NeedMoreData
     }
 
-    /// Parse a DNS response (ingress).
+    /// Parse a DNS response and export it with its query.
     fn parse_response(&mut self, data: &[u8], timestamp_ns: u64) -> ParseResult {
-        if data.len() < 12 {
-            return ParseResult::Error("DNS packet too short for header".into());
-        }
-
         let id = u16::from_be_bytes([data[0], data[1]]);
         let flags = u16::from_be_bytes([data[2], data[3]]);
         let rcode = flags & 0x000F;
         let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
         let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
 
-        // Skip question section
+        // Question section: the first question names the exchange if the
+        // query was not seen.
         let mut offset = 12;
+        let mut question: Option<(String, u16)> = None;
         for _ in 0..qdcount {
-            let (_, new_offset) = match parse_dns_name(data, offset) {
+            let (name, new_offset) = match parse_dns_name(data, offset) {
                 Some(r) => r,
                 None => return ParseResult::Error("DNS: failed to parse question name".into()),
             };
-            offset = new_offset + 4; // skip QTYPE + QCLASS
-            if offset > data.len() {
+            if new_offset + 4 > data.len() {
                 return ParseResult::Error("DNS: truncated question section".into());
             }
+            if question.is_none() {
+                question = Some((
+                    name,
+                    u16::from_be_bytes([data[new_offset], data[new_offset + 1]]),
+                ));
+            }
+            offset = new_offset + 4; // skip QTYPE + QCLASS
         }
+        let pending = self.pending_queries.remove(&id);
+        let (qname, qtype) = match (&pending, question) {
+            (Some(p), _) => (Some(p.qname.clone()), Some(p.qtype)),
+            (None, Some((name, qtype))) => (Some(name), Some(qtype)),
+            (None, None) => (None, None),
+        };
 
         // Parse answer section
         let mut resolved_ips = Vec::new();
         let mut cname_targets = Vec::new();
         let mut srv_targets = Vec::new();
         let mut headers = Vec::new();
+        if let Some(qtype) = qtype {
+            headers.push(("qtype".into(), qtype_to_string(qtype).to_string()));
+        }
 
         for _ in 0..ancount {
             if offset >= data.len() {
@@ -169,28 +235,14 @@ impl DnsParser {
             match rtype {
                 TYPE_A if rdlength == 4 => {
                     let ip = u32::from_be_bytes([rdata[0], rdata[1], rdata[2], rdata[3]]);
-                    let ip_str = format!("{}.{}.{}.{}", rdata[0], rdata[1], rdata[2], rdata[3]);
-                    resolved_ips.push(ip_str);
-
-                    // Look up the original qname for this response
-                    let domain = self
-                        .pending_queries
-                        .get(&id)
-                        .map(|(q, _)| q.clone())
-                        .unwrap_or_default();
-
-                    if !domain.is_empty() {
+                    resolved_ips.push(std::net::Ipv4Addr::from(ip).to_string());
+                    if let Some(domain) = qname.as_deref().filter(|d| !d.is_empty()) {
                         headers.push(("dns_a_record".into(), format!("{}|{}|{}", domain, ip, ttl)));
                     }
                 }
                 TYPE_AAAA if rdlength == 16 => {
-                    // Format as IPv6
-                    let mut parts = Vec::with_capacity(8);
-                    for i in 0..8 {
-                        let word = u16::from_be_bytes([rdata[i * 2], rdata[i * 2 + 1]]);
-                        parts.push(format!("{:x}", word));
-                    }
-                    resolved_ips.push(parts.join(":"));
+                    let octets: [u8; 16] = rdata.try_into().unwrap();
+                    resolved_ips.push(std::net::Ipv6Addr::from(octets).to_string());
                 }
                 TYPE_CNAME => {
                     if let Some((cname, _)) = parse_dns_name(data, offset) {
@@ -218,15 +270,14 @@ impl DnsParser {
 
         // Build L7Message
         let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, timestamp_ns);
-        msg.method = Some("RESPONSE".into());
+        msg.method = Some("QUERY".into());
+        msg.path = qname;
         msg.status = Some(rcode as u32);
         msg.response_size_bytes = data.len() as u64;
         msg.headers = headers;
-
-        // Match pending query for qname + latency
-        if let Some((qname, req_ts)) = self.pending_queries.remove(&id) {
-            msg.path = Some(qname);
-            msg.latency_ns = Some(timestamp_ns.saturating_sub(req_ts));
+        if let Some(p) = pending {
+            msg.latency_ns = Some(timestamp_ns.saturating_sub(p.timestamp_ns));
+            msg.request_size_bytes = p.size;
         }
 
         // Build payload_text from resolved records
@@ -240,27 +291,53 @@ impl DnsParser {
 
         ParseResult::Messages(vec![msg])
     }
+
+    /// Reassemble length-prefixed messages from a TCP stream.
+    fn feed_tcp(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
+        let mut buf = std::mem::take(match direction {
+            Direction::Egress => &mut self.client_buf,
+            Direction::Ingress => &mut self.server_buf,
+        });
+        let mut out = Vec::new();
+        let mut result = None;
+        if buf.extend(data).is_err() {
+            result = Some(ParseResult::Error("DNS TCP buffer overflow".into()));
+        }
+        while result.is_none() && buf.len() >= 2 {
+            let d = buf.data();
+            let len = u16::from_be_bytes([d[0], d[1]]) as usize;
+            if d.len() < 2 + len {
+                break;
+            }
+            match self.message(&d[2..2 + len], timestamp_ns) {
+                ParseResult::Messages(m) => out.extend(m),
+                ParseResult::NeedMoreData => {}
+                err @ ParseResult::Error(_) => result = Some(err),
+            }
+            buf.consume(2 + len);
+        }
+        match direction {
+            Direction::Egress => self.client_buf = buf,
+            Direction::Ingress => self.server_buf = buf,
+        }
+        match result {
+            Some(err) => err,
+            None if out.is_empty() => ParseResult::NeedMoreData,
+            None => ParseResult::Messages(out),
+        }
+    }
 }
 
 impl ProtocolParser for DnsParser {
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
-        if data.len() < 12 {
-            return ParseResult::Error("DNS packet too short".into());
-        }
-
-        let flags = u16::from_be_bytes([data[2], data[3]]);
-        let is_response = (flags >> 15) & 1 == 1;
-
-        match direction {
-            Direction::Egress => self.parse_query(data, timestamp_ns),
-            Direction::Ingress => {
-                if is_response {
-                    self.parse_response(data, timestamp_ns)
-                } else {
-                    // Ingress query (e.g. from a DNS server perspective) — treat as query
-                    self.parse_query(data, timestamp_ns)
-                }
-            }
+        let transport = *self.transport.get_or_insert(if looks_like_tcp(data) {
+            Transport::Tcp
+        } else {
+            Transport::Udp
+        });
+        match transport {
+            Transport::Udp => self.message(data, timestamp_ns),
+            Transport::Tcp => self.feed_tcp(data, direction, timestamp_ns),
         }
     }
 
@@ -459,7 +536,7 @@ mod tests {
         match result {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
-                assert_eq!(msgs[0].method.as_deref(), Some("RESPONSE"));
+                assert_eq!(msgs[0].method.as_deref(), Some("QUERY"));
                 assert_eq!(
                     msgs[0].path.as_deref(),
                     Some("nginx.default.svc.cluster.local")
@@ -698,20 +775,155 @@ mod tests {
         assert!(matches!(result, ParseResult::Error(_)));
     }
 
+    fn one(r: ParseResult) -> L7Message {
+        match r {
+            ParseResult::Messages(mut m) if m.len() == 1 => m.pop().unwrap(),
+            other => panic!("expected one message, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_unknown_query_type_ignored() {
         let mut parser = DnsParser::new();
 
         let query = build_dns_query(0x8888, "mx.example.com", 15); // MX = 15
-        let result = parser.feed(&query, Direction::Egress, 1000);
-        match result {
-            ParseResult::Messages(msgs) => {
-                assert_eq!(msgs.len(), 1);
-                assert_eq!(msgs[0].method.as_deref(), Some("QUERY"));
-                assert_eq!(msgs[0].path.as_deref(), Some("mx.example.com"));
-            }
-            other => panic!("expected Messages, got {other:?}"),
-        }
+        parser.feed(&query, Direction::Egress, 1000);
+        let resp = build_dns_response(0x8888, 0, "mx.example.com", 15, &[]);
+        let msg = one(parser.feed(&resp, Direction::Ingress, 2000));
+        assert_eq!(msg.method.as_deref(), Some("QUERY"));
+        assert_eq!(msg.path.as_deref(), Some("mx.example.com"));
+        assert!(
+            msg.headers
+                .contains(&("qtype".to_string(), "MX".to_string()))
+        );
+    }
+
+    #[test]
+    fn exchange_is_one_message_with_qtype_and_rcode() {
+        let mut parser = DnsParser::new();
+        let query = build_dns_query(0x0101, "nx-tok_1_.oracle.test", TYPE_A);
+        assert!(
+            matches!(
+                parser.feed(&query, Direction::Egress, 1000),
+                ParseResult::NeedMoreData
+            ),
+            "the query alone is not an exchange"
+        );
+        let resp = build_dns_response(0x0101, 3, "nx-tok_1_.oracle.test", TYPE_A, &[]);
+        let msg = one(parser.feed(&resp, Direction::Ingress, 1500));
+        assert_eq!(msg.method.as_deref(), Some("QUERY"));
+        assert_eq!(msg.path.as_deref(), Some("nx-tok_1_.oracle.test"));
+        assert_eq!(msg.status, Some(3));
+        assert!(
+            msg.headers
+                .contains(&("qtype".to_string(), "A".to_string()))
+        );
+        assert_eq!(msg.request_size_bytes, query.len() as u64);
+        assert_eq!(msg.latency_ns, Some(500));
+    }
+
+    #[test]
+    fn query_captured_on_ingress_is_still_a_query() {
+        // Server-side capture: the query arrives on ingress.
+        let mut parser = DnsParser::new();
+        let query = build_dns_query(0x0202, "svc.local", TYPE_A);
+        assert!(matches!(
+            parser.feed(&query, Direction::Ingress, 1000),
+            ParseResult::NeedMoreData
+        ));
+        let resp = build_dns_response(0x0202, 0, "svc.local", TYPE_A, &[]);
+        let msg = one(parser.feed(&resp, Direction::Egress, 2000));
+        assert_eq!(msg.latency_ns, Some(1000));
+    }
+
+    #[test]
+    fn response_without_query_named_from_question() {
+        let mut parser = DnsParser::new();
+        let resp = build_dns_response(0x0303, 2, "fail-tok_2_.oracle.test", TYPE_AAAA, &[]);
+        let msg = one(parser.feed(&resp, Direction::Ingress, 2000));
+        assert_eq!(msg.path.as_deref(), Some("fail-tok_2_.oracle.test"));
+        assert_eq!(msg.status, Some(2));
+        assert!(
+            msg.headers
+                .contains(&("qtype".to_string(), "AAAA".to_string()))
+        );
+    }
+
+    #[test]
+    fn aaaa_answer_in_canonical_form() {
+        let mut parser = DnsParser::new();
+        parser.feed(
+            &build_dns_query(0x0404, "v6.test", TYPE_AAAA),
+            Direction::Egress,
+            1,
+        );
+        let name = encode_dns_name("v6.test");
+        let mut rdata = [0u8; 16];
+        rdata[0] = 0xfd;
+        rdata[15] = 0x2a;
+        let resp = build_dns_response(
+            0x0404,
+            0,
+            "v6.test",
+            TYPE_AAAA,
+            &[(&name, TYPE_AAAA, 60, &rdata)],
+        );
+        let msg = one(parser.feed(&resp, Direction::Ingress, 2));
+        assert_eq!(msg.payload_text.as_deref(), Some("fd00::2a"));
+    }
+
+    fn tcp(msg: &[u8]) -> Vec<u8> {
+        let mut v = (msg.len() as u16).to_be_bytes().to_vec();
+        v.extend_from_slice(msg);
+        v
+    }
+
+    #[test]
+    fn dns_over_tcp_length_prefixed_and_reassembled() {
+        let mut parser = DnsParser::new();
+        let query = tcp(&build_dns_query(0x0505, "a-tok_3_.oracle.test", TYPE_A));
+        assert!(matches!(
+            parser.feed(&query, Direction::Egress, 1000),
+            ParseResult::NeedMoreData
+        ));
+        let name = encode_dns_name("a-tok_3_.oracle.test");
+        let resp = tcp(&build_dns_response(
+            0x0505,
+            0,
+            "a-tok_3_.oracle.test",
+            TYPE_A,
+            &[(&name, TYPE_A, 60, &[10, 0, 0, 3])],
+        ));
+        // Split across segments, the length prefix on its own.
+        assert!(matches!(
+            parser.feed(&resp[..2], Direction::Ingress, 2000),
+            ParseResult::NeedMoreData
+        ));
+        assert!(matches!(
+            parser.feed(&resp[2..20], Direction::Ingress, 2000),
+            ParseResult::NeedMoreData
+        ));
+        let msg = one(parser.feed(&resp[20..], Direction::Ingress, 2000));
+        assert_eq!(msg.path.as_deref(), Some("a-tok_3_.oracle.test"));
+        assert_eq!(msg.status, Some(0));
+        assert_eq!(msg.payload_text.as_deref(), Some("10.0.0.3"));
+    }
+
+    #[test]
+    fn udp_response_is_not_mistaken_for_tcp() {
+        // A UDP response with one answer: its ANCOUNT=1 sits where a TCP
+        // reading's QDCOUNT would be.
+        let mut parser = DnsParser::new();
+        let name = encode_dns_name("x.test");
+        let resp = build_dns_response(
+            0x0606,
+            0,
+            "x.test",
+            TYPE_A,
+            &[(&name, TYPE_A, 60, &[1, 2, 3, 4])],
+        );
+        let msg = one(parser.feed(&resp, Direction::Ingress, 1));
+        assert_eq!(msg.path.as_deref(), Some("x.test"));
     }
 
     #[test]
