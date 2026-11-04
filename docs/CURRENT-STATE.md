@@ -130,7 +130,12 @@ production-hardened compliance platform.
     TLS, Redis AUTH and Kafka client ids; SQL password clauses and AMQP
     metadata are covered by unit tests only.
 - Service graphing:
-  - DNS/IP-based identity works.
+  - DNS/IP-based identity works. DNS names come only from answers to
+    queries seen on the same flow, are validated hostnames, last at most an
+    hour, and are dropped when they hold PII (except in `full`); there is no
+    list of trusted resolvers, so a workload can still name an address of
+    its choosing through a resolver it runs. The audit log records the
+    address beside the name (`service_addr`).
   - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,
     `node:name`) is implemented and tested against a fake API server only;
     not yet validated on a real cluster.

@@ -5,12 +5,18 @@ The agent recognises Redis on port 6379 and Kafka on 9092, so the servers
 only need to answer: Redis with +OK to every command, Kafka with an empty
 ApiVersions v0 response echoing the correlation id.
 
+First, one DNS query (UDP 53) for a name carrying an SSN, which the fake
+server resolves to its own address. The Kafka exchanges that follow carry
+PII to that address, so their audit entries name the server end: the name
+must not be that DNS name (or reach any sink) unless the mode is full.
+
 Usage:
   MODE=server HOST=ip python3 secrets_oracle.py
   MODE=client HOST=ip PLANT=tag python3 secrets_oracle.py N truth.jsonl
 
 Truth lines: {"id", "secrets": [redis password], "pii": [kafka client id],
-"auth": command used}. Every planted value is unique per tag and index.
+"auth": command used}; the first line's "pii" also holds the SSN in the DNS
+name. Every planted value is unique per tag and index.
 """
 import json
 import os
@@ -22,7 +28,32 @@ import threading
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PLANT = os.environ.get("PLANT", "x")
-REDIS_PORT, KAFKA_PORT = 6379, 9092
+REDIS_PORT, KAFKA_PORT, DNS_PORT = 6379, 9092, 53
+DNS_SSN = "771-55-0199"  # group 55: no other leg plants it
+
+
+def dns_name():
+    return f"{DNS_SSN}.{PLANT}.dns.test"
+
+
+def dns_query(qid, name):
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+    return q + struct.pack(">HH", 1, 1)  # A, IN
+
+
+def dns_serve():
+    """Answer every A query with this server's own address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((HOST, DNS_PORT))
+    while True:
+        q, peer = s.recvfrom(512)
+        if len(q) < 17:
+            continue
+        end = q.index(b"\0", 12) + 5  # question: name + type + class
+        resp = q[:2] + struct.pack(">HHHHH", 0x8180, 1, 1, 0, 0) + q[12:end]
+        resp += struct.pack(">HHHIH", 0xC00C, 1, 1, 3600, 4) + socket.inet_aton(HOST)
+        s.sendto(resp, peer)
 
 
 class Redis(socketserver.BaseRequestHandler):
@@ -60,10 +91,16 @@ def main():
                    for p, h in ((REDIS_PORT, Redis), (KAFKA_PORT, Kafka))]
         for s in servers[1:]:
             threading.Thread(target=s.serve_forever, daemon=True).start()
+        threading.Thread(target=dns_serve, daemon=True).start()
         servers[0].serve_forever()
         return
 
     n, out = int(sys.argv[1]), open(sys.argv[2], "w")
+    d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    d.settimeout(5)
+    d.sendto(dns_query(0x5150, dns_name()), (HOST, DNS_PORT))
+    d.recv(512)
+    d.close()
     r = socket.create_connection((HOST, REDIS_PORT))
     k = socket.create_connection((HOST, KAFKA_PORT))
     for i in range(n):
@@ -76,7 +113,8 @@ def main():
         req = struct.pack(">hhih", 18, 0, i, len(client_id)) + client_id
         k.sendall(struct.pack(">i", len(req)) + req)
         k.recv(64)
-        out.write(json.dumps({"id": i, "secrets": [pw], "pii": [client_id.decode()],
+        pii = [client_id.decode()] + ([DNS_SSN] if i == 0 else [])
+        out.write(json.dumps({"id": i, "secrets": [pw], "pii": pii,
                               "auth": auth[0]}) + "\n")
     r.close()
     k.close()

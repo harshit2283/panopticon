@@ -23,7 +23,12 @@ pub struct AuditEntry {
     pub source: PiiSource,
     pub confidence: f32,
     pub action: AuditAction,
+    /// The server end, named like the service graph names it.
     pub service_identity: String,
+    /// The server end's `ip:port`, always: a name taken from DNS answers
+    /// seen in the traffic is only as good as those answers.
+    #[serde(default)]
+    pub service_addr: String,
 }
 
 pub struct PiiAuditLog {
@@ -85,6 +90,7 @@ mod tests {
                 confidence: 1.0,
                 action: AuditAction::Redacted,
                 service_identity: "unknown".to_string(),
+                service_addr: "unknown".to_string(),
             }])
             .unwrap();
         }
@@ -98,6 +104,7 @@ mod tests {
                 confidence: 0.9,
                 action: AuditAction::Detected,
                 service_identity: "unknown".to_string(),
+                service_addr: "unknown".to_string(),
             }])
             .unwrap();
         }

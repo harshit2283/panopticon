@@ -1408,26 +1408,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             && let Some(audit_arc) = ctx.audit_log.as_ref()
         {
             use crate::export::audit::{AuditAction, AuditEntry};
-            // The service the PII travelled to or from: the server end.
-            let service = if ctx.event.src_addr == 0 && ctx.event.dst_addr == 0 {
-                "unknown".to_string()
-            } else {
-                let conn = ConnectionTuple {
-                    src_addr: ctx.event.src_addr,
-                    dst_addr: ctx.event.dst_addr,
-                    src_port: ctx.event.src_port,
-                    dst_port: ctx.event.dst_port,
-                    pid: ctx.event.pid,
-                };
-                match ctx.graph_builder.as_ref() {
-                    Some(gb) => gb.server_identity(&conn, ctx.sender_is_server, msg.protocol),
-                    None => {
-                        let (_, (addr, port)) =
-                            crate::graph::orient(&conn, ctx.sender_is_server, msg.protocol);
-                        format!("{}:{}", format_ipv4(addr), port)
-                    }
-                }
-            };
+            let (service, service_addr) = audit_service(ctx, msg.protocol);
             let entries: Vec<AuditEntry> = report
                 .entities
                 .iter()
@@ -1442,6 +1423,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                         AuditAction::Detected
                     },
                     service_identity: service.clone(),
+                    service_addr: service_addr.clone(),
                 })
                 .collect();
 
@@ -1506,28 +1488,42 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                 pid: ctx.event.pid,
             };
             gb.record_with_server(&conn_tuple, ctx.sender_is_server, msg, pii_report.as_ref());
-
-            // DNS cache feeding (Option A): extract resolved A records from DNS messages
-            if msg.protocol == crate::protocol::Protocol::Dns {
-                for (key, value) in &msg.headers {
-                    if key == "dns_a_record" {
-                        // Format: "domain|ip_u32|ttl_secs"
-                        let parts: Vec<&str> = value.splitn(3, '|').collect();
-                        if parts.len() == 3
-                            && let (Ok(ip), Ok(ttl)) =
-                                (parts[1].parse::<u32>(), parts[2].parse::<u64>())
-                        {
-                            gb.dns_cache.insert_observed(
-                                parts[0],
-                                ip,
-                                std::time::Duration::from_secs(ttl),
-                            );
-                        }
-                    }
-                }
-            }
+            gb.observe_dns(msg);
         }
     }
+}
+
+/// The service the PII travelled to or from, for the audit log: the server
+/// end's name, as the service graph names it, and its `ip:port`. In
+/// `metrics_only` the name never comes from DNS answers (payload-derived):
+/// a Kubernetes name or the address.
+#[cfg(target_os = "linux")]
+fn audit_service(
+    ctx: &MessageContext<'_>,
+    protocol: crate::protocol::Protocol,
+) -> (String, String) {
+    let e = ctx.event;
+    if e.src_addr == 0 && e.dst_addr == 0 {
+        return ("unknown".to_string(), "unknown".to_string());
+    }
+    let conn = ConnectionTuple {
+        src_addr: e.src_addr,
+        dst_addr: e.dst_addr,
+        src_port: e.src_port,
+        dst_port: e.dst_port,
+        pid: e.pid,
+    };
+    let (_, (addr, port)) = crate::graph::orient(&conn, ctx.sender_is_server, protocol);
+    let service_addr = format!("{}:{}", format_ipv4(addr), port);
+    let dns = ctx.privacy != PrivacyMode::MetricsOnly;
+    let name = match ctx.graph_builder.as_ref() {
+        Some(gb) => {
+            gb.server_identity(&conn, ctx.sender_is_server, protocol, dns)
+                .name
+        }
+        None => service_addr.clone(),
+    };
+    (name, service_addr)
 }
 
 /// `metrics_only`: drop every string taken from the payload (path or query

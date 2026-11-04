@@ -16,6 +16,9 @@
 //! DNS cache integration uses Option A: resolved records are returned in
 //! `L7Message.headers` as `("dns_a_record", "domain|ip_u32|ttl_secs")` tuples.
 //! The event loop extracts these and feeds `DnsCache::insert_observed()`.
+//! Only an answer to a query seen on the same flow (same transaction ID and
+//! question name) carries them: an unsolicited or spoofed response is
+//! exported as a message but names nothing (F8, F12).
 
 use std::collections::HashMap;
 
@@ -194,7 +197,20 @@ impl DnsParser {
             }
             offset = new_offset + 4; // skip QTYPE + QCLASS
         }
-        let pending = self.pending_queries.remove(&id);
+        // The response must answer the query this flow sent: same ID and
+        // same question. Anything else (an unsolicited or spoofed answer,
+        // or one the agent joined too late to see asked) is still exported,
+        // but must not name addresses in the DNS cache.
+        let matched = question.as_ref().is_some_and(|(name, _)| {
+            self.pending_queries
+                .get(&id)
+                .is_some_and(|p| p.qname.eq_ignore_ascii_case(name))
+        });
+        let pending = if matched {
+            self.pending_queries.remove(&id)
+        } else {
+            None
+        };
         let (qname, qtype) = match (&pending, question) {
             (Some(p), _) => (Some(p.qname.clone()), Some(p.qtype)),
             (None, Some((name, qtype))) => (Some(name), Some(qtype)),
@@ -246,7 +262,7 @@ impl DnsParser {
                 TYPE_A if rdlength == 4 => {
                     let ip = u32::from_be_bytes([rdata[0], rdata[1], rdata[2], rdata[3]]);
                     resolved_ips.push(std::net::Ipv4Addr::from(ip).to_string());
-                    if let Some(domain) = qname.as_deref().filter(|d| !d.is_empty()) {
+                    if let Some(domain) = qname.as_deref().filter(|d| matched && !d.is_empty()) {
                         headers.push(("dns_a_record".into(), format!("{}|{}|{}", domain, ip, ttl)));
                     }
                 }
@@ -595,6 +611,65 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    fn a_records(result: ParseResult) -> Vec<String> {
+        let ParseResult::Messages(msgs) = result else {
+            panic!("expected a message, got {result:?}");
+        };
+        assert_eq!(msgs.len(), 1, "the response is still exported");
+        msgs[0]
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "dns_a_record")
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// F8 / F12: only an answer to a query seen on this flow names an
+    /// address; an unsolicited or mismatched one is exported, unnamed.
+    #[test]
+    fn test_only_answers_to_seen_queries_name_addresses() {
+        let answer = |id, qname: &str| {
+            let name = encode_dns_name(qname);
+            build_dns_response(
+                id,
+                RCODE_NOERROR,
+                qname,
+                TYPE_A,
+                &[(&name, TYPE_A, 60, &[203, 0, 113, 5])],
+            )
+        };
+        // Unsolicited: no query at all.
+        let mut p = DnsParser::new();
+        assert!(
+            a_records(p.feed(&answer(0x1111, "api.stripe.com"), Direction::Ingress, 1)).is_empty()
+        );
+        // Right ID, other question.
+        p.feed(
+            &build_dns_query(0x2222, "app.internal", TYPE_A),
+            Direction::Egress,
+            2,
+        );
+        assert!(
+            a_records(p.feed(&answer(0x2222, "api.stripe.com"), Direction::Ingress, 3)).is_empty()
+        );
+        // Right question, other ID.
+        assert!(
+            a_records(p.feed(&answer(0x2223, "app.internal"), Direction::Ingress, 4)).is_empty()
+        );
+        // The real answer still matches: the forgeries did not consume the query.
+        assert_eq!(
+            a_records(p.feed(&answer(0x2222, "APP.internal"), Direction::Ingress, 5)),
+            vec![format!(
+                "app.internal|{}|60",
+                u32::from_be_bytes([203, 0, 113, 5])
+            )]
+        );
+        // A replayed answer to an already answered query names nothing.
+        assert!(
+            a_records(p.feed(&answer(0x2222, "app.internal"), Direction::Ingress, 6)).is_empty()
+        );
     }
 
     #[test]

@@ -9,7 +9,9 @@
 #   tls    http_oracle.py over TLS on loopback, captured by the OpenSSL
 #          uprobes (as run_tls.sh's openssl stack)
 #   proto  secrets_oracle.py over the veth: Redis AUTH / HELLO AUTH and Kafka
-#          ApiVersions with an email client id, against fake servers
+#          ApiVersions with an email client id, against fake servers, after
+#          a DNS lookup of a name carrying an SSN that resolves to the Kafka
+#          server (the name must not become the audit log's service name)
 # The agent runs at debug level with every sink the mode allows: the export
 # (full, redacted), the raw dump (full; also converted to pcap), the PII
 # audit log and the HTTP endpoints (/metrics, /debug/state, scraped before

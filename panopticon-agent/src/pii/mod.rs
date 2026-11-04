@@ -399,8 +399,12 @@ impl PiiEngine {
     /// caller (the privacy mode in effect).
     ///
     /// Every string field an exporter can carry is scanned: method, path,
-    /// content type, header names and values (all protocols; DNS answers
-    /// excepted), request and response body. With redaction on, credentials
+    /// content type, header names and values (all protocols), request and
+    /// response body. A DNS answer (`dns_a_record`, `domain|ip|ttl`) is not
+    /// rewritten, since it feeds the DNS cache; with redaction on, one whose
+    /// name holds PII (`123-45-6789.example.com`) is removed instead, so the
+    /// name never becomes a service identity. Its PII is counted once,
+    /// from the query name in `path`. With redaction on, credentials
     /// are also masked whatever the protocol: credential-named HTTP headers
     /// wholesale, the arguments of an `AUTH` command, and keyword-introduced
     /// secrets (`PASSWORD '…'`, `IDENTIFIED BY '…'`, `requirepass …`,
@@ -443,6 +447,14 @@ impl PiiEngine {
             msg.protocol,
             Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
         );
+        if redact_enabled {
+            msg.headers.retain(|(name, value)| {
+                name != "dns_a_record" || {
+                    let domain = value.split('|').next().unwrap_or_default();
+                    self.scan_with(domain, false).is_none()
+                }
+            });
+        }
         for (name, value) in msg.headers.iter_mut() {
             // DNS answers (domain|ip|ttl) feed the DNS cache: an IP-shaped
             // value there must not be rewritten.
@@ -695,6 +707,47 @@ mod tests {
         )];
         let _ = engine.scan_message(&mut msg);
         assert_eq!(msg.headers[0].1, "api.internal|167772161|30");
+    }
+
+    /// Codex #4: a DNS name carrying PII must not become a service name
+    /// (audit `service_identity`, graph nodes) or reach the export when
+    /// redacting; in full mode it is kept like any other payload.
+    #[test]
+    fn test_dns_answer_naming_pii_is_dropped_when_redacting() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let dns = || {
+            let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, 1);
+            msg.path = Some("123-45-6789.attacker.test".to_string());
+            msg.headers = vec![
+                ("qtype".to_string(), "A".to_string()),
+                (
+                    "dns_a_record".to_string(),
+                    "123-45-6789.attacker.test|167772161|30".to_string(),
+                ),
+                (
+                    "dns_a_record".to_string(),
+                    "api.internal|167772162|30".to_string(),
+                ),
+            ];
+            msg
+        };
+        let mut msg = dns();
+        let report = engine.scan_message_with(&mut msg, true).unwrap();
+        assert_eq!(report.entities.len(), 1, "the SSN, counted once (path)");
+        let all = format!("{:?} {:?}", msg.path, msg.headers);
+        assert!(!all.contains("123-45-6789"), "{all}");
+        assert_eq!(
+            msg.headers
+                .iter()
+                .filter(|(k, _)| k == "dns_a_record")
+                .count(),
+            1,
+            "the clean answer stays"
+        );
+        let mut full = dns();
+        engine.scan_message_with(&mut full, false);
+        assert_eq!(full.headers, dns().headers);
     }
 
     #[test]
