@@ -276,12 +276,8 @@ pub struct ExportEvent {
 /// export latency).
 const EXPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 /// Poll interval ceiling while idle: the first event after a quiet period
-/// is written within this delay. Traffic arriving at 150K/s fills the
-/// channel (4096) in about 27 ms, so this stays well below that.
-const EXPORT_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
-/// A drain that wrote at least this many events re-drains at once instead
-/// of sleeping: the channel is filling faster than one poll interval.
-const EXPORT_BUSY_BATCH: usize = 256;
+/// is written within this delay.
+const EXPORT_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Channel-based handle for sending events to a dedicated writer task.
 /// Eliminates per-event Mutex contention on the hot path.
@@ -324,7 +320,7 @@ impl JsonExportHandle {
             use tokio::sync::mpsc::error::TryRecvError;
             let mut poll = EXPORT_POLL_INTERVAL;
             loop {
-                let mut written = 0usize;
+                let mut wrote = false;
                 let closed = loop {
                     if privacy.get() == PrivacyMode::MetricsOnly {
                         break true; // no per-request export any more
@@ -337,16 +333,14 @@ impl JsonExportHandle {
                             {
                                 tracing::warn!(error = %e, "JSON export write failed");
                             }
-                            written += 1;
+                            wrote = true;
                         }
                         Err(TryRecvError::Empty) => break false,
                         Err(TryRecvError::Disconnected) => break true,
                     }
                 };
                 // Flush once per drained batch
-                if written > 0
-                    && let Err(e) = exporter.flush()
-                {
+                if wrote && let Err(e) = exporter.flush() {
                     tracing::warn!(error = %e, "JSON export flush failed");
                 }
                 if closed {
@@ -357,11 +351,7 @@ impl JsonExportHandle {
                 }
                 // Back off while idle (a fixed 5ms poll cost ~1% of a core
                 // with no traffic); tighten again as soon as events flow.
-                if written >= EXPORT_BUSY_BATCH {
-                    poll = EXPORT_POLL_INTERVAL;
-                    continue;
-                }
-                poll = if written > 0 {
+                poll = if wrote {
                     EXPORT_POLL_INTERVAL
                 } else {
                     (poll * 2).min(EXPORT_IDLE_POLL_INTERVAL)
