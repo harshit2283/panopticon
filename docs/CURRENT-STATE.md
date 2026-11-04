@@ -61,7 +61,11 @@ production-hardened compliance platform.
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
 - PII detection:
-  - Regex-first scanning is the stable baseline.
+  - Regex-first scanning is the stable baseline: 16 validated patterns
+    (checksums, issuer prefixes, context keywords), including Indian
+    identifiers. On the labelled corpus (`tests/pii/`), 1.1% of clean
+    payloads produce a finding, down from 54%. Remaining misses are numbers
+    with no context; see `BENCHMARKS.md` §3.
   - ONNX-backed ML inference is optional and throughput-sensitive.
 - Service graphing:
   - DNS/IP-based identity works.

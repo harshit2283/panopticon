@@ -7,11 +7,12 @@ here has not been measured.
 
 - [1. Test environment](#1-test-environment)
 - [2. Capture accuracy (ground truth)](#2-capture-accuracy-ground-truth)
-- [3. Overhead](#3-overhead)
-- [4. Micro-benchmarks](#4-micro-benchmarks)
-- [5. Fuzzing](#5-fuzzing)
-- [6. Known limits found while measuring](#6-known-limits-found-while-measuring)
-- [7. Reproducing](#7-reproducing)
+- [3. PII detection accuracy](#3-pii-detection-accuracy)
+- [4. Overhead](#4-overhead)
+- [5. Micro-benchmarks](#5-micro-benchmarks)
+- [6. Fuzzing](#6-fuzzing)
+- [7. Known limits found while measuring](#7-known-limits-found-while-measuring)
+- [8. Reproducing](#8-reproducing)
 
 ## 1. Test environment
 
@@ -88,9 +89,13 @@ Before this fix, the client process was not hooked at all. The probes were
 PID-scoped, and a second process running an already-hooked binary was
 skipped. Every replica of a Go service on a node was affected. Probes now
 cover every process that runs the binary, as they do for `libssl`. POST
-bodies are cut at `max_body_bytes` (4 KB). Go's JSON encoder sorts keys, so
-in the 5 KB POSTs the SSN falls past the cut. It is then neither exported
-nor redacted, which is why only 75 of 117 bodies show redaction.
+bodies are cut at `max_body_bytes` (4 KB). Go's JSON encoder sorts keys
+(`email`, `note`, `ssn`), so in the 5 KB POSTs the SSN falls past the cut and
+is never exported. Earlier runs counted those bodies as unredacted ("PII
+redacted in 75/117", against 110/110 for CPython, whose `json.dumps` keeps
+`ssn` before `note`). That was a scorer artifact, not a detection gap: no raw
+value reached the export. `score.py` now reports such bodies as "cut at
+max_body_bytes before a PII value" instead.
 
 ### HTTPS (OpenSSL uprobes)
 
@@ -183,7 +188,131 @@ AMQP synchronous methods), or when the message content is complete (AMQP
 publish, deliver, return). IPv4 answers in DNS records are redacted to
 `<IP_V4>` by the default PII policy.
 
-## 3. Overhead
+## 3. PII detection accuracy
+
+Capture accuracy above shows that PII reaches the scanner. This section shows
+how well the scanner tells PII from look-alikes. The detector measured is the
+default build: regex patterns with validation. ONNX/ML inference is
+feature-gated (`--features ml`), off by default (`pii.mode` is `Disabled`),
+and no model ships in `models/`, so names and addresses are not measured (see
+below).
+
+### Method
+
+- **Corpus**: `tests/pii/gen_corpus.py` (seed 20261104) writes
+  `tests/pii/corpus.jsonl`: 5,000 payloads, 70% clean. Each one is a single
+  agent field: JSON request and response bodies, form bodies, query strings,
+  HTTP header values, SQL text, Redis arguments and log lines. Every PII value
+  has a label with its exact type and byte span.
+- **Types**: email; phone (US, international, India `+91`, `0` and bare
+  10-digit); credit card (Luhn-valid, real issuer prefixes, RuPay
+  included); US SSN; Aadhaar (Verhoeff-valid, first digit 2–9); PAN; UPI ID;
+  GSTIN (valid check character); Indian passport; IBAN (valid mod-97);
+  IPv4; JWT; API key; AWS access key.
+- **Hard negatives**: most clean payloads are full of values that look like
+  PII: order and transaction IDs, UUIDs, ISO timestamps, Unix epochs in
+  seconds and milliseconds, 12-digit numbers that fail Verhoeff, 16-digit
+  numbers that fail Luhn, version strings, user agents, OIDs, prices, SKUs,
+  base64 blobs, hex hashes, `logo@2x.png`, `lodash@4.17.21`, and PAN, GSTIN,
+  IBAN and passport look-alikes that fail their checks or have no context.
+- **Policy decisions**: every IPv4 address counts as PII, because client
+  addresses are personal data under GDPR and India's DPDP Act, and a passive
+  observer cannot tell a client from a server. Emails at `example.com` count
+  as real emails: test accounts use them, and so do the capture oracles.
+- **Scoring**: `pii::accuracy` (a `cargo test`) puts each sample in its
+  `L7Message` field and calls `PiiEngine::scan_message`, the call the event
+  loop makes, with the default config. A finding is a true positive if it
+  overlaps a label of the same type. The three phone categories are scored as
+  one family. Values in credential headers (`Authorization`, `Cookie`,
+  `X-Api-Key`, …) are masked wholesale without detection, so they count only
+  for the redaction check. The redaction check asserts that, after the call,
+  no labelled value is still present in the field.
+- **Caveat**: the same corpus was used to tune the patterns and to score
+  them, and the hard negatives are only as varied as the generator. Read the
+  numbers as a regression baseline, not as accuracy on your own traffic.
+
+### Results
+
+| Type | Labels | Precision before → after | Recall before → after | F1 before → after |
+|---|---|---|---|---|
+| AADHAAR | 124 | 0.077 → 0.992 | 1.000 → 1.000 | 0.143 → 0.996 |
+| API_KEY | 135 | 1.000 → 1.000 | 0.919 → 0.919 | 0.958 → 0.958 |
+| AWS_KEY | 140 | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| CREDIT_CARD | 114 | 0.675 → 1.000 | 1.000 → 1.000 | 0.806 → 1.000 |
+| EMAIL | 164 | 0.275 → 1.000 | 1.000 → 1.000 | 0.432 → 1.000 |
+| GSTIN | 118 | — → 1.000 | 0.000 → 1.000 | 0.000 → 1.000 |
+| IBAN | 123 | — → 1.000 | 0.000 → 1.000 | 0.000 → 1.000 |
+| IP_V4 | 215 | 0.466 → 1.000 | 1.000 → 1.000 | 0.636 → 1.000 |
+| JWT | 124 | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| PAN | 129 | 0.103 → 0.694 | 1.000 → 1.000 | 0.186 → 0.819 |
+| PASSPORT_IN | 124 | — → 1.000 | 0.000 → 0.847 | 0.000 → 0.917 |
+| PHONE | 257 | 0.248 → 0.996 | 0.899 → 0.895 | 0.389 → 0.943 |
+| SSN | 120 | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| UPI | 143 | — → 1.000 | 0.000 → 1.000 | 0.000 → 1.000 |
+
+| Payload-level | Before | After |
+|---|---|---|
+| Clean payloads with any finding | 1,908 / 3,508 (54.4%) | 39 / 3,508 (1.11%) |
+| Labelled values surviving redaction | 461 / 2,101 | 57 / 2,101 |
+
+"—": nothing detected. GSTIN, IBAN, passport and UPI had no pattern before.
+"Before" is commit `5d7194b`.
+
+What changed (`panopticon-agent/src/pii/regex_prefilter.rs`, `validate` and
+`RegexPrefilter::scan`):
+
+- **Aadhaar**: Verhoeff check digit, first digit 2–9, and not one group of a
+  longer grouped number (`continues_digit_group`). Before, any 12 digits
+  matched, including the first 12 of a spaced card number.
+- **Credit card**: Luhn plus a real issuer prefix and length
+  (`card_iin_valid`). Millisecond epochs pass Luhn one time in ten.
+- **PAN**: the 4th character must be a holder type (P, C, H, F, A, T, B, L,
+  J, G).
+- **Phones**: US numbers follow NANP (area and exchange codes start with
+  2–9). A US number without separators or `+1`, and an Indian mobile
+  without `+91` (`9876543210`), counts only after a phone keyword (`phone`, `mobile`, `msisdn`, `tel`,
+  `contact`, …) with no other number in between (`has_context`). Before,
+  every 10-digit ID and epoch was a US phone number. A new `PHONE_IN`
+  category covers `+91`, `0`-prefixed and bare Indian mobiles.
+  International numbers need 8–15 digits, and all their groups are consumed.
+- **IPv4**: not part of a longer dotted run (`1.3.6.1.4.1…` OIDs).
+- **Email**: not an image or script asset name (`logo@2x.png`).
+- **New**: `UPI` (a VPA with a known bank handle), `GSTIN` (check
+  character), `IBAN` (mod-97), `PASSPORT_IN` (needs the word "passport"
+  just before it).
+- **One finding per value**: overlapping candidates resolve to the longest,
+  so a GSTIN is not also reported as a PAN.
+
+`cargo test` fails if any type drops below its precision or recall floor, if
+more than 1.25% of clean payloads produce a finding, or if more than 60
+labelled values survive redaction (`GATE` in `pii/accuracy.rs`).
+
+Cost (`cargo bench --bench pii_regex`, Apple M-series laptop, medians,
+before → after): 4 KB with no PII 6.01 → 5.87 µs, 4 KB with PII 9.25 →
+9.33 µs (no significant change), full HTTP exchange 850 → 918 ns (+7%).
+
+### What it still misses or over-reports
+
+- **No context, no detection**: a bare phone number or passport number with
+  no keyword just before it (a log line `user 9876543210 verified`, or a
+  positional SQL `INSERT … VALUES (…)` list where the column name is far
+  away). These make up all of the remaining phone, passport and API-key
+  misses.
+- **PAN-shaped codes**: product codes such as `PRDPF6402A` are
+  indistinguishable from a PAN and are flagged.
+- **Every IPv4 address** is flagged, by the policy above.
+- **Bare 10-digit numbers after a phone keyword** are reported as `PHONE_IN`,
+  even when they are US numbers.
+- **Names, street addresses, dates of birth**: only the ML path could find
+  them. To measure it: build with `--features ml`, install ONNX Runtime
+  1.19.2+ (`ORT_LIB_LOCATION`), download the ~265 MB DistilBERT-NER model
+  (`scripts/download_model.sh`) and set `pii.mode` to in-agent with its
+  `model_path`. The corpus has no name or address labels yet.
+- **Past `max_body_bytes`** (4 KB by default) nothing is scanned or exported.
+  A value cut in half at the boundary is exported in part and not
+  recognised.
+
+## 4. Overhead
 
 ### Kernel (per captured packet)
 
@@ -309,7 +438,7 @@ Not measured yet: throughput above ~25K requests/s (the load generator is the
 limit on this VM), kernel-to-export latency percentiles, and memory with the
 ONNX model loaded.
 
-## 4. Micro-benchmarks
+## 5. Micro-benchmarks
 
 Criterion, `cargo bench -p panopticon-agent`. The benchmarks call the real
 parsers and PII engine, and each one asserts it produced the expected result
@@ -329,8 +458,10 @@ before it is timed. Values are medians.
 
 The regex prefilter costs about 2.5 µs per KB on clean text, so the scan cost
 grows with payload size.
+The PII rows predate the validation added in §3. On a laptop that change
+moved them by −3%, 0% and +7% respectively.
 
-## 5. Fuzzing
+## 6. Fuzzing
 
 The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has two targets:
 
@@ -345,7 +476,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 - **`detect`** runs protocol detection and direction inference: 91M
   executions and 0 crashes.
 
-## 6. Known limits found while measuring
+## 7. Known limits found while measuring
 
 - **MySQL 8 clients use TLS by default.** That is why MySQL recall was 0% on
   the wire before; the oracle disables TLS to test the parser. On real
@@ -373,7 +504,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   scored against one server implementation (Kafka 3.8, RabbitMQ 3.13, a
   dnspython server).
 
-## 7. Reproducing
+## 8. Reproducing
 
 Requirements: root on Linux 5.8+, a release build
 (`cargo build -p panopticon-agent --release`), Docker for the database and
@@ -405,6 +536,11 @@ sudo tests/load/run_load.sh 64 30s 0 1
 # (with your config; add --json-export /dev/null to include export).
 sudo ./target/release/panopticon-agent -i eth0 --capture-raw /tmp/load.pncap
 ./target/release/panopticon-agent --replay-bench /tmp/load.pncap
+
+# PII detection accuracy (no root, any OS); prints the per-type table.
+# Regenerate the corpus only when changing the generator.
+cargo test -p panopticon-agent pii_accuracy -- --nocapture
+python3 tests/pii/gen_corpus.py
 
 # Micro-benchmarks
 cargo bench -p panopticon-agent --bench parser_throughput --bench pii_regex --bench protocol_detect

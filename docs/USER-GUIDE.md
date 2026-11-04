@@ -205,9 +205,33 @@ graph names it: Kubernetes workload when known, else DNS name, else `ip:port`
 (`unknown` only for TLS exchanges whose socket addresses were not learned).
 
 `action` is `Redacted` when `pii.redact = true`, else `Detected`.
-Categories: `Email`, `PhoneUs`, `PhoneIntl`, `Ssn`, `CreditCard` (Luhn
-checked), `IpV4`, `Jwt`, `ApiKey`, `AwsKey`, `Aadhaar`, `Pan`, plus ML-only
-categories when built with ML.
+Categories (redaction placeholder in brackets):
+
+| Category | What it matches |
+|---|---|
+| `Email` (`<EMAIL>`) | Email addresses, `example.com` included; not asset names like `logo@2x.png` |
+| `PhoneUs` (`<PHONE_US>`) | North American numbers (valid area and exchange codes) |
+| `PhoneIn` (`<PHONE_IN>`) | Indian mobiles: `+91 98765 43210`, `+919876543210`, `09876543210` |
+| `PhoneIntl` (`<PHONE_INTL>`) | Other `+`-prefixed numbers, 8–15 digits |
+| `Ssn` (`<SSN>`) | US SSNs written `123-45-6789` |
+| `CreditCard` (`<CREDIT_CARD>`) | 13–19 digits passing Luhn with a real issuer prefix (Visa, Mastercard, Amex, RuPay, …) |
+| `Aadhaar` (`<AADHAAR>`) | 12 digits, first 2–9, valid Verhoeff check digit |
+| `Pan` (`<PAN>`) | Indian PAN, `AAAPA9999A` with a valid holder-type letter |
+| `Upi` (`<UPI>`) | UPI IDs with a known bank handle: `name@okaxis`, `9876543210@ybl` |
+| `Gstin` (`<GSTIN>`) | GSTINs with a valid state code and check character |
+| `PassportIn` (`<PASSPORT_IN>`) | Indian passport numbers, only after the word "passport" |
+| `Iban` (`<IBAN>`) | IBANs, compact or spaced, passing mod-97 |
+| `IpV4` (`<IP_V4>`) | Every IPv4 address (client addresses are personal data) |
+| `Jwt` (`<JWT>`) | JSON Web Tokens |
+| `ApiKey` (`<API_KEY>`) | A value after `api_key`, `secret_key`, `access_token` and similar |
+| `AwsKey` (`<AWS_KEY>`) | AWS access key IDs (`AKIA…`, `ASIA…`) |
+
+A US number written without separators or `+1` (`4155552671`), and an Indian
+mobile without `+91` (`9876543210`, `09876543210`), counts as a phone only
+when a word like `phone`, `mobile`, `msisdn` or `tel` comes just before it.
+Builds with ML (`--features ml` and a model) add `PersonName`, `Location`,
+`Organization` and `DateOfBirth`. Per-type precision and recall are in
+[BENCHMARKS.md §3](BENCHMARKS.md#3-pii-detection-accuracy).
 
 ### 5.3 What gets redacted
 
@@ -223,8 +247,10 @@ With `pii.redact = true` (the default), before anything is logged or exported:
   body** are scanned and redacted.
 
 Detection is pattern-based. It will miss PII that does not match a pattern
-(names, free-text addresses) and has known false positives (any IPv4 address,
-10-digit numbers as US phone numbers). Treat the exports as sensitive anyway.
+(names, free-text addresses), a bare phone or passport number with no keyword
+before it (e.g. in a positional SQL `VALUES` list), and anything past
+`max_body_bytes`. It flags every IPv4 address and PAN-shaped product codes.
+Treat the exports as sensitive anyway.
 
 ### 5.4 Metrics and endpoints (`--metrics-bind`)
 

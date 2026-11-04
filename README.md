@@ -63,7 +63,7 @@ current release report.
 | DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
 | Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes. |
-| Regex-first PII detection | Supported | Baseline detection path. |
+| Regex-first PII detection | Supported | 16 validated patterns, including Aadhaar, PAN, UPI, GSTIN, Indian passport and phone, and IBAN. Precision and recall are measured per type on a labelled corpus, and a `cargo test` gate fails on regressions (`docs/BENCHMARKS.md`). Names and addresses need the ML path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
 | Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
 | Kubernetes deployment hardening | Out of scope | Helm chart exists, but production hardening is not part of this MVP. |
