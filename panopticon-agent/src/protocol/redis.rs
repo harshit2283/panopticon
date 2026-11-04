@@ -331,7 +331,7 @@ fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
                 other => other,
             }
         }
-        _ => RespParse::Error(format!("unknown RESP type byte: 0x{:02x}", data[0])),
+        _ => RespParse::Error("unknown RESP type byte".into()),
     }
 }
 
@@ -369,7 +369,7 @@ fn parse_integer(data: &[u8]) -> RespParse {
             let s = std::str::from_utf8(&data[1..pos]).unwrap_or("0");
             match s.parse::<i64>() {
                 Ok(n) => RespParse::Complete(RespValue::Integer(n), pos + 2),
-                Err(_) => RespParse::Error(format!("invalid RESP integer: {s}")),
+                Err(_) => RespParse::Error("invalid RESP integer".into()),
             }
         }
         None => RespParse::Incomplete,
@@ -386,7 +386,7 @@ fn parse_bulk_string(data: &[u8]) -> RespParse {
     let len_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let len: i64 = match len_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid bulk string length: {len_str}")),
+        Err(_) => return RespParse::Error("invalid bulk string length".into()),
     };
 
     if len < 0 {
@@ -422,7 +422,7 @@ fn parse_aggregate(
     let count_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let count: usize = match count_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid RESP3 count: {count_str}")),
+        Err(_) => return RespParse::Error("invalid RESP3 count".into()),
     };
     let total = count.saturating_mul(per_entry);
     let mut offset = crlf_pos + 2;
@@ -452,7 +452,7 @@ fn parse_array(data: &[u8], depth: usize) -> RespParse {
     let count_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let count: i64 = match count_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid array count: {count_str}")),
+        Err(_) => return RespParse::Error("invalid array count".into()),
     };
 
     if count < 0 {
@@ -678,6 +678,22 @@ mod tests {
             panic!()
         };
         assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
+    }
+
+    #[test]
+    fn test_parse_errors_do_not_quote_input() {
+        for bad in [
+            &b":12-34-5678\r\n"[..],
+            b"$12-34-5678\r\n",
+            b"*12-34-5678\r\n",
+            b"%12-34-5678\r\n",
+        ] {
+            let mut parser = RedisParser::new();
+            match parser.feed(bad, Direction::Ingress, 1) {
+                ParseResult::Error(e) => assert!(!e.contains("12-34"), "{e}"),
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
