@@ -8,7 +8,9 @@
 //! **Linux-only**: `scan_all_processes`, `scan_pid`, `parse_proc_maps`
 //! read `/proc/*/maps` to find loaded TLS libraries.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
@@ -78,9 +80,69 @@ pub enum GoVersion {
 /// probed as a potential Go binary, and reading each one fully made the
 /// agent's peak RSS track the size of the largest binary on the host.
 pub fn resolve_elf_symbols(path: &str, symbols: &[&str]) -> Result<HashMap<String, u64>> {
-    let file = std::fs::File::open(path).with_context(|| format!("failed to open ELF: {path}"))?;
+    with_untrusted_elf(path, |data| resolve_elf_symbols_from_bytes(data, symbols))
+        .with_context(|| format!("failed to open ELF: {path}"))?
+}
+
+/// Largest file examined as a TLS target. Real libssl and Go binaries are far
+/// smaller; anything bigger is skipped rather than parsed.
+const MAX_ELF_FILE_BYTES: u64 = 1 << 30;
+
+/// Byte budget for all reads from one workload-controlled ELF. `ReadCache`
+/// allocates and zero-fills whatever size a section header declares (symtab,
+/// dynsym, symtab_shndx, `.go.buildinfo`, ...), so without a cap a sparse
+/// file with a huge `sh_size` OOM-kills the agent. Every read is charged
+/// before it is allocated; once the budget is spent the parse fails.
+const MAX_ELF_READ_BYTES: u64 = 128 << 20;
+
+/// `ReadRef` over a file cache that refuses reads past a cumulative budget.
+#[derive(Clone, Copy)]
+struct BudgetedRead<'a> {
+    cache: &'a ReadCache<std::fs::File>,
+    left: &'a Cell<u64>,
+}
+
+impl BudgetedRead<'_> {
+    fn charge(self, n: u64) -> std::result::Result<(), ()> {
+        self.left.set(self.left.get().checked_sub(n).ok_or(())?);
+        Ok(())
+    }
+}
+
+impl<'a> ReadRef<'a> for BudgetedRead<'a> {
+    fn len(self) -> std::result::Result<u64, ()> {
+        self.cache.len()
+    }
+
+    fn read_bytes_at(self, offset: u64, size: u64) -> std::result::Result<&'a [u8], ()> {
+        self.charge(size)?; // before ReadCache allocates `size` bytes
+        self.cache.read_bytes_at(offset, size)
+    }
+
+    fn read_bytes_at_until(
+        self,
+        range: Range<u64>,
+        delimiter: u8,
+    ) -> std::result::Result<&'a [u8], ()> {
+        // ReadCache caps a string scan at 4 KiB; charge what it keeps.
+        let bytes = self.cache.read_bytes_at_until(range, delimiter)?;
+        self.charge(bytes.len() as u64)?;
+        Ok(bytes)
+    }
+}
+
+/// Open a workload-controlled ELF and run `f` over a budgeted reader. Every
+/// parse of a file under `/proc/<pid>/root` must go through here.
+fn with_untrusted_elf<T>(path: &str, f: impl FnOnce(BudgetedRead<'_>) -> T) -> Result<T> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    anyhow::ensure!(size <= MAX_ELF_FILE_BYTES, "ELF too large: {size} bytes");
     let cache = ReadCache::new(file);
-    resolve_elf_symbols_from_bytes(&cache, symbols)
+    let left = Cell::new(MAX_ELF_READ_BYTES);
+    Ok(f(BudgetedRead {
+        cache: &cache,
+        left: &left,
+    }))
 }
 
 /// Inner implementation over any `ReadRef` (a byte slice in tests, a
@@ -165,9 +227,7 @@ fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
 
 /// Entry and return-instruction offsets of the function `name` in an ELF.
 pub fn go_read_probes(path: &str, name: &str) -> Option<GoReadProbes> {
-    let file = std::fs::File::open(path).ok()?;
-    let cache = ReadCache::new(file);
-    go_read_probes_from(&cache, name)
+    with_untrusted_elf(path, |data| go_read_probes_from(data, name)).ok()?
 }
 
 fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Option<GoReadProbes> {
@@ -176,11 +236,19 @@ fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Option<
         .symbols()
         .find(|s| s.name().ok() == Some(name) && s.size() > 0)?;
     let (addr, size) = (sym.address(), sym.size());
-    let code = elf
-        .sections()
-        .find(|s| s.address() <= addr && addr + size <= s.address() + s.size())?
-        .data_range(addr, size)
-        .ok()??;
+    // Read only the function's bytes, not the whole section.
+    let section = elf.sections().find(|s| {
+        s.address() <= addr
+            && addr
+                .checked_add(size)
+                .is_some_and(|e| e <= s.address() + s.size())
+    })?;
+    let (sec_off, sec_len) = section.file_range()?;
+    let rel = addr - section.address();
+    if rel.checked_add(size)? > sec_len {
+        return None;
+    }
+    let code = data.read_bytes_at(sec_off.checked_add(rel)?, size).ok()?;
     let rets = return_addresses(elf.architecture(), addr, code)?;
     if rets.is_empty() || rets.len() > MAX_GO_RETURNS {
         return None;
@@ -232,8 +300,7 @@ fn return_addresses(arch: object::Architecture, addr: u64, code: &[u8]) -> Optio
 /// Returns the Go version string (e.g., `"go1.21.5"`) or `None` if
 /// not a Go binary or the version cannot be determined.
 pub fn detect_go_version(path: &str) -> Option<String> {
-    let cache = ReadCache::new(std::fs::File::open(path).ok()?);
-    detect_go_version_from_bytes(&cache)
+    with_untrusted_elf(path, |data| detect_go_version_from_bytes(data)).ok()?
 }
 
 /// Inner implementation for testability.
@@ -862,6 +929,58 @@ mod tests {
         assert!(!from_file.is_empty());
         assert_eq!(from_file, from_bytes);
         assert_eq!(detect_go_version(path), None);
+    }
+
+    /// Write a sparse ELF64 whose SHT_SYMTAB declares `symtab_size` bytes at
+    /// offset 4096. Only the headers occupy disk.
+    fn write_sparse_elf(name: &str, symtab_size: u64) -> std::path::PathBuf {
+        let mut elf = vec![0u8; 64 + 3 * 64 + 1]; // headers, then one NUL as strtab
+        elf[..16].copy_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        elf[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        elf[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+        let mut sh = |i: usize, ty: u32, off: u64, size: u64, link: u32, ent: u64| {
+            let b = 64 + i * 64;
+            elf[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes());
+            elf[b + 24..b + 32].copy_from_slice(&off.to_le_bytes());
+            elf[b + 32..b + 40].copy_from_slice(&size.to_le_bytes());
+            elf[b + 40..b + 44].copy_from_slice(&link.to_le_bytes());
+            elf[b + 56..b + 64].copy_from_slice(&ent.to_le_bytes());
+        };
+        sh(1, object::elf::SHT_SYMTAB, 4096, symtab_size, 2, 24);
+        sh(2, object::elf::SHT_STRTAB, 256, 1, 0, 0);
+        let path =
+            std::env::temp_dir().join(format!("panopticon-f4-{name}-{}.elf", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &file, &elf).unwrap();
+        file.set_len(4096 + symtab_size).unwrap(); // sparse: no disk used
+        path
+    }
+
+    /// F4: a symtab whose declared size is over the read budget must fail
+    /// the parse before `ReadCache` allocates and zero-fills that size.
+    #[test]
+    fn test_huge_declared_symtab_rejected_without_allocating() {
+        // Control: the same ELF with a small symtab parses.
+        let small = write_sparse_elf("small", 24 * 4);
+        let ok = resolve_elf_symbols(small.to_str().unwrap(), &["SSL_write"]);
+        std::fs::remove_file(&small).unwrap();
+        assert!(ok.is_ok(), "control ELF must parse: {ok:?}");
+
+        let huge = write_sparse_elf("huge", 24 << 24); // 384 MiB of symbols
+        let p = huge.to_str().unwrap();
+        let symbols = resolve_elf_symbols(p, &["SSL_write"]);
+        let go = detect_go_version(p);
+        let probes = go_read_probes(p, "crypto/tls.(*Conn).Read");
+        std::fs::remove_file(&huge).unwrap();
+        assert!(symbols.is_err(), "over-budget symtab must fail the parse");
+        assert_eq!(go, None);
+        assert_eq!(probes, None);
     }
 
     #[test]
