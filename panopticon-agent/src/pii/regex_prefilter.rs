@@ -93,7 +93,12 @@ impl Default for RegexPrefilter {
 
 impl RegexPrefilter {
     pub fn new() -> Self {
-        let defs = pattern_defs();
+        // ASCII-only matching: Unicode `\d`/`\s`/`\b` would accept multi-byte
+        // digits (U+0967 ...) and the validators index candidates by byte.
+        let defs: Vec<(PiiCategory, String)> = pattern_defs()
+            .into_iter()
+            .map(|(cat, p)| (cat, format!("(?-u){p}")))
+            .collect();
         let set =
             RegexSet::new(defs.iter().map(|(_, p)| p)).expect("invalid regex in PII pattern set");
         let patterns = defs
@@ -324,7 +329,11 @@ fn gstin_valid(s: &str) -> bool {
 
 /// IBAN mod-97 check (ISO 13616).
 fn iban_valid(s: &str) -> bool {
-    let rotated = s[4..].bytes().chain(s[..4].bytes());
+    let b = s.as_bytes();
+    if b.len() < 5 || !s.is_ascii() {
+        return false;
+    }
+    let rotated = b[4..].iter().chain(&b[..4]).copied();
     let mut rem = 0u32;
     for c in rotated {
         let Some(v) = (c as char).to_digit(36) else {
@@ -342,6 +351,20 @@ fn iban_valid(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ascii_digits_do_not_panic_or_match() {
+        let f = RegexPrefilter::new();
+        // U+0967 DEVANAGARI DIGIT ONE inside an IBAN-shaped value.
+        for text in [
+            "GB\u{0967}2WEST12345698",
+            "iban=GB\u{0662}2WEST12345698 x",
+            "\u{0967}\u{0968}\u{0969}-45-6789",
+        ] {
+            assert!(f.scan(text).is_empty(), "{text}");
+        }
+        assert!(!iban_valid("GB\u{0967}2WEST12345698"));
+    }
 
     fn prefilter() -> RegexPrefilter {
         RegexPrefilter::new()
