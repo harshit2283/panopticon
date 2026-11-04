@@ -6,4 +6,6 @@ pub mod json;
 pub mod metrics;
 pub mod otlp;
 #[cfg(unix)]
+pub mod pcap;
+#[cfg(unix)]
 pub mod raw_capture;
