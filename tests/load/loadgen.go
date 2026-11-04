@@ -5,7 +5,8 @@
 //	    [-rate 0] [-newconn] [-size 512] [-post 0.2] -out ids.txt
 //
 // The client runs -c workers for -d, each issuing requests back to back
-// (or paced to a total of -rate req/s). Every completed request's id is
+// (or, with -rate, each on its own schedule so the total is -rate req/s;
+// it reports achieved vs target and client latency percentiles). Every completed request's id is
 // written to -out, one per line, so score_load.py can compute capture recall
 // at that load. -newconn opens a fresh TCP connection per request
 // (Connection: close), which stresses connection tracking instead of
@@ -24,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,22 +87,32 @@ func client(args []string) {
 	var done, failed atomic.Int64
 	var next atomic.Int64
 
-	var tick <-chan time.Time
+	// Fixed rate: each worker keeps its own schedule (one request every
+	// conc/rate seconds, workers staggered by 1/rate), so no shared ticker
+	// drops ticks at high rates. A worker that falls behind sends at once
+	// to catch up; nothing is sent after the deadline, so a generator (or a
+	// system under test) that cannot hold the rate shows up as achieved < target.
+	var interval time.Duration
 	if *rate > 0 {
-		t := time.NewTicker(time.Second / time.Duration(*rate))
-		defer t.Stop()
-		tick = t.C
+		interval = time.Duration(float64(time.Second) * float64(*conc) / float64(*rate))
 	}
-	deadline := time.Now().Add(*dur)
+	start := time.Now()
+	deadline := start.Add(*dur)
 	postEvery := 0
 	if *post > 0 {
 		postEvery = int(1 / *post)
 	}
+	// Latency per request in µs: from the scheduled send time (includes any
+	// delay behind schedule, i.e. corrected for coordinated omission, and
+	// the sleep's wake-up slop, up to ~0.5 ms at low rates) and from the
+	// actual send (service time).
+	lat := make([][]uint32, *conc)
+	svc := make([][]uint32, *conc)
 
 	var wg sync.WaitGroup
 	for i := 0; i < *conc; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
 			tr := &http.Transport{
 				DisableKeepAlives:   *newConn,
@@ -108,9 +120,19 @@ func client(args []string) {
 				DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 			}
 			hc := &http.Client{Transport: tr, Timeout: 10 * time.Second}
-			for time.Now().Before(deadline) {
-				if tick != nil {
-					<-tick
+			due := start.Add(time.Duration(i) * interval / time.Duration(*conc))
+			for {
+				now := time.Now()
+				if interval > 0 {
+					if due.After(now) {
+						time.Sleep(due.Sub(now))
+					}
+				} else {
+					due = now
+				}
+				sent := time.Now()
+				if !sent.Before(deadline) {
+					break
 				}
 				id := next.Add(1)
 				tok := fmt.Sprintf("r%d", id)
@@ -122,30 +144,58 @@ func client(args []string) {
 				} else {
 					req, _ = http.NewRequest("GET", fmt.Sprintf("%s/len/%d?id=%s", *url, *size, tok), nil)
 				}
+				sched := due
 				resp, err := hc.Do(req)
+				due = due.Add(interval)
 				if err != nil {
 					failed.Add(1)
 					continue
 				}
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
+				end := time.Now()
 				if *fin {
 					tr.CloseIdleConnections()
 				}
 				done.Add(1)
+				lat[i] = append(lat[i], uint32(end.Sub(sched).Microseconds()))
+				svc[i] = append(svc[i], uint32(end.Sub(sent).Microseconds()))
 				mu.Lock()
 				w.WriteString(tok)
 				w.WriteByte('\n')
 				mu.Unlock()
 			}
 			tr.CloseIdleConnections()
-		}()
+		}(i)
 	}
-	start := time.Now()
 	wg.Wait()
 	elapsed := time.Since(start)
 	w.Flush()
 	f.Close()
+	achieved := float64(done.Load()) / dur.Seconds()
 	fmt.Printf("requests=%d failed=%d elapsed=%.1fs rate=%.0f/s\n",
 		done.Load(), failed.Load(), elapsed.Seconds(), float64(done.Load())/elapsed.Seconds())
+	if *rate > 0 {
+		miss := 100 * (1 - achieved/float64(*rate))
+		valid := "ok"
+		if miss > 2 {
+			valid = "INVALID(>2%)"
+		}
+		fmt.Printf("fixed_rate: target=%d achieved=%.0f miss_pct=%.2f %s\n", *rate, achieved, miss, valid)
+	}
+	p := func(name string, per [][]uint32) {
+		var all []uint32
+		for _, s := range per {
+			all = append(all, s...)
+		}
+		if len(all) == 0 {
+			return
+		}
+		sort.Slice(all, func(a, b int) bool { return all[a] < all[b] })
+		q := func(f float64) uint32 { return all[int(f*float64(len(all)-1))] }
+		fmt.Printf("%s: p50_us=%d p90_us=%d p99_us=%d p999_us=%d max_us=%d\n",
+			name, q(0.5), q(0.9), q(0.99), q(0.999), all[len(all)-1])
+	}
+	p("latency", lat) // from scheduled send time
+	p("service", svc) // from actual send time
 }

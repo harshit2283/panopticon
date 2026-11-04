@@ -447,8 +447,10 @@ contention for the VM's 4 vCPUs. Plan on roughly one core per 60K
 captured packets per second with JSON export on.
 
 Not measured yet: kernel-to-export latency percentiles, and memory with the
-ONNX model loaded. Throughput above ~25K requests/s (the load generator is
-the limit on this VM) is measured on 64 vCPUs below.
+ONNX model loaded. Kernel-to-worker latency is measured, in an experiment
+build, in the [scaling study](#scaling-study-and-fixed-rate-overhead-preliminary).
+Throughput above ~25K requests/s (the load generator is the limit on this VM)
+is measured on 64 vCPUs below.
 
 ### 64-vCPU scale test
 
@@ -562,8 +564,11 @@ each):
   probes.
 - **Agent:** `handle_messages` (PII scan, redaction and export for each
   parsed message, including a clone of each message) is 45% of samples.
-  Contention on the shared connection map (`dashmap` `lock_shared_slow`,
-  7%) and on the shared regex cache pool (`Pool::get_slow`, 3%) follow.
+  Contention follows: `dashmap` `lock_shared_slow` (7%) and the shared regex
+  cache pool (`Pool::get_slow`, 3%). The `lock_shared_slow` samples come from
+  the service graph's `DashMap::len()` in `EdgeAggregator::record`, not from
+  the connection map, which is per worker (see the
+  [scaling study](#scaling-study-and-fixed-rate-overhead-preliminary)).
   memmove is no longer among the top 20 symbols.
 - **At 200 KB bodies:** the agent's time is spread over body copies
   (`BytesMut` drop 7%, `Vec` clone 4%), regex search (6%) and JSON
@@ -580,9 +585,12 @@ model.
   The 4K row delivered 9.48M events in 20 s, about 470K events/s, with 99.8%
   recall. The agent's 16 CPUs were 75% busy, while the load generator was
   the limit.
-- **P99 < 5 ms kernel → user space: not measured.** The drain tick bounds
-  the time an event waits in the ring at about 2 ms under traffic. Queueing
-  in the worker channels is not measured.
+- **P99 < 5 ms kernel → user space: partly met (preliminary, experiment
+  build).** The scaling study measures TC timestamp to worker, including
+  queueing in the worker channels. The target is met at 64 connections at
+  every rate measured (P99 2.1-3.7 ms), and at 4K connections at 20K req/s
+  (4.2 ms). It is missed at 4K connections from 50K req/s (8.4-10.5 ms) and
+  at saturation. The median is about 1.3 ms, set by the 2 ms drain tick.
 - **RSS < 200 MB: met at 64 and 1K connections, exceeded above.** The 4K
   row peaks at 215 MiB and the 200 KB rows at 245-252 MiB. Queued batches
   are bounded by workers × channel slots × 68 KB. The ring memory is the
@@ -611,6 +619,360 @@ VM (5.15 verifier included).
   load is not measured.
 - **Go TLS client view flakes.** One exchange in 500 is mispaired in about 1
   run in 5, with or without this change (2 of 10 runs each), with no drops.
+
+### Scaling study and fixed-rate overhead (preliminary)
+
+**Preliminary.** One VM on a shared host, measured on one day (2026-11-04).
+The key comparisons have three runs per cell; most matrix cells have one. The
+experiment builds are not merged. The raw per-run outputs, perf reports and
+the scripts that produce every number below are kept with the study notes, so
+each figure can be recomputed.
+
+**Question.** The 64-vCPU rows above give agent CPU per event. Doubled to per
+request, that is about 13 µs at 64 connections and 46 µs at 4K. Those rows
+were closed-loop runs at different rates, though: about 70K req/s at 64
+connections and 220-265K req/s at 4K. They mixed request rate with connection
+count, so this study holds the rate fixed and tests five explanations, one
+change at a time.
+
+**Rig.** As in the 64-vCPU scale test:
+
+- **VM.** 64 vCPUs and 64 GB on kernel 7.0, on an AMD Threadripper PRO 9995WX
+  host. The vCPUs are not pinned to host cores.
+- **Pinning.** The agent runs on CPUs 0-15 (16 workers). The load generator,
+  server and veth softirqs run on CPUs 16-63.
+- **Agent config.** The rate limiter is lifted the same way in every run
+  (`max_events_per_sec = 100000000`).
+- **Load.** 512 B responses, 20% POSTs with an email address in the body,
+  20 s per run.
+
+**Method.**
+
+- **Fixed rate.** `loadgen.go -rate N` now paces each connection on its own
+  schedule. The old shared ticker dropped ticks at high rates. Every cell
+  reports achieved against target, and a miss over 2% makes the cell invalid.
+  No fixed-rate run in this study missed by more than 0.18%.
+- **Agent CPU.** `utime + stime` of the agent over the load plus a 3 s drain.
+  It is divided by the requests the client completed (µs/req) and by the load
+  duration (cores).
+- **Recall.** Requests found in the JSON export divided by requests completed.
+- **Recall proxy.** Without the export, recall uses a proxy. The scanner finds
+  one PII entity per request (the IP address in `Host`) plus the email in
+  every 5th request, so `pii_detections / (requests + POSTs)` estimates the
+  share of requests that were parsed and scanned. It reads exactly 100% when
+  nothing is dropped. Export drops happen after the scan, so the proxy cannot
+  see them.
+- **Application slowdown.** The same cell is run without the agent
+  (`NO_AGENT=1`). The comparison uses client service latency (request sent to
+  last byte) and the server process's CPU per request.
+- **Discard rule.** A run is discarded if mean steal in either CPU set is over
+  1%, or if other tenants' load is over 40. Other tenants' load is the host's
+  1-minute load minus this VM's busy vCPUs. One run was discarded and repeated
+  (no agent, 64 connections, 20K req/s, 1.06% steal). As first written, the
+  rule used raw host load, which counts this VM's own vCPU threads. That would
+  have dropped 7 high-rate matrix runs whose steal was below 0.1%, so the rule
+  was corrected to other tenants' load. No other run is affected under either
+  version.
+- **Experiments.** Each experiment is a compile-time switch in one source
+  tree, so the baseline binary is built from that same tree. The baseline
+  differs from the release code in one way: the JSON export moved after the
+  service graph, so that H3 can move the message into it. That move is
+  expected to be cost-neutral; it was not measured separately.
+
+**Finding 1. Request rate drives the per-request cost, not connection count.**
+At the same fixed rate up to 50K req/s, 4K connections cost the agent about
+the same per request as 64. The table shows the baseline agent in mode (b),
+redacted with every request exported, and in mode (a1), metrics only.
+
+| Conns | Rate | (b) redacted + export: µs/req | cores | (a1) metrics_only: µs/req |
+|---|---|---|---|---|
+| 64 | 5K | 27.9 [27.7-31.8] (n=3) | 0.14 [0.14-0.16] (n=3) | 23.5 (n=1) |
+| 64 | 20K | 18.1 [17.1-19.4] (n=6) | 0.36 [0.34-0.39] (n=6) | 12.4 (n=1) |
+| 64 | 50K | 14.4 [13.6-14.9] (n=6) | 0.71 [0.68-0.74] (n=6) | 8.3 (n=1) |
+| 64 | 100K | 12.6 [11.9-13.1] (n=4) | 1.27 [1.19-1.31] (n=4) | 7.4 (n=1) |
+| 64 | max (119K achieved) | 13.1 [12.9-13.9] (n=3) | 1.55 [1.54-1.65] (n=3) | 7.7 (n=1) |
+| 4096 | 5K | 28.5 [27.2-32.5] (n=3) | 0.14 [0.13-0.16] (n=3) | 22.9 (n=1) |
+| 4096 | 20K | 18.9 [18.1-19.2] (n=6) | 0.37 [0.36-0.38] (n=6) | 13.1 (n=1) |
+| 4096 | 50K | 18.2 [17.1-18.3] (n=3) | 0.91 [0.85-0.91] (n=3) | 11.4 (n=1) |
+| 4096 | 100K | 24.6 [24.1-25.3] (n=4) | 2.46 [2.41-2.53] (n=4) | 18.8 (n=1) |
+| 4096 | 150K | 36.5 [35.6-37.6] (n=4) | 5.46 [5.35-5.65] (n=4) | 25.5 (n=1) |
+| 4096 | 200K | 39.0 (n=1) | 7.81 (n=1) | 38.3 (n=1) |
+| 4096 | max (263K achieved) | 47.6 [47.3-50.3] (n=3) | 12.89 [11.62-13.24] (n=3) | 40.4 (n=1) |
+
+- **Up to about 100K req/s at 64 connections,** the cost per request falls as
+  the rate rises, because fixed costs such as the 2 ms drain tick are shared
+  by more requests.
+- **At 4K connections it rises again** from about 100K req/s. At 100K, 4K
+  connections cost 24.6 µs/req against 12.6 at 64.
+- **64 connections never reach the steep part** on this rig. The closed-loop
+  client tops out near 120K req/s at 64 connections, but reaches 260K at 4K.
+  That is why the closed-loop rows above looked like a connection-count
+  effect.
+- **The high-rate gap is the same contention as Finding 2.** In interleaved runs at 100K (three each), the `len()` fix (H2-len) shrinks the gap from 1.9x (baseline: 24.4 against 12.6 µs/req) to 1.2x (H2-len: 13.7 against 11.5).
+
+**Finding 2. The steep part comes from one call, `DashMap::len()` in the
+service graph.** `EdgeAggregator::record` (`graph/aggregator.rs`) compares
+`current_window.len()` with `MAX_FLOWS_PER_WINDOW` on every request.
+`DashMap::len()` read-locks and unlocks each of the map's 64 shards. That makes
+about 128 atomic read-modify-writes per request, on lock words shared by all
+16 workers. Every worker also write-locks the one shard that holds the hot
+flow key.
+
+A frame-pointer profile at 4K connections and 150K req/s shows:
+
+| Measure | Value |
+|---|---|
+| `EdgeAggregator::record`, inclusive | 52% of agent CPU |
+| `DashMap::len()` inside it | 49% of agent CPU |
+| `record_with_server` self time on the shard read-lock and unlock lines (`perf annotate`, `dashmap/src/lock.rs:61` and `:70`) | 91% |
+| `lock_shared_slow` | 6.5% of samples, 5.5 points of it from that `len()` |
+| `lock_exclusive_slow` | 0.5%, from the same function's `entry()` |
+| `len()` at 20K req/s | 4.9-5.7% of agent CPU |
+
+The `len()` cost is cache-line traffic between busy workers, so it grows with
+how many workers run at the same time, which means with the request rate.
+
+None of the lock-wait samples above the 0.5% call-graph cutoff come from
+`ConnectionFsmManager` (one per worker), `IdentityResolver` or `DnsCache`. An
+earlier version of *Where the time goes now* above blamed these samples on the
+shared connection map; they are this `len()` call.
+
+**Hypotheses.** The predictions were written down before any run. Each figure
+is agent µs/request as median [min-max] over 3 runs, then the change against
+the baseline median. A change whose range overlaps the baseline's range counts
+as no effect.
+
+Every hypothesis was tested twice:
+
+- **Stage 1:** each change on its own, against the baseline.
+- **Stage 2:** each change on top of the `len()` fix (H2-len), against H2-len.
+  At 150K req/s the `len()` contention swamps everything else, and it makes
+  the other changes interact non-linearly. For example, making PII cheaper
+  sends workers into the contended map more often.
+
+| | Prediction | Measured | Verdict |
+|---|---|---|---|
+| **P0**, fixed rate closes the gap | 64 → 4K gap under 1.5x at 20K req/s | 17.6 [17.1-18.0] → 18.9 [18.8-19.2] µs/req at 20K (1.07x). At 50K, 14.4 → 18.2 (1.26x). At 100K, 24.4 vs 12.6 (1.9x), and 13.7 vs 11.5 (1.2x) with H2-len. | **Supported** up to 50K req/s. Above that the gap is Finding 2. |
+| **H1**, regex pool: one `RegexPrefilter` per worker | -1..-4% at 4K, about 0 at 64 | Stage 1: +4.5% at 64×20K, +3.2% at 4K×20K (overlap), **+25%** at 4K×150K (45.0 [44.1-52.7] vs 35.9). Stage 2: **-12.8%** at 4K×150K (12.9 [12.7-13.2] vs 14.8 [14.0-15.8]), +4.6% at 64×50K (overlap). | **Refuted as specified**: alone it is worse in every cell. **Supported only on top of H2-len** at 4K×150K. Alone it makes things worse because faster PII scanning sends the workers into the contended map more often. The mechanism did engage. In flat profiles at 4K×150K, regex time fell from 5.6 to 2.4 µs/req, the pool (`get_slow` + `put_value`) from 1.7 to 1.2 µs/req, and the lazy-DFA rebuild (`determinize::*`, 2.6 µs/req) dropped below the top 60 symbols. The shared pool discards and rebuilds caches when it is contended. |
+| **H2**, shared graph maps | `lock_shared_slow` mostly from `EdgeAggregator::record` via `len()`; -5..-8% at 4K | Attribution as predicted (Finding 2). H2-len (atomic flow count instead of `len()`): **-55.7%** at 4K×150K (15.9 [14.1-16.0] vs 35.9 [35.6-37.6]), -7.3% at 64×50K, -4.8% at 4K×20K, -2.3% at 64×20K (overlap). Per-worker aggregators (H2-shard): -56% at 150K alone, nothing more on top of H2-len (+0.7%, overlap). Per-thread identity memo (H2-id): no effect in either stage. `ConnectionFsmManager`: no lock waits. | **Supported**, with the size predicted about 10x too low. The fix is `len()`. Sharding and the identity memo add nothing measurable. |
+| **H3**, per-message clones | Clones 5-10% of samples; saving 3-6%, flat across connection counts | `L7Message::clone` is 7.4% (64) and 8.1% (4K) of agent CPU at 20K, and 4.1% at 150K. Stage 1: -2.3% at 64×20K (overlap), **-6.3%** at 4K×20K, -4.4% at 64×50K, -5.0% at 4K×150K (overlap). Stage 2: **-6.8%** at 4K×150K, -4.6% at 64×50K (overlap). | **Supported**, small. |
+| **H4**, cache misses on per-connection state | IPC down 15-25% and LLC misses/request over 2x at 4K vs 64, same 20K rate | User-space IPC 1.44 → 1.26 (-13%), user cycles/request +15% (50.0K → 57.4K), instructions/request equal (71.7K vs 72.1K). `cache-misses`/request 268 [231-304] vs 289 [281-297], and L1d misses/request 861 vs 870, both overlapping. `LLC-loads` and `LLC-load-misses` are not available in the guest. | **Refuted as stated.** IPC drops a little, but the miss counters do not move. The extra 7.4K user cycles per request are the same order as the measured 1.3 µs/req gap (17.6 → 18.9). Where they come from is not identified (see Caveats). |
+| **H5**, PII scan is a flat per-byte cost | PII share within ±3 points between 64 and 4K at the same rate; PII off saves the same µs at both | At 20K: share of agent CPU (`scan_message_with`, inclusive) 15.7% (64) vs 16.8% (4K). PII on → off, both in `full` mode: -3.2 µs/req at 64 and -2.8 at 4K. At 50K (stage 2): -2.5 µs. At 4K×150K: -4.6 µs in stage 2, but +17 µs in stage 1 (PII off made the contended baseline slower). | **Supported across connection counts** at a fixed rate. **Not flat across rate:** the per-request PII cost grows about 1.5x by 150K req/s through the regex cache pool (H1). |
+
+**Combined.** The table below compares stage 1 "all five" (H1 + H2-len +
+H2-shard + H2-id + H3) with the subsets the data supports: *win* (H2-len + H3)
+and *win1* (H2-len + H3 + H1).
+
+| Build | 64 conns × 20K | 4K conns × 20K | 64 conns × 50K | 4K conns × 150K |
+|---|---|---|---|---|
+| baseline | 17.6 [17.1-18.0] | 18.9 [18.8-19.2] | 13.7 [13.6-14.9] | 35.9 [35.6-37.6] |
+| H2-len | 17.2 [17.0-17.7], -2% (overlap) | 18.0 [17.7-18.7], -5% | 12.7 [11.8-13.3], -7% | 15.9 [14.1-16.0], -56%, recall 98.51% |
+| H3 | 17.2 [16.7-17.3], -2% (overlap) | 17.7 [16.7-17.8], -6% | 13.1 [12.5-13.4], -4% | 34.1 [31.3-37.5], -5% (overlap) |
+| win: H2-len + H3 | 15.9 [15.0-16.8], -10% | 17.3 [17.3-17.6], -8% | 11.8 [11.7-12.2], -14% | 13.6 [13.4-14.6], -62%, recall 98.71% |
+| win1: + H1 | 15.6 [14.7-16.0], -11% | 18.0 [17.4-18.4], -5% | 12.6 [12.6-12.8], -8% | 12.4 [11.6-12.7], -65%, recall 98.89% |
+| all five | 17.0 [15.1-17.5], -3% (overlap) | 17.6 [17.3-18.2], -7% | 12.5 [12.3-12.8], -9% | 12.3 [11.5-13.3], -66%, recall 98.69% |
+
+**Next limit after the fix: the JSON export queue.** With H2-len, recall at
+4K×150K falls from 99.99% to 98.3-98.9%. All the loss is `drops_export_full`:
+the export channel holds 4,096 events and has one writer that polls every
+5 ms. Once the workers are no longer throttled by the map, they deliver
+bursts the queue cannot absorb. The agent CPU is then about 2 cores out of
+16, so this is a queue-sizing and burst problem, not a CPU limit.
+
+#### Fixed-rate overhead matrix (baseline build)
+
+This is the overhead to publish: the baseline build at fixed rates. That build
+is the release code plus the cost-neutral sink reorder described under Method.
+
+- **Modes.**
+  - **(a1)** `metrics_only`.
+  - **(a2)** `redacted` with the JSON export off. Export sampling does not
+    exist in the config: `sampling_mode` and `sample_rate` are parsed but
+    nothing reads them. So "export off" stands in for "export sampled".
+  - **(b)** `redacted`, every request exported.
+  - **(c)** `full` with the JSON export and the raw dump (`capture_raw_path`
+    on tmpfs, size cap lifted).
+- **Runs.** Mode (b) has three runs per cell. The no-agent baseline has three
+  too, except at 64×20K, which has two after one run was discarded. Modes
+  (a1), (a2) and (c) have one run per cell.
+- **Column notes.**
+  - **Drops:** kernel ring / worker channel full / export queue full / raw
+    dump.
+  - **Client latency:** service time, request sent to last byte.
+  - **Server µs/req:** CPU of the server process per request. It includes the
+    softirq and TC work charged to it.
+  - **Kernel ns/pkt:** TC program cost (`bpf_cost.py`).
+
+##### (a1) metrics_only, no export
+
+| Conns | Target (achieved, max miss) | n | Agent cores | Agent µs/req | Peak RSS MiB | Recall | Drops kernel / channel / export / raw | Client p50 µs, none -> agent | Client p99 µs, none -> agent | Server µs/req, none -> agent | Kernel ns/pkt |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 5.0K (5.0K, 0.00%) | 1 | 0.12 | 23.5 | 94 | proxy 100.00% | 0 / 0 / 0 / 0 | 75 [74-75] -> 80 | 380 [345-411] -> 435 | 39.3 [38.7-40.9] -> 42.9 | 786 |
+| 64 | 20.0K (20.0K, 0.00%) | 1 | 0.25 | 12.4 | 94 | proxy 100.00% | 0 / 0 / 0 / 0 | 64 [64-64] -> 68 | 874 [837-910] -> 864 | 58.0 [57.7-58.4] -> 62.6 | 741 |
+| 64 | 50.0K (50.0K, 0.00%) | 1 | 0.42 | 8.3 | 95 | proxy 100.00% | 0 / 0 / 0 / 0 | 108 [108-120] -> 124 | 3016 [2867-3209] -> 3243 | 102.6 [101.6-108.9] -> 109.9 | 773 |
+| 64 | max: 116.4K (none: 120.7K) | 1 | 0.90 | 7.7 | 101 | proxy 100.00% | 0 / 0 / 0 / 0 | 275 [274-277] -> 284 | 2801 [2777-2803] -> 2913 | 114.7 [113.3-116.1] -> 121.9 | 736 |
+| 4096 | 5.0K (5.0K, 0.00%) | 1 | 0.11 | 22.9 | 95 | proxy 100.00% | 0 / 0 / 0 / 0 | 84 [84-84] -> 88 | 881 [497-894] -> 977 | 70.4 [69.2-75.3] -> 80.4 | 510 |
+| 4096 | 20.0K (20.0K, 0.00%) | 1 | 0.26 | 13.1 | 95 | proxy 100.00% | 0 / 0 / 0 / 0 | 66 [66-66] -> 69 | 8967 [8023-11626] -> 13401 | 67.6 [65.3-70.2] -> 74.5 | 505 |
+| 4096 | 50.0K (50.0K, 0.00%) | 1 | 0.57 | 11.4 | 112 | proxy 100.00% | 0 / 0 / 0 / 0 | 77 [77-77] -> 78 | 23185 [20434-24028] -> 21452 | 74.9 [71.3-75.4] -> 76.2 | 498 |
+| 4096 | max: 257.0K (none: 287.6K) | 1 | 10.38 | 40.4 | 152 | proxy 100.00% | 0 / 0 / 0 / 0 | 5386 [5096-5416] -> 6362 | 68491 [67805-68811] -> 77822 | 44.6 [43.7-45.6] -> 49.3 | 717 |
+
+##### (a2) redacted, JSON export off (proxy for sampled export, which does not exist)
+
+| Conns | Target (achieved, max miss) | n | Agent cores | Agent µs/req | Peak RSS MiB | Recall | Drops kernel / channel / export / raw | Client p50 µs, none -> agent | Client p99 µs, none -> agent | Server µs/req, none -> agent | Kernel ns/pkt |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 5.0K (5.0K, 0.00%) | 1 | 0.12 | 24.4 | 94 | proxy 100.00% | 0 / 0 / 0 / 0 | 75 [74-75] -> 85 | 380 [345-411] -> 461 | 39.3 [38.7-40.9] -> 46.3 | 839 |
+| 64 | 20.0K (20.0K, 0.00%) | 1 | 0.26 | 12.9 | 95 | proxy 100.00% | 0 / 0 / 0 / 0 | 64 [64-64] -> 68 | 874 [837-910] -> 817 | 58.0 [57.7-58.4] -> 62.2 | 753 |
+| 64 | 50.0K (50.0K, 0.00%) | 1 | 0.45 | 8.9 | 94 | proxy 100.00% | 0 / 0 / 0 / 0 | 108 [108-120] -> 131 | 3016 [2867-3209] -> 3355 | 102.6 [101.6-108.9] -> 112.2 | 785 |
+| 64 | max: 119.4K (none: 120.7K) | 1 | 0.92 | 7.7 | 99 | proxy 100.00% | 0 / 0 / 0 / 0 | 275 [274-277] -> 278 | 2801 [2777-2803] -> 2836 | 114.7 [113.3-116.1] -> 116.1 | 718 |
+| 4096 | 5.0K (5.0K, 0.00%) | 1 | 0.11 | 22.5 | 94 | proxy 100.00% | 0 / 0 / 0 / 0 | 84 [84-84] -> 86 | 881 [497-894] -> 727 | 70.4 [69.2-75.3] -> 76.0 | 511 |
+| 4096 | 20.0K (20.0K, 0.00%) | 1 | 0.25 | 12.4 | 101 | proxy 100.00% | 0 / 0 / 0 / 0 | 66 [66-66] -> 69 | 8967 [8023-11626] -> 15455 | 67.6 [65.3-70.2] -> 78.8 | 500 |
+| 4096 | 50.0K (50.0K, 0.00%) | 1 | 0.55 | 11.2 | 116 | proxy 100.00% | 0 / 0 / 0 / 0 | 77 [77-77] -> 78 | 23185 [20434-24028] -> 21350 | 74.9 [71.3-75.4] -> 72.6 | 504 |
+| 4096 | max: 272.3K (none: 287.6K) | 1 | 13.44 | 49.4 | 180 | proxy 98.96% | 0 / 100755 / 0 / 0 | 5386 [5096-5416] -> 6057 | 68491 [67805-68811] -> 73009 | 44.6 [43.7-45.6] -> 44.3 | 697 |
+
+##### (b) redacted, every request exported to JSON
+
+| Conns | Target (achieved, max miss) | n | Agent cores | Agent µs/req | Peak RSS MiB | Recall | Drops kernel / channel / export / raw | Client p50 µs, none -> agent | Client p99 µs, none -> agent | Server µs/req, none -> agent | Kernel ns/pkt |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 5.0K (5.0K, 0.00%) | 3 | 0.14 [0.14-0.16] | 27.9 [27.7-31.8] | 94 [94-95] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 75 [74-75] -> 83 [78-90] | 380 [345-411] -> 441 [407-454] | 39.3 [38.7-40.9] -> 44.0 [41.8-49.6] | 771 [738-879] |
+| 64 | 20.0K (20.0K, 0.00%) | 3 | 0.37 [0.36-0.39] | 18.3 [18.1-19.4] | 95 [95-97] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 64 [64-64] -> 67 [66-69] | 874 [837-910] -> 803 [802-877] | 58.0 [57.7-58.4] -> 60.3 [60.1-64.4] | 720 [706-760] |
+| 64 | 50.0K (50.0K, 0.00%) | 3 | 0.72 [0.71-0.73] | 14.4 [14.3-14.6] | 95 [94-95] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 108 [108-120] -> 116 [112-117] | 3016 [2867-3209] -> 2960 [2889-2974] | 102.6 [101.6-108.9] -> 104.2 [103.5-107.8] | 750 [745-755] |
+| 64 | max: 118.6K (none: 120.7K) | 3 | 1.55 [1.54-1.65] | 13.1 [12.9-13.9] | 113 [111-118] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 275 [274-277] -> 279 [277-280] | 2801 [2777-2803] -> 2854 [2836-2860] | 114.7 [113.3-116.1] -> 117.3 [115.7-117.6] | 722 [720-732] |
+| 4096 | 5.0K (5.0K, 0.00%) | 3 | 0.14 [0.13-0.16] | 28.5 [27.2-32.5] | 94 [94-95] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 84 [84-84] -> 89 [89-90] | 881 [497-894] -> 1077 [796-1187] | 70.4 [69.2-75.3] -> 77.3 [75.5-79.3] | 535 [518-560] |
+| 4096 | 20.0K (20.0K, 0.00%) | 3 | 0.37 [0.36-0.37] | 18.9 [18.1-18.9] | 100 [98-104] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 66 [66-66] -> 69 [69-69] | 8967 [8023-11626] -> 12490 [11920-15124] | 67.6 [65.3-70.2] -> 77.0 [76.8-78.1] | 505 [504-511] |
+| 4096 | 50.0K (50.0K, 0.01%) | 3 | 0.91 [0.85-0.91] | 18.2 [17.1-18.3] | 117 [115-119] | 100.00 [100.00-100.00]% | 0 / 0 / 0 / 0 | 77 [77-77] -> 79 [77-79] | 23185 [20434-24028] -> 24212 [13199-25082] | 74.9 [71.3-75.4] -> 78.5 [62.4-79.2] | 511 [503-512] |
+| 4096 | max: 263.0K (none: 287.6K) | 3 | 12.89 [11.62-13.24] | 47.6 [47.3-50.3] | 179 [169-180] | 99.37 [98.34-99.46]% | 0 / 22804 / 25420 / 0 | 5386 [5096-5416] -> 6131 [6085-6456] | 68491 [67805-68811] -> 76492 [71127-83899] | 44.6 [43.7-45.6] -> 45.0 [44.0-49.5] | 696 [686-879] |
+
+##### (c) full, JSON export + raw dump
+
+| Conns | Target (achieved, max miss) | n | Agent cores | Agent µs/req | Peak RSS MiB | Recall | Drops kernel / channel / export / raw | Client p50 µs, none -> agent | Client p99 µs, none -> agent | Server µs/req, none -> agent | Kernel ns/pkt |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 5.0K (5.0K, 0.00%) | 1 | 0.20 | 39.1 | 161 | 100.00% | 0 / 0 / 0 / 0 | 75 [74-75] -> 83 | 380 [345-411] -> 448 | 39.3 [38.7-40.9] -> 45.1 | 842 |
+| 64 | 20.0K (20.0K, 0.00%) | 1 | 0.56 | 27.9 | 161 | 100.00% | 0 / 0 / 0 / 0 | 64 [64-64] -> 71 | 874 [837-910] -> 939 | 58.0 [57.7-58.4] -> 64.9 | 784 |
+| 64 | 50.0K (50.0K, 0.00%) | 1 | 1.17 | 23.4 | 169 | 100.00% | 0 / 0 / 0 / 0 | 108 [108-120] -> 133 | 3016 [2867-3209] -> 3360 | 102.6 [101.6-108.9] -> 112.3 | 793 |
+| 64 | max: 96.6K (none: 120.7K) | 1 | 2.48 | 25.7 | 185 | 88.73% | 0 / 655 / 217421 / 1061610 | 275 [274-277] -> 303 | 2801 [2777-2803] -> 3133 | 114.7 [113.3-116.1] -> 123.8 | 760 |
+| 4096 | 5.0K (5.0K, 0.00%) | 1 | 0.18 | 37.3 | 160 | 100.00% | 0 / 0 / 0 / 0 | 84 [84-84] -> 88 | 881 [497-894] -> 742 | 70.4 [69.2-75.3] -> 74.0 | 519 |
+| 4096 | 20.0K (20.0K, 0.00%) | 1 | 0.55 | 27.7 | 168 | 100.00% | 0 / 0 / 0 / 0 | 66 [66-66] -> 69 | 8967 [8023-11626] -> 11688 | 67.6 [65.3-70.2] -> 75.7 | 506 |
+| 4096 | 50.0K (50.0K, 0.08%) | 1 | 1.23 | 24.7 | 185 | 100.00% | 0 / 0 / 0 / 0 | 77 [77-77] -> 79 | 23185 [20434-24028] -> 27520 | 74.9 [71.3-75.4] -> 78.8 | 514 |
+| 4096 | max: 244.4K (none: 287.6K) | 1 | 11.72 | 47.9 | 237 | 93.06% | 5483 / 2850 / 334613 / 996720 | 5386 [5096-5416] -> 6657 | 68491 [67805-68811] -> 80781 | 44.6 [43.7-45.6] -> 50.0 | 749 |
+
+Excluded by the discard rule: B-none-c64-r20k
+
+Reading the matrix:
+
+- **Mode (b), the default config.** At 20K req/s it costs 0.37 cores
+  (18.3-18.9 µs/req) and 95-100 MiB, at 64 or 4K connections.
+- **Mode (b) at higher rates.** At 64 connections it stays at 13-14 µs/req
+  up to the client's limit (about 119K req/s, 1.55 cores). At 4K connections
+  it rises from about 100K req/s because of Finding 2: 0.91 cores at 50K,
+  12.9 cores at 263K.
+- **Export.** It adds about 5-7 µs/req at 20K: (b) against (a2).
+- **Raw dump, mode (c).** It adds about 6-11 µs/req over (b) at fixed rates. At full
+  rate it cannot keep up. At 64 connections it dropped 1.06M raw records and
+  217K exports (recall 88.7%), and the client fell from 120.7K to 96.6K
+  req/s. Each record is a full 4,164-byte event.
+- **Application slowdown at fixed rates up to 50K.** Median client latency
+  rises by 2-8 µs in mode (b) and by up to 25 µs in the other modes. The
+  server's CPU per request rises by 2-9 µs in mode (b) and by up to 11 µs in
+  the other modes.
+- **Tail latency at 4K connections.** From 20K req/s up, p99 is already
+  9-35 ms without the agent, so it is dominated by the 4,096-goroutine client.
+  Treat the 4K p99 columns as noise, apart from a consistent rise at 4K×20K
+  in mode (b): 8,967 → 12,490 µs, with ranges that do not overlap.
+- **Max rate (closed loop).** The agent costs the application 2% at 64
+  connections (118.6K against 120.7K req/s) and 9% at 4K (263.0K against
+  287.6K).
+- **RSS.** Under 200 MiB in every mode except (c) at maximum rate (237 MiB).
+
+#### Kernel → worker latency
+
+An experiment build stamps every 64th event at the worker with
+`CLOCK_MONOTONIC - event.timestamp_ns`. `timestamp_ns` is the TC program's
+`bpf_ktime_get_ns()`. The samples go into log2 buckets with 4 sub-buckets,
+so each bucket is about 19% wide, and the table shows bucket upper bounds.
+The instrumented runs' µs/req fell within or just below the baseline's
+range, so the stamping costs nothing measurable. Mode (b), one run per cell
+unless noted:
+
+| Conns | Rate | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| 64 | 20K | 1.3 ms | 3.7 ms | 4.2 ms |
+| 64 | 50K | 1.3 ms | 2.1 ms | 2.6 ms |
+| 64 | max (113K) | 1.3 ms | 2.6 ms | 5.2 ms |
+| 4K | 20K | 1.3 ms | 4.2 ms | 12.6 ms |
+| 4K | 50K (2 runs) | 1.3 ms | 8.4-10.5 ms | 14.7 ms |
+| 4K | max (268K) | 33.6 ms | 117 ms | 201 ms |
+
+- **p50.** It sits in the 1.05-1.31 ms bucket in every cell below
+  saturation. That fits the 2 ms drain tick: below saturation, events are
+  drained by the tick rather than by a wakeup.
+- **The 5 ms P99 target.** Met at 64 connections at every rate measured, and
+  at 4K connections at 20K. Missed at 4K connections from 50K req/s. At the
+  maximum rate the workers are saturated by the `len()` contention and events
+  queue in their channels.
+- **Not measured.** Latency with the H2-len fix.
+
+#### Recommendations, ranked by measured gain per line changed
+
+1. **Replace `DashMap::len()` in `EdgeAggregator::record` with an atomic flow
+   count.** About 10 lines. At 4K connections and 150K req/s, µs/req falls
+   from 35.9 to 15.9 (-56%). Other cells: -7% at 64×50K and -5% at 4K×20K.
+   Do it together with item 4.
+2. **Stop cloning each message (H3).** About 25 lines: take the parser's
+   messages by value, redact in place, and move them into the JSON export as
+   the last sink. Saves 5-7% (-6.3% at 4K×20K; -6.8% on top of the item 1 fix
+   at 150K). Items 1 and 2 together ("win") measured -8 to -14% at 20-50K
+   req/s and -62% at 4K×150K.
+3. **One `RegexPrefilter` per worker (H1).** About 10 lines. It is only worth
+   it on top of item 1: -12.8% at 4K×150K, but +4.6% (within noise) at
+   64×50K. It removes the lazy-DFA rebuilds that the shared cache pool causes
+   (`determinize::*` falls from 6.7% to below the top 60 symbols). Ship it
+   only with a high-rate benchmark that keeps it honest.
+4. **Size the JSON export queue for bursts.** It is a fixed 4,096 events with
+   a 5 ms poll. Once item 1 lands, it is the first thing to drop data at high
+   rates (1.1-1.7% of exports at 150K req/s). Not measured here.
+
+**Not recommended, because the data did not support them:**
+
+- **Per-worker aggregators (H2-shard).** No gain over the item 1 fix,
+  with more code and memory.
+- **Per-thread identity memo (H2-id).** No effect in either stage.
+- **Per-connection state layout or prefetching for cache misses (H4).** The
+  miss counters did not move between 64 and 4K connections.
+- **Moving PII scanning off the hot path to save connection-scaling cost
+  (H5).** The scan cost does not depend on connection count. It is about
+  3 µs/req at fixed rates up to 50K. Its growth at high rates is the regex
+  pool (item 3).
+
+#### Caveats
+
+- **Shared host.** This is one VM on a shared host, and the vCPUs are not
+  pinned to host cores. The guest reports a meaningless L3 topology (one
+  "1 GiB" instance per vCPU), so cache effects across the host's 12 CCDs are
+  uncontrolled.
+- **Load during the study.** Mean steal stayed at or below 0.36% in every
+  kept run (304 of 305). Other tenants' load rose from about 8 to about 31
+  during the matrix runs.
+- **Counters.** `LLC-loads` and `LLC-load-misses` are not supported in the
+  guest. `cache-misses` and `cache-references` are AMD's generic events, which
+  may not count cross-core (coherence) transfers. Those transfers are exactly
+  what the `len()` contention generates, and they may be where the +15% user
+  cycles at 4K go (H4). The 7-event `perf stat` set was multiplexed (about 85%
+  enabled), so the user/kernel split was repeated with 6 events and no
+  multiplexing.
+- **Profiles.** DWARF call graphs (`--call-graph dwarf`) did not unwind the
+  agent's user stacks in this VM, though they worked for other binaries. The
+  call-graph attribution therefore uses a build with frame pointers
+  (`-C force-frame-pointers=yes`). That build is used for attribution only and
+  never timed. Its µs/req at 150K (34.3) matched the baseline's.
+- **Rate vs connections.** 64 connections cannot reach 150K req/s on this
+  rig, so the steep part of the curve is measured at 4K connections only.
+  At the same 100K rate, `len()` costs far more with 4K connections than with 64: the fix takes 4K from 24.4 to 13.7 µs/req and 64 from 12.6 to 11.5. Why more workers contend at the same rate when there are more connections was not measured. One candidate is that 4K connections spread the work more evenly over the 16 workers, so more of them are in `record()` at once.
+- **Recall proxy.** Modes (a1) and (a2) use the PII-count recall proxy, which
+  cannot see export drops (there is no export in those modes).
+- **Repetition.** Matrix cells outside mode (b) are single runs.
+- **Untested.** The loadgen's latency from the *scheduled* send time includes
+  up to about 0.5 ms of Go timer slop at low rates, so the tables use service
+  time instead. The ONNX model path and TLS traffic were not tested.
 
 ## 5. Micro-benchmarks
 
@@ -705,6 +1067,11 @@ sudo tests/oracle/run_messaging.sh 500 7
 # request per connection). Reports recall, drops by cause, CPU and RSS.
 sudo tests/load/run_load.sh 64 20s
 sudo tests/load/run_load.sh 64 30s 0 1
+
+# Fixed rate (scaling study): 4K connections at 20K req/s, reporting achieved
+# vs target, client latency and server CPU; then the same load with no agent.
+sudo tests/load/run_load.sh 4096 20s 20000
+sudo NO_AGENT=1 tests/load/run_load.sh 4096 20s 20000
 
 # User-space cost per event, one core: record a capture, then replay it
 # (with your config; add --json-export /dev/null to include export).

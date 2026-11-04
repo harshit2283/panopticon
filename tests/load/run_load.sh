@@ -14,7 +14,10 @@
 #   the same but closes with a plain FIN instead of Connection: close.
 # Env: MIN_RECALL (unset = report only), PYTHON (with pyroute2), AGENT_ARGS,
 #      KEEP=1 to keep the (large) export and id list, NO_EXPORT=1 to run
-#      without the JSON export (no recall score; isolates its cost).
+#      without the JSON export (no recall score; isolates its cost),
+#      NO_AGENT=1 to run the same load with no agent (application baseline).
+# With rate>0 the client holds a fixed rate and reports achieved vs target
+# (a miss over 2% marks the run invalid) and client latency percentiles.
 # Needs: root, go, a built agent, python3 with pyroute2.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
@@ -51,10 +54,12 @@ sysctl -qw kernel.bpf_stats_enabled=1
 SP=$!
 EXPORT=(--json-export "$OUT/agent.jsonl")
 [[ ${NO_EXPORT:-0} == 1 ]] && EXPORT=()
-# shellcheck disable=SC2086
-"$AGENT" -i "$IFACE" "${EXPORT[@]}" --metrics-bind "$METRICS" \
-  ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
-AP=$!
+if [[ ${NO_AGENT:-0} != 1 ]]; then
+  # shellcheck disable=SC2086
+  "$AGENT" -i "$IFACE" "${EXPORT[@]}" --metrics-bind "$METRICS" \
+    ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
+  AP=$!
+fi
 sleep 4
 
 NC=()
@@ -62,10 +67,26 @@ NC=()
 [[ $NEWCONN == fin ]] && NC=(-fin)
 START=$(date +%s.%N)
 # CPU is counted from here: startup work (TLS scan, map setup) is excluded.
-read -r UT0 ST0 < <(awk '{print $14, $15}' "/proc/$AP/stat")
+read -r SUT0 SST0 < <(awk '{print $14, $15}' "/proc/$SP/stat")
+[[ -n ${AP:-} ]] && read -r UT0 ST0 < <(awk '{print $14, $15}' "/proc/$AP/stat")
 nsenter --net=/var/run/netns/$NS "$OUT/loadgen" client \
   -url "http://$HOST_IP:$PORT" -c "$CONC" -d "$DUR" -rate "$RATE" -size "$SIZE" \
   "${NC[@]}" -out "$OUT/ids.txt" | tee "$OUT/client.txt"
+# Server CPU over the load (its own process: handlers, plus the softirq and
+# TC work charged to it), per request.
+read -r SUT SST < <(awk -v u="$SUT0" -v s="$SST0" '{print $14 - u, $15 - s}' "/proc/$SP/stat")
+REQS=$(sed -n 's/^requests=\([0-9]*\).*/\1/p' "$OUT/client.txt")
+DURS=$(sed -n 's/.* elapsed=\([0-9.]*\)s.*/\1/p' "$OUT/client.txt")
+python3 -c 'import sys
+ut, st, tck, n, d = map(float, sys.argv[1:6])
+cpu = (ut + st) / tck
+print(f"server: cpu={cpu:.2f}s cores={cpu / d:.2f} cpu_per_request={cpu / max(n, 1) * 1e6:.1f}us")' \
+  "$SUT" "$SST" "$(getconf CLK_TCK)" "$REQS" "$DURS"
+if [[ ${NO_AGENT:-0} == 1 ]]; then
+  rm -f "$OUT/ids.txt"
+  echo "artifacts: $OUT"
+  exit 0
+fi
 sleep 3  # let the agent drain
 
 python3 -I "$ORACLE/bpf_cost.py" "$AP"
@@ -79,19 +100,33 @@ for line in open(sys.argv[1]):
         vals[m.group(1)] = vals.get(m.group(1), 0) + float(m.group(2))
 keys = ["events_received", "events_dropped", "kernel_ringbuf_drops", "drops_rate_limit",
         "drops_channel_full", "drops_export_full", "drops_parser_error", "capture_truncated",
-        "active_connections"]
+        "raw_capture_dropped", "pii_detections", "active_connections"]
 print("metrics: " + " ".join(f"{k}={int(vals[k])}" for k in keys if k in vals))
 open(sys.argv[1] + ".received", "w").write(str(int(vals.get("events_received", 0))))
+open(sys.argv[1] + ".pii", "w").write(str(int(vals.get("pii_detections", 0))))
 EOF
 read -r UT ST < <(awk -v u="$UT0" -v s="$ST0" '{print $14 - u, $15 - s}' "/proc/$AP/stat")
 HWM=$(awk '/VmHWM/ {print $2}' "/proc/$AP/status")
+# Per request (the client's count) as well as per event: an HTTP exchange is
+# two or more events. cores = agent CPU over the load duration (the drain
+# after it is in the numerator, so a slight overestimate).
 python3 -c 'import sys, time
-ut, st, tck, start, hwm = map(float, sys.argv[1:6])
+ut, st, tck, start, hwm, reqs, dur = map(float, sys.argv[1:8])
 cpu, wall = (ut + st) / tck, time.time() - start
-events = int(open(sys.argv[6]).read() or 0)
+events = int(open(sys.argv[8]).read() or 0)
 per = f" cpu_per_event={cpu / events * 1e6:.1f}us" if events else ""
-print(f"agent: cpu={cpu:.2f}s over {wall:.0f}s ({cpu / wall:.0%} of one core){per} peak_rss={hwm / 1024:.0f}MiB")' \
-  "$UT" "$ST" "$(getconf CLK_TCK)" "$START" "$HWM" "$OUT/metrics.txt.received"
+print(f"agent: cpu={cpu:.2f}s over {wall:.0f}s ({cpu / wall:.0%} of one core){per} peak_rss={hwm / 1024:.0f}MiB")
+print(f"agent_per_request: cores={cpu / dur:.2f} cpu_per_request={cpu / max(reqs, 1) * 1e6:.1f}us")' \
+  "$UT" "$ST" "$(getconf CLK_TCK)" "$START" "$HWM" "$REQS" "$DURS" "$OUT/metrics.txt.received"
+# Recall proxy for runs without the export: each request carries one PII
+# entity the scanner finds (the IP address in its Host header) and every 5th
+# (id % 5 == 0) is a POST whose body adds an email address, so detections
+# over requests + POSTs completed estimates the share parsed and scanned.
+python3 -c 'import sys
+ids = [int(l.strip()[1:]) for l in open(sys.argv[1]) if l.strip()]
+want = len(ids) + sum(1 for i in ids if i % 5 == 0)
+pii = int(open(sys.argv[2]).read() or 0)
+print(f"pii_recall_proxy={pii / max(want, 1):.2%} ({pii}/{want} expected entities)")' "$OUT/ids.txt" "$OUT/metrics.txt.pii"
 kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
 status=0
 [[ ${NO_EXPORT:-0} == 1 ]] || python3 -I "$HERE/score_load.py" "$OUT/ids.txt" "$OUT/agent.jsonl" ${MIN_RECALL:-} || status=1
