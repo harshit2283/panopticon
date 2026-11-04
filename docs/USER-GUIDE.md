@@ -161,7 +161,7 @@ setting covers that range, `[privacy] mode` in the config file or
 
 | Mode | What can leave the agent |
 |---|---|
-| `full` | Everything: the event export unredacted, and the raw dump of every payload with TLS decrypted (§5.5). |
+| `full` | Everything: the event export unredacted (protocol login secrets excepted, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
 | `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
 | `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols. |
 
@@ -295,21 +295,37 @@ exported:
 
 - the **path and query string** are scanned (also in percent-decoded form) and
   matches replaced by `<CATEGORY>`, e.g. `<EMAIL>`;
-- **HTTP header values** are scanned the same way, and credential headers
-  (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
-  `X-Api-Key`, `X-Auth-Token`, `X-Amz-Security-Token`) are replaced entirely
-  by `<REDACTED>`;
-- the **request body** (e.g. POST JSON or form data) and the **response
-  body** are scanned and redacted.
+- **header names and values** are scanned the same way, for every protocol
+  (HTTP headers, gRPC metadata, Kafka `client_id`, AMQP consumer tags,
+  routing keys and reply texts). HTTP, HTTP/2 and gRPC credential headers are
+  replaced entirely by `<REDACTED>`: any header whose lowercased name contains
+  `token`, `auth`, `key`, `secret`, `session`, `csrf`, `xsrf`, `signature`,
+  `password`, `passwd`, `cookie` or `credential` (so `Authorization`,
+  `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Vault-Token`, `PRIVATE-TOKEN`,
+  `X-Goog-Api-Key`, `X-Hub-Signature-256`, ...). `:authority` and
+  `Sec-WebSocket-Key` stay readable;
+- the **method** (including a gRPC method path), the **content type**, the
+  **request body** (e.g. POST JSON or form data) and the **response body**
+  are scanned and redacted;
+- **credentials** are masked in every field whatever the protocol: the value
+  after `PASSWORD`, `IDENTIFIED BY`, `requirepass`, `masterauth` or
+  `password=` / `"password":`, and the arguments of a Redis `AUTH`.
+
+Login secrets are masked by the protocol parsers themselves, so they reach
+no sink in any privacy mode, `full` included: Redis `AUTH`, `HELLO … AUTH`,
+`MIGRATE … AUTH`/`AUTH2`, `CONFIG SET requirepass|masterauth|masteruser` and
+`ACL SETUSER` password rules; SQL `PASSWORD '…'` and `IDENTIFIED BY '…'`
+clauses (PostgreSQL, MySQL); the AMQP and Kafka SASL exchanges. Only the raw
+dump (`full` mode, §5.5) keeps them.
 
 Detection is pattern-based. It will miss PII that does not match a pattern
 (names, free-text addresses), a bare phone or passport number with no keyword
 before it (e.g. in a positional SQL `VALUES` list), and anything past
 `max_body_bytes`. It flags every IPv4 address and PAN-shaped product codes.
 Treat the exports as sensitive anyway.
-Header values are scanned for HTTP, HTTP/2 and gRPC only; other protocols'
-metadata (e.g. Kafka or AMQP headers) is exported as parsed. If what the
-patterns miss must not leave the node, use `metrics_only`.
+A password bound as a prepared-statement parameter (`ALTER ROLE … PASSWORD $1`)
+is not recognised as one. If what the patterns miss must not leave the node,
+use `metrics_only`.
 
 ### 5.4 Metrics and endpoints (`--metrics-bind`)
 

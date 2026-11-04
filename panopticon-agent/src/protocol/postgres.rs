@@ -468,7 +468,9 @@ impl PostgresParser {
     fn build_msg(&mut self, ts: u64) -> L7Message {
         let mut msg = L7Message::new(Protocol::Postgres, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
-        if let Some(q) = self.query_text.take() {
+        if let Some(mut q) = self.query_text.take() {
+            // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
+            super::mask_secrets_in(&mut q);
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
             }
@@ -870,6 +872,24 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_password_clause_is_masked() {
+        let mut p = setup_ready_parser();
+        p.feed(
+            &make_frontend_msg(b'Q', b"ALTER ROLE app WITH LOGIN PASSWORD 'pg-s3cret'\0"),
+            Direction::Egress,
+            1000,
+        );
+        let mut response = make_backend_msg(b'C', b"ALTER ROLE\0");
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
+            panic!("expected a message");
+        };
+        let q = msgs[0].payload_text.as_deref().unwrap();
+        assert_eq!(q, "ALTER ROLE app WITH LOGIN PASSWORD <REDACTED>");
+        assert_eq!(msgs[0].method.as_deref(), Some("ALTER"));
     }
 
     #[test]

@@ -61,7 +61,8 @@ impl RedisParser {
                     self.client_buf.consume(consumed);
 
                     // Enqueue this command — VecDeque preserves order for pipelining.
-                    let parts = flatten_to_strings(&value);
+                    let mut parts = flatten_to_strings(&value);
+                    mask_credentials(&mut parts);
                     if !parts.is_empty() {
                         self.pending_queue.push_back((parts, timestamp_ns));
                     }
@@ -181,6 +182,63 @@ impl ProtocolParser for RedisParser {
 
     fn state_name(&self) -> &'static str {
         self.current_state()
+    }
+}
+
+/// Replace the secrets a command carries with [`super::REDACTED_CREDENTIAL`]
+/// before it is queued, so no sink, in any privacy mode, ever sees them (as
+/// the AMQP and Kafka parsers drop their auth exchanges):
+/// `AUTH [user] pw`, `HELLO … AUTH user pw`, `MIGRATE … AUTH pw | AUTH2 user pw`,
+/// `CONFIG SET requirepass|masterauth|masteruser pw` and the password rules
+/// (`>pw`, `<pw`, `#hash`, `!hash`) of `ACL SETUSER`.
+fn mask_credentials(parts: &mut [String]) {
+    let mask = |s: &mut String| {
+        zeroize::Zeroize::zeroize(s);
+        *s = super::REDACTED_CREDENTIAL.to_string();
+    };
+    let Some(cmd) = parts.first().map(|c| c.to_ascii_uppercase()) else {
+        return;
+    };
+    let arg_is = |parts: &[String], i: usize, names: &[&str]| {
+        parts
+            .get(i)
+            .is_some_and(|a| names.iter().any(|n| a.eq_ignore_ascii_case(n)))
+    };
+    match cmd.as_str() {
+        "AUTH" => parts[1..].iter_mut().for_each(mask),
+        "HELLO" | "MIGRATE" => {
+            let mut i = 1;
+            while i < parts.len() {
+                // HELLO's AUTH and MIGRATE's AUTH2 take user + password.
+                let n = if arg_is(parts, i, &["AUTH2"])
+                    || (cmd == "HELLO" && arg_is(parts, i, &["AUTH"]))
+                {
+                    2
+                } else if arg_is(parts, i, &["AUTH"]) {
+                    1
+                } else {
+                    0
+                };
+                let end = (i + 1 + n).min(parts.len());
+                parts[i + 1..end].iter_mut().for_each(mask);
+                i += 1 + n;
+            }
+        }
+        "CONFIG" if arg_is(parts, 1, &["SET"]) => {
+            let mut i = 2;
+            while i + 1 < parts.len() {
+                if arg_is(parts, i, &["requirepass", "masterauth", "masteruser"]) {
+                    mask(&mut parts[i + 1]);
+                }
+                i += 2;
+            }
+        }
+        "ACL" if arg_is(parts, 1, &["SETUSER"]) => parts
+            .iter_mut()
+            .skip(3)
+            .filter(|r| r.starts_with(['>', '<', '#', '!']))
+            .for_each(mask),
+        _ => {}
     }
 }
 
@@ -563,6 +621,63 @@ mod tests {
             }
             other => panic!("expected SET message, got {other:?}"),
         }
+    }
+
+    fn resp(args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend(format!("${}\r\n{a}\r\n", a.len()).bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_credentials_never_leave_the_parser() {
+        let cases: &[&[&str]] = &[
+            &["AUTH", "s3cretpw"],
+            &["auth", "alice", "s3cretpw"],
+            &[
+                "HELLO", "3", "AUTH", "default", "s3cretpw", "SETNAME", "app",
+            ],
+            &[
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH", "s3cretpw", "KEYS", "k",
+            ],
+            &[
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH2", "u", "s3cretpw",
+            ],
+            &["CONFIG", "SET", "requirepass", "s3cretpw"],
+            &[
+                "CONFIG",
+                "SET",
+                "maxmemory",
+                "1gb",
+                "masterauth",
+                "s3cretpw",
+            ],
+            &["ACL", "SETUSER", "bob", "on", ">s3cretpw", "~*", "+@all"],
+        ];
+        for args in cases {
+            let mut parser = RedisParser::new();
+            parser.feed(&resp(args), Direction::Egress, 1);
+            let ParseResult::Messages(msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+                panic!("no message for {args:?}");
+            };
+            let m = &msgs[0];
+            let all = format!("{:?} {:?} {:?}", m.method, m.path, m.request_text);
+            assert!(!all.contains("s3cretpw"), "{args:?} leaked: {all}");
+            assert!(all.contains(crate::protocol::REDACTED_CREDENTIAL), "{all}");
+        }
+        // Ordinary arguments stay readable.
+        let mut parser = RedisParser::new();
+        parser.feed(
+            &resp(&["HELLO", "3", "SETNAME", "app"]),
+            Direction::Egress,
+            1,
+        );
+        let ParseResult::Messages(msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+            panic!()
+        };
+        assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
     }
 
     #[test]

@@ -94,8 +94,9 @@ production-hardened compliance platform.
     payloads produce a finding, down from 54%. Remaining misses are numbers
     with no context; see `BENCHMARKS.md` §3.
   - ONNX-backed ML inference is optional and throughput-sensitive.
-  - In `redacted` mode, header values are scanned for HTTP, HTTP/2 and gRPC
-    only; other protocols' metadata is exported as parsed. The leak test
+  - In `redacted` mode, header names and values are scanned for every
+    protocol, and credentials (credential-named HTTP headers, Redis `AUTH`,
+    SQL password clauses) are masked. The leak test
     covers HTTP and OpenSSL TLS, not the database or messaging protocols.
 - Service graphing:
   - DNS/IP-based identity works.

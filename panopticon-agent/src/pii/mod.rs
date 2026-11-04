@@ -29,25 +29,33 @@ use self::sampler::{InferenceSampler, template_hash};
 use crate::config::{PiiConfig, PiiMode};
 use crate::protocol::{L7Message, Protocol};
 
-/// Replacement value for credential-bearing headers when redaction is on.
-const REDACTED_CREDENTIAL: &str = "<REDACTED>";
+use crate::protocol::{REDACTED_CREDENTIAL, mask_secrets_in};
 
-/// Headers whose values are credentials/session tokens. Their values are
-/// masked wholesale when redaction is on; regexes cannot reliably recognise
-/// opaque tokens and session cookies.
+/// Headers whose values are credentials or session tokens, masked wholesale
+/// when redaction is on: regexes cannot recognise opaque tokens and session
+/// cookies. Matched by name: any name containing one of [`CREDENTIAL_NAME_PARTS`],
+/// so vendor headers (`X-Vault-Token`, `PRIVATE-TOKEN`, `X-Goog-Api-Key`,
+/// `X-Hub-Signature-256`, `X-CSRF-Token`, ...) are covered without a list.
 fn is_credential_header(name: &str) -> bool {
-    const CREDENTIAL_HEADERS: &[&str] = &[
-        "authorization",
-        "proxy-authorization",
+    const CREDENTIAL_NAME_PARTS: &[&str] = &[
+        "token",
+        "auth",
+        "key",
+        "secret",
+        "session",
+        "csrf",
+        "xsrf",
+        "signature",
+        "password",
+        "passwd",
         "cookie",
-        "set-cookie",
-        "x-api-key",
-        "x-auth-token",
-        "x-amz-security-token",
+        "credential",
     ];
-    CREDENTIAL_HEADERS
-        .iter()
-        .any(|h| name.eq_ignore_ascii_case(h))
+    // Names that match a part but carry nothing secret: the HTTP/2 authority
+    // (the host) and the WebSocket handshake nonce.
+    const READABLE: &[&str] = &[":authority", "sec-websocket-key"];
+    let name = name.to_ascii_lowercase();
+    !READABLE.contains(&name.as_str()) && CREDENTIAL_NAME_PARTS.iter().any(|p| name.contains(p))
 }
 
 /// Decode `%XX` escapes and `+` (form encoding) for PII scanning.
@@ -175,6 +183,13 @@ impl Drop for PiiReport {
             text.zeroize();
         }
     }
+}
+
+/// Findings accumulated over the fields of one message.
+#[derive(Default)]
+struct Found {
+    entities: Vec<PiiEntity>,
+    scanned_bytes: usize,
 }
 
 /// Thread-safe PII detection engine. Cloneable (Arc internals).
@@ -382,6 +397,14 @@ impl PiiEngine {
 
     /// [`scan_message`](Self::scan_message) with redaction decided by the
     /// caller (the privacy mode in effect).
+    ///
+    /// Every string field an exporter can carry is scanned: method, path,
+    /// content type, header names and values (all protocols; DNS answers
+    /// excepted), request and response body. With redaction on, credentials
+    /// are also masked whatever the protocol: credential-named HTTP headers
+    /// wholesale, the arguments of an `AUTH` command, and keyword-introduced
+    /// secrets (`PASSWORD '…'`, `IDENTIFIED BY '…'`, `requirepass …`,
+    /// `password=…`) in any field.
     pub fn scan_message_with(
         &self,
         msg: &mut L7Message,
@@ -390,77 +413,92 @@ impl PiiEngine {
         if !self.config.enabled {
             return None;
         }
-        let mut entities = Vec::new();
-        let mut scanned_bytes = 0;
+        let mut found = Found::default();
+
+        if redact_enabled
+            && msg
+                .method
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("AUTH"))
+        {
+            for f in [&mut msg.path, &mut msg.request_text].into_iter().flatten() {
+                f.zeroize();
+                *f = REDACTED_CREDENTIAL.to_string();
+            }
+        }
 
         if let Some(path) = msg.path.as_mut() {
             // Query strings are usually percent-encoded (alice%40example.com),
             // which the regexes would miss: scan the decoded form.
-            let decoded = percent_decode(path);
-            if let Some(mut report) = self.scan_with(&decoded, redact_enabled) {
-                scanned_bytes += report.scanned_bytes;
-                if let Some(redacted) = report.redacted_text.take() {
-                    path.zeroize();
-                    *path = redacted;
-                }
-                entities.append(&mut report.entities);
-            }
+            self.scan_field(path, true, redact_enabled, &mut found);
+        }
+        for field in [&mut msg.method, &mut msg.content_type]
+            .into_iter()
+            .flatten()
+        {
+            self.scan_field(field, false, redact_enabled, &mut found);
         }
 
-        if matches!(
+        let http = matches!(
             msg.protocol,
             Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
-        ) {
-            for (name, value) in msg.headers.iter_mut() {
-                if redact_enabled && is_credential_header(name) {
-                    value.zeroize();
-                    *value = REDACTED_CREDENTIAL.to_string();
-                    continue;
-                }
-                if let Some(mut report) = self.scan_with(value, redact_enabled) {
-                    scanned_bytes += report.scanned_bytes;
-                    if let Some(redacted) = report.redacted_text.take() {
-                        value.zeroize();
-                        *value = redacted;
-                    }
-                    entities.append(&mut report.entities);
-                }
+        );
+        for (name, value) in msg.headers.iter_mut() {
+            // DNS answers (domain|ip|ttl) feed the DNS cache: an IP-shaped
+            // value there must not be rewritten.
+            if name == "dns_a_record" {
+                continue;
             }
+            if redact_enabled && http && is_credential_header(name) {
+                value.zeroize();
+                *value = REDACTED_CREDENTIAL.to_string();
+            } else {
+                self.scan_field(value, false, redact_enabled, &mut found);
+            }
+            self.scan_field(name, false, redact_enabled, &mut found);
         }
 
-        if let Some(body) = msg.request_text.as_mut()
-            && let Some(mut report) = self.scan_with(body, redact_enabled)
-        {
-            scanned_bytes += report.scanned_bytes;
-            if let Some(redacted) = report.redacted_text.take() {
-                body.zeroize();
-                *body = redacted;
-            }
-            entities.append(&mut report.entities);
+        if let Some(body) = msg.request_text.as_mut() {
+            self.scan_field(body, false, redact_enabled, &mut found);
         }
 
         let mut redacted_payload = None;
-        if let Some(text) = msg.payload_text.as_mut()
-            && let Some(mut report) = self.scan_with(text, redact_enabled)
-        {
-            scanned_bytes += report.scanned_bytes;
-            if let Some(redacted) = report.redacted_text.take() {
-                text.zeroize();
-                *text = redacted.clone();
-                redacted_payload = Some(redacted);
+        if let Some(text) = msg.payload_text.as_mut() {
+            let before = found.entities.len();
+            self.scan_field(text, false, redact_enabled, &mut found);
+            if redact_enabled && found.entities.len() > before {
+                redacted_payload = Some(text.clone());
             }
-            entities.append(&mut report.entities);
         }
 
-        if entities.is_empty() {
+        if found.entities.is_empty() {
             return None;
         }
         Some(PiiReport {
-            entities,
+            entities: found.entities,
             redacted_text: redacted_payload,
-            scanned_bytes,
+            scanned_bytes: found.scanned_bytes,
             redacted: redact_enabled,
         })
+    }
+
+    /// Scan one field (percent-decoded first when `decode`); with redaction
+    /// on, replace it by its redacted form and then mask credentials in it.
+    /// Entity offsets stay relative to the field as scanned.
+    fn scan_field(&self, field: &mut String, decode: bool, redact: bool, found: &mut Found) {
+        let decoded = decode.then(|| percent_decode(field));
+        let text = decoded.as_deref().unwrap_or(field.as_str());
+        if let Some(mut report) = self.scan_with(text, redact) {
+            found.scanned_bytes += report.scanned_bytes;
+            if let Some(redacted) = report.redacted_text.take() {
+                field.zeroize();
+                *field = redacted;
+            }
+            found.entities.append(&mut report.entities);
+        }
+        if redact {
+            mask_secrets_in(field);
+        }
     }
 
     /// Scan text with external service (async).
@@ -657,6 +695,109 @@ mod tests {
         )];
         let _ = engine.scan_message(&mut msg);
         assert_eq!(msg.headers[0].1, "api.internal|167772161|30");
+    }
+
+    #[test]
+    fn test_credential_header_names() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "Cookie",
+            "set-cookie",
+            "x-api-key",
+            "X-Auth-Token",
+            "x-amz-security-token",
+            "X-Vault-Token",
+            "PRIVATE-TOKEN",
+            "x-goog-api-key",
+            "x-csrf-token",
+            "X-XSRF-TOKEN",
+            "x-hub-signature-256",
+            "x-session-id",
+            "x-client-secret",
+            "x-db-password",
+            "x-amz-credential",
+        ] {
+            assert!(is_credential_header(name), "{name} must be masked");
+        }
+        for name in [
+            "content-type",
+            "keep-alive",
+            "accept-encoding",
+            "accept",
+            "host",
+            ":authority",
+            ":path",
+            "sec-websocket-key",
+            "user-agent",
+            "x-request-id",
+            "content-length",
+        ] {
+            assert!(!is_credential_header(name), "{name} must stay readable");
+        }
+    }
+
+    #[test]
+    fn test_vendor_token_headers_are_masked() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Http2, Direction::Egress, 1);
+        msg.headers = vec![
+            ("x-vault-token".into(), "hvs.CAESIJopaqueVaultToken".into()),
+            ("private-token".into(), "glpat-opaqueGitlabToken".into()),
+            ("content-type".into(), "application/json".into()),
+        ];
+        let _ = engine.scan_message_with(&mut msg, true);
+        assert_eq!(msg.headers[0].1, REDACTED_CREDENTIAL);
+        assert_eq!(msg.headers[1].1, REDACTED_CREDENTIAL);
+        assert_eq!(msg.headers[2].1, "application/json");
+    }
+
+    #[test]
+    fn test_protocol_credentials_masked_when_redacting() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        // A Redis AUTH as a parser that did not mask it would emit it.
+        let auth = || {
+            let mut m = L7Message::new(Protocol::Redis, Direction::Ingress, 1);
+            m.method = Some("AUTH".into());
+            m.path = Some("alice".into());
+            m.request_text = Some("r3dis-s3cret".into());
+            m
+        };
+        let mut msg = auth();
+        let _ = engine.scan_message_with(&mut msg, true);
+        assert_eq!(msg.path.as_deref(), Some(REDACTED_CREDENTIAL));
+        assert_eq!(msg.request_text.as_deref(), Some(REDACTED_CREDENTIAL));
+
+        let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, 1);
+        msg.payload_text = Some("CREATE USER bob IDENTIFIED BY 'sql-s3cret'".into());
+        msg.request_text = Some("requirepass r3dis-s3cret".into());
+        let _ = engine.scan_message_with(&mut msg, true);
+        let all = format!("{:?} {:?}", msg.payload_text, msg.request_text);
+        assert!(!all.contains("s3cret"), "{all}");
+
+        // full mode with redaction off: exported as captured.
+        let mut msg = auth();
+        let _ = engine.scan_message_with(&mut msg, false);
+        assert_eq!(msg.request_text.as_deref(), Some("r3dis-s3cret"));
+    }
+
+    #[test]
+    fn test_every_exported_field_is_scanned() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Kafka, Direction::Ingress, 1);
+        msg.method = Some("/pkg.Svc/carol@example.com".into());
+        msg.content_type = Some("text/plain; owner=dave@example.com".into());
+        msg.headers = vec![
+            ("client_id".into(), "erin@example.com".into()),
+            ("frank@example.com".into(), "v".into()),
+        ];
+        let report = engine.scan_message_with(&mut msg, true).expect("PII found");
+        let all = format!("{:?} {:?} {:?}", msg.method, msg.content_type, msg.headers);
+        assert!(!all.contains("example.com"), "{all}");
+        assert_eq!(report.entities.len(), 4);
     }
 
     #[test]

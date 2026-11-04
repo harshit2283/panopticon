@@ -119,6 +119,44 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// What a masked credential value is replaced with, at the parser and in
+/// the PII engine.
+pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
+
+/// A secret given after a keyword: SQL `PASSWORD '…'` / `IDENTIFIED BY '…'`,
+/// Redis `requirepass` / `masterauth` (CONFIG SET), and `password=…` /
+/// `"password": "…"` in forms and JSON. Group 3 is the value.
+static SECRET_CLAUSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)\b(password|passwd|identified(?:\s+with\s+\S+)?\s+by(?:\s+password)?|requirepass|masterauth)\b(["']?\s*(?:[=:(]|\s)\s*)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"|[^\s'",;)&]+)"#,
+    )
+    .expect("SECRET_CLAUSE")
+});
+
+/// `text` with every [`SECRET_CLAUSE`] value replaced by
+/// [`REDACTED_CREDENTIAL`], or None when there is none. Shared by the SQL
+/// parsers and `PiiEngine::scan_message_with`.
+pub fn mask_secrets(text: &str) -> Option<String> {
+    if !SECRET_CLAUSE.is_match(text) {
+        return None;
+    }
+    Some(
+        SECRET_CLAUSE
+            .replace_all(text, |c: &regex::Captures<'_>| {
+                format!("{}{}{REDACTED_CREDENTIAL}", &c[1], &c[2])
+            })
+            .into_owned(),
+    )
+}
+
+/// [`mask_secrets`] in place.
+pub fn mask_secrets_in(text: &mut String) {
+    if let Some(masked) = mask_secrets(text) {
+        zeroize::Zeroize::zeroize(text);
+        *text = masked;
+    }
+}
+
 // ── ParseResult ──────────────────────────────────────────────────────────
 
 /// Result of feeding data to a protocol parser.
