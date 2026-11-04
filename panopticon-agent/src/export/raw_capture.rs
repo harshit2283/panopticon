@@ -54,7 +54,14 @@ impl RawCaptureHandle {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
-        match self.tx.try_send(*event) {
+        // Records are whole DataEvents: zero the payload past payload_len,
+        // which holds stale bytes of earlier events in the worker's scratch
+        // (other connections', or the part head_only cut, or events the
+        // capture gate dropped).
+        let mut event = *event;
+        let len = (event.payload_len as usize).min(event.payload.len());
+        event.payload[len..].fill(0);
+        match self.tx.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -309,6 +316,22 @@ mod tests {
         assert_eq!(lines[0]["truncated"], false);
         assert_eq!(lines[1]["orig_len"], 9000);
         assert_eq!(lines[1]["truncated"], true);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bytes_past_payload_len_never_reach_the_file() {
+        let path = tmp_path("stale");
+        let (handle, thread) = spawn(&path, 1 << 20, 64, 0, full()).unwrap();
+        // A reused scratch event: a short payload over an earlier long one.
+        let mut e = event(b"ssn=123-45-6789 beyond the cut", 30);
+        e.payload_len = 3;
+        handle.record(&e);
+        handle.shutdown();
+        thread.join().unwrap();
+        let file = std::fs::read(&path).unwrap();
+        assert!(!file.windows(11).any(|w| w == b"123-45-6789"));
+        assert!(file.windows(3).any(|w| w == b"ssn"));
         std::fs::remove_file(&path).ok();
     }
 
