@@ -161,7 +161,7 @@ setting covers that range, `[privacy] mode` in the config file or
 
 | Mode | What can leave the agent |
 |---|---|
-| `full` | Everything: the event export unredacted (protocol login secrets excepted, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
+| `full` | Everything: the event export unredacted (login secrets still masked unless `mask_credentials = false`, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
 | `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
 | `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols. |
 
@@ -317,12 +317,32 @@ exported:
   after `PASSWORD`, `IDENTIFIED BY`, `requirepass`, `masterauth` or
   `password=` / `"password":`, and the arguments of a Redis `AUTH`.
 
-Login secrets are masked by the protocol parsers themselves, so they reach
-no sink in any privacy mode, `full` included: Redis `AUTH`, `HELLO … AUTH`,
-`MIGRATE … AUTH`/`AUTH2`, `CONFIG SET requirepass|masterauth|masteruser` and
-`ACL SETUSER` password rules; SQL `PASSWORD '…'` and `IDENTIFIED BY '…'`
-clauses (PostgreSQL, MySQL); the AMQP and Kafka SASL exchanges. Only the raw
-dump (`full` mode, §5.5) keeps them.
+Login secrets are masked in every privacy mode by default, `full` included:
+Redis `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET
+requirepass|masterauth|masteruser` and `ACL SETUSER` password rules; SQL
+`PASSWORD '…'` and `IDENTIFIED BY '…'` clauses (PostgreSQL, MySQL); the
+credential headers and `password=` values above. The raw dump (`full` mode,
+§5.5) always keeps them. The AMQP and Kafka SASL exchanges are never
+exported as events.
+
+To export login secrets too, `full` mode accepts:
+
+```toml
+[privacy]
+mode = "full"
+mask_credentials = false   # default true
+```
+
+The agent refuses `mask_credentials = false` in `redacted` and
+`metrics_only`, and in `full` with `[pii] redact = true`; it prints a
+warning at startup when it is set. Changing it needs a restart (SIGHUP
+reloads that change it are rejected).
+
+| `full` mode settings | PII values | Login secrets |
+|---|---|---|
+| default | exported | masked |
+| `[pii] redact = true` | masked | masked |
+| `mask_credentials = false` | exported | exported |
 
 Detection is pattern-based. It will miss PII that does not match a pattern
 (names, free-text addresses), a bare phone or passport number with no keyword

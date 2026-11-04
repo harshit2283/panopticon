@@ -149,6 +149,22 @@ pub fn mask_secrets(text: &str) -> Option<String> {
     )
 }
 
+// ponytail: process-wide switch so parsers need no config plumbing; fine
+// while there is one agent per process. Set once at startup by
+// `set_mask_credentials`; only ever flipped false -> true at runtime.
+static MASK_CREDENTIALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether login secrets (Redis AUTH, SQL PASSWORD clauses, credential
+/// headers, `password=` values) are masked before any sink. `[privacy]
+/// mask_credentials`, default true; false is only allowed in `full` mode.
+pub fn mask_credentials_enabled() -> bool {
+    MASK_CREDENTIALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_mask_credentials(on: bool) {
+    MASK_CREDENTIALS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// [`mask_secrets`] in place.
 pub fn mask_secrets_in(text: &mut String) {
     if let Some(masked) = mask_secrets(text) {

@@ -62,7 +62,9 @@ impl RedisParser {
 
                     // Enqueue this command — VecDeque preserves order for pipelining.
                     let mut parts = flatten_to_strings(&value);
-                    mask_credentials(&mut parts);
+                    if super::mask_credentials_enabled() {
+                        mask_credentials(&mut parts);
+                    }
                     if !parts.is_empty() {
                         self.pending_queue.push_back((parts, timestamp_ns));
                     }

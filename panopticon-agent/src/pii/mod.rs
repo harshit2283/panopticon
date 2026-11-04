@@ -414,8 +414,11 @@ impl PiiEngine {
             return None;
         }
         let mut found = Found::default();
+        // Login secrets are masked whenever values are redacted, and also in
+        // `full` mode unless `[privacy] mask_credentials = false`.
+        let mask_creds = redact_enabled || self.config.mask_credentials;
 
-        if redact_enabled
+        if mask_creds
             && msg
                 .method
                 .as_deref()
@@ -449,7 +452,7 @@ impl PiiEngine {
             if name == "dns_a_record" {
                 continue;
             }
-            if redact_enabled && http && is_credential_header(name) {
+            if mask_creds && http && is_credential_header(name) {
                 value.zeroize();
                 *value = REDACTED_CREDENTIAL.to_string();
             } else {
@@ -496,7 +499,7 @@ impl PiiEngine {
             }
             found.entities.append(&mut report.entities);
         }
-        if redact {
+        if redact || self.config.mask_credentials {
             mask_secrets_in(field);
         }
     }
@@ -671,6 +674,7 @@ mod tests {
     fn test_scan_message_detects_without_rewriting_when_redact_off() {
         let config = PiiConfig {
             redact: false,
+            mask_credentials: false,
             ..PiiConfig::default()
         };
         let engine = PiiEngine::new(&config, &[]);
@@ -777,9 +781,24 @@ mod tests {
         let all = format!("{:?} {:?}", msg.payload_text, msg.request_text);
         assert!(!all.contains("s3cret"), "{all}");
 
-        // full mode with redaction off: exported as captured.
+        // full mode, redaction off: login secrets still masked by default
+        // ([privacy] mask_credentials = true), PII left as captured.
         let mut msg = auth();
+        msg.payload_text = Some("mail alice@example.com".into());
         let _ = engine.scan_message_with(&mut msg, false);
+        assert_eq!(msg.request_text.as_deref(), Some(REDACTED_CREDENTIAL));
+        assert_eq!(msg.payload_text.as_deref(), Some("mail alice@example.com"));
+
+        // full mode with mask_credentials = false: exported as captured.
+        let raw = PiiEngine::new(
+            &PiiConfig {
+                mask_credentials: false,
+                ..PiiConfig::default()
+            },
+            &[],
+        );
+        let mut msg = auth();
+        let _ = raw.scan_message_with(&mut msg, false);
         assert_eq!(msg.request_text.as_deref(), Some("r3dis-s3cret"));
     }
 

@@ -166,6 +166,9 @@ pub struct AgentConfig {
     /// `[pii] redact` as written in the config file, if it was. Only checked
     /// against `privacy_mode`; redaction itself follows the mode.
     pub pii_redact_setting: Option<bool>,
+    /// `[privacy] mask_credentials` (default true): mask login secrets in
+    /// every export. false is only accepted in `full` with PII redaction off.
+    pub mask_credentials: bool,
 
     // ── PII detection ─────────────────────────────
     /// PII detection pipeline configuration.
@@ -247,6 +250,7 @@ impl Default for AgentConfig {
 
             privacy_mode: PrivacyMode::Redacted,
             pii_redact_setting: None,
+            mask_credentials: true,
 
             pii: PiiConfig::default(),
             pii_external_url_allowlist: vec![],
@@ -322,6 +326,9 @@ pub struct PiiConfig {
     /// Replace detected PII with `<CATEGORY>` placeholders. Derived from
     /// `privacy_mode` by `apply_privacy` (false only in `full`).
     pub redact: bool,
+    /// Mask login secrets even when `redact` is off. Copied from `[privacy]
+    /// mask_credentials` by `apply_privacy`.
+    pub mask_credentials: bool,
     /// Minimum confidence threshold for detected entities.
     pub min_confidence: f32,
 }
@@ -333,6 +340,7 @@ impl Default for PiiConfig {
             regex_enabled: true,
             mode: PiiMode::Disabled,
             redact: true,
+            mask_credentials: true,
             min_confidence: 0.7,
         }
     }
@@ -444,6 +452,8 @@ pub struct AgentConfigFile {
 pub struct PrivacyConfigFile {
     /// `"full"`, `"redacted"` or `"metrics_only"`.
     pub mode: Option<PrivacyMode>,
+    /// Mask login secrets in exports (default true). Only `full` may set false.
+    pub mask_credentials: Option<bool>,
 }
 
 /// TOML-friendly PII config subset.
@@ -558,8 +568,13 @@ impl AgentConfigFile {
         if let Some(v) = self.tls_scan_interval_secs {
             base.tls_scan_interval = Duration::from_secs(v);
         }
-        if let Some(mode) = self.privacy.and_then(|p| p.mode) {
-            base.privacy_mode = mode;
+        if let Some(privacy) = self.privacy {
+            if let Some(mode) = privacy.mode {
+                base.privacy_mode = mode;
+            }
+            if let Some(mask) = privacy.mask_credentials {
+                base.mask_credentials = mask;
+            }
         }
         if let Some(pii) = self.pii {
             if pii.redact.is_some() {
@@ -723,6 +738,19 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
         );
     }
     config.pii.redact = mode != PrivacyMode::Full || config.pii_redact_setting == Some(true);
+    config.pii.mask_credentials = config.mask_credentials;
+    if !config.mask_credentials && config.pii.redact {
+        anyhow::bail!(
+            "[privacy] mask_credentials = false exports login secrets, which [privacy] \
+             mode = \"{mode}\"{} never does. It is only allowed with mode = \"full\" \
+             and PII redaction off",
+            if mode == PrivacyMode::Full {
+                " with [pii] redact = true"
+            } else {
+                ""
+            }
+        );
+    }
 
     if mode != PrivacyMode::Full && config.capture_raw_path.is_some() {
         anyhow::bail!(
@@ -1107,6 +1135,39 @@ mod tests {
         assert!(check_reload(Redacted, Redacted, true).is_ok());
         assert!(check_reload(Redacted, Full, true).is_err());
         assert!(check_reload(MetricsOnly, Redacted, true).is_err());
+    }
+
+    #[test]
+    fn test_mask_credentials_only_off_in_full_without_redaction() {
+        // Default: masked, in every mode.
+        for mode in [
+            PrivacyMode::Full,
+            PrivacyMode::Redacted,
+            PrivacyMode::MetricsOnly,
+        ] {
+            let mut config = AgentConfig::default();
+            config.privacy_mode = mode;
+            apply_privacy(&mut config).unwrap();
+            assert!(config.pii.mask_credentials, "{mode}");
+        }
+        let off = |mode, redact: Option<bool>| {
+            let mut config = AgentConfig::default();
+            config.privacy_mode = mode;
+            config.pii_redact_setting = redact;
+            config.mask_credentials = false;
+            apply_privacy(&mut config).map(|()| config.pii.mask_credentials)
+        };
+        assert_eq!(off(PrivacyMode::Full, None).unwrap(), false);
+        assert!(off(PrivacyMode::Full, Some(true)).is_err());
+        assert!(off(PrivacyMode::Redacted, None).is_err());
+        assert!(off(PrivacyMode::MetricsOnly, None).is_err());
+    }
+
+    #[test]
+    fn test_mask_credentials_parses_from_toml() {
+        let config =
+            load_config_from_str("[privacy]\nmode = \"full\"\nmask_credentials = false\n").unwrap();
+        assert!(!config.mask_credentials);
     }
 
     #[test]

@@ -243,6 +243,15 @@ async fn main() -> Result<()> {
         }
         // After every override: nothing may contradict the privacy mode.
         config::apply_privacy(&mut agent_config)?;
+        protocol::set_mask_credentials(agent_config.mask_credentials);
+        if !agent_config.mask_credentials {
+            eprintln!(
+                "panopticon: WARNING: [privacy] mask_credentials = false: login secrets are exported unmasked"
+            );
+            tracing::warn!(
+                "[privacy] mask_credentials = false: login secrets are exported unmasked"
+            );
+        }
         let privacy_mode = agent_config.privacy_mode;
         info!(mode = %privacy_mode, "Privacy mode");
         if privacy_mode == config::PrivacyMode::Full {
@@ -532,8 +541,21 @@ async fn main() -> Result<()> {
                             // runtime; widening it needs a restart.
                             let current = privacy.get();
                             let requested = new_config.privacy_mode;
-                            let check =
-                                config::check_reload(current, requested, running_can_redact);
+                            let check = config::check_reload(
+                                current,
+                                requested,
+                                running_can_redact,
+                            )
+                            .and_then(|()| {
+                                if new_config.mask_credentials
+                                    != protocol::mask_credentials_enabled()
+                                {
+                                    Err("changing [privacy] mask_credentials needs a restart"
+                                        .into())
+                                } else {
+                                    Ok(())
+                                }
+                            });
                             if let Err(why) = check.and_then(|()| {
                                 privacy
                                     .tighten(requested)

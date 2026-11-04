@@ -628,7 +628,9 @@ impl MysqlParser {
         msg.method = Some("QUERY".into());
         if let Some(mut q) = self.query_text.take() {
             // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
-            super::mask_secrets_in(&mut q);
+            if super::mask_credentials_enabled() {
+                super::mask_secrets_in(&mut q);
+            }
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
             }
