@@ -12,6 +12,7 @@
 use std::cmp::Reverse;
 
 use regex::{Regex, RegexSet};
+use zeroize::Zeroize;
 
 use super::{PiiCategory, PiiEntity, PiiSource};
 
@@ -145,10 +146,28 @@ impl RegexPrefilter {
         // One finding per value: longest candidate first, then pattern
         // priority; drop anything overlapping a kept one.
         candidates.sort_by_key(|(idx, e)| (Reverse(e.end - e.start), *idx, e.start));
+        // A dropped candidate still marks secret bytes: widen the kept
+        // findings it overlaps so the mask covers the union (an ApiKey match
+        // that ends inside a JWT must not leave the JWT's tail exposed).
         let mut kept: Vec<PiiEntity> = Vec::with_capacity(candidates.len());
         for (_, e) in candidates {
-            if !kept.iter().any(|k| e.start < k.end && k.start < e.end) {
+            let mut overlapped = false;
+            for k in kept
+                .iter_mut()
+                .filter(|k| e.start < k.end && k.start < e.end)
+            {
+                overlapped = true;
+                k.start = k.start.min(e.start);
+                k.end = k.end.max(e.end);
+            }
+            if !overlapped {
                 kept.push(e);
+            }
+        }
+        for k in kept.iter_mut() {
+            if k.text.len() != k.end - k.start {
+                k.text.zeroize();
+                k.text = text[k.start..k.end].to_string();
             }
         }
         kept.sort_by_key(|e| e.start);
@@ -458,6 +477,18 @@ mod tests {
         let text = format!("Authorization: Bearer {}", jwt);
         let entities = pf.scan(&text);
         assert!(entities.iter().any(|e| e.category == PiiCategory::Jwt));
+    }
+
+    #[test]
+    fn test_overlapping_candidates_mask_their_union() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123_XYZ-def";
+        let text = format!("access_token={}{jwt} done", " ".repeat(100));
+        let entities = prefilter().scan(&text);
+        assert_eq!(entities.len(), 1, "one finding per value");
+        let redacted = crate::pii::redactor::redact(&text, &entities);
+        assert!(!redacted.contains("abc123_XYZ-def"), "{redacted}");
+        assert!(!redacted.contains("eyJzdWIi"), "{redacted}");
+        assert!(redacted.ends_with("> done"), "{redacted}");
     }
 
     #[test]
