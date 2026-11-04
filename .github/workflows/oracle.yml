@@ -2,7 +2,9 @@ name: Ground-truth accuracy
 
 # Runs the agent against the traffic oracles in tests/oracle/ on the runner's
 # own kernel and fails if capture recall drops below 99% for any protocol,
-# or if any raw PII value reaches the export. See docs/BENCHMARKS.md.
+# or if any raw PII value reaches the export. The privacy-modes step checks
+# every sink (export, raw dump, audit log, logs, HTTP endpoints) against
+# what each [privacy] mode allows. See docs/BENCHMARKS.md.
 
 on:
   pull_request:
@@ -50,6 +52,9 @@ jobs:
 
       - name: HTTPS (OpenSSL and Go crypto/tls uprobes)
         run: sudo env PATH="$PATH" tests/oracle/run_tls.sh 500 42 0.99
+
+      - name: Privacy modes (planted PII in every sink, HTTP and HTTPS)
+        run: sudo env PATH="$PATH" PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_modes.sh 300 1234 0.99
 
       - name: Redis, PostgreSQL, MySQL, gRPC
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_protocols.sh 300 7 0.99

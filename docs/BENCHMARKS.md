@@ -534,7 +534,7 @@ sudo tests/load/run_load.sh 64 30s 0 1
 
 # User-space cost per event, one core: record a capture, then replay it
 # (with your config; add --json-export /dev/null to include export).
-sudo ./target/release/panopticon-agent -i eth0 --capture-raw /tmp/load.pncap
+sudo ./target/release/panopticon-agent -i eth0 --privacy-mode full --capture-raw /tmp/load.pncap
 ./target/release/panopticon-agent --replay-bench /tmp/load.pncap
 
 # PII detection accuracy (no root, any OS); prints the per-type table.

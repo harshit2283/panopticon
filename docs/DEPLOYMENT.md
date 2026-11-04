@@ -86,9 +86,10 @@ look for `Failed to attach TC classifier` in its logs.
 | `metrics.port` | `9435` | Health, readiness and metrics port. |
 | `metrics.bindAddress` | `$(POD_IP)` | With host networking this is the node IP. `0.0.0.0` listens on all interfaces. |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the prometheus-operator CRDs. |
+| `privacy.mode` | `redacted` | What may leave the node: `full`, `redacted` or `metrics_only` (USER-GUIDE §4.3). Passed as `--privacy-mode`, so it overrides `[privacy] mode` in `agent.config`. |
 | `export.hostPath` | `""` | Host directory for `events.jsonl` / `pii-audit.jsonl`; empty disables file export. |
-| `export.jsonEvents` / `export.piiAuditLog` | `true` / `true` | Which files to write when `hostPath` is set. |
-| `export.rawCapture` | `false` | Also write `raw.pncap`: every captured payload, **unredacted** (USER-GUIDE §5.5). |
+| `export.jsonEvents` / `export.piiAuditLog` | `true` / `true` | Which files to write when `hostPath` is set. `jsonEvents` is skipped when `privacy.mode` is `metrics_only`. |
+| `export.rawCapture` | `false` | Also write `raw.pncap`: every captured payload, **unredacted, decrypted TLS included** (USER-GUIDE §5.5). Needs `privacy.mode=full`; the chart refuses to render otherwise. |
 | `securityContext` | `{privileged: true}` | See §6 for a reduced-capability profile. |
 | `priorityClassName` | `""` | `system-node-critical` is only admitted in `kube-system`. |
 | `tolerations` | `[{operator: Exists}]` | Runs on every node, including tainted ones. |
@@ -124,8 +125,8 @@ image:
 agent:
   config: |
     max_events_per_sec = 200000
-    [pii]
-    redact = true
+privacy:
+  mode: redacted
 export:
   hostPath: /var/lib/panopticon
 metrics:
@@ -203,7 +204,13 @@ journalctl -u panopticon -f
   or loopback, and firewall port 9435 to your Prometheus.
 - **Exports are sensitive.** Even redacted, events reveal who talks to whom,
   URL structure and timing. Restrict `export.hostPath` permissions and ship
-  them only to systems approved for that data.
+  them only to systems approved for that data. If nothing per-request may
+  leave the node, set `privacy.mode: metrics_only`.
+- **`privacy.mode: full` writes decrypted traffic.** The event export and
+  `raw.pncap` then hold passwords, tokens and personal data in clear,
+  including TLS plaintext. Enable it only on nodes and for the time you need
+  it; the files are owner-only (`0600`) but readable by anything with root
+  or access to the host path.
 - **Reduced privileges (kernel 5.8+).** Instead of `privileged: true`:
 
   ```yaml

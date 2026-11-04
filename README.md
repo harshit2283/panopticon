@@ -22,6 +22,11 @@ hardening work.
 - Builds a service graph named by Kubernetes workload (`namespace/workload`)
   in a cluster, else by DNS name or IP.
 - Exports JSONL, Prometheus metrics, OTLP spans, and a PII audit log.
+- One privacy mode decides what leaves the node: `full` (unredacted export
+  and a raw dump of every payload, TLS decrypted, convertible to pcap for
+  Wireshark), `redacted` (PII masked; default) or `metrics_only` (metrics,
+  service map and PII audit only). Each mode is checked against planted PII
+  in every output (`tests/oracle/run_modes.sh`).
 
 ## Documentation
 
@@ -64,6 +69,7 @@ current release report.
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
 | Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes. |
 | Regex-first PII detection | Supported | 16 validated patterns, including Aadhaar, PAN, UPI, GSTIN, Indian passport and phone, and IBAN. Precision and recall are measured per type on a labelled corpus, and a `cargo test` gate fails on regressions (`docs/BENCHMARKS.md`). Names and addresses need the ML path. |
+| Privacy modes (`full`, `redacted`, `metrics_only`) | Supported | Enforced at startup and only tightened on reload. Ground-truth leak test over HTTP and OpenSSL TLS: planted values found only where the mode allows, at 100% recall ([current state](docs/CURRENT-STATE.md)). |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
 | Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
 | Kubernetes deployment hardening | Out of scope | Helm chart exists, but production hardening is not part of this MVP. |
@@ -151,6 +157,9 @@ correctness across every kernel.
   exposure boundary grows, use TLS or mTLS and stronger endpoint
   authentication.
 - Treat JSONL export and the PII audit log as sensitive artifacts.
+- `--privacy-mode full` writes decrypted TLS plaintext and unredacted
+  personal data to the export and raw dump; enable it only when you need it
+  and protect those files.
 
 ## Open Source
 

@@ -37,8 +37,11 @@ use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
 use crate::util::format_ipv4;
 #[cfg(target_os = "linux")]
 use crate::{
-    config::AgentConfig, export::json::JsonExportHandle, export::otlp::OtlpExportHandle,
-    loader::EventSource, pii::PiiEngine,
+    config::{AgentConfig, PrivacyGate, PrivacyMode},
+    export::json::JsonExportHandle,
+    export::otlp::OtlpExportHandle,
+    loader::EventSource,
+    pii::PiiEngine,
 };
 
 #[cfg(target_os = "linux")]
@@ -54,10 +57,12 @@ struct WorkerTaskContext {
     graph_builder: Option<Arc<GraphBuilder>>,
     raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
     max_body_bytes: usize,
+    privacy: Arc<PrivacyGate>,
 }
 
 #[cfg(target_os = "linux")]
 struct MessageContext<'a> {
+    privacy: PrivacyMode,
     worker_id: usize,
     log_events: bool,
     stats: &'a EventStats,
@@ -258,6 +263,7 @@ pub struct EventLoop {
     audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
     graph_builder: Option<Arc<GraphBuilder>>,
     raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
+    privacy: Arc<PrivacyGate>,
 }
 
 #[cfg(target_os = "linux")]
@@ -271,6 +277,7 @@ impl EventLoop {
         graph_builder: Option<GraphBuilder>,
     ) -> Self {
         Self {
+            privacy: Arc::new(PrivacyGate::new(config.privacy_mode)),
             config,
             stats: Arc::new(EventStats::new()),
             pii_engine,
@@ -308,6 +315,7 @@ impl EventLoop {
             graph_builder: self.graph_builder.clone(),
             raw_capture: None,
             max_body_bytes: self.config.max_body_bytes,
+            privacy: Arc::clone(&self.privacy),
         };
         let worker = tokio::spawn(worker_task(0, rx, ctx));
         for chunk in events.chunks(WORKER_BATCH) {
@@ -322,6 +330,11 @@ impl EventLoop {
 
     pub fn stats(&self) -> &Arc<EventStats> {
         &self.stats
+    }
+
+    /// The privacy mode in effect, for tightening it on config reload.
+    pub fn privacy(&self) -> &Arc<PrivacyGate> {
+        &self.privacy
     }
 
     /// Main entry point: spawn workers, consume RingBufs, route events.
@@ -373,6 +386,7 @@ impl EventLoop {
                 graph_builder: graph,
                 raw_capture: self.raw_capture.clone(),
                 max_body_bytes: self.config.max_body_bytes,
+                privacy: Arc::clone(&self.privacy),
             };
             let handle = tokio::spawn(worker_task(worker_id, rx, worker_ctx));
             worker_handles.push(handle);
@@ -907,8 +921,13 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
     while let Some(batch) = rx.recv().await {
         // By reference: each DataEvent is ~4KB, so moving it out of the
         // batch would copy it again.
+        // Read once per batch: a reload may have tightened it.
+        let privacy = ctx.privacy.get();
+        let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
         for event in &batch {
-            if let Some(raw) = ctx.raw_capture.as_ref() {
+            if let Some(raw) = ctx.raw_capture.as_ref()
+                && privacy == PrivacyMode::Full
+            {
                 raw.record(event);
             }
 
@@ -919,7 +938,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
 
             ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
 
-            if ctx.log_events {
+            if log_events {
                 let src = format_ipv4(event.src_addr);
                 let dst = format_ipv4(event.dst_addr);
                 info!(
@@ -966,7 +985,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                             // Race: another event created it between contains() and get_or_create()
                         }
                     }
-                    if ctx.log_events {
+                    if log_events {
                         debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
                     }
                 }
@@ -997,7 +1016,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                 &msgs,
                                 &MessageContext {
                                     worker_id,
-                                    log_events: ctx.log_events,
+                                    log_events,
                                     stats: ctx.stats.as_ref(),
                                     pii_engine: &ctx.pii_engine,
                                     json_export: &ctx.json_export,
@@ -1007,6 +1026,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     event,
                                     sender_is_server,
                                     max_body_bytes: ctx.max_body_bytes,
+                                    privacy,
                                     owners: owners.get(cookie),
                                 },
                             );
@@ -1016,7 +1036,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                 &[msg],
                                 &MessageContext {
                                     worker_id,
-                                    log_events: ctx.log_events,
+                                    log_events,
                                     stats: ctx.stats.as_ref(),
                                     pii_engine: &ctx.pii_engine,
                                     json_export: &ctx.json_export,
@@ -1026,6 +1046,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                                     event,
                                     sender_is_server,
                                     max_body_bytes: ctx.max_body_bytes,
+                                    privacy,
                                     owners: owners.get(cookie),
                                 },
                             );
@@ -1095,11 +1116,20 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         let pii_report = ctx
             .pii_engine
             .as_ref()
-            .and_then(|e| e.scan_message(&mut msg));
+            // Redact unless the mode is full, and in full too if the config
+            // asks for a redacted export ([pii] redact = true).
+            .and_then(|e| {
+                let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
+                e.scan_message_with(&mut msg, redact)
+            });
         if let Some(report) = pii_report.as_ref() {
             ctx.stats
                 .pii_detections
                 .fetch_add(report.entities.len() as u64, Ordering::Relaxed);
+        }
+        let metrics_only = ctx.privacy == PrivacyMode::MetricsOnly;
+        if metrics_only {
+            strip_payload_strings(&mut msg);
         }
         let msg = &msg;
 
@@ -1166,7 +1196,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         }
 
         // JSON export (channel-based — no mutex, no per-event flush)
-        if let Some(handle) = ctx.json_export.as_ref()
+        if let Some(handle) = ctx.json_export.as_ref().filter(|_| !metrics_only)
             && !handle.try_send(
                 msg.clone(),
                 pii_report.clone(),
@@ -1185,7 +1215,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         }
 
         // OTLP export (channel-based — drop when full, never block workers)
-        if let Some(handle) = ctx.otlp_export.as_ref() {
+        if let Some(handle) = ctx.otlp_export.as_ref().filter(|_| !metrics_only) {
             if !handle.try_send_span(msg.clone()) {
                 debug!(
                     worker = ctx.worker_id,
@@ -1243,6 +1273,19 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             }
         }
     }
+}
+
+/// `metrics_only`: drop every string taken from the payload (path or query
+/// template, method, headers, bodies) once PII has been counted, so the
+/// graph, the audit log and logs cannot carry any of it. DNS answers stay:
+/// they only feed the DNS cache that names services in the graph.
+fn strip_payload_strings(msg: &mut crate::protocol::L7Message) {
+    msg.method = None;
+    msg.path = None;
+    msg.content_type = None;
+    msg.payload_text = None;
+    msg.request_text = None;
+    msg.headers.retain(|(k, _)| k == "dns_a_record");
 }
 
 /// Bound the body text a message carries before PII scanning and export.
@@ -1604,6 +1647,28 @@ mod tests {
         cap_body_text(&mut msg, 4095);
         assert_eq!(msg.payload_text.as_deref().map(str::len), Some(4094));
         assert_eq!(msg.request_text.as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn strip_payload_strings_keeps_only_dns_answers() {
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.method = Some("POST".into());
+        msg.path = Some("/u?email=a@b.c".into());
+        msg.content_type = Some("text/plain".into());
+        msg.payload_text = Some("ssn 123-45-6789".into());
+        msg.request_text = Some("body".into());
+        msg.headers = vec![
+            ("x-user".into(), "a@b.c".into()),
+            ("dns_a_record".into(), "svc.local|167772161|30".into()),
+        ];
+        msg.status = Some(201);
+        strip_payload_strings(&mut msg);
+        assert!(msg.method.is_none() && msg.path.is_none() && msg.content_type.is_none());
+        assert!(msg.payload_text.is_none() && msg.request_text.is_none());
+        assert_eq!(msg.headers.len(), 1);
+        assert_eq!(msg.headers[0].0, "dns_a_record");
+        assert_eq!(msg.status, Some(201));
     }
 
     #[cfg(target_os = "linux")]

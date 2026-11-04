@@ -20,7 +20,7 @@
 # RABBITMQ_IMAGE=mirror.gcr.io/library/rabbitmq:3.13.
 # Containers are named ${CONTAINER_PREFIX:-o-}kafka / ...rabbit. AGENT_ARGS adds
 # agent flags; @PROTO@ in it becomes the protocol, e.g.
-# AGENT_ARGS="--capture-raw /tmp/@PROTO@.pncap" to record a replayable capture.
+# AGENT_ARGS="--privacy-mode full --capture-raw /tmp/@PROTO@.pncap" to record a replayable capture.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.

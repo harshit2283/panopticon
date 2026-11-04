@@ -24,8 +24,17 @@ agent:
   #   config: |
   #     max_events_per_sec = 200000
   #     [pii]
-  #     redact = true
+  #     min_confidence = 0.8
   config: ""
+
+# What captured data may leave the node (docs/USER-GUIDE.md §5.1):
+#   full          unredacted event export and the raw dump allowed (decrypted TLS!)
+#   redacted      PII values masked in every export (default)
+#   metrics_only  metrics, service map and PII audit (type and count) only;
+#                 export.jsonEvents is then skipped
+# Passed as --privacy-mode, so it overrides `[privacy] mode` in agent.config.
+privacy:
+  mode: redacted
 
 metrics:
   # Port for /healthz, /readyz, /metrics. 9435 avoids the common clash with a
@@ -47,8 +56,9 @@ export:
   hostPath: ""
   jsonEvents: true
   piiAuditLog: true
-  # Write every captured payload UNREDACTED to <hostPath>/raw.pncap
-  # (decode with `panopticon-agent --decode-capture`). Off by default.
+  # Write every captured payload UNREDACTED, decrypted TLS included, to
+  # <hostPath>/raw.pncap (decode with `panopticon-agent --decode-capture`, add
+  # `--pcap out.pcap` for Wireshark). Needs privacy.mode=full. Off by default.
   # Size cap: `capture_raw_max_bytes` in agent.config (default 1 GiB).
   rawCapture: false
 

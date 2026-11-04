@@ -67,11 +67,23 @@ spec:
             {{- end }}
             - "--metrics-bind"
             - "{{ .Values.metrics.bindAddress }}:{{ .Values.metrics.port }}"
+            {{- $mode := .Values.privacy.mode }}
+            {{- if not (has $mode (list "full" "redacted" "metrics_only")) }}
+            {{- fail "privacy.mode must be full, redacted or metrics_only" }}
+            {{- end }}
+            {{- if and .Values.export.rawCapture (ne $mode "full") }}
+            {{- fail "export.rawCapture writes unredacted, decrypted payloads and needs privacy.mode=full" }}
+            {{- end }}
+            {{- if and .Values.agent.logEvents (eq $mode "metrics_only") }}
+            {{- fail "agent.logEvents is not allowed with privacy.mode=metrics_only" }}
+            {{- end }}
+            - "--privacy-mode"
+            - {{ $mode | quote }}
             {{- if .Values.agent.logEvents }}
             - "--log-events"
             {{- end }}
             {{- if .Values.export.hostPath }}
-            {{- if .Values.export.jsonEvents }}
+            {{- if and .Values.export.jsonEvents (ne $mode "metrics_only") }}
             - "--json-export"
             - "/var/lib/panopticon/events.jsonl"
             {{- end }}

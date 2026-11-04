@@ -2,8 +2,10 @@
 
 Panopticon is an eBPF agent that watches the network traffic on a Linux host,
 reconstructs application requests (HTTP, databases, caches, queues), finds
-personal data in them, and reports what it saw — with that personal data
-redacted. It never modifies or blocks traffic.
+personal data in them, and reports what it saw. One setting, the privacy
+mode (§4.3), decides how much of it leaves the node: everything including
+decrypted TLS, events with personal data redacted (the default), or only
+metrics. It never modifies or blocks traffic.
 
 > **Status: experimental.** Read [`CURRENT-STATE.md`](CURRENT-STATE.md) for
 > what is validated and what is not before relying on it.
@@ -17,17 +19,18 @@ redacted. It never modifies or blocks traffic.
 
 For every completed request/response exchange it can parse, Panopticon
 produces one **event**: protocol, method, path or query, status, latency,
-sizes, headers and (for text payloads) the body — after PII redaction.
+sizes, headers and (for text payloads) the body — after PII redaction unless
+the privacy mode is `full`.
 
-| Output | How to enable | Contains |
-|---|---|---|
-| JSONL event log | `--json-export <file>` | One JSON object per exchange (see §5.1) |
-| PII audit log | `--pii-audit-log <file>` | One line per PII finding: category, action — never the value (§5.2) |
-| Prometheus metrics | `--metrics-bind <addr:port>` | Capture, drop and PII counters (§5.3) |
-| Health endpoints | `--metrics-bind <addr:port>` | `/healthz`, `/readyz`, `/debug/state` |
-| OTLP spans | config file `[otlp]` | One span per exchange to an OTLP/gRPC collector |
-| Console | `--log-events` | Every packet and exchange (development only, very verbose) |
-| Raw capture | `--capture-raw <file>` | Every captured payload, **unredacted**, for your own analysis (§5.5) |
+| Output | How to enable | Contains | Privacy modes |
+|---|---|---|---|
+| JSONL event log | `--json-export <file>` | One JSON object per exchange (see §5.1) | `full`, `redacted` |
+| PII audit log | `--pii-audit-log <file>` | One line per PII finding: category, action — never the value (§5.2) | all |
+| Prometheus metrics | `--metrics-bind <addr:port>` | Capture, drop and PII counters (§5.4) | all |
+| Health endpoints | `--metrics-bind <addr:port>` | `/healthz`, `/readyz`, `/debug/state` | all |
+| OTLP spans | config file `[otlp]` | One span per exchange to an OTLP/gRPC collector | `full`, `redacted` |
+| Console | `--log-events` | Every packet and exchange (development only, very verbose) | `full`, `redacted` |
+| Raw capture | `--capture-raw <file>` | Every captured payload, **unredacted, decrypted TLS included**; converts to pcap for Wireshark (§5.5) | `full` only |
 
 Protocols: HTTP/1.1, HTTP/2, gRPC, PostgreSQL, MySQL, Redis, Kafka, AMQP and
 DNS are validated against ground truth (see [`BENCHMARKS.md`](BENCHMARKS.md)).
@@ -83,11 +86,13 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 | `--json-export <FILE>` | Write events as JSONL. **The file is truncated at startup.** |
 | `--pii-audit-log <FILE>` | Write PII audit records as JSONL (appended). |
 | `--metrics-bind <ADDR:PORT>` | Serve `/healthz`, `/readyz`, `/metrics`, `/debug/state`. Off by default. |
-| `--log-events` | Log every packet and exchange to stdout. Contains (redacted) traffic. |
+| `--log-events` | Log every packet and exchange to stdout. Contains traffic (redacted unless the mode is `full`). Not allowed in `metrics_only`. |
 | `--smoke-test` | Exit 0 on the first captured event, 1 after 30s. |
 | `--kubernetes <auto\|true\|false>` | Kubernetes identity (§5.6); overrides `[kubernetes] enabled`. Also `PANOPTICON_KUBERNETES`. |
-| `--capture-raw <FILE>` | Write every captured payload, unredacted, to a binary capture file (§5.5). |
+| `--privacy-mode <full\|redacted\|metrics_only>` | What may leave the node (§4.3); overrides `[privacy] mode`. Also `PANOPTICON_PRIVACY_MODE`. Default `redacted`. |
+| `--capture-raw <FILE>` | Write every captured payload, unredacted and with TLS decrypted, to a binary capture file (§5.5). Needs `--privacy-mode full`. |
 | `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root. |
+| `--decode-capture <FILE> --pcap <OUT>` | Convert a raw capture to a pcap file for Wireshark / tshark (§5.5) and exit. |
 | `-v, --verbose` | Debug logging (otherwise `RUST_LOG`, default `info`). |
 
 ### 4.2 Config file reference
@@ -110,13 +115,16 @@ json_export_path = "/var/lib/panopticon/events.jsonl"     # default: unset (off)
 pii_audit_log_path = "/var/lib/panopticon/pii-audit.jsonl" # default: unset (off)
 metrics_bind = "127.0.0.1:9435"                           # default: unset (off)
 # map_pin_path = "/sys/fs/bpf/panopticon"                 # default: unset (no pinning)
-# capture_raw_path = "/var/lib/panopticon/raw.pncap"      # default: unset (off) — UNREDACTED
+# capture_raw_path = "/var/lib/panopticon/raw.pncap"      # default: unset (off) — UNREDACTED, needs mode = "full"
 capture_raw_max_bytes = 1073741824  # raw capture stops at this size (1 GiB)
+
+[privacy]
+mode = "redacted"      # "full" | "redacted" | "metrics_only" (§4.3)
 
 [pii]
 enabled = true
 regex_enabled = true
-redact = true          # replace detected values before anything is logged/exported
+# redact: follows the privacy mode; leave it out (§4.3)
 min_confidence = 0.7   # for ML findings (ML is not in the default build)
 
 [graph]
@@ -138,8 +146,52 @@ watch = true           # stream changes between re-lists; false = refresh only b
 
 Accepted but **not yet acted on** (so you are not surprised):
 `pid_filter`, `sampling_mode`, `sample_rate`; `SIGHUP` re-reads the file but
-does not apply changes — restart the agent instead. Unknown keys are ignored
-silently, so check spelling.
+applies only a stricter privacy mode (§4.3) — restart the agent for anything
+else. Unknown keys are ignored silently (except inside `[privacy]`, where
+they are an error), so check spelling.
+
+### 4.3 Privacy modes
+
+Panopticon's users range from teams who need every byte, decrypted TLS
+included, to teams for whom nothing but counts may leave the node. One
+setting covers that range, `[privacy] mode` in the config file or
+`--privacy-mode` on the command line:
+
+| Mode | What can leave the agent |
+|---|---|
+| `full` | Everything: the event export unredacted, and the raw dump of every payload with TLS decrypted (§5.5). |
+| `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
+| `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols. |
+
+The mode is enforced, not advisory. Settings that would contradict it stop
+the agent at startup with a message saying why:
+
+- `capture_raw_path` / `--capture-raw` in any mode other than `full`;
+- `json_export_path` / `--json-export`, `log_events` / `--log-events` or
+  `[otlp] enabled` in `metrics_only`;
+- `redacted` with `[pii] enabled = false` or `regex_enabled = false` (nothing
+  would be masked);
+- `[pii] redact = false` outside `full`. `redact` otherwise follows the mode
+  and is best left out. The one combination kept from before the mode
+  existed: `redact = true` with `mode = "full"` keeps the event export
+  redacted while the raw dump stays unredacted.
+
+**Reloading (`SIGHUP`)** can make the mode stricter at runtime (for example
+`redacted` → `metrics_only`: exports stop at once, files already written are
+left as they are). It cannot make it wider: a reload asking for a wider mode
+is rejected with an error and the running config is kept; restart the agent
+to widen it. `--privacy-mode` keeps overriding the file on reload.
+
+In `full` mode the agent logs a warning at startup that decrypted payloads
+are being written unredacted. The JSON export and the raw dump are created
+readable by their owner only (`0600`). In `redacted` and `metrics_only`,
+panic messages (which can quote the data being processed) are reduced to
+where the panic happened.
+
+Each mode is checked against ground truth: `tests/oracle/run_modes.sh`
+plants unique PII values in HTTP and HTTPS traffic and searches every output
+(export, raw dump, pcap, audit log, agent log at debug level, `/metrics`,
+`/debug/state`) for them; results are in [`CURRENT-STATE.md`](CURRENT-STATE.md).
 
 ## 5. Reading the output
 
@@ -204,7 +256,8 @@ One line per finding, with no values:
 graph names it: Kubernetes workload when known, else DNS name, else `ip:port`
 (`unknown` only for TLS exchanges whose socket addresses were not learned).
 
-`action` is `Redacted` when `pii.redact = true`, else `Detected`.
+`action` is `Redacted` when the value was masked (privacy modes `redacted`
+and `metrics_only`), `Detected` in `full` mode (unless `[pii] redact = true`).
 Categories (redaction placeholder in brackets):
 
 | Category | What it matches |
@@ -235,7 +288,8 @@ Builds with ML (`--features ml` and a model) add `PersonName`, `Location`,
 
 ### 5.3 What gets redacted
 
-With `pii.redact = true` (the default), before anything is logged or exported:
+In privacy mode `redacted` (the default), before anything is logged or
+exported:
 
 - the **path and query string** are scanned (also in percent-decoded form) and
   matches replaced by `<CATEGORY>`, e.g. `<EMAIL>`;
@@ -251,6 +305,9 @@ Detection is pattern-based. It will miss PII that does not match a pattern
 before it (e.g. in a positional SQL `VALUES` list), and anything past
 `max_body_bytes`. It flags every IPv4 address and PAN-shaped product codes.
 Treat the exports as sensitive anyway.
+Header values are scanned for HTTP, HTTP/2 and gRPC only; other protocols'
+metadata (e.g. Kafka or AMQP headers) is exported as parsed. If what the
+patterns miss must not leave the node, use `metrics_only`.
 
 ### 5.4 Metrics and endpoints (`--metrics-bind`)
 
@@ -283,13 +340,44 @@ The endpoints have no authentication: bind to loopback or a private address.
 Pattern-based PII detection misses things (names, free-text addresses,
 domain-specific identifiers) and flags others it should not. If you need to
 run your own classifiers, keep an evidence trail, or check what Panopticon
-reported, capture the raw bytes:
+reported, capture the raw bytes. This needs privacy mode `full` (§4.3):
+
+> **Security warning.** A raw capture holds every payload the agent saw,
+> exactly as sent: passwords, session tokens, API keys and personal data,
+> and for TLS connections captured through OpenSSL or Go the **decrypted**
+> plaintext. Anyone who can read the file, or the pcap made from it, can
+> read that traffic. The agent warns at startup whenever mode `full` is on.
 
 ```bash
-sudo panopticon-agent --capture-raw /var/lib/panopticon/raw.pncap
+sudo panopticon-agent --privacy-mode full --capture-raw /var/lib/panopticon/raw.pncap
 # later, anywhere, without root:
 panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
+# or, for Wireshark / tshark:
+panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap --pcap raw.pcap
 ```
+
+**Opening it in Wireshark.** `wireshark raw.pcap` (or `tshark -r raw.pcap`)
+opens the converted file directly. Captured events hold application payload
+only, so the converter writes each one as a raw IPv4 packet (no Ethernet
+header) with a TCP or UDP header built from the event's addresses, ports and
+direction, and TCP sequence numbers that run per connection and direction.
+Wireshark's dissectors therefore see ordinary cleartext traffic: HTTP inside
+TLS shows as HTTP, and *Analyze → Follow → TCP Stream* shows each
+connection's requests and responses in order. Details:
+
+- TLS connections captured through OpenSSL or Go appear as their
+  **plaintext**, under the connection's real addresses once the agent learned
+  them. Packets of the same connection seen on the wire (the ciphertext) are
+  left out, and when both ends run on the node only the server's view (the
+  end with the lower port) is kept. A TLS connection whose addresses were
+  never seen is shown as `127.0.0.1:<port> → 127.0.0.2:443`.
+- Bytes that were not captured (beyond 4096 per packet or TLS buffer) show as
+  gaps ("previous segment not captured"), not as corrupted streams.
+- Packets carry no handshake (SYN/FIN), so Wireshark marks the first one of
+  each connection "previous segment not captured"; that is expected.
+- Timestamps are the kernel's monotonic clock (time since boot), so dates
+  show as January 1970; the intervals between packets are real.
+- The pcap is created owner-only (`0600`), like the capture.
 
 Each decoded line is one captured packet or TLS buffer:
 
@@ -304,10 +392,13 @@ Each decoded line is one captured packet or TLS buffer:
 
 - **Nothing is redacted** — passwords, tokens and personal data are written
   as they appeared on the wire (or as plaintext for TLS captured via
-  OpenSSL/Go). The JSON event log stays redacted at the same time.
+  OpenSSL/Go). In mode `full` the JSON event log is unredacted too, unless
+  the config sets `[pii] redact = true` (§4.3).
 - The file is created readable by its owner only (`0600`), truncated at
   startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
   agent logs a warning at startup whenever raw capture is on.
+- If a reload tightens the mode away from `full`, recording stops at once;
+  the file keeps what was written.
 - Group packets of one connection by `connection_id`; `direction` and the
   addresses tell you which side sent each one. For TLS events, `pid`
   identifies the process and `connection_id` is the TLS library's connection
