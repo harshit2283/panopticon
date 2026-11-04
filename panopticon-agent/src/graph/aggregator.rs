@@ -7,7 +7,7 @@
 //! the current window is swapped out and returned as `AggregatedFlow`s for
 //! the DAG to ingest.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -80,6 +80,10 @@ pub struct EdgeAggregator {
     uuid_re: Regex,
     /// Observations folded into OVERFLOW_TEMPLATE (cumulative).
     overflowed: AtomicU64,
+    /// Entries in `current_window`. `DashMap::len()` read-locks every shard,
+    /// which on the per-request path cost up to half the agent's CPU under
+    /// load (docs/BENCHMARKS.md, scaling study).
+    flows: AtomicUsize,
 }
 
 impl EdgeAggregator {
@@ -93,6 +97,7 @@ impl EdgeAggregator {
             )
             .expect("UUID regex is valid"),
             overflowed: AtomicU64::new(0),
+            flows: AtomicUsize::new(0),
         }
     }
 
@@ -124,19 +129,19 @@ impl EdgeAggregator {
             protocol,
             template,
         };
-        // Approximate under concurrency (len() and the insert race), which
-        // only lets the cap be exceeded by a few entries.
-        if self.current_window.len() >= MAX_FLOWS_PER_WINDOW
+        // Approximate under concurrency (the count and the insert race),
+        // which only lets the cap be exceeded by a few entries.
+        if self.flows.load(Ordering::Relaxed) >= MAX_FLOWS_PER_WINDOW
             && !self.current_window.contains_key(&key)
         {
             key.template = OVERFLOW_TEMPLATE.to_string();
             self.overflowed.fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut entry = self
-            .current_window
-            .entry(key)
-            .or_insert_with(|| FlowStats::new(timestamp_ns));
+        let mut entry = self.current_window.entry(key).or_insert_with(|| {
+            self.flows.fetch_add(1, Ordering::Relaxed);
+            FlowStats::new(timestamp_ns)
+        });
 
         let stats = entry.value_mut();
         stats.request_count += 1;
@@ -173,6 +178,12 @@ impl EdgeAggregator {
             .map(|r| (r.key().clone(), r.value().clone()))
             .collect();
 
+        // Reset before clear: a record racing the flush can then only
+        // overcount by the few entries `clear` removes (the cap triggers a
+        // few flows early). Resetting after would let a record between the
+        // two see the old count and an empty map, and fold a real flow into
+        // the overflow template.
+        self.flows.store(0, Ordering::Relaxed);
         self.current_window.clear();
         self.window_start.store(now_epoch_ms(), Ordering::Relaxed);
 
@@ -417,21 +428,24 @@ mod tests {
                 format!("/{w}")
             })
             .collect();
-        for w in &words {
-            agg.record(
-                "a",
-                "b",
-                Protocol::Http1,
-                Some("GET"),
-                Some(w),
-                Some(200),
-                None,
-                0,
-                0,
-                false,
-                1,
-            );
-        }
+        let fill = |agg: &EdgeAggregator| {
+            for w in &words {
+                agg.record(
+                    "a",
+                    "b",
+                    Protocol::Http1,
+                    Some("GET"),
+                    Some(w),
+                    Some(200),
+                    None,
+                    0,
+                    0,
+                    false,
+                    1,
+                );
+            }
+        };
+        fill(&agg);
         assert_eq!(agg.active_flows(), MAX_FLOWS_PER_WINDOW + 1);
         assert_eq!(agg.overflowed(), 500);
         let flows = agg.flush();
@@ -440,6 +454,13 @@ mod tests {
             .find(|f| f.key.template == OVERFLOW_TEMPLATE)
             .unwrap();
         assert_eq!(other.stats.request_count, 500);
+
+        // The flow count resets with the window: the next window admits the
+        // same flows again and caps at the same point.
+        assert_eq!(agg.active_flows(), 0);
+        fill(&agg);
+        assert_eq!(agg.active_flows(), MAX_FLOWS_PER_WINDOW + 1);
+        assert_eq!(agg.overflowed(), 1000);
     }
 
     fn make_aggregator() -> EdgeAggregator {

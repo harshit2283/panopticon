@@ -1144,7 +1144,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                     match result {
                         FsmResult::Messages(msgs) => {
                             guarded_handle_messages(
-                                &msgs,
+                                msgs,
                                 &MessageContext {
                                     worker_id,
                                     log_events,
@@ -1164,7 +1164,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                         }
                         FsmResult::MessageComplete(msg) => {
                             guarded_handle_messages(
-                                &[msg],
+                                [msg],
                                 &MessageContext {
                                     worker_id,
                                     log_events,
@@ -1359,17 +1359,22 @@ fn feed_event(
 }
 
 #[cfg(target_os = "linux")]
-fn guarded_handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>) {
+fn guarded_handle_messages(
+    msgs: impl IntoIterator<Item = crate::protocol::L7Message>,
+    ctx: &MessageContext<'_>,
+) {
     guarded(ctx.stats, ctx.worker_id, || handle_messages(msgs, ctx));
 }
 
 #[cfg(target_os = "linux")]
-fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>) {
-    for msg in msgs {
+fn handle_messages(
+    msgs: impl IntoIterator<Item = crate::protocol::L7Message>,
+    ctx: &MessageContext<'_>,
+) {
+    for mut msg in msgs {
         // PII scan + in-place redaction happens FIRST, so that logging, the
         // audit log, every exporter and the service graph only ever see the
         // sanitized message (path/query, headers and payload).
-        let mut msg = msg.clone();
         let pii_report = scan_with_body_cap(&mut msg, ctx.max_body_bytes, |msg| {
             ctx.pii_engine
                 .as_ref()
@@ -1389,7 +1394,6 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         if metrics_only {
             strip_payload_strings(&mut msg);
         }
-        let msg = &msg;
 
         if ctx.log_events {
             info!(
@@ -1435,26 +1439,6 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
             }
         }
 
-        // JSON export (channel-based — no mutex, no per-event flush)
-        if let Some(handle) = ctx.json_export.as_ref().filter(|_| !metrics_only)
-            && !handle.try_send(
-                msg.clone(),
-                pii_report.clone(),
-                crate::export::json::TransportContext {
-                    client_pid: ctx.owners.and_then(|o| o.client),
-                    server_pid: ctx.owners.and_then(|o| o.server),
-                    ..crate::export::json::TransportContext::from_data_event(ctx.event)
-                },
-                ctx.privacy,
-            )
-        {
-            ctx.stats.drops_export_full.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                worker = ctx.worker_id,
-                "JSON export event dropped due to exporter backpressure"
-            );
-        }
-
         // OTLP export (channel-based — drop when full, never block workers)
         if let Some(handle) = ctx.otlp_export.as_ref().filter(|_| !metrics_only) {
             if !handle.try_send_span(msg.clone(), ctx.privacy) {
@@ -1492,8 +1476,29 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                 dst_port: ctx.event.dst_port,
                 pid: ctx.event.pid,
             };
-            gb.record_with_server(&conn_tuple, ctx.sender_is_server, msg, pii_report.as_ref());
-            gb.observe_dns(msg);
+            gb.record_with_server(&conn_tuple, ctx.sender_is_server, &msg, pii_report.as_ref());
+            gb.observe_dns(&msg);
+        }
+
+        // JSON export (channel-based — no mutex, no per-event flush). Last, so
+        // the message and report move into it instead of being cloned.
+        if let Some(handle) = ctx.json_export.as_ref().filter(|_| !metrics_only)
+            && !handle.try_send(
+                msg,
+                pii_report,
+                crate::export::json::TransportContext {
+                    client_pid: ctx.owners.and_then(|o| o.client),
+                    server_pid: ctx.owners.and_then(|o| o.server),
+                    ..crate::export::json::TransportContext::from_data_event(ctx.event)
+                },
+                ctx.privacy,
+            )
+        {
+            ctx.stats.drops_export_full.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                worker = ctx.worker_id,
+                "JSON export event dropped due to exporter backpressure"
+            );
         }
     }
 }
