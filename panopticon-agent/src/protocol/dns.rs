@@ -30,6 +30,16 @@ const MAX_PENDING_QUERIES: usize = 1024;
 /// Maximum recursion depth for DNS name pointer decompression.
 const MAX_NAME_RECURSION: usize = 10;
 
+/// RFC 1035 §2.3.4: a name is at most 255 bytes on the wire, so at most 127
+/// labels. Compression lets a peer point many records at one long run of
+/// labels; these limits bound each expanded name.
+const MAX_NAME_WIRE_LEN: usize = 255;
+const MAX_LABELS: usize = 127;
+
+/// Answer records decoded per response. With the name limits this bounds
+/// the output of one message to roughly 64 * 300 bytes.
+const MAX_ANSWERS: usize = 64;
+
 // DNS record types
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
@@ -200,7 +210,7 @@ impl DnsParser {
             headers.push(("qtype".into(), qtype_to_string(qtype).to_string()));
         }
 
-        for _ in 0..ancount {
+        for _ in 0..ancount.min(MAX_ANSWERS) {
             if offset >= data.len() {
                 break;
             }
@@ -363,6 +373,7 @@ fn parse_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
     let mut jumped = false;
     let mut end_offset = 0; // The position after the name in the original data
     let mut recursion = 0;
+    let mut wire_len = 1; // the terminating root label
 
     loop {
         if offset >= data.len() {
@@ -388,7 +399,8 @@ fn parse_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
                 end_offset = offset + 2;
             }
             let pointer = ((len_byte as usize & 0x3F) << 8) | (data[offset + 1] as usize);
-            if pointer >= data.len() {
+            // Only backward pointers: they reference names already written.
+            if pointer >= offset {
                 return None;
             }
             offset = pointer;
@@ -399,9 +411,16 @@ fn parse_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
             }
             continue;
         }
+        if len_byte & 0xC0 != 0 {
+            return None; // reserved label types (0x40, 0x80)
+        }
 
         // Regular label
         let label_len = len_byte as usize;
+        wire_len += 1 + label_len;
+        if wire_len > MAX_NAME_WIRE_LEN || labels.len() >= MAX_LABELS {
+            return None;
+        }
         offset += 1;
         if offset + label_len > data.len() {
             return None;
@@ -409,10 +428,6 @@ fn parse_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
         let label = String::from_utf8_lossy(&data[offset..offset + label_len]).into_owned();
         labels.push(label);
         offset += label_len;
-    }
-
-    if !jumped {
-        // end_offset was set in the termination case
     }
 
     let name = if labels.is_empty() {
@@ -512,6 +527,31 @@ mod test_helpers {
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    /// F11: names are bounded at 255 wire bytes, pointers go backward only,
+    /// and answers per message are capped.
+    #[test]
+    fn test_name_expansion_is_bounded() {
+        let long = format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(60)); // 254 bytes
+        let too_long = format!("{0}.{0}.{0}.{0}", "a".repeat(63)); // 257 bytes
+        assert!(parse_dns_name(&encode_dns_name(&long), 0).is_some());
+        assert!(parse_dns_name(&encode_dns_name(&too_long), 0).is_none());
+        // A pointer to itself or forward is refused.
+        assert!(parse_dns_name(&[0xC0, 0x00], 0).is_none());
+        assert!(parse_dns_name(&[0xC0, 0x02, 0x00], 0).is_none());
+
+        // 1000 CNAME answers all pointing at the 254-byte question name.
+        let ptr: &[u8] = &[0xC0, 0x0C];
+        let answers: Vec<(&[u8], u16, u32, &[u8])> =
+            (0..1000).map(|_| (ptr, TYPE_CNAME, 60, ptr)).collect();
+        let resp = build_dns_response(7, RCODE_NOERROR, &long, TYPE_CNAME, &answers);
+        let ParseResult::Messages(msgs) = DnsParser::new().feed(&resp, Direction::Ingress, 1)
+        else {
+            panic!("expected a message");
+        };
+        let out = msgs[0].payload_text.as_deref().unwrap_or("").len();
+        assert!(out <= MAX_ANSWERS * 300, "payload_text is {out} bytes");
+    }
 
     #[test]
     fn test_parse_a_record_response() {
