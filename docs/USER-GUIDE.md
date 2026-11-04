@@ -342,9 +342,9 @@ connection's requests and responses in order. Details:
 - TLS connections captured through OpenSSL or Go appear as their
   **plaintext**, under the connection's real addresses once the agent learned
   them. Packets of the same connection seen on the wire (the ciphertext) are
-  left out, and when both ends run on the node only one process's view is
-  kept. A TLS connection whose addresses were never seen is shown as
-  `127.0.0.1:<port> → 127.0.0.2:443`.
+  left out, and when both ends run on the node only the server's view (the
+  end with the lower port) is kept. A TLS connection whose addresses were
+  never seen is shown as `127.0.0.1:<port> → 127.0.0.2:443`.
 - Bytes that were not captured (beyond 4096 per packet or TLS buffer) show as
   gaps ("previous segment not captured"), not as corrupted streams.
 - Packets carry no handshake (SYN/FIN), so Wireshark marks the first one of

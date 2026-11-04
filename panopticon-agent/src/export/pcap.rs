@@ -11,8 +11,8 @@
 //! TLS plaintext from the uprobes appears as cleartext streams:
 //! - packets of a connection whose plaintext was captured are dropped (they
 //!   are its ciphertext), and when both ends of one connection run on the
-//!   node only the first process's view is kept (the other is the same
-//!   bytes again);
+//!   node only the server's view (the lower port's) is kept: the other is
+//!   the same bytes again;
 //! - a TLS connection whose socket addresses were never seen gets stand-in
 //!   endpoints `127.0.0.1:<port> -> 127.0.0.2:443`, the port derived from the
 //!   process and connection.
@@ -119,8 +119,9 @@ struct TlsConn {
 struct Plan {
     /// (pid, library connection) -> its connections' addresses.
     tls: HashMap<(u32, u64), TlsConn>,
-    /// Address pair -> the process whose plaintext view is written.
-    tls_owner: HashMap<Flow, u32>,
+    /// Address pair -> (pid, its local port): the process whose plaintext
+    /// view is written.
+    tls_owner: HashMap<Flow, (u32, u16)>,
 }
 
 impl Plan {
@@ -132,7 +133,17 @@ impl Plan {
             if conn.addrs.back() != Some(&lr) {
                 conn.addrs.push_back(lr);
             }
-            self.tls_owner.entry(unordered(lr.0, lr.1)).or_insert(e.pid);
+            // With both ends on the node, keep the server's view (the end
+            // with the lower port): a client's first write on a reused
+            // connection object can carry the previous connection's
+            // addresses, a server's reads and writes cannot.
+            let owner = self
+                .tls_owner
+                .entry(unordered(lr.0, lr.1))
+                .or_insert((e.pid, lr.0.1));
+            if owner.0 != e.pid && lr.0.1 < owner.1 {
+                *owner = (e.pid, lr.0.1);
+            }
         }
         Ok(())
     }
@@ -181,7 +192,7 @@ impl Plan {
                 if self
                     .tls_owner
                     .get(&unordered(local, remote))
-                    .is_some_and(|&owner| owner != e.pid)
+                    .is_some_and(|&(owner, _)| owner != e.pid)
                 {
                     return None;
                 }
@@ -460,48 +471,50 @@ mod tests {
             SERVER,
             b"\x17\x03\x03",
         );
-        // Client process: wrote the request, addresses not yet known.
-        let mut first_write = event(
-            EventType::TlsData,
-            Direction::Egress,
-            (0, 0),
-            (0, 0),
-            b"GET /",
-        );
-        first_write.pid = 10;
-        let mut read = event(
-            EventType::TlsData,
-            Direction::Ingress,
-            SERVER,
-            CLIENT,
-            b"HTTP/1.1 200",
-        );
-        read.pid = 10;
-        // Server process: the same request again from the other end.
-        let mut server_view = event(
-            EventType::TlsData,
-            Direction::Ingress,
-            CLIENT,
-            SERVER,
-            b"GET /",
-        );
-        server_view.pid = 20;
-        server_view.socket_cookie = 99;
+        let tls = |pid, conn, dir, src, dst, data: &[u8]| {
+            let mut e = event(EventType::TlsData, dir, src, dst, data);
+            (e.pid, e.socket_cookie) = (pid, conn);
+            e
+        };
+        // Client process 10: wrote the request (addresses not yet known),
+        // read the response.
+        let first_write = tls(10, 1, Direction::Egress, (0, 0), (0, 0), b"GET /");
+        let read = tls(10, 1, Direction::Ingress, SERVER, CLIENT, b"HTTP/1.1 200");
+        // Server process 20: the same exchange from the other end.
+        let server_read = tls(20, 2, Direction::Ingress, CLIENT, SERVER, b"GET /");
+        let server_write = tls(20, 2, Direction::Egress, SERVER, CLIENT, b"HTTP/1.1 200");
+        // A client-only connection (its server is elsewhere).
+        let remote: Endpoint = (0x0A00_0009, 443);
+        let lone_write = tls(10, 3, Direction::Egress, (0, 0), (0, 0), b"POST /x");
+        let lone_read = tls(10, 3, Direction::Ingress, remote, CLIENT, b"HTTP/1.1 201");
 
-        let (_, recs) = convert_events(&[udp, cipher, first_write, read, server_view]);
+        let (_, recs) = convert_events(&[
+            udp,
+            cipher,
+            first_write,
+            read,
+            server_read,
+            server_write,
+            lone_write,
+            lone_read,
+        ]);
         assert_eq!(
             recs.len(),
-            3,
-            "ciphertext and the server's duplicate view dropped"
+            5,
+            "ciphertext and the client's duplicate view dropped"
         );
         assert_eq!(recs[0].pkt[9], IPPROTO_UDP);
         assert_eq!(&recs[0].pkt[28..], b"dns");
-        // The early write uses the addresses learned later: client -> server.
-        let w = &recs[1].pkt;
-        assert_eq!(&w[12..16], &[10, 0, 0, 2]);
-        assert_eq!(u16::from_be_bytes([w[22], w[23]]), 80);
-        assert_eq!(&w[40..], b"GET /");
-        assert_eq!(&recs[2].pkt[40..], b"HTTP/1.1 200");
+        // The server's view, oriented client -> server for the request.
+        assert_eq!(&recs[1].pkt[12..16], &[10, 0, 0, 2]);
+        assert_eq!(&recs[1].pkt[40..], b"GET /");
         assert_eq!(&recs[2].pkt[12..16], &[10, 0, 0, 1]);
+        assert_eq!(&recs[2].pkt[40..], b"HTTP/1.1 200");
+        // The early write uses the addresses learned later: client -> remote.
+        let w = &recs[3].pkt;
+        assert_eq!(&w[12..16], &[10, 0, 0, 2]);
+        assert_eq!(&w[16..20], &[10, 0, 0, 9]);
+        assert_eq!(u16::from_be_bytes([w[22], w[23]]), 443);
+        assert_eq!(&w[40..], b"POST /x");
     }
 }
