@@ -2,10 +2,13 @@
 # Score the agent's Redis / PostgreSQL / MySQL / gRPC capture against ground
 # truth.
 #
-# Starts the three database servers in Docker on the host network and a gRPC
-# server (grpc_oracle.py) on a non-standard port, puts a client in a netns
-# behind a veth (the agent attaches to the host end, server side), runs each
-# oracle with a fresh agent, and scores with score_db.py / score_h2.py.
+# Starts the three database servers in Docker, published on the veth address
+# $HOST_IP only (never on the host's LAN interfaces), and a gRPC server
+# (grpc_oracle.py) on a non-standard port, puts a client in a netns behind a
+# veth (the agent attaches to the host end, server side), runs each oracle
+# with a fresh agent, and scores with score_db.py / score_h2.py. All three
+# servers use a random per-run password, passed to db_oracle.py and
+# score_db.py as ORACLE_PASSWORD (score_db.py fails if it reaches the export).
 # Exits non-zero if any protocol's recall is below MIN_RECALL.
 #
 # Usage: sudo tests/oracle/run_protocols.sh [ops=500] [seed=7] [min_recall=0.99]
@@ -32,6 +35,10 @@ REDIS_IMAGE=${REDIS_IMAGE:-redis:7.4}
 POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:16}
 MYSQL_IMAGE=${MYSQL_IMAGE:-mysql:8.4}
 OUT=$(mktemp -d)
+# Random per run; Redis keeps protected mode on (the image default) and
+# requires this password too.
+ORACLE_PASSWORD=$("$PY" -c 'import secrets; print(secrets.token_hex(16))')
+export ORACLE_PASSWORD
 
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
@@ -42,22 +49,26 @@ cleanup() {
 trap cleanup EXIT
 
 docker rm -f o-redis o-pg o-mysql >/dev/null 2>&1 || true
-docker run -d --name o-redis --network host "$REDIS_IMAGE" --protected-mode no >/dev/null
-docker run -d --name o-pg --network host -e POSTGRES_PASSWORD=oracle -e POSTGRES_DB=oracle \
-  "$POSTGRES_IMAGE" >/dev/null
-docker run -d --name o-mysql --network host -e MYSQL_ROOT_PASSWORD=oracle \
-  -e MYSQL_DATABASE=oracle "$MYSQL_IMAGE" >/dev/null
 "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
-"$PY" "$HERE/netns.py" up
+"$PY" "$HERE/netns.py" up  # first: the published ports bind to $HOST_IP
+# ponytail: the password is visible in `docker inspect` / host ps to local
+# root and users; fine for a throwaway run, use --env-file + a config file if
+# the lab ever gets untrusted local users.
+docker run -d --name o-redis -p "$HOST_IP:6379:6379" "$REDIS_IMAGE" \
+  --requirepass "$ORACLE_PASSWORD" >/dev/null
+docker run -d --name o-pg -p "$HOST_IP:5432:5432" -e POSTGRES_PASSWORD="$ORACLE_PASSWORD" \
+  -e POSTGRES_DB=oracle "$POSTGRES_IMAGE" >/dev/null
+docker run -d --name o-mysql -p "$HOST_IP:3306:3306" -e MYSQL_ROOT_PASSWORD="$ORACLE_PASSWORD" \
+  -e MYSQL_DATABASE=oracle "$MYSQL_IMAGE" >/dev/null
 
 wait_ready() {
   for _ in $(seq 1 120); do
     HOST_IP=$HOST_IP nsenter --net=/var/run/netns/$NS "$PY" - <<'EOF' 2>/dev/null && return 0
 import os, redis, psycopg, pymysql
-host = os.environ["HOST_IP"]
-redis.Redis(host=host).ping()
-psycopg.connect(host=host, user="postgres", password="oracle", dbname="oracle").close()
-pymysql.connect(host=host, user="root", password="oracle", database="oracle",
+host, pw = os.environ["HOST_IP"], os.environ["ORACLE_PASSWORD"]
+redis.Redis(host=host, password=pw).ping()
+psycopg.connect(host=host, user="postgres", password=pw, dbname="oracle").close()
+pymysql.connect(host=host, user="root", password=pw, database="oracle",
                 ssl_disabled=True).close()
 EOF
     sleep 2

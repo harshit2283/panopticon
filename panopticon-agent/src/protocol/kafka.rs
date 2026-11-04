@@ -803,7 +803,7 @@ impl KafkaParser {
             }
             let size = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
             if size <= 0 || size > MAX_MESSAGE_SIZE {
-                return ParseResult::Error(format!("Kafka: invalid message size {}", size));
+                return ParseResult::Error("Kafka: invalid message size".into());
             }
             let total_len = 4 + size as usize;
             let have = data.len();

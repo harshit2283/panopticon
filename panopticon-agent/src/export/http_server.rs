@@ -62,11 +62,20 @@ async fn healthz() -> &'static str {
 /// Deliberately not tied to "events seen": a quiet node would otherwise never
 /// become Ready and would stall DaemonSet rolling updates. Traffic volume is
 /// observable via `panopticon_events_received_total` instead.
+///
+/// Parser / PII panics are caught per step and the workers keep running, so
+/// they do not make the agent unready; the body reports how many there were.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.ready.load(Ordering::Relaxed) {
-        (StatusCode::OK, "ready")
+    let panics = state.stats.worker_panics.load(Ordering::Relaxed);
+    let note = if panics > 0 {
+        format!(" (worker panics caught: {panics})")
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        String::new()
+    };
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, format!("ready{note}"))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, format!("not ready{note}"))
     }
 }
 
@@ -99,6 +108,7 @@ async fn debug_state(State(state): State<AppState>) -> Json<serde_json::Value> {
     let drops_rate = state.stats.drops_rate_limit.load(Ordering::Relaxed);
     let drops_channel = state.stats.drops_channel_full.load(Ordering::Relaxed);
     let drops_parser = state.stats.drops_parser_error.load(Ordering::Relaxed);
+    let worker_panics = state.stats.worker_panics.load(Ordering::Relaxed);
     let ringbuf_pending = received.saturating_sub(processed);
 
     Json(serde_json::json!({
@@ -107,6 +117,7 @@ async fn debug_state(State(state): State<AppState>) -> Json<serde_json::Value> {
         "events_processed": processed,
         "active_connections": active,
         "worker_count": state.worker_count,
+        "worker_panics": worker_panics,
         "drops": {
             "rate_limit": drops_rate,
             "channel_full": drops_channel,
@@ -180,6 +191,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_reports_caught_worker_panics() {
+        let state = make_test_state();
+        state.ready.store(true, Ordering::Relaxed);
+        state.stats.worker_panics.fetch_add(3, Ordering::Relaxed);
+        let resp = make_app(state)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"ready (worker panics caught: 3)");
     }
 
     #[tokio::test]

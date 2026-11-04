@@ -61,7 +61,8 @@ impl RedisParser {
                     self.client_buf.consume(consumed);
 
                     // Enqueue this command — VecDeque preserves order for pipelining.
-                    let parts = flatten_to_strings(&value);
+                    let mut parts = flatten_to_strings(&value);
+                    mask_credentials(&mut parts);
                     if !parts.is_empty() {
                         self.pending_queue.push_back((parts, timestamp_ns));
                     }
@@ -184,6 +185,63 @@ impl ProtocolParser for RedisParser {
     }
 }
 
+/// Replace the secrets a command carries with [`super::REDACTED_CREDENTIAL`]
+/// before it is queued, so no sink, in any privacy mode, ever sees them (as
+/// the AMQP and Kafka parsers drop their auth exchanges):
+/// `AUTH [user] pw`, `HELLO … AUTH user pw`, `MIGRATE … AUTH pw | AUTH2 user pw`,
+/// `CONFIG SET requirepass|masterauth|masteruser pw` and the password rules
+/// (`>pw`, `<pw`, `#hash`, `!hash`) of `ACL SETUSER`.
+fn mask_credentials(parts: &mut [String]) {
+    let mask = |s: &mut String| {
+        zeroize::Zeroize::zeroize(s);
+        *s = super::REDACTED_CREDENTIAL.to_string();
+    };
+    let Some(cmd) = parts.first().map(|c| c.to_ascii_uppercase()) else {
+        return;
+    };
+    let arg_is = |parts: &[String], i: usize, names: &[&str]| {
+        parts
+            .get(i)
+            .is_some_and(|a| names.iter().any(|n| a.eq_ignore_ascii_case(n)))
+    };
+    match cmd.as_str() {
+        "AUTH" => parts[1..].iter_mut().for_each(mask),
+        "HELLO" | "MIGRATE" => {
+            let mut i = 1;
+            while i < parts.len() {
+                // HELLO's AUTH and MIGRATE's AUTH2 take user + password.
+                let n = if arg_is(parts, i, &["AUTH2"])
+                    || (cmd == "HELLO" && arg_is(parts, i, &["AUTH"]))
+                {
+                    2
+                } else if arg_is(parts, i, &["AUTH"]) {
+                    1
+                } else {
+                    0
+                };
+                let end = (i + 1 + n).min(parts.len());
+                parts[i + 1..end].iter_mut().for_each(mask);
+                i += 1 + n;
+            }
+        }
+        "CONFIG" if arg_is(parts, 1, &["SET"]) => {
+            let mut i = 2;
+            while i + 1 < parts.len() {
+                if arg_is(parts, i, &["requirepass", "masterauth", "masteruser"]) {
+                    mask(&mut parts[i + 1]);
+                }
+                i += 2;
+            }
+        }
+        "ACL" if arg_is(parts, 1, &["SETUSER"]) => parts
+            .iter_mut()
+            .skip(3)
+            .filter(|r| r.starts_with(['>', '<', '#', '!']))
+            .for_each(mask),
+        _ => {}
+    }
+}
+
 // ── RESP Value Types ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -273,7 +331,7 @@ fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
                 other => other,
             }
         }
-        _ => RespParse::Error(format!("unknown RESP type byte: 0x{:02x}", data[0])),
+        _ => RespParse::Error("unknown RESP type byte".into()),
     }
 }
 
@@ -311,7 +369,7 @@ fn parse_integer(data: &[u8]) -> RespParse {
             let s = std::str::from_utf8(&data[1..pos]).unwrap_or("0");
             match s.parse::<i64>() {
                 Ok(n) => RespParse::Complete(RespValue::Integer(n), pos + 2),
-                Err(_) => RespParse::Error(format!("invalid RESP integer: {s}")),
+                Err(_) => RespParse::Error("invalid RESP integer".into()),
             }
         }
         None => RespParse::Incomplete,
@@ -328,7 +386,7 @@ fn parse_bulk_string(data: &[u8]) -> RespParse {
     let len_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let len: i64 = match len_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid bulk string length: {len_str}")),
+        Err(_) => return RespParse::Error("invalid bulk string length".into()),
     };
 
     if len < 0 {
@@ -364,7 +422,7 @@ fn parse_aggregate(
     let count_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let count: usize = match count_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid RESP3 count: {count_str}")),
+        Err(_) => return RespParse::Error("invalid RESP3 count".into()),
     };
     let total = count.saturating_mul(per_entry);
     let mut offset = crlf_pos + 2;
@@ -394,7 +452,7 @@ fn parse_array(data: &[u8], depth: usize) -> RespParse {
     let count_str = std::str::from_utf8(&data[1..crlf_pos]).unwrap_or("");
     let count: i64 = match count_str.parse() {
         Ok(n) => n,
-        Err(_) => return RespParse::Error(format!("invalid array count: {count_str}")),
+        Err(_) => return RespParse::Error("invalid array count".into()),
     };
 
     if count < 0 {
@@ -562,6 +620,79 @@ mod tests {
                 assert_eq!(msgs[0].request_text.as_deref(), Some("bob@example.com!!"));
             }
             other => panic!("expected SET message, got {other:?}"),
+        }
+    }
+
+    fn resp(args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend(format!("${}\r\n{a}\r\n", a.len()).bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_credentials_never_leave_the_parser() {
+        let cases: &[&[&str]] = &[
+            &["AUTH", "s3cretpw"],
+            &["auth", "alice", "s3cretpw"],
+            &[
+                "HELLO", "3", "AUTH", "default", "s3cretpw", "SETNAME", "app",
+            ],
+            &[
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH", "s3cretpw", "KEYS", "k",
+            ],
+            &[
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH2", "u", "s3cretpw",
+            ],
+            &["CONFIG", "SET", "requirepass", "s3cretpw"],
+            &[
+                "CONFIG",
+                "SET",
+                "maxmemory",
+                "1gb",
+                "masterauth",
+                "s3cretpw",
+            ],
+            &["ACL", "SETUSER", "bob", "on", ">s3cretpw", "~*", "+@all"],
+        ];
+        for args in cases {
+            let mut parser = RedisParser::new();
+            parser.feed(&resp(args), Direction::Egress, 1);
+            let ParseResult::Messages(msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+                panic!("no message for {args:?}");
+            };
+            let m = &msgs[0];
+            let all = format!("{:?} {:?} {:?}", m.method, m.path, m.request_text);
+            assert!(!all.contains("s3cretpw"), "{args:?} leaked: {all}");
+            assert!(all.contains(crate::protocol::REDACTED_CREDENTIAL), "{all}");
+        }
+        // Ordinary arguments stay readable.
+        let mut parser = RedisParser::new();
+        parser.feed(
+            &resp(&["HELLO", "3", "SETNAME", "app"]),
+            Direction::Egress,
+            1,
+        );
+        let ParseResult::Messages(msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+            panic!()
+        };
+        assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
+    }
+
+    #[test]
+    fn test_parse_errors_do_not_quote_input() {
+        for bad in [
+            &b":12-34-5678\r\n"[..],
+            b"$12-34-5678\r\n",
+            b"*12-34-5678\r\n",
+            b"%12-34-5678\r\n",
+        ] {
+            let mut parser = RedisParser::new();
+            match parser.feed(bad, Direction::Ingress, 1) {
+                ParseResult::Error(e) => assert!(!e.contains("12-34"), "{e}"),
+                other => panic!("expected an error, got {other:?}"),
+            }
         }
     }
 

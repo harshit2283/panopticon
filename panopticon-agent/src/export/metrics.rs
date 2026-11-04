@@ -33,6 +33,7 @@ pub struct AgentMetrics {
     pub raw_capture_dropped: Counter<u64>,
     pub kernel_drops: Counter<u64>,
     pub drops_export_full: Counter<u64>,
+    pub worker_panics: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -100,6 +101,14 @@ impl AgentMetrics {
             drops_export_full.clone(),
         );
 
+        let worker_panics = Counter::<u64>::default();
+        registry.register(
+            "panopticon_worker_panics",
+            "Parser or PII steps that panicked on captured data and were skipped; \
+             the worker keeps running. Any increase is a bug worth reporting",
+            worker_panics.clone(),
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -156,6 +165,7 @@ impl AgentMetrics {
             raw_capture_dropped,
             kernel_drops,
             drops_export_full,
+            worker_panics,
             parse_latency,
             ringbuf_approx_pending,
         };
@@ -219,6 +229,10 @@ impl AgentMetrics {
         );
         self.drops_export_full.inner().store(
             stats.drops_export_full.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.worker_panics.inner().store(
+            stats.worker_panics.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
 
@@ -300,8 +314,12 @@ mod tests {
         stats
             .drops_export_full
             .store(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .worker_panics
+            .store(2, std::sync::atomic::Ordering::Relaxed);
 
         metrics.sync_from_stats(&stats);
+        assert_eq!(metrics.worker_panics.get(), 2);
 
         assert_eq!(metrics.kernel_drops.get(), 5);
         assert_eq!(metrics.drops_export_full.get(), 4);

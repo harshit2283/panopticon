@@ -626,7 +626,9 @@ impl MysqlParser {
         let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, ts);
         msg.request_text = self.param_text.take();
         msg.method = Some("QUERY".into());
-        if let Some(q) = self.query_text.take() {
+        if let Some(mut q) = self.query_text.take() {
+            // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
+            super::mask_secrets_in(&mut q);
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
             }
@@ -1086,6 +1088,35 @@ mod tests {
                 assert_eq!(m[0].latency_ns, Some(1000));
             }
             other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_password_clause_is_masked() {
+        for (sql, want) in [
+            (
+                "CREATE USER 'app'@'%' IDENTIFIED BY 'my-s3cret'",
+                "CREATE USER 'app'@'%' IDENTIFIED BY <REDACTED>",
+            ),
+            (
+                "ALTER USER app IDENTIFIED WITH caching_sha2_password BY 'my-s3cret'",
+                "ALTER USER app IDENTIFIED WITH caching_sha2_password BY <REDACTED>",
+            ),
+            ("SET PASSWORD = 'my-s3cret'", "SET PASSWORD = <REDACTED>"),
+        ] {
+            let mut p = MysqlParser::new();
+            p.state = State::Ready;
+            let mut cmd = vec![COM_QUERY];
+            cmd.extend_from_slice(sql.as_bytes());
+            p.feed(&make_packet(0, &cmd), Direction::Egress, 1000);
+            let ParseResult::Messages(m) = p.feed(
+                &make_packet(1, &[OK_MARKER, 0, 0, 2, 0]),
+                Direction::Ingress,
+                2000,
+            ) else {
+                panic!("expected a message for {sql}");
+            };
+            assert_eq!(m[0].payload_text.as_deref(), Some(want));
         }
     }
 

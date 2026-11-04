@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 //! Redaction: replace PII entity text spans with category placeholders like `<EMAIL>`.
 //!
-//! Handles overlapping spans by sorting and skipping overlaps (earlier span wins).
+//! Overlapping spans are merged: the earlier span names the placeholder and
+//! the placeholder covers the union of both.
 
 use super::PiiEntity;
 
 /// Redact text by replacing entity spans with `<CATEGORY>` placeholders.
-/// Handles overlapping spans by merging them (earlier span wins).
+/// Overlapping spans are merged: the earlier one names the placeholder, which
+/// covers their union.
 pub fn redact(text: &str, entities: &[PiiEntity]) -> String {
     if entities.is_empty() {
         return text.to_string();
@@ -21,7 +23,9 @@ pub fn redact(text: &str, entities: &[PiiEntity]) -> String {
 
     for entity in &sorted {
         if entity.start < pos {
-            // Overlapping with previous -- skip
+            // Overlaps the previous span: mask the union, never leave a
+            // crossing tail exposed.
+            pos = pos.max(entity.end);
             continue;
         }
         // Append text before this entity
@@ -90,6 +94,16 @@ mod tests {
         ];
         let result = redact(text, &entities);
         assert_eq!(result, "data: <PHONE_US>");
+    }
+
+    #[test]
+    fn test_crossing_spans_mask_the_union() {
+        let text = "x AAAABBBBCCCC y";
+        let entities = vec![
+            make_entity(PiiCategory::ApiKey, 2, 10, "AAAABBBB"),
+            make_entity(PiiCategory::Jwt, 6, 14, "BBBBCCCC"),
+        ];
+        assert_eq!(redact(text, &entities), "x <API_KEY> y");
     }
 
     #[test]

@@ -71,6 +71,35 @@ impl std::fmt::Display for PrivacyMode {
 #[derive(Debug)]
 pub struct PrivacyGate(std::sync::atomic::AtomicU8);
 
+/// Whether a config reload may move the running agent from `current` to
+/// `requested`. The mode may only get stricter, and tightening to
+/// `redacted` needs the redactor the agent was started with
+/// (`running_can_redact`): workers keep the PII engine built at startup, so
+/// a reload cannot install one.
+pub fn check_reload(
+    current: PrivacyMode,
+    requested: PrivacyMode,
+    running_can_redact: bool,
+) -> Result<(), String> {
+    if (requested as u8) > (current as u8) {
+        return Err(format!(
+            "a wider privacy mode ({current} -> {requested}) needs a restart"
+        ));
+    }
+    if requested == PrivacyMode::Redacted && current != requested && !running_can_redact {
+        return Err(format!(
+            "the agent was started without regex PII redaction ([pii] enabled / \
+             regex_enabled off), so it cannot switch to {requested} at runtime; restart it"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a PII engine built from `pii` masks values in redacted mode.
+pub fn can_redact(pii: &PiiConfig) -> bool {
+    pii.enabled && pii.regex_enabled && !matches!(pii.mode, PiiMode::External { .. })
+}
+
 impl PrivacyGate {
     pub fn new(mode: PrivacyMode) -> Self {
         Self(std::sync::atomic::AtomicU8::new(mode as u8))
@@ -702,6 +731,14 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
              but the mode is \"{mode}\""
         );
     }
+    // The external service is sent raw field values: never wire it up
+    // where the mode promises they stay on the node.
+    if mode != PrivacyMode::Full && matches!(config.pii.mode, PiiMode::External { .. }) {
+        anyhow::bail!(
+            "the external PII service is sent raw, unredacted values; it needs \
+             [privacy] mode = \"full\", but the mode is \"{mode}\""
+        );
+    }
     match mode {
         PrivacyMode::MetricsOnly => {
             for (enabled, setting) in [
@@ -711,10 +748,6 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
                 ),
                 (config.otlp.enabled, "[otlp] enabled"),
                 (config.log_events, "log_events / --log-events"),
-                (
-                    matches!(config.pii.mode, PiiMode::External { .. }),
-                    "external PII service",
-                ),
             ] {
                 if enabled {
                     anyhow::bail!(
@@ -1059,6 +1092,42 @@ mod tests {
         assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
         assert!(!gate.tighten(PrivacyMode::Redacted));
         assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
+    }
+
+    #[test]
+    fn test_reload_cannot_tighten_without_a_redactor() {
+        use PrivacyMode::*;
+        // full, started with [pii] enabled = false: no engine in the workers.
+        let started = privacy("[privacy]\nmode = \"full\"\n[pii]\nenabled = false\n").unwrap();
+        assert!(!can_redact(&started.pii));
+        assert!(check_reload(Full, Redacted, false).is_err());
+        // metrics_only drops every payload string: no redactor needed.
+        assert!(check_reload(Full, MetricsOnly, false).is_ok());
+        assert!(check_reload(Full, Redacted, true).is_ok());
+        assert!(check_reload(Redacted, Redacted, true).is_ok());
+        assert!(check_reload(Redacted, Full, true).is_err());
+        assert!(check_reload(MetricsOnly, Redacted, true).is_err());
+    }
+
+    #[test]
+    fn test_external_pii_service_needs_full() {
+        for mode in [
+            PrivacyMode::Redacted,
+            PrivacyMode::MetricsOnly,
+            PrivacyMode::Full,
+        ] {
+            let mut config = AgentConfig::default();
+            config.privacy_mode = mode;
+            config.pii.mode = PiiMode::External {
+                url: "http://localhost:8080/pii".into(),
+                sample_rate: 1.0,
+                timeout_ms: 100,
+            };
+            assert_eq!(
+                apply_privacy(&mut config).is_ok(),
+                mode == PrivacyMode::Full
+            );
+        }
     }
 
     #[test]

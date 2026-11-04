@@ -81,7 +81,7 @@ struct Args {
 
     /// Print a raw capture file as JSON lines (metadata + base64 payload), then exit.
     /// With --pcap, write a Wireshark-readable pcap file instead.
-    /// Needs no privileges.
+    /// Needs no privileges, but needs --privacy-mode full (the output is unredacted).
     #[arg(long, value_name = "FILE")]
     decode_capture: Option<String>,
 
@@ -104,9 +104,44 @@ struct Args {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+const FULL_MODE_WARNING: &str = "PRIVACY MODE FULL: captured payloads, including DECRYPTED \
+     TLS traffic, credentials and personal data, are written UNREDACTED to the configured \
+     export and dump files. Restrict access to them and delete them when done.";
+
+/// The privacy mode for the offline tools (`--decode-capture`, `--pcap`):
+/// `--privacy-mode`, else the config file's `[privacy] mode`, else the default.
+fn offline_privacy_mode(args: &Args) -> Result<config::PrivacyMode> {
+    if let Some(mode) = args
+        .privacy_mode
+        .as_deref()
+        .and_then(config::PrivacyMode::parse)
+    {
+        return Ok(mode);
+    }
+    Ok(match &args.config {
+        Some(path) => config::load_config(path)?.privacy_mode,
+        None => config::AgentConfig::default().privacy_mode,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    #[cfg(unix)]
+    if args.decode_capture.is_some() {
+        // The capture holds every payload unredacted, TLS decrypted: decoding
+        // it is a full-mode operation like writing it.
+        let mode = offline_privacy_mode(&args)?;
+        if mode != config::PrivacyMode::Full {
+            anyhow::bail!(
+                "--decode-capture prints raw, unredacted payloads (decrypted TLS, \
+                 credentials, personal data); it needs --privacy-mode full, but the \
+                 mode is \"{mode}\""
+            );
+        }
+        eprintln!("panopticon: WARNING: {FULL_MODE_WARNING}");
+    }
 
     #[cfg(unix)]
     if let (Some(input), Some(out)) = (&args.decode_capture, &args.pcap) {
@@ -211,11 +246,9 @@ async fn main() -> Result<()> {
         let privacy_mode = agent_config.privacy_mode;
         info!(mode = %privacy_mode, "Privacy mode");
         if privacy_mode == config::PrivacyMode::Full {
-            tracing::warn!(
-                "PRIVACY MODE FULL: captured payloads, including DECRYPTED TLS traffic, \
-                 credentials and personal data, are written UNREDACTED to the configured \
-                 export and dump files. Restrict access to them and delete them when done."
-            );
+            // Also on stderr: RUST_LOG=error must not hide it.
+            eprintln!("panopticon: WARNING: {FULL_MODE_WARNING}");
+            tracing::warn!("{FULL_MODE_WARNING}");
         }
         if let Some(ref path) = args.replay_bench {
             return replay_bench(&agent_config, path).await;
@@ -475,6 +508,7 @@ async fn main() -> Result<()> {
         let smoke_test = agent_config.smoke_test;
 
         // 9. SIGHUP config hot-reload
+        let running_can_redact = config::can_redact(&agent_config.pii);
         let shared_config = Arc::new(ArcSwap::from_pointee(agent_config));
         let config_path_for_reload = args.config.clone();
         let config_swap = Arc::clone(&shared_config);
@@ -498,12 +532,18 @@ async fn main() -> Result<()> {
                             // runtime; widening it needs a restart.
                             let current = privacy.get();
                             let requested = new_config.privacy_mode;
-                            if !privacy.tighten(requested) {
+                            let check =
+                                config::check_reload(current, requested, running_can_redact);
+                            if let Err(why) = check.and_then(|()| {
+                                privacy
+                                    .tighten(requested)
+                                    .then_some(())
+                                    .ok_or_else(|| "a wider privacy mode needs a restart".into())
+                            }) {
                                 tracing::error!(
                                     current = %current,
                                     requested = %requested,
-                                    "Config reload rejected: a wider privacy mode needs a \
-                                     restart; keeping the current config"
+                                    "Config reload rejected: {why}; keeping the current config"
                                 );
                                 continue;
                             }
@@ -618,7 +658,7 @@ async fn smoke_test_wait(enabled: bool, stats: &event_loop::EventStats) -> Resul
 mod tests {
     use clap::Parser;
 
-    use super::Args;
+    use super::{Args, config, offline_privacy_mode};
 
     #[test]
     fn test_cli_default_args() {
@@ -711,6 +751,22 @@ mod tests {
             assert_eq!(args.privacy_mode.as_deref(), Some(mode));
         }
         assert!(Args::try_parse_from(["panopticon-agent", "--privacy-mode", "all"]).is_err());
+    }
+
+    #[test]
+    fn test_offline_decode_needs_full_mode() {
+        let mode = |argv: &[&str]| offline_privacy_mode(&Args::try_parse_from(argv).unwrap());
+        let base = ["panopticon-agent", "--decode-capture", "raw.pncap"];
+        assert_eq!(mode(&base).unwrap(), config::PrivacyMode::Redacted);
+        let with = |extra: &[&'static str]| [&base[..], extra].concat();
+        assert_eq!(
+            mode(&with(&["--pcap", "o.pcap", "--privacy-mode", "full"])).unwrap(),
+            config::PrivacyMode::Full
+        );
+        assert_eq!(
+            mode(&with(&["--privacy-mode", "metrics_only"])).unwrap(),
+            config::PrivacyMode::MetricsOnly
+        );
     }
 
     #[test]

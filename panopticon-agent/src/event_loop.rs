@@ -165,6 +165,8 @@ pub struct EventStats {
     pub kernel_drops: AtomicU64,
     /// Parsed exchanges not exported because the JSON writer was behind.
     pub drops_export_full: AtomicU64,
+    /// Parser / PII steps that panicked and were skipped (worker kept running).
+    pub worker_panics: AtomicU64,
 }
 
 impl EventStats {
@@ -184,6 +186,7 @@ impl EventStats {
             truncated_events: AtomicU64::new(0),
             kernel_drops: AtomicU64::new(0),
             drops_export_full: AtomicU64::new(0),
+            worker_panics: AtomicU64::new(0),
         }
     }
 }
@@ -1122,8 +1125,10 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
             if !payload.is_empty() {
                 // Detect protocol and create FSM if not exists
                 if !manager.contains(cookie)
-                    && let Some(proto) =
+                    && let Some(proto) = guarded(&ctx.stats, worker_id, || {
                         detect_protocol(payload, event.src_port, event.dst_port, event.direction)
+                    })
+                    .flatten()
                 {
                     use crate::protocol::fsm::CreateResult;
                     let server = server_endpoint(event, proto, payload);
@@ -1153,20 +1158,34 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                 }
 
                 let src = sender_endpoint(event);
-                let first = manager.process_packet_from(
-                    cookie,
-                    src,
-                    event.direction,
-                    payload,
-                    event.timestamp_ns,
-                );
+                // A parser panic closes the connection instead of the worker.
+                let panicked = || Some(FsmResult::Error("parser panicked".into()));
+                let first = guarded(&ctx.stats, worker_id, || {
+                    manager.process_packet_from(
+                        cookie,
+                        src,
+                        event.direction,
+                        payload,
+                        event.timestamp_ns,
+                    )
+                })
+                .unwrap_or_else(panicked);
                 // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
                 // writes) were never seen: let the parser count them instead of
                 // desynchronising on the next message.
                 let truncated = event.truncated_bytes() as usize;
                 let after_gap = if truncated > 0 {
                     ctx.stats.truncated_events.fetch_add(1, Ordering::Relaxed);
-                    manager.skip_from(cookie, src, event.direction, truncated, event.timestamp_ns)
+                    guarded(&ctx.stats, worker_id, || {
+                        manager.skip_from(
+                            cookie,
+                            src,
+                            event.direction,
+                            truncated,
+                            event.timestamp_ns,
+                        )
+                    })
+                    .unwrap_or_else(panicked)
                 } else {
                     None
                 };
@@ -1174,7 +1193,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                 for result in [first, after_gap].into_iter().flatten() {
                     match result {
                         FsmResult::Messages(msgs) => {
-                            handle_messages(
+                            guarded_handle_messages(
                                 &msgs,
                                 &MessageContext {
                                     worker_id,
@@ -1194,7 +1213,7 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                             );
                         }
                         FsmResult::MessageComplete(msg) => {
-                            handle_messages(
+                            guarded_handle_messages(
                                 &[msg],
                                 &MessageContext {
                                     worker_id,
@@ -1267,6 +1286,28 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
     debug!(worker_id, "Worker shutting down");
 }
 
+/// Run one parser / PII step so that a panic in it (a bug reachable from
+/// captured bytes) costs that step, not the worker: an unwound tokio task
+/// never restarts, and every event routed to it afterwards would be lost as
+/// `drops_channel_full`. Counted in `worker_panics`; None when it panicked.
+/// The release profile unwinds (no `panic = "abort"`), so this applies there.
+fn guarded<T>(stats: &EventStats, worker_id: usize, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            stats.worker_panics.fetch_add(1, Ordering::Relaxed);
+            // The panic hook already printed where; the payload may quote data.
+            tracing::error!(worker = worker_id, "worker step panicked; event skipped");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>) {
+    guarded(ctx.stats, ctx.worker_id, || handle_messages(msgs, ctx));
+}
+
 #[cfg(target_os = "linux")]
 fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>) {
     for msg in msgs {
@@ -1274,16 +1315,16 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         // audit log, every exporter and the service graph only ever see the
         // sanitized message (path/query, headers and payload).
         let mut msg = msg.clone();
-        cap_body_text(&mut msg, ctx.max_body_bytes);
-        let pii_report = ctx
-            .pii_engine
-            .as_ref()
-            // Redact unless the mode is full, and in full too if the config
-            // asks for a redacted export ([pii] redact = true).
-            .and_then(|e| {
-                let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
-                e.scan_message_with(&mut msg, redact)
-            });
+        let pii_report = scan_with_body_cap(&mut msg, ctx.max_body_bytes, |msg| {
+            ctx.pii_engine
+                .as_ref()
+                // Redact unless the mode is full, and in full too if the config
+                // asks for a redacted export ([pii] redact = true).
+                .and_then(|e| {
+                    let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
+                    e.scan_message_with(msg, redact)
+                })
+        });
         if let Some(report) = pii_report.as_ref() {
             ctx.stats
                 .pii_detections
@@ -1448,6 +1489,52 @@ fn strip_payload_strings(msg: &mut crate::protocol::L7Message) {
     msg.payload_text = None;
     msg.request_text = None;
     msg.headers.retain(|(k, _)| k == "dns_a_record");
+}
+
+/// Bytes past `max_body_bytes` that are still scanned, so a value straddling
+/// the cut is detected whole and redacted before the cut drops its tail.
+const SCAN_LOOKAHEAD: usize = 256;
+
+/// Bound the bodies to `max` bytes around a PII scan: scan up to
+/// `max + SCAN_LOOKAHEAD`, then cut to `max` and drop a token the cut split,
+/// so no prefix of an undetected value (`123-45-6` of an SSN) is exported.
+fn scan_with_body_cap(
+    msg: &mut crate::protocol::L7Message,
+    max: usize,
+    scan: impl FnOnce(&mut crate::protocol::L7Message) -> Option<crate::pii::PiiReport>,
+) -> Option<crate::pii::PiiReport> {
+    cap_body_text(msg, max.saturating_add(SCAN_LOOKAHEAD));
+    let mut report = scan(msg);
+    let redacted = report.as_mut().and_then(|r| r.redacted_text.as_mut());
+    for text in [
+        msg.payload_text.as_mut(),
+        msg.request_text.as_mut(),
+        redacted,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        cut_partial_token(text, max);
+    }
+    report
+}
+
+/// Cut `text` to at most `max` bytes; when the cut falls inside a token
+/// (letters, digits and `-._@+%`), drop that token's head too.
+fn cut_partial_token(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let is_token = |c: char| c.is_alphanumeric() || "-._@+%".contains(c);
+    let mut keep = crate::protocol::truncate_utf8(text, max).len();
+    if text[keep..].chars().next().is_some_and(is_token) {
+        keep = text[..keep]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !is_token(c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+    }
+    text.truncate(keep);
 }
 
 /// Bound the body text a message carries before PII scanning and export.
@@ -1873,6 +1960,41 @@ mod tests {
         cap_body_text(&mut msg, 4095);
         assert_eq!(msg.payload_text.as_deref().map(str::len), Some(4094));
         assert_eq!(msg.request_text.as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn body_cap_never_exports_a_split_value() {
+        let engine = crate::pii::PiiEngine::new(&crate::config::PiiConfig::default(), &[]);
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        // The SSN straddles the 4096-byte cut.
+        let head = "x ".repeat(2042); // 4084 bytes: the cut leaves "123-45-6"
+        msg.payload_text = Some(format!("{head}ssn 123-45-6789 and more text"));
+        let report = scan_with_body_cap(&mut msg, 4096, |m| engine.scan_message_with(m, true));
+        let body = msg.payload_text.as_deref().unwrap();
+        assert!(body.len() <= 4096);
+        assert!(!body.contains("123-45"), "{}", &body[4080..]);
+        assert!(report.unwrap().redacted_text.as_ref().unwrap().len() <= 4096);
+
+        // Redaction off (full): still never ends in a split token.
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.payload_text = Some(format!("{head}ssn 123-45-6789"));
+        scan_with_body_cap(&mut msg, 4096, |_| None);
+        assert!(msg.payload_text.as_deref().unwrap().ends_with("ssn "));
+    }
+
+    #[test]
+    fn guarded_step_survives_a_panic_and_counts_it() {
+        let stats = EventStats::new();
+        assert_eq!(guarded(&stats, 0, || 7), Some(7));
+        let r = guarded(&stats, 0, || -> u8 {
+            panic!("byte index 4 is not a char boundary")
+        });
+        assert_eq!(r, None);
+        assert_eq!(stats.worker_panics.load(Ordering::Relaxed), 1);
+        // Still usable afterwards.
+        assert_eq!(guarded(&stats, 0, || 8), Some(8));
     }
 
     #[test]

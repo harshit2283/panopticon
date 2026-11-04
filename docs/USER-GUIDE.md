@@ -93,8 +93,8 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 | `--kubernetes <auto\|true\|false>` | Kubernetes identity (§5.6); overrides `[kubernetes] enabled`. Also `PANOPTICON_KUBERNETES`. |
 | `--privacy-mode <full\|redacted\|metrics_only>` | What may leave the node (§4.3); overrides `[privacy] mode`. Also `PANOPTICON_PRIVACY_MODE`. Default `redacted`. |
 | `--capture-raw <FILE>` | Write every captured payload, unredacted and with TLS decrypted, to a binary capture file (§5.5). Needs `--privacy-mode full`. |
-| `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root. |
-| `--decode-capture <FILE> --pcap <OUT>` | Convert a raw capture to a pcap file for Wireshark / tshark (§5.5) and exit. |
+| `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root, but needs `--privacy-mode full` (or `full` in the config file): the output is unredacted. |
+| `--decode-capture <FILE> --pcap <OUT>` | Convert a raw capture to a pcap file for Wireshark / tshark (§5.5) and exit. Also needs `--privacy-mode full`. |
 | `-v, --verbose` | Debug logging (otherwise `RUST_LOG`, default `info`). |
 
 ### 4.2 Config file reference
@@ -161,7 +161,7 @@ setting covers that range, `[privacy] mode` in the config file or
 
 | Mode | What can leave the agent |
 |---|---|
-| `full` | Everything: the event export unredacted, and the raw dump of every payload with TLS decrypted (§5.5). |
+| `full` | Everything: the event export unredacted (protocol login secrets excepted, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
 | `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
 | `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols. |
 
@@ -173,6 +173,8 @@ the agent at startup with a message saying why:
   `[otlp] enabled` in `metrics_only`;
 - `redacted` with `[pii] enabled = false` or `regex_enabled = false` (nothing
   would be masked);
+- the external PII service in any mode other than `full` (it is sent raw
+  values);
 - `[pii] redact = false` outside `full`. `redact` otherwise follows the mode
   and is best left out. The one combination kept from before the mode
   existed: `redact = true` with `mode = "full"` keeps the event export
@@ -182,16 +184,20 @@ the agent at startup with a message saying why:
 `redacted` → `metrics_only`: exports stop at once, files already written are
 left as they are). It cannot make it wider: a reload asking for a wider mode
 is rejected with an error and the running config is kept; restart the agent
-to widen it. `--privacy-mode` keeps overriding the file on reload.
+to widen it. A reload from `full` to `redacted` is rejected the same way when
+the agent was started without regex PII detection (`[pii] enabled` or
+`regex_enabled` off): it has no redactor to switch on, so restart it. `--privacy-mode` keeps overriding the file on reload.
 
-In `full` mode the agent logs a warning at startup that decrypted payloads
-are being written unredacted. The JSON export, the PII audit log and the raw dump are created
+In `full` mode the agent prints a warning at startup, on stderr and in the
+log (so `RUST_LOG=error` cannot hide it), that decrypted payloads are being
+written unredacted. The JSON export, the PII audit log and the raw dump are created
 readable by their owner only (`0600`). In `redacted` and `metrics_only`,
 panic messages (which can quote the data being processed) are reduced to
 where the panic happened.
 
 Each mode is checked against ground truth: `tests/oracle/run_modes.sh`
-plants unique PII values in HTTP and HTTPS traffic and searches every output
+plants unique PII values and credentials in HTTP, HTTPS, Redis and Kafka
+traffic and searches every output
 (export, raw dump, pcap, audit log, agent log at debug level, `/metrics`,
 `/debug/state`) for them; results are in [`CURRENT-STATE.md`](CURRENT-STATE.md).
 
@@ -295,28 +301,44 @@ exported:
 
 - the **path and query string** are scanned (also in percent-decoded form) and
   matches replaced by `<CATEGORY>`, e.g. `<EMAIL>`;
-- **HTTP header values** are scanned the same way, and credential headers
-  (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
-  `X-Api-Key`, `X-Auth-Token`, `X-Amz-Security-Token`) are replaced entirely
-  by `<REDACTED>`;
-- the **request body** (e.g. POST JSON or form data) and the **response
-  body** are scanned and redacted.
+- **header names and values** are scanned the same way, for every protocol
+  (HTTP headers, gRPC metadata, Kafka `client_id`, AMQP consumer tags,
+  routing keys and reply texts). HTTP, HTTP/2 and gRPC credential headers are
+  replaced entirely by `<REDACTED>`: any header whose lowercased name contains
+  `token`, `auth`, `key`, `secret`, `session`, `csrf`, `xsrf`, `signature`,
+  `password`, `passwd`, `cookie` or `credential` (so `Authorization`,
+  `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Vault-Token`, `PRIVATE-TOKEN`,
+  `X-Goog-Api-Key`, `X-Hub-Signature-256`, ...). `:authority` and
+  `Sec-WebSocket-Key` stay readable;
+- the **method** (including a gRPC method path), the **content type**, the
+  **request body** (e.g. POST JSON or form data) and the **response body**
+  are scanned and redacted;
+- **credentials** are masked in every field whatever the protocol: the value
+  after `PASSWORD`, `IDENTIFIED BY`, `requirepass`, `masterauth` or
+  `password=` / `"password":`, and the arguments of a Redis `AUTH`.
+
+Login secrets are masked by the protocol parsers themselves, so they reach
+no sink in any privacy mode, `full` included: Redis `AUTH`, `HELLO … AUTH`,
+`MIGRATE … AUTH`/`AUTH2`, `CONFIG SET requirepass|masterauth|masteruser` and
+`ACL SETUSER` password rules; SQL `PASSWORD '…'` and `IDENTIFIED BY '…'`
+clauses (PostgreSQL, MySQL); the AMQP and Kafka SASL exchanges. Only the raw
+dump (`full` mode, §5.5) keeps them.
 
 Detection is pattern-based. It will miss PII that does not match a pattern
 (names, free-text addresses), a bare phone or passport number with no keyword
 before it (e.g. in a positional SQL `VALUES` list), and anything past
 `max_body_bytes`. It flags every IPv4 address and PAN-shaped product codes.
 Treat the exports as sensitive anyway.
-Header values are scanned for HTTP, HTTP/2 and gRPC only; other protocols'
-metadata (e.g. Kafka or AMQP headers) is exported as parsed. If what the
-patterns miss must not leave the node, use `metrics_only`.
+A password bound as a prepared-statement parameter (`ALTER ROLE … PASSWORD $1`)
+is not recognised as one. If what the patterns miss must not leave the node,
+use `metrics_only`.
 
 ### 5.4 Metrics and endpoints (`--metrics-bind`)
 
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | 200 while the process is up (liveness) |
-| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown |
+| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown. The body also counts caught worker panics, if any |
 | `/metrics` | Prometheus text format |
 | `/debug/state` | JSON counters (no traffic content) |
 
@@ -328,6 +350,7 @@ patterns miss must not leave the node, use `metrics_only`.
 | `panopticon_drops_rate_limit_total` | Over `max_events_per_sec` |
 | `panopticon_kernel_ringbuf_drops_total` | Lost in the kernel: the agent did not drain the ring buffer fast enough. Give it more CPU |
 | `panopticon_drops_channel_full_total` | Parser workers falling behind (bursts or too little CPU) |
+| `panopticon_worker_panics_total` | Parser or PII steps that panicked on captured data. The step is skipped (a parser panic closes that connection) and the worker keeps running. Any increase is a bug: please report it |
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
@@ -348,14 +371,15 @@ reported, capture the raw bytes. This needs privacy mode `full` (§4.3):
 > exactly as sent: passwords, session tokens, API keys and personal data,
 > and for TLS connections captured through OpenSSL or Go the **decrypted**
 > plaintext. Anyone who can read the file, or the pcap made from it, can
-> read that traffic. The agent warns at startup whenever mode `full` is on.
+> read that traffic. The agent warns at startup whenever mode `full` is on,
+> and decoding a capture needs `--privacy-mode full` too.
 
 ```bash
 sudo panopticon-agent --privacy-mode full --capture-raw /var/lib/panopticon/raw.pncap
 # later, anywhere, without root:
-panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
+panopticon-agent --privacy-mode full --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
 # or, for Wireshark / tshark:
-panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap --pcap raw.pcap
+panopticon-agent --privacy-mode full --decode-capture /var/lib/panopticon/raw.pncap --pcap raw.pcap
 ```
 
 **Opening it in Wireshark.** `wireshark raw.pcap` (or `tshark -r raw.pcap`)

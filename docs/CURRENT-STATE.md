@@ -25,8 +25,11 @@ production-hardened compliance platform.
   every request that carried it, and no raw PII values in the export
   (`tests/oracle/run_protocols.sh`).
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
-  `redacted`, `metrics_only`) are checked with planted PII in HTTP and
-  OpenSSL TLS traffic, searched for in every output (export, raw dump and
+  `redacted`, `metrics_only`) are checked with planted PII and credentials
+  in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
+  Content-Type parameter, an X-Vault-Token, a JWT behind an overlapping
+  `access_token=`) and in Redis AUTH / HELLO AUTH and Kafka client ids,
+  searched for in every output (export, raw dump and
   its pcap conversion, audit log, agent log at debug level, `/metrics`,
   `/debug/state`): values appear only where the mode allows, recall 100%
   (`tests/oracle/run_modes.sh`, kernel 7.0).
@@ -101,9 +104,11 @@ production-hardened compliance platform.
     payloads produce a finding, down from 54%. Remaining misses are numbers
     with no context; see `BENCHMARKS.md` §3.
   - ONNX-backed ML inference is optional and throughput-sensitive.
-  - In `redacted` mode, header values are scanned for HTTP, HTTP/2 and gRPC
-    only; other protocols' metadata is exported as parsed. The leak test
-    covers HTTP and OpenSSL TLS, not the database or messaging protocols.
+  - In `redacted` mode, header names and values are scanned for every
+    protocol, and credentials (credential-named HTTP headers, Redis `AUTH`,
+    SQL password clauses) are masked. The leak test covers HTTP, OpenSSL
+    TLS, Redis AUTH and Kafka client ids; SQL password clauses and AMQP
+    metadata are covered by unit tests only.
 - Service graphing:
   - DNS/IP-based identity works.
   - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,

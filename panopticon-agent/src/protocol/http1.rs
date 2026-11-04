@@ -377,7 +377,7 @@ impl Http1Parser {
 
             let chunk_size = match usize::from_str_radix(size_str, 16) {
                 Ok(n) => n,
-                Err(_) => return ChunkResult::Error(format!("invalid chunk size: {size_str}")),
+                Err(_) => return ChunkResult::Error("invalid chunk size".into()),
             };
 
             // Last chunk (size=0)
@@ -395,7 +395,7 @@ impl Http1Parser {
             // chunk_size is peer-controlled: a size like FFFFFFFFFFFFFFFF must
             // not overflow (debug panic / release wrap + slice panic).
             let Some(total) = chunk_size.checked_add(crlf_pos + 4) else {
-                return ChunkResult::Error(format!("chunk size overflow: {size_str}"));
+                return ChunkResult::Error("chunk size overflow".into());
             };
             if data.len() < total {
                 return ChunkResult::NeedMoreData;
@@ -677,6 +677,18 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n";
         // Must not panic (previously integer overflow / out-of-bounds slice).
         let _ = parser.feed(resp, Direction::Ingress, 2000);
+    }
+
+    #[test]
+    fn test_parse_errors_do_not_quote_input() {
+        // Errors are logged: they must not carry captured bytes.
+        let mut parser = Http1Parser::new();
+        parser.feed(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", Direction::Egress, 1);
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nssn=123-45-6789\r\nx\r\n";
+        match parser.feed(resp, Direction::Ingress, 2) {
+            ParseResult::Error(e) => assert!(!e.contains("123-45"), "{e}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]

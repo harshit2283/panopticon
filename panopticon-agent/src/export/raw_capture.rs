@@ -11,11 +11,9 @@
 //!   `orig_len` in each record says how large the original was.
 //!
 //! `decode_to_jsonl` turns a capture into JSON lines (metadata + base64
-//! payload); exposed as `panopticon-agent --decode-capture <FILE>`.
+//! payload); exposed as `panopticon-agent --privacy-mode full --decode-capture <FILE>`.
 
-use std::fs::{OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -80,16 +78,7 @@ pub fn spawn(
     queue_capacity: usize,
     start_timestamp_ns: u64,
 ) -> Result<(RawCaptureHandle, JoinHandle<()>)> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("failed to open raw capture file {path}"))?;
-    // `mode` only applies on creation; tighten a pre-existing file too.
-    std::fs::set_permissions(path, Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to restrict permissions on {path}"))?;
+    let file = super::open_private(path, false).context("raw capture file")?;
     let writer = CaptureWriter::new(file, start_timestamp_ns)
         .with_context(|| format!("failed to write capture header to {path}"))?;
 
@@ -215,6 +204,7 @@ pub fn decode_to_jsonl<R: io::Read, W: Write>(input: R, mut out: W) -> Result<u6
 mod tests {
     use super::*;
     use panopticon_common::{Direction, EventType, TlsLibrary};
+    use std::os::unix::fs::PermissionsExt;
 
     fn event(payload: &[u8], orig_len: u32) -> DataEvent {
         let mut e: DataEvent = unsafe { std::mem::zeroed() };
