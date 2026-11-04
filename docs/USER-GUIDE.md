@@ -337,7 +337,7 @@ use `metrics_only`.
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | 200 while the process is up (liveness) |
-| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown |
+| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown. The body also counts caught worker panics, if any |
 | `/metrics` | Prometheus text format |
 | `/debug/state` | JSON counters (no traffic content) |
 
@@ -349,6 +349,7 @@ use `metrics_only`.
 | `panopticon_drops_rate_limit_total` | Over `max_events_per_sec` |
 | `panopticon_kernel_ringbuf_drops_total` | Lost in the kernel: the agent did not drain the ring buffer fast enough. Give it more CPU |
 | `panopticon_drops_channel_full_total` | Parser workers falling behind (bursts or too little CPU) |
+| `panopticon_worker_panics_total` | Parser or PII steps that panicked on captured data. The step is skipped (a parser panic closes that connection) and the worker keeps running. Any increase is a bug: please report it |
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
