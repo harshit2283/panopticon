@@ -17,10 +17,9 @@ use aya::maps::perf::PerfEventArrayBuffer;
 use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
+use panopticon_common::{DataEvent, Direction, EventType};
 #[cfg(target_os = "linux")]
-use panopticon_common::{
-    DataEvent, Direction, EventType, TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes,
-};
+use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]

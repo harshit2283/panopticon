@@ -65,11 +65,12 @@ flate2 = { version = "1", optional = true }
 snap = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
 
+libc = { workspace = true }
+
 # Linux-only dependencies (aya doesn't compile on macOS)
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
 aya-log = { workspace = true }
-libc = { workspace = true }
 # Adds the `user` feature (aya::Pod impls + utility methods) only on Linux.
 # On macOS the base dep above is used without `user`, avoiding the aya transitive dep.
 panopticon-common = { path = "../panopticon-common", features = ["user"] }

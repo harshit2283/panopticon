@@ -202,22 +202,21 @@ pub struct ConnInfo {
 
 // ── Pod Impls (user-space only) ────────────────────────────────────────────
 
-#[cfg(feature = "user")]
 // SAFETY: DataEvent is #[repr(C)], Copy, contains no pointers.
 // Explicit `_pad` field is zeroed by producers. Verified by ABI tests.
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for DataEvent {}
 
-#[cfg(feature = "user")]
 // SAFETY: ProcessEvent is #[repr(C)], Copy, no pointers.
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for ProcessEvent {}
 
-#[cfg(feature = "user")]
 // SAFETY: ConnInfo is #[repr(C)], Copy, no pointers.
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for ConnInfo {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 
-#[cfg(feature = "user")]
 impl DataEvent {
     /// Returns the valid payload slice, clamped to `MAX_PAYLOAD_SIZE`.
     pub fn payload_bytes(&self) -> &[u8] {
@@ -231,7 +230,6 @@ impl DataEvent {
     }
 }
 
-#[cfg(feature = "user")]
 impl ProcessEvent {
     /// Returns the process comm as a UTF-8 string, truncated at the first
     /// null byte. Returns `"<invalid>"` if the bytes aren't valid UTF-8.
@@ -245,7 +243,6 @@ impl ProcessEvent {
     }
 }
 
-#[cfg(feature = "user")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawDataEvent {
@@ -269,7 +266,6 @@ struct RawDataEvent {
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
-#[cfg(feature = "user")]
 impl RawDataEvent {
     fn to_data_event(self) -> Option<DataEvent> {
         Some(DataEvent {
@@ -297,7 +293,6 @@ impl RawDataEvent {
 /// Parse a `DataEvent` from raw bytes and validate enum fields.
 ///
 /// Returns `None` if the byte length is wrong or enum discriminants are invalid.
-#[cfg(feature = "user")]
 pub fn parse_data_event_bytes(bytes: &[u8]) -> Option<DataEvent> {
     if bytes.len() != core::mem::size_of::<RawDataEvent>() {
         return None;
