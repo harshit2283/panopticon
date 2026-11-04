@@ -66,15 +66,29 @@ struct Args {
           value_parser = ["auto", "true", "false"])]
     kubernetes: Option<String>,
 
-    /// Write every captured event, UNREDACTED, to this file (PNCAP format,
-    /// owner-only permissions, truncated at start). Decode with --decode-capture.
+    /// What captured data may leave the agent: `full` (unredacted export and
+    /// raw dump allowed), `redacted` (PII masked; default) or `metrics_only`
+    /// (metrics, service map and PII audit only). Overrides `[privacy] mode`.
+    #[arg(long, env = "PANOPTICON_PRIVACY_MODE", value_name = "full|redacted|metrics_only",
+          value_parser = config::PrivacyMode::NAMES)]
+    privacy_mode: Option<String>,
+
+    /// Write every captured event, UNREDACTED, including decrypted TLS, to
+    /// this file (PNCAP format, owner-only permissions, truncated at start).
+    /// Needs --privacy-mode full. Decode with --decode-capture.
     #[arg(long, value_name = "FILE")]
     capture_raw: Option<String>,
 
     /// Print a raw capture file as JSON lines (metadata + base64 payload), then exit.
+    /// With --pcap, write a Wireshark-readable pcap file instead.
     /// Needs no privileges.
     #[arg(long, value_name = "FILE")]
     decode_capture: Option<String>,
+
+    /// With --decode-capture: write the capture to this classic pcap file
+    /// (raw IPv4, synthesized TCP/UDP headers) for Wireshark or tshark.
+    #[arg(long, value_name = "OUT", requires = "decode_capture")]
+    pcap: Option<String>,
 
     /// Benchmark: run a raw capture file (from --capture-raw) through one
     /// worker's parse/PII/graph/export path as fast as possible, print the
@@ -93,6 +107,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    #[cfg(unix)]
+    if let (Some(input), Some(out)) = (&args.decode_capture, &args.pcap) {
+        let (records, skipped) = export::pcap::convert_file(input, out)?;
+        eprintln!("wrote {records} packets to {out} ({skipped} events without payload skipped)");
+        return Ok(());
+    }
 
     #[cfg(unix)]
     if let Some(ref path) = args.decode_capture {
@@ -177,6 +198,24 @@ async fn main() -> Result<()> {
         }
         if let Some(ref path) = args.capture_raw {
             agent_config.capture_raw_path = Some(path.clone());
+        }
+        let cli_privacy = args
+            .privacy_mode
+            .as_deref()
+            .and_then(config::PrivacyMode::parse);
+        if let Some(mode) = cli_privacy {
+            agent_config.privacy_mode = mode;
+        }
+        // After every override: nothing may contradict the privacy mode.
+        config::apply_privacy(&mut agent_config)?;
+        let privacy_mode = agent_config.privacy_mode;
+        info!(mode = %privacy_mode, "Privacy mode");
+        if privacy_mode == config::PrivacyMode::Full {
+            tracing::warn!(
+                "PRIVACY MODE FULL: captured payloads, including DECRYPTED TLS traffic, \
+                 credentials and personal data, are written UNREDACTED to the configured \
+                 export and dump files. Restrict access to them and delete them when done."
+            );
         }
         if let Some(ref path) = args.replay_bench {
             return replay_bench(&agent_config, path).await;
@@ -350,6 +389,27 @@ async fn main() -> Result<()> {
             pii_audit_log,
             graph_builder,
         );
+        let privacy = Arc::clone(event_loop.privacy());
+
+        // A panic message can quote the data being processed (e.g. a string
+        // slice out of a payload): print only where it happened unless the
+        // mode allows raw payloads anyway.
+        let default_hook = std::panic::take_hook();
+        let panic_privacy = Arc::clone(&privacy);
+        std::panic::set_hook(Box::new(move |info| {
+            let mode = panic_privacy.get();
+            if mode == config::PrivacyMode::Full {
+                default_hook(info);
+            } else {
+                let at = info
+                    .location()
+                    .map_or_else(|| "unknown location".to_string(), |l| l.to_string());
+                eprintln!(
+                    "thread panicked at {at} (message withheld in privacy mode {mode}: \
+                     it may quote captured data)"
+                );
+            }
+        }));
 
         // 7b. Raw capture (unredacted): opt-in only, loudly.
         let (event_loop, raw_capture) = match &agent_config.capture_raw_path {
@@ -424,8 +484,36 @@ async fn main() -> Result<()> {
             loop {
                 sig.recv().await;
                 if let Some(ref path) = config_path_for_reload {
-                    match config::load_config(path) {
+                    let reloaded = config::load_config(path).and_then(|mut c| {
+                        // --privacy-mode keeps overriding the file.
+                        if let Some(mode) = cli_privacy {
+                            c.privacy_mode = mode;
+                        }
+                        config::apply_privacy(&mut c)?;
+                        Ok(c)
+                    });
+                    match reloaded {
                         Ok(new_config) => {
+                            // The privacy mode may only get stricter at
+                            // runtime; widening it needs a restart.
+                            let current = privacy.get();
+                            let requested = new_config.privacy_mode;
+                            if !privacy.tighten(requested) {
+                                tracing::error!(
+                                    current = %current,
+                                    requested = %requested,
+                                    "Config reload rejected: a wider privacy mode needs a \
+                                     restart; keeping the current config"
+                                );
+                                continue;
+                            }
+                            if requested != current {
+                                tracing::warn!(
+                                    from = %current,
+                                    to = %requested,
+                                    "Privacy mode tightened at runtime"
+                                );
+                            }
                             info!(path = %path, "Config reloaded via SIGHUP");
                             config_swap.store(Arc::new(new_config));
                             // TODO: sync runtime-tunable fields to eBPF CONFIG map
@@ -612,6 +700,30 @@ mod tests {
         let args = Args::parse_from(["panopticon-agent", "--kubernetes", "false"]);
         assert_eq!(args.kubernetes.as_deref(), Some("false"));
         assert!(Args::try_parse_from(["panopticon-agent", "--kubernetes", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_privacy_mode() {
+        let args = Args::parse_from(["panopticon-agent"]);
+        assert!(args.privacy_mode.is_none());
+        for mode in ["full", "redacted", "metrics_only"] {
+            let args = Args::parse_from(["panopticon-agent", "--privacy-mode", mode]);
+            assert_eq!(args.privacy_mode.as_deref(), Some(mode));
+        }
+        assert!(Args::try_parse_from(["panopticon-agent", "--privacy-mode", "all"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_pcap_requires_decode_capture() {
+        assert!(Args::try_parse_from(["panopticon-agent", "--pcap", "out.pcap"]).is_err());
+        let args = Args::parse_from([
+            "panopticon-agent",
+            "--decode-capture",
+            "dump.pncap",
+            "--pcap",
+            "out.pcap",
+        ]);
+        assert_eq!(args.pcap.as_deref(), Some("out.pcap"));
     }
 
     #[test]

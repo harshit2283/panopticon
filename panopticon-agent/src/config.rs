@@ -15,6 +15,80 @@ pub enum SamplingMode {
     HeadOnly { max_bytes: usize },
 }
 
+/// What captured data may leave the agent: the one data-handling setting.
+///
+/// Ordered from strictest to widest, so `a < b` means `a` is stricter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// Only metrics, the service map (service names and protocols) and the
+    /// PII audit log (type, never value). No per-request export, no raw dump,
+    /// no payload-derived strings in any sink or in logs at info and above.
+    MetricsOnly = 0,
+    /// Per-request export with every detected PII value masked (default).
+    Redacted = 1,
+    /// Unredacted export and the raw (decrypted) payload dump are allowed.
+    Full = 2,
+}
+
+impl PrivacyMode {
+    pub const NAMES: [&'static str; 3] = ["full", "redacted", "metrics_only"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MetricsOnly => "metrics_only",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "metrics_only" => Some(Self::MetricsOnly),
+            "redacted" => Some(Self::Redacted),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::MetricsOnly,
+            1 => Self::Redacted,
+            _ => Self::Full,
+        }
+    }
+}
+
+impl std::fmt::Display for PrivacyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The privacy mode in effect, shared by every worker. It can only become
+/// stricter at runtime; widening it needs a restart.
+#[derive(Debug)]
+pub struct PrivacyGate(std::sync::atomic::AtomicU8);
+
+impl PrivacyGate {
+    pub fn new(mode: PrivacyMode) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(mode as u8))
+    }
+
+    pub fn get(&self) -> PrivacyMode {
+        PrivacyMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Switch to `mode` if it is at least as strict as the current one.
+    /// Returns false (and changes nothing) for a wider mode.
+    pub fn tighten(&self, mode: PrivacyMode) -> bool {
+        self.0
+            .fetch_min(mode as u8, std::sync::atomic::Ordering::Relaxed)
+            >= mode as u8
+    }
+}
+
 /// Agent configuration controlling resource usage, capture behavior, and export.
 ///
 /// Synced to the eBPF CONFIG array map on startup and config reload.
@@ -52,6 +126,15 @@ pub struct AgentConfig {
     pub tls_scan_enabled: bool,
     /// Interval between full /proc rescans.
     pub tls_scan_interval: Duration,
+
+    // ── Privacy ───────────────────────────────────
+    /// What captured data may leave the agent (`[privacy] mode`).
+    /// `apply_privacy` derives `pii.redact` from it and rejects settings
+    /// that contradict it.
+    pub privacy_mode: PrivacyMode,
+    /// `[pii] redact` as written in the config file, if it was. Only checked
+    /// against `privacy_mode`; redaction itself follows the mode.
+    pub pii_redact_setting: Option<bool>,
 
     // ── PII detection ─────────────────────────────
     /// PII detection pipeline configuration.
@@ -131,6 +214,9 @@ impl Default for AgentConfig {
             tls_scan_enabled: true,
             tls_scan_interval: Duration::from_secs(60),
 
+            privacy_mode: PrivacyMode::Redacted,
+            pii_redact_setting: None,
+
             pii: PiiConfig::default(),
             pii_external_url_allowlist: vec![],
 
@@ -202,7 +288,8 @@ pub struct PiiConfig {
     pub regex_enabled: bool,
     /// PII detection mode (ML, external service, or disabled).
     pub mode: PiiMode,
-    /// Replace detected PII with `<CATEGORY>` placeholders.
+    /// Replace detected PII with `<CATEGORY>` placeholders. Derived from
+    /// `privacy_mode` by `apply_privacy` (false only in `full`).
     pub redact: bool,
     /// Minimum confidence threshold for detected entities.
     pub min_confidence: f32,
@@ -304,6 +391,7 @@ pub struct AgentConfigFile {
     pub sample_rate: Option<f64>,
     pub tls_scan_enabled: Option<bool>,
     pub tls_scan_interval_secs: Option<u64>,
+    pub privacy: Option<PrivacyConfigFile>,
     pub pii: Option<PiiConfigFile>,
     pub pii_external_url_allowlist: Option<Vec<String>>,
     pub graph: Option<GraphConfigFile>,
@@ -317,6 +405,14 @@ pub struct AgentConfigFile {
     pub capture_raw_path: Option<String>,
     pub capture_raw_max_bytes: Option<u64>,
     pub max_body_bytes: Option<usize>,
+}
+
+/// `[privacy]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfigFile {
+    /// `"full"`, `"redacted"` or `"metrics_only"`.
+    pub mode: Option<PrivacyMode>,
 }
 
 /// TOML-friendly PII config subset.
@@ -431,7 +527,13 @@ impl AgentConfigFile {
         if let Some(v) = self.tls_scan_interval_secs {
             base.tls_scan_interval = Duration::from_secs(v);
         }
+        if let Some(mode) = self.privacy.and_then(|p| p.mode) {
+            base.privacy_mode = mode;
+        }
         if let Some(pii) = self.pii {
+            if pii.redact.is_some() {
+                base.pii_redact_setting = pii.redact;
+            }
             pii.merge_into(&mut base.pii);
         }
         if let Some(v) = self.pii_external_url_allowlist {
@@ -573,6 +675,78 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Make the config obey its privacy mode. Call once the config file and the
+/// CLI overrides have both been applied (before anything is opened).
+///
+/// Sets `pii.redact` from the mode and fails with a clear message on any
+/// setting that would contradict it, so the mode is the only thing a reader
+/// of the config has to check.
+pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
+    let mode = config.privacy_mode;
+    let redact = mode != PrivacyMode::Full;
+    if let Some(setting) = config.pii_redact_setting
+        && setting != redact
+    {
+        anyhow::bail!(
+            "[pii] redact = {setting} contradicts [privacy] mode = \"{mode}\", which {}. \
+             Remove `redact`: the privacy mode decides redaction{}",
+            if redact {
+                "redacts PII"
+            } else {
+                "exports unredacted"
+            },
+            if redact {
+                " (use mode = \"full\" for unredacted export)"
+            } else {
+                ""
+            }
+        );
+    }
+    config.pii.redact = redact;
+
+    if mode != PrivacyMode::Full && config.capture_raw_path.is_some() {
+        anyhow::bail!(
+            "capture_raw_path / --capture-raw writes every payload, including decrypted TLS, \
+             unredacted; it needs [privacy] mode = \"full\" (--privacy-mode full), \
+             but the mode is \"{mode}\""
+        );
+    }
+    match mode {
+        PrivacyMode::MetricsOnly => {
+            for (enabled, setting) in [
+                (
+                    config.json_export_path.is_some(),
+                    "json_export_path / --json-export",
+                ),
+                (config.otlp.enabled, "[otlp] enabled"),
+                (config.log_events, "log_events / --log-events"),
+                (
+                    matches!(config.pii.mode, PiiMode::External { .. }),
+                    "external PII service",
+                ),
+            ] {
+                if enabled {
+                    anyhow::bail!(
+                        "{setting} sends per-request data off the node, which \
+                         [privacy] mode = \"metrics_only\" does not allow"
+                    );
+                }
+            }
+        }
+        PrivacyMode::Redacted => {
+            if !config.pii.enabled || !config.pii.regex_enabled {
+                anyhow::bail!(
+                    "[privacy] mode = \"redacted\" needs PII detection ([pii] enabled = true and \
+                     regex_enabled = true): without it nothing would be masked. Use \
+                     mode = \"full\" to export unredacted, or \"metrics_only\""
+                );
+            }
+        }
+        PrivacyMode::Full => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +816,9 @@ mod tests {
             metrics_bind = "0.0.0.0:9090"
             map_pin_path = "/sys/fs/bpf/panopticon"
 
+            [privacy]
+            mode = "full"
+
             [otlp]
             enabled = true
             endpoint = "http://collector:4317"
@@ -665,7 +842,9 @@ mod tests {
             watch = false
         "#;
 
-        let config = load_config_from_str(toml).unwrap();
+        let mut config = load_config_from_str(toml).unwrap();
+        apply_privacy(&mut config).unwrap();
+        assert_eq!(config.privacy_mode, PrivacyMode::Full);
         assert!(!config.capture_enabled);
         assert_eq!(config.interfaces, vec!["wlan0", "eth1"]);
         assert_eq!(config.max_events_per_sec, 100_000);
@@ -790,6 +969,95 @@ mod tests {
         "#;
         let err = load_config_from_str(toml).unwrap_err().to_string();
         assert!(err.contains("sample_rate must be between 0.0 and 1.0"));
+    }
+
+    fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {
+        let mut config = load_config_from_str(toml)?;
+        apply_privacy(&mut config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn test_privacy_mode_default_and_values() {
+        let config = privacy("").unwrap();
+        assert_eq!(config.privacy_mode, PrivacyMode::Redacted);
+        assert!(config.pii.redact);
+        for name in PrivacyMode::NAMES {
+            let config = privacy(&format!("[privacy]\nmode = \"{name}\"\n")).unwrap();
+            assert_eq!(config.privacy_mode.as_str(), name);
+            assert_eq!(PrivacyMode::parse(name), Some(config.privacy_mode));
+            assert_eq!(config.pii.redact, name != "full", "{name}");
+        }
+        assert!(load_config_from_str("[privacy]\nmode = \"everything\"\n").is_err());
+    }
+
+    #[test]
+    fn test_privacy_redact_must_agree_with_mode() {
+        // Agreeing legacy settings are accepted.
+        assert!(privacy("[pii]\nredact = true\n").is_ok());
+        assert!(privacy("[privacy]\nmode = \"full\"\n[pii]\nredact = false\n").is_ok());
+        let err = privacy("[pii]\nredact = false\n").unwrap_err().to_string();
+        assert!(
+            err.contains("contradicts") && err.contains("redacted"),
+            "{err}"
+        );
+        let err = privacy("[privacy]\nmode = \"full\"\n[pii]\nredact = true\n").unwrap_err();
+        assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    #[test]
+    fn test_privacy_raw_capture_needs_full() {
+        for mode in ["redacted", "metrics_only"] {
+            let toml = format!("capture_raw_path = \"/tmp/x\"\n[privacy]\nmode = \"{mode}\"\n");
+            let err = privacy(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("capture_raw_path") && err.contains(mode),
+                "{err}"
+            );
+        }
+        assert!(privacy("capture_raw_path = \"/tmp/x\"\n[privacy]\nmode = \"full\"\n").is_ok());
+        // A CLI override applied after the file is checked the same way.
+        let mut config = load_config_from_str("").unwrap();
+        config.capture_raw_path = Some("/tmp/x".into());
+        assert!(apply_privacy(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_privacy_metrics_only_rejects_event_sinks() {
+        let base = "\n[privacy]\nmode = \"metrics_only\"\n";
+        assert!(privacy(&format!("pii_audit_log_path = \"/tmp/a\"\n{base}")).is_ok());
+        for (extra, what) in [
+            ("json_export_path = \"/tmp/e\"\n", "json_export_path"),
+            ("log_events = true\n", "log_events"),
+            ("[otlp]\nenabled = true\n", "otlp"),
+        ] {
+            let err = privacy(&format!("{extra}{base}")).unwrap_err().to_string();
+            assert!(err.contains(what) && err.contains("metrics_only"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_privacy_redacted_needs_pii_detection() {
+        for extra in ["enabled = false", "regex_enabled = false"] {
+            let err = privacy(&format!("[pii]\n{extra}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("redacted"), "{err}");
+            let ok = format!("[privacy]\nmode = \"metrics_only\"\n[pii]\n{extra}\n");
+            assert!(privacy(&ok).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_privacy_gate_only_tightens() {
+        let gate = PrivacyGate::new(PrivacyMode::Redacted);
+        assert!(!gate.tighten(PrivacyMode::Full));
+        assert_eq!(gate.get(), PrivacyMode::Redacted);
+        assert!(gate.tighten(PrivacyMode::Redacted));
+        assert!(gate.tighten(PrivacyMode::MetricsOnly));
+        assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
+        assert!(!gate.tighten(PrivacyMode::Redacted));
+        assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
     }
 
     #[test]

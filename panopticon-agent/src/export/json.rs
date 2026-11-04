@@ -186,14 +186,20 @@ pub struct JsonExporter {
 
 impl JsonExporter {
     /// Create a new exporter writing to the given path.
-    /// Creates or truncates the file.
+    /// Creates or truncates the file, owner-only (0600) on Unix: in `full`
+    /// privacy mode it holds unredacted payloads.
     pub fn new(path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(path)
             .with_context(|| format!("Failed to open JSON export file: {}", path))?;
+        // `mode` only applies on creation; tighten a pre-existing file too.
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .with_context(|| format!("Failed to restrict permissions on {path}"))?;
         Ok(Self {
             writer: BufWriter::new(file),
             k8s: None,
@@ -383,6 +389,19 @@ mod tests {
             server_pid: None,
             tls_library: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_export_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("panopticon_json_{}", std::process::id()));
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        JsonExporter::new(path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

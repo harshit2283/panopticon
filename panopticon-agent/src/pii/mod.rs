@@ -304,6 +304,12 @@ impl PiiEngine {
 
     /// Scan text for PII. Returns None if PII detection is disabled or no PII found.
     pub fn scan(&self, text: &str) -> Option<PiiReport> {
+        self.scan_with(text, self.config.redact)
+    }
+
+    /// [`scan`](Self::scan) with redaction decided by the caller (the
+    /// privacy mode in effect) instead of the engine's config.
+    pub fn scan_with(&self, text: &str, redact_enabled: bool) -> Option<PiiReport> {
         if !self.config.enabled || text.is_empty() {
             return None;
         }
@@ -332,7 +338,7 @@ impl PiiEngine {
             return None;
         }
 
-        let redacted_text = if self.config.redact {
+        let redacted_text = if redact_enabled {
             Some(redact(text, &entities))
         } else {
             None
@@ -354,10 +360,19 @@ impl PiiEngine {
     /// Entity offsets in the returned report are relative to the field they
     /// were found in. `redacted_text` is the redacted payload, if any.
     pub fn scan_message(&self, msg: &mut L7Message) -> Option<PiiReport> {
+        self.scan_message_with(msg, self.config.redact)
+    }
+
+    /// [`scan_message`](Self::scan_message) with redaction decided by the
+    /// caller (the privacy mode in effect).
+    pub fn scan_message_with(
+        &self,
+        msg: &mut L7Message,
+        redact_enabled: bool,
+    ) -> Option<PiiReport> {
         if !self.config.enabled {
             return None;
         }
-        let redact_enabled = self.config.redact;
         let mut entities = Vec::new();
         let mut scanned_bytes = 0;
 
@@ -365,7 +380,7 @@ impl PiiEngine {
             // Query strings are usually percent-encoded (alice%40example.com),
             // which the regexes would miss: scan the decoded form.
             let decoded = percent_decode(path);
-            if let Some(mut report) = self.scan(&decoded) {
+            if let Some(mut report) = self.scan_with(&decoded, redact_enabled) {
                 scanned_bytes += report.scanned_bytes;
                 if let Some(redacted) = report.redacted_text.take() {
                     path.zeroize();
@@ -385,7 +400,7 @@ impl PiiEngine {
                     *value = REDACTED_CREDENTIAL.to_string();
                     continue;
                 }
-                if let Some(mut report) = self.scan(value) {
+                if let Some(mut report) = self.scan_with(value, redact_enabled) {
                     scanned_bytes += report.scanned_bytes;
                     if let Some(redacted) = report.redacted_text.take() {
                         value.zeroize();
@@ -397,7 +412,7 @@ impl PiiEngine {
         }
 
         if let Some(body) = msg.request_text.as_mut()
-            && let Some(mut report) = self.scan(body)
+            && let Some(mut report) = self.scan_with(body, redact_enabled)
         {
             scanned_bytes += report.scanned_bytes;
             if let Some(redacted) = report.redacted_text.take() {
@@ -409,7 +424,7 @@ impl PiiEngine {
 
         let mut redacted_payload = None;
         if let Some(text) = msg.payload_text.as_mut()
-            && let Some(mut report) = self.scan(text)
+            && let Some(mut report) = self.scan_with(text, redact_enabled)
         {
             scanned_bytes += report.scanned_bytes;
             if let Some(redacted) = report.redacted_text.take() {
