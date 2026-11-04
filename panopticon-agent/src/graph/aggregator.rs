@@ -176,26 +176,20 @@ impl EdgeAggregator {
 
     /// Swap out the current window and return all completed flows.
     pub fn flush(&self) -> Vec<AggregatedFlow> {
-        // Drain all entries from the current window
+        // Take and remove each entry under its shard's lock, so a record
+        // racing the flush lands either in this window or the next, never
+        // in neither. Every insert added one to `flows` under the same lock,
+        // so subtracting what was removed keeps the count exact.
         let mut flows = Vec::new();
-        let entries: Vec<_> = self
-            .current_window
-            .iter()
-            .map(|r| (r.key().clone(), r.value().clone()))
-            .collect();
-
-        // Reset before clear: a record racing the flush can then only
-        // overcount by the few entries `clear` removes (the cap triggers a
-        // few flows early). Resetting after would let a record between the
-        // two see the old count and an empty map, and fold a real flow into
-        // the overflow template.
-        self.flows.store(0, Ordering::Relaxed);
-        self.current_window.clear();
+        self.current_window.retain(|key, stats| {
+            flows.push(AggregatedFlow {
+                key: key.clone(),
+                stats: stats.clone(),
+            });
+            false
+        });
+        self.flows.fetch_sub(flows.len(), Ordering::Relaxed);
         self.window_start.store(now_epoch_ms(), Ordering::Relaxed);
-
-        for (key, stats) in entries {
-            flows.push(AggregatedFlow { key, stats });
-        }
         flows
     }
 
@@ -471,6 +465,56 @@ mod tests {
         fill(&agg);
         assert_eq!(agg.active_flows(), MAX_FLOWS_PER_WINDOW + 1);
         assert_eq!(agg.overflowed(), 1000);
+    }
+
+    #[test]
+    fn flush_racing_records_loses_nothing_and_keeps_count_exact() {
+        let agg = std::sync::Arc::new(make_aggregator());
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let agg = std::sync::Arc::clone(&agg);
+                std::thread::spawn(move || {
+                    for i in 0..20_000u32 {
+                        let path = format!("/t{t}/k{}", i % 500);
+                        agg.record(
+                            "a",
+                            "b",
+                            Protocol::Http1,
+                            Some("GET"),
+                            Some(&path),
+                            Some(200),
+                            None,
+                            0,
+                            0,
+                            false,
+                            1,
+                        );
+                    }
+                })
+            })
+            .collect();
+        let mut total = 0u64;
+        while !writers.iter().all(|w| w.is_finished()) {
+            total += agg
+                .flush()
+                .iter()
+                .map(|f| f.stats.request_count)
+                .sum::<u64>();
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        total += agg
+            .flush()
+            .iter()
+            .map(|f| f.stats.request_count)
+            .sum::<u64>();
+        assert_eq!(total, 80_000, "every record lands in exactly one window");
+        assert_eq!(
+            agg.flows.load(Ordering::Relaxed),
+            0,
+            "count matches the empty map"
+        );
     }
 
     fn make_aggregator() -> EdgeAggregator {
