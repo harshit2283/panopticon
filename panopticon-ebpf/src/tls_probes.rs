@@ -573,15 +573,13 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event)._pad = [0; 6];
         (*event).orig_len = len as u32;
 
-        // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE
-        let copy_len = if len > MAX_PAYLOAD_SIZE {
-            MAX_PAYLOAD_SIZE
-        } else {
-            len
-        };
+        // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE. The u32
+        // min (not an if/else) bounds both the signed and unsigned range, which
+        // the 5.15 verifier needs on the dead chunk paths it still walks.
+        let copy_len = (len as u32).min(MAX_PAYLOAD_SIZE as u32) as usize;
         (*event).payload_len = copy_len as u32;
 
-        if copy_len > 0 && copy_len <= MAX_PAYLOAD_SIZE {
+        if copy_len > 0 {
             let dst = core::slice::from_raw_parts_mut((*event).payload.as_mut_ptr(), copy_len);
             if bpf_probe_read_user_buf(buf, dst).is_err() {
                 (*event).payload_len = 0;
