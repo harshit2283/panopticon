@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Ground-truth leak test for the privacy modes (full, redacted, metrics_only).
 #
-# For each mode, one agent run sees two legs of traffic carrying planted,
-# unique PII values (in request bodies, query strings and a header):
-#   http  http_oracle.py over a veth pair, captured by TC (as run.sh)
-#   tls   http_oracle.py over TLS on loopback, captured by the OpenSSL
-#         uprobes (as run_tls.sh's openssl stack)
+# For each mode, one agent run sees three legs of traffic carrying planted,
+# unique PII values (in request bodies, query strings, headers and a
+# Content-Type parameter) and credentials (X-Vault-Token, a JWT after an
+# overlapping access_token=, Redis AUTH passwords):
+#   http   http_oracle.py over a veth pair, captured by TC (as run.sh)
+#   tls    http_oracle.py over TLS on loopback, captured by the OpenSSL
+#          uprobes (as run_tls.sh's openssl stack)
+#   proto  secrets_oracle.py over the veth: Redis AUTH / HELLO AUTH and Kafka
+#          ApiVersions with an email client id, against fake servers
 # The agent runs at debug level with every sink the mode allows: the export
 # (full, redacted), the raw dump (full; also converted to pcap), the PII
 # audit log and the HTTP endpoints (/metrics, /debug/state, scraped before
@@ -53,12 +57,14 @@ SPS=$!
 env TLS=1 HOST=127.0.0.1 TLS_CERT="$OUT/cert.pem" TLS_KEY="$OUT/key.pem" MODE=server \
   python3 -I "$HERE/http_oracle.py" "$TLS_PORT" &
 SPS="$SPS $!"
+MODE=server HOST=$HOST_IP python3 -I "$HERE/secrets_oracle.py" &
+SPS="$SPS $!"
 sleep 1
 
 status=0
 for mode in $MODES; do
   D=$OUT/$mode
-  mkdir -p "$D/http" "$D/tls"
+  mkdir -p "$D/http" "$D/tls" "$D/proto"
   args=(-v -i "$IFACE" --privacy-mode "$mode" --metrics-bind "$METRICS"
         --pii-audit-log "$D/audit.jsonl")
   [[ $mode != metrics_only ]] && args+=(--json-export "$D/agent.jsonl")
@@ -72,6 +78,8 @@ for mode in $MODES; do
     python3 -I "$HERE/http_oracle.py" "$HTTP_PORT" "$N" "$D/http/truth.jsonl"
   env PLANT=${mode}tls SSN_AREA=234 TLS=1 HOST=127.0.0.1 SEED=$SEED MODE=client \
     python3 -I "$HERE/http_oracle.py" "$TLS_PORT" "$N" "$D/tls/truth.jsonl"
+  PLANT=${mode}proto HOST=$HOST_IP nsenter --net=/var/run/netns/$NS \
+    python3 -I "$HERE/secrets_oracle.py" "$N" "$D/proto/truth.jsonl"
   sleep 12  # past one 10 s stats/graph flush, so its log line is checked too
   curl -sf "http://$METRICS/metrics" >"$D/metrics.txt" || echo "metrics scrape failed"
   curl -sf "http://$METRICS/debug/state" >"$D/debug_state.json" || echo "debug scrape failed"

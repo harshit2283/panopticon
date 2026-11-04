@@ -28,8 +28,12 @@ OUT = sys.argv[3] if len(sys.argv) > 3 else "truth.jsonl"
 SEED = int(os.environ.get("SEED", "1234"))
 TLS = os.environ.get("TLS") == "1"
 # PLANT=<tag> (run_modes.sh): body PII derived from <tag>, plus unique PII in
-# every request's query string and an X-Contact header, so several runs can
-# share one agent without colliding. SSN_AREA sets the SSNs' first group.
+# every request's query string, an X-Contact header and a Content-Type
+# parameter, so several runs can share one agent without colliding. It also
+# plants credentials that must never reach a redacted sink ("secrets"): an
+# X-Vault-Token and a JWT after "access_token=" and 100 spaces (whose tail an
+# overlapping ApiKey match once left exposed). SSN_AREA sets the SSNs' first
+# group.
 PLANT = os.environ.get("PLANT", "")
 SSN_AREA = os.environ.get("SSN_AREA", "123")
 
@@ -126,7 +130,7 @@ def main():
             pos += 1
         r = rnd.random()
         tag = f"q{i}"
-        headers, query_pii, header_pii = {}, [], []
+        headers, query_pii, header_pii, secrets = {}, [], [], []
         if r < 0.35:
             n = rnd.choice([0, 10, 500, 1400, 3000, 9000, 70000])
             method, path, body = "GET", f"/len/{n}?id={tag}", None
@@ -149,12 +153,19 @@ def main():
             query_pii, header_pii = [f"{PLANT}q{i}@example.org"], [f"{PLANT}h{i}@example.net"]
             path += f"&contact={query_pii[0]}"
             headers["X-Contact"] = header_pii[0]
+            header_pii.append(f"{PLANT}c{i}@example.net")
+            headers["Content-Type"] = f"application/json; owner={header_pii[1]}"
+            vault = f"hvs.{PLANT}vault{i}tokenAAAAAAAAAAAA"
+            jwt_tail = f"eyJzdWIiOi{PLANT}j{i}In0.sig{PLANT}x{i}"
+            secrets = [vault, jwt_tail]
+            headers["X-Vault-Token"] = vault
+            headers["X-Note"] = "access_token=" + " " * 100 + "eyJhbGciOiJIUzI1NiJ9." + jwt_tail
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
         body_pii = [email, ssn] if method == "POST" else []
         out.write(json.dumps({"id": tag, "method": method, "path": path, "body_pii": body_pii,
-                              "query_pii": query_pii, "header_pii": header_pii,
+                              "query_pii": query_pii, "header_pii": header_pii, "secrets": secrets,
                               "status": resp.status, "response_size": len(data),
                               "conn": conn_no, "pos": pos}) + "\n")
     out.close()
