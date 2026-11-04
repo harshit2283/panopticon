@@ -53,7 +53,8 @@ current release report.
 | Capability | MVP Status | Notes |
 |---|---|---|
 | Linux x86_64 on kernel 5.8+ | Supported | Primary development path with RingBuf support. |
-| Linux x86_64 on kernel 4.15-5.7 | Unsupported | A PerfEventArray fallback path exists, but the eBPF object always creates a RingBuf map and uses 5.5+ helpers, so it fails to load below 5.8. |
+| RHEL 8 / 9 (Rocky Linux 8.10 on 4.18, 9.8 on 5.14) | Supported | Red Hat backports the BPF ring buffer and the 5.5+ probe-read helpers; every accuracy suite except AMQP deliveries on 8.10 passes (see [current state](docs/CURRENT-STATE.md)). |
+| Linux x86_64 on upstream kernel 4.15-5.7 | Unsupported | A PerfEventArray fallback path exists, but the eBPF object always creates a RingBuf map and uses 5.5+ helpers, so it fails to load on kernels without them. |
 | Linux ARM64 | Partial | Build/runtime path exists, but validation coverage is still limited. |
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |
 | Windows runtime | Unsupported | No Windows eBPF/runtime support. |
@@ -66,7 +67,7 @@ current release report.
 | Kafka parsing | Supported | Classic and flexible (KIP-482) versions, topic IDs; 100% recall, topic and error code against ground truth (librdkafka, kafka-python). Record keys/values of uncompressed batches are PII-scanned; compressed batches are not decoded. Detected on port 9092 only. |
 | AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. |
 | DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
-| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
+| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated with the `sock_send/recv_length` tracepoints, 6.3+, and with the fentry fallback on RHEL 8 and 9; kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
 | Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes. |
 | Regex-first PII detection | Supported | 16 validated patterns, including Aadhaar, PAN, UPI, GSTIN, Indian passport and phone, and IBAN. Precision and recall are measured per type on a labelled corpus, and a `cargo test` gate fails on regressions (`docs/BENCHMARKS.md`). Names and addresses need the ML path. |
 | Privacy modes (`full`, `redacted`, `metrics_only`) | Supported | Enforced at startup and only tightened on reload. Ground-truth leak test over HTTP and OpenSSL TLS: planted values found only where the mode allows, at 100% recall ([current state](docs/CURRENT-STATE.md)). |
@@ -79,7 +80,7 @@ current release report.
 - IPv6 capture is not implemented.
 - Kubernetes pod/service identity has not been validated on a real cluster
   (only against a fake API server).
-- On kernels older than 6.3, TLS socket addresses come from an fentry/kprobe
+- On kernels without BTF (no fentry), TLS socket addresses come from a kprobe
   fallback that has not been validated yet.
 - Broad TLS library coverage beyond the current OpenSSL and partial Go paths is
   not implemented.

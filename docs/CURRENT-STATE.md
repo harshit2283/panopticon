@@ -43,8 +43,28 @@ production-hardened compliance platform.
 
 - Linux kernel support:
   - 5.8+ is the supported floor. Full accuracy suites pass on 5.15, 6.8 and 7.0 (also loaded on 6.18).
-  - 4.15-5.7 does not load today: the PerfEventArray fallback exists in code,
-    but the object always creates a RingBuf map and uses 5.5+ helpers.
+  - RHEL 8 and 9 are supported: their 4.18 and 5.14 kernels carry the BPF
+    ring buffer and 5.5+ probe-read helpers. Measured on Rocky Linux 8.10
+    (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
+    (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
+    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
+    exported, every TLS exchange carrying its socket addresses (via fentry).
+    The agent probes the ring buffer by creating one rather than trusting the
+    version number; before that, RHEL 8 fell to the PerfEventArray path and
+    captured nothing.
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 88-95% over four lab runs
+    (other AMQP methods 100%). The broker-to-consumer stream there carried
+    TCP retransmissions and GSO segments up to 18 KB; the agent has no TCP
+    sequence tracking, so a retransmitted segment is parsed twice
+    (duplicate deliveries) and frames past the 4 KB capture window are lost.
+    RHEL 9 passed (100%, one earlier run at 85%).
+  - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
+    different record layout (an extra `common_preempt_lazy_count` field moves
+    every field by 8 bytes). The agent checks each tracepoint's tracefs
+    `format` against the offsets its programs read and uses fentry instead
+    when they differ.
+  - Upstream 4.15-5.7 does not load today: the PerfEventArray fallback exists
+    in code, but the object always creates a RingBuf map and uses 5.5+ helpers.
   - ARM64 support exists but validation remains limited; no arm64 image yet.
 - TLS plaintext capture:
   - OpenSSL via a shared `libssl` (including the `_ex` API) is validated
@@ -52,8 +72,9 @@ production-hardened compliance platform.
     (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
     found.
   - TLS exchanges carry their socket addresses and join the service graph:
-    validated via the `sock_send/recv_length` tracepoints (kernel 6.3+); the
-    fentry/kprobe fallback for older kernels is not validated yet.
+    validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
+    via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
+    without BTF is not validated yet.
   - Go `crypto/tls` reads and writes (Go 1.17+ register ABI) are validated
     the same way: 100% recall from both processes. Binaries built with `-s`
     (no symbol table) are not found; arm64 is untested.

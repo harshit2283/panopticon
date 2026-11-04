@@ -36,7 +36,8 @@ const PINNED_MAP_NAMES: [&str; 12] = [
 #[derive(Debug, Clone)]
 pub struct KernelCapabilities {
     pub version: (u32, u32, u32),
-    /// RingBuf support (kernel >= 5.8).
+    /// RingBuf support, probed by creating a ring buffer map (5.8+ upstream,
+    /// backported to RHEL 8's 4.18).
     pub has_ringbuf: bool,
     /// BTF (BPF Type Format) available — /sys/kernel/btf/vmlinux exists.
     pub has_btf: bool,
@@ -63,14 +64,20 @@ pub struct EbpfState {
     pub attached_libs: HashSet<(u64, u64)>,
 }
 
-/// Detect kernel capabilities by reading /proc/version and checking sysfs.
+/// Detect kernel capabilities from /proc/version, sysfs and a BPF map probe.
 pub fn detect_kernel_caps() -> Result<KernelCapabilities> {
     let version = read_kernel_version()?;
     let (major, minor, _patch) = version;
 
+    // Probe instead of trusting the version: RHEL 8's 4.18 has the ring
+    // buffer backported. Fall back to the version only if probing errors
+    // (e.g. no privilege, or not Linux).
+    let has_ringbuf =
+        aya::sys::is_map_supported(aya::maps::MapType::RingBuf).unwrap_or((major, minor) >= (5, 8));
+
     Ok(KernelCapabilities {
         version,
-        has_ringbuf: (major, minor) >= (5, 8),
+        has_ringbuf,
         has_btf: Path::new("/sys/kernel/btf/vmlinux").exists(),
         has_cgroup_id: (major, minor) >= (4, 18),
         has_tc_ebpf: (major, minor) >= (4, 15),
@@ -100,8 +107,9 @@ pub fn load_and_attach(
             e
         } else {
             e.context(format!(
-                "kernel {}.{}.{} is below the supported floor of 5.8 (BPF ring buffer \
-                 and 5.5+ probe-read helpers are required)",
+                "kernel {}.{}.{} has no BPF ring buffer: the agent needs it and the 5.5+ \
+                 probe-read helpers (upstream 5.8+, or a distro kernel with them \
+                 backported, such as RHEL 8's 4.18)",
                 caps.version.0, caps.version.1, caps.version.2
             ))
         }
@@ -157,8 +165,8 @@ pub fn load_and_attach(
     }
     if config.tls_scan_enabled {
         // Give TLS connections their socket addresses (see tls_probes.rs):
-        // sock tracepoints (6.3+), else fentry where the kernel has BTF,
-        // else kprobes.
+        // sock tracepoints (6.3+, RHEL 9) when their record layout matches,
+        // else fentry where the kernel has BTF, else kprobes.
         for (tracepoint, fentry_prog, kprobe_prog, function) in [
             (
                 "sock_send_length",
@@ -834,6 +842,7 @@ fn try_attach_tracepoint(
     category: &str,
     name: &str,
 ) -> Result<aya::programs::trace_point::TracePointLinkId> {
+    check_tracepoint_layout(category, name)?;
     let prog: &mut TracePoint = ebpf
         .program_mut(prog_name)
         .context(format!("program '{prog_name}' not found"))?
@@ -841,6 +850,82 @@ fn try_attach_tracepoint(
     prog.load()?;
     let link_id = prog.attach(category, name)?;
     Ok(link_id)
+}
+
+/// Field offsets the eBPF tracepoint programs read with `read_at`
+/// (tls_probes.rs, sock_monitor.rs). Kernels can lay these records out
+/// differently: RHEL 9 adds `common_preempt_lazy_count` to the common header,
+/// moving every field by 8, and RHEL 8's 4.18 has a `u8` protocol in
+/// `inet_sock_set_state`, moving `saddr`/`daddr` back by one.
+const TRACEPOINT_LAYOUTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "sock_send_length",
+        &[("sk", 8), ("family", 16), ("protocol", 18)],
+    ),
+    (
+        "sock_recv_length",
+        &[("sk", 8), ("family", 16), ("protocol", 18)],
+    ),
+    (
+        "inet_sock_set_state",
+        &[
+            ("skaddr", 8),
+            ("oldstate", 16),
+            ("newstate", 20),
+            ("sport", 24),
+            ("dport", 26),
+            ("family", 28),
+            ("protocol", 30),
+            ("saddr", 32),
+            ("daddr", 36),
+        ],
+    ),
+];
+
+/// Refuse a tracepoint whose record layout (from its tracefs `format` file)
+/// differs from the offsets the program reads, so the caller falls back to
+/// fentry/kprobes instead of reading the wrong fields. Unreadable format
+/// files pass: attaching then fails on its own.
+fn check_tracepoint_layout(category: &str, name: &str) -> Result<()> {
+    let Some((_, fields)) = TRACEPOINT_LAYOUTS.iter().find(|(n, _)| *n == name) else {
+        return Ok(());
+    };
+    let Some(format) = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .find_map(|root| {
+            std::fs::read_to_string(format!("{root}/events/{category}/{name}/format")).ok()
+        })
+    else {
+        return Ok(());
+    };
+    tracepoint_layout_mismatch(&format, fields).map_or(Ok(()), |m| {
+        anyhow::bail!("{category}/{name} record layout differs: {m}")
+    })
+}
+
+/// The first expected field whose offset in `format` differs, described.
+fn tracepoint_layout_mismatch(format: &str, fields: &[(&str, usize)]) -> Option<String> {
+    let offset_of = |field: &str| {
+        format.lines().find_map(|line| {
+            let decl = line.trim().strip_prefix("field:")?.split(';').next()?;
+            let ident = decl.rsplit([' ', '*']).next()?.split('[').next()?;
+            if ident != field {
+                return None;
+            }
+            line.split("offset:")
+                .nth(1)?
+                .split(';')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+    };
+    fields
+        .iter()
+        .find_map(|&(field, want)| match offset_of(field) {
+            Some(got) if got == want => None,
+            got => Some(format!("{field} at {got:?}, program reads {want}")),
+        })
 }
 
 /// Parse kernel version from /proc/version_signature or /proc/version.
@@ -881,18 +966,25 @@ const CAP_BPF: u32 = 39;
 /// Check if the process has the required Linux capabilities for eBPF.
 /// Returns a list of missing capability names (empty = all present).
 ///
-/// Kernel >= 5.8 supports fine-grained capabilities (CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN).
-/// Older kernels require the coarse-grained CAP_SYS_ADMIN.
+/// Kernels that know CAP_BPF (upstream 5.8+, RHEL 8's 4.18) accept the
+/// fine-grained CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN; older ones need
+/// CAP_SYS_ADMIN. Read from /proc/sys/kernel/cap_last_cap, not the version.
 pub fn check_required_capabilities(caps: &KernelCapabilities) -> Vec<&'static str> {
     let effective = read_effective_caps().unwrap_or(0);
-    check_capabilities_with_bitmask(caps, effective)
+    let fine_grained = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map_or((caps.version.0, caps.version.1) >= (5, 8), |last| {
+            last >= CAP_BPF
+        });
+    check_capabilities_with_bitmask(fine_grained, effective)
 }
 
 /// Inner function testable with a specific bitmask (avoids reading /proc in tests).
-fn check_capabilities_with_bitmask(caps: &KernelCapabilities, effective: u64) -> Vec<&'static str> {
+fn check_capabilities_with_bitmask(fine_grained: bool, effective: u64) -> Vec<&'static str> {
     let mut missing = Vec::new();
 
-    if (caps.version.0, caps.version.1) >= (5, 8) {
+    if fine_grained {
         // Modern kernel: fine-grained caps
         if effective & (1u64 << CAP_BPF) == 0 {
             missing.push("CAP_BPF");
@@ -1006,63 +1098,60 @@ CapPrm:\t00000000ffffffff
         assert_eq!(result, Some(0));
     }
 
+    // ── Tracepoint record layout ──────────────────────────────────────
+
+    #[test]
+    fn test_tracepoint_layout_upstream_and_rhel9() {
+        let fields = TRACEPOINT_LAYOUTS[0].1;
+        let upstream = "\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\n\
+            \tfield:void * sk;\toffset:8;\tsize:8;\tsigned:0;\n\
+            \tfield:__u16 family;\toffset:16;\tsize:2;\tsigned:0;\n\
+            \tfield:__u16 protocol;\toffset:18;\tsize:2;\tsigned:0;\n";
+        assert_eq!(tracepoint_layout_mismatch(upstream, fields), None);
+        // RHEL 9 (5.14): common_preempt_lazy_count shifts every field by 8.
+        let rhel9 = "\tfield:unsigned char common_preempt_lazy_count;\toffset:8;\tsize:1;\tsigned:0;\n\n\
+            \tfield:void * sk;\toffset:16;\tsize:8;\tsigned:0;\n\
+            \tfield:__u16 family;\toffset:24;\tsize:2;\tsigned:0;\n\
+            \tfield:__u16 protocol;\toffset:26;\tsize:2;\tsigned:0;\n";
+        assert_eq!(
+            tracepoint_layout_mismatch(rhel9, fields).as_deref(),
+            Some("sk at Some(16), program reads 8")
+        );
+        // Array fields (`__u8 saddr[4]`) match by name.
+        let saddr = [("saddr", 31)];
+        let rhel8 = "\tfield:__u8 saddr[4];\toffset:31;\tsize:4;\tsigned:0;\n";
+        assert_eq!(tracepoint_layout_mismatch(rhel8, &saddr), None);
+    }
+
     // ── Capability requirement checks ─────────────────────────────────
 
     #[test]
     fn test_check_caps_modern_kernel_all_present() {
-        let caps = KernelCapabilities {
-            version: (5, 15, 0),
-            has_ringbuf: true,
-            has_btf: true,
-            has_cgroup_id: true,
-            has_tc_ebpf: true,
-        };
         // All three caps set: CAP_NET_ADMIN(12) + CAP_PERFMON(38) + CAP_BPF(39)
         let bitmask = (1u64 << 12) | (1u64 << 38) | (1u64 << 39);
-        let missing = check_capabilities_with_bitmask(&caps, bitmask);
+        let missing = check_capabilities_with_bitmask(true, bitmask);
         assert!(missing.is_empty(), "all caps present, got: {:?}", missing);
     }
 
     #[test]
     fn test_check_caps_modern_kernel_missing_bpf() {
-        let caps = KernelCapabilities {
-            version: (5, 15, 0),
-            has_ringbuf: true,
-            has_btf: true,
-            has_cgroup_id: true,
-            has_tc_ebpf: true,
-        };
         // Only NET_ADMIN + PERFMON, missing BPF
         let bitmask = (1u64 << 12) | (1u64 << 38);
-        let missing = check_capabilities_with_bitmask(&caps, bitmask);
+        let missing = check_capabilities_with_bitmask(true, bitmask);
         assert_eq!(missing, vec!["CAP_BPF"]);
     }
 
     #[test]
     fn test_check_caps_old_kernel_sys_admin_present() {
-        let caps = KernelCapabilities {
-            version: (4, 18, 0),
-            has_ringbuf: false,
-            has_btf: false,
-            has_cgroup_id: true,
-            has_tc_ebpf: true,
-        };
         let bitmask = 1u64 << CAP_SYS_ADMIN;
-        let missing = check_capabilities_with_bitmask(&caps, bitmask);
+        let missing = check_capabilities_with_bitmask(false, bitmask);
         assert!(missing.is_empty());
     }
 
     #[test]
     fn test_check_caps_old_kernel_sys_admin_missing() {
-        let caps = KernelCapabilities {
-            version: (4, 18, 0),
-            has_ringbuf: false,
-            has_btf: false,
-            has_cgroup_id: true,
-            has_tc_ebpf: true,
-        };
         let bitmask = 0u64; // no caps
-        let missing = check_capabilities_with_bitmask(&caps, bitmask);
+        let missing = check_capabilities_with_bitmask(false, bitmask);
         assert_eq!(missing, vec!["CAP_SYS_ADMIN"]);
     }
 

@@ -12,7 +12,7 @@ For day-to-day usage and output formats see [`USER-GUIDE.md`](USER-GUIDE.md).
 
 | Requirement | Detail |
 |---|---|
-| Kernel | **5.8+** on every node (RingBuf, `bpf_probe_read_{kernel,user}`). Older kernels fail at load time. |
+| Kernel | **5.8+** on every node (RingBuf, `bpf_probe_read_{kernel,user}`), or a distro kernel with both backported: RHEL 8 (validated on Rocky Linux 8.10, 4.18) and RHEL 9 (Rocky 9.8, 5.14). Kernels without them fail at load time. |
 | Architecture | x86_64. arm64 builds are not published yet. |
 | Privileges | Root/privileged, or `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE` (+ `CAP_SYS_ADMIN` for some tracefs/debugfs setups). |
 | Host namespaces | Host network (TC hooks on node interfaces) and host PID (finding TLS libraries via `/proc/<pid>/root`). |
@@ -71,7 +71,7 @@ curl -s "$NODE_IP:9435/metrics" | grep -E 'events_received_total|drops_'
 
 Pods become Ready as soon as the eBPF programs are attached — a quiet node is
 still Ready. If a pod crash-loops, loading the eBPF programs failed (usually a
-kernel older than 5.8 or missing privileges). If it runs but captures nothing,
+kernel without the BPF ring buffer, i.e. older than 5.8 and not RHEL 8/9, or missing privileges). If it runs but captures nothing,
 look for `Failed to attach TC classifier` in its logs.
 
 ### 3.3 Values
@@ -211,7 +211,7 @@ journalctl -u panopticon -f
   including TLS plaintext. Enable it only on nodes and for the time you need
   it; the files are owner-only (`0600`) but readable by anything with root
   or access to the host path.
-- **Reduced privileges (kernel 5.8+).** Instead of `privileged: true`:
+- **Reduced privileges (kernels with `CAP_BPF`: 5.8+, RHEL 8/9).** Instead of `privileged: true`:
 
   ```yaml
   securityContext:
