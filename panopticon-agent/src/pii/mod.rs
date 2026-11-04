@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 //! PII detection pipeline: regex prefilter -> optional ML inference -> redaction.
 
+#[cfg(test)]
+mod accuracy;
 pub mod classifier;
 pub mod external;
 pub mod redactor;
