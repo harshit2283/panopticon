@@ -30,7 +30,8 @@ hardening work.
 - [Deployment](docs/DEPLOYMENT.md): Kubernetes (Helm), Docker, systemd,
   hardening, upgrades and releases.
 - [Benchmarks](docs/BENCHMARKS.md): measured capture accuracy, kernel and
-  agent overhead, parser/PII micro-benchmarks, fuzzing, and how to reproduce.
+  agent overhead, a 64-vCPU scale test, parser/PII micro-benchmarks,
+  fuzzing, and how to reproduce.
 
 ## Public Source Of Truth
 
@@ -62,7 +63,7 @@ current release report.
 | AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. |
 | DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated on kernels with the `sock_send/recv_length` tracepoints, 6.3+; fentry/kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
-| Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes. |
+| Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (Go 1.17+, amd64 validated; binaries stripped of symbols are not found); 100% recall against ground truth from both client and server processes, except that about 1 run in 5 mispairs one exchange in 500 in the client view. |
 | Regex-first PII detection | Supported | Baseline detection path. |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
 | Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
