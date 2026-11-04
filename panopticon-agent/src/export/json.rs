@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use anyhow::{Context, Result};
@@ -186,20 +186,10 @@ pub struct JsonExporter {
 
 impl JsonExporter {
     /// Create a new exporter writing to the given path.
-    /// Creates or truncates the file, owner-only (0600) on Unix: in `full`
-    /// privacy mode it holds unredacted payloads.
+    /// Replaces the file with a fresh owner-only (0600) one on Unix: in
+    /// `full` privacy mode it holds unredacted payloads.
     pub fn new(path: &str) -> Result<Self> {
-        let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options
-            .open(path)
-            .with_context(|| format!("Failed to open JSON export file: {}", path))?;
-        // `mode` only applies on creation; tighten a pre-existing file too.
-        #[cfg(unix)]
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .with_context(|| format!("Failed to restrict permissions on {path}"))?;
+        let file = super::open_private(path, false).context("JSON export file")?;
         Ok(Self {
             writer: BufWriter::new(file),
             k8s: None,

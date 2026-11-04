@@ -1,6 +1,6 @@
 //! Convert a PNCAP raw capture (`--capture-raw`) into a classic pcap file
 //! that Wireshark and tshark open directly
-//! (`panopticon-agent --decode-capture dump.pncap --pcap dump.pcap`).
+//! (`panopticon-agent --privacy-mode full --decode-capture dump.pncap --pcap dump.pcap`).
 //!
 //! Events carry L7 payload only, so every packet gets synthesized IPv4 and
 //! TCP (or UDP) headers from the event's addresses, ports and direction
@@ -37,19 +37,12 @@ type Flow = (Endpoint, Endpoint);
 
 /// `convert_file` writes the pcap owner-only: it holds decrypted payloads.
 pub fn convert_file(input: &str, output: &str) -> Result<(u64, u64)> {
-    use std::os::unix::fs::OpenOptionsExt;
     let open = || {
         std::fs::File::open(input)
             .map(io::BufReader::new)
             .with_context(|| format!("cannot open capture {input}"))
     };
-    let out = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(output)
-        .with_context(|| format!("cannot create {output}"))?;
+    let out = super::open_private(output, false)?;
     convert(open()?, open()?, io::BufWriter::new(out))
 }
 
