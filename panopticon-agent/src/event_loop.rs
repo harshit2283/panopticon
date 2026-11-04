@@ -20,7 +20,8 @@ use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
 use panopticon_common::{
-    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, data_event_record_len,
+    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TLS_KEY_BIT,
+    data_event_record_len,
 };
 #[cfg(target_os = "linux")]
 use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes, read_data_event_into};
@@ -1610,32 +1611,32 @@ fn server_endpoint(
 
 /// Key identifying the connection an event belongs to.
 ///
-/// TC and socket events carry the kernel socket cookie. TLS events carry the
-/// library's connection object pointer (`SSL*`, `*tls.Conn`), unique only
-/// within a process, so it is combined with the PID; the high bit keeps
-/// these keys apart from kernel cookies. Events without one fall back to a
-/// per-thread key.
-#[cfg(target_os = "linux")]
+/// TC and socket events carry the flow cookie, which has bit 63 clear
+/// (`panopticon_common::tc_flow_cookie`). TLS events carry the library's
+/// connection object pointer (`SSL*`, `*tls.Conn`), chosen by the traced
+/// process and unique only within it: it is hashed with the PID under a
+/// per-process random key, so no process can pick a pointer that lands on
+/// another connection's key (F18), and bit 63 is set so a TLS key never
+/// equals a TC cookie. Events without one fall back to a per-thread key.
 fn connection_key(event: &DataEvent) -> u64 {
+    use std::hash::BuildHasher;
+    static TLS_KEY: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
     if event.event_type != EventType::TlsData {
         return event.socket_cookie;
     }
     if event.socket_cookie == 0 {
         return tls_synthetic_cookie(event.pid, event.tgid);
     }
-    0x8000_0000_0000_0000 | fxhash::hash64(&(event.pid, event.socket_cookie))
+    TLS_KEY_BIT
+        | TLS_KEY
+            .get_or_init(std::hash::RandomState::new)
+            .hash_one((event.pid, event.socket_cookie))
 }
 
-/// Generate a synthetic per-thread cookie for TLS events without a
-/// connection pointer.
-///
-/// Uses PID + TGID to create a unique key that won't collide with real socket cookies.
-/// Real socket cookies are kernel-assigned, typically < 2^32.
-/// High bit set avoids collision with real cookies.
-/// Includes both pid and tgid to handle forked processes correctly.
-#[cfg(target_os = "linux")]
+/// Synthetic per-thread key for TLS events without a connection pointer:
+/// PID and TGID, in the TLS key space (bit 63 set, see [`connection_key`]).
 fn tls_synthetic_cookie(pid: u32, tgid: u32) -> u64 {
-    0x8000_0000_0000_0000 | ((pid as u64) << 32) | (tgid as u64)
+    TLS_KEY_BIT | ((pid as u64) << 32) | (tgid as u64)
 }
 
 #[cfg(test)]
@@ -1878,14 +1879,14 @@ mod tests {
     #[test]
     fn test_tls_synthetic_cookie_high_bit_set() {
         let cookie = tls_synthetic_cookie(1, 1);
-        // High bit must be set to avoid collision with real kernel cookies
-        assert!(cookie & 0x8000_0000_0000_0000 != 0);
+        // Bit 63 set: outside the TC flow cookie space (bit 63 clear).
+        assert!(cookie & TLS_KEY_BIT != 0);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn test_tls_synthetic_cookie_no_collision_with_real() {
-        // Real kernel cookies are typically small positive integers
+        // TC flow cookies have bit 63 clear, so small ones included
         for real_cookie in 1u64..10_000 {
             for pid in [1u32, 100, 1000, 65535] {
                 assert_ne!(
@@ -1916,6 +1917,32 @@ mod tests {
             unique_workers.len() > 1,
             "all PIDs routed to same worker — broken distribution"
         );
+    }
+
+    #[test]
+    fn tls_keys_are_keyed_and_disjoint_from_tc_cookies() {
+        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
+        let mut tls: DataEvent = unsafe { std::mem::zeroed() };
+        tls.event_type = EventType::TlsData;
+        tls.pid = 4242;
+        tls.socket_cookie = 0x5555_0000_1230; // the SSL* the process chose
+        let key = connection_key(&tls);
+        assert_eq!(key & TLS_KEY_BIT, TLS_KEY_BIT);
+        // F18: the key is no longer the public, invertible fxhash, so a
+        // process cannot solve for an SSL* that lands on a chosen key.
+        assert_ne!(
+            key,
+            TLS_KEY_BIT | fxhash::hash64(&(tls.pid, tls.socket_cookie))
+        );
+        assert_eq!(key, connection_key(&tls), "stable within the process");
+        // A TC flow cookie (bit 63 clear by construction) is used as is and
+        // can never equal a TLS key.
+        let mut tc = tls;
+        tc.event_type = EventType::TcPacket;
+        tc.socket_cookie =
+            panopticon_common::tc_flow_cookie(9, 0x0A00_0001, 0x0A00_0002, 40000, 80, 6);
+        assert_eq!(connection_key(&tc), tc.socket_cookie);
+        assert_eq!(connection_key(&tc) & TLS_KEY_BIT, 0);
     }
 
     fn sock_event(kind: EventType, cookie: u64, pid: u32) -> DataEvent {

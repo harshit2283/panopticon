@@ -34,6 +34,13 @@ pub const CONFIG_PID_FILTER_ON: u32 = 3;
 /// Active DATA_EVENTS ring shards minus one (a power of two minus one).
 /// 0, the default, sends every event to DATA_EVENTS_0.
 pub const CONFIG_RING_SHARD_MASK: u32 = 5;
+/// Per-boot random key mixed into TC flow cookies ([`tc_flow_cookie`]),
+/// so a peer cannot compute another flow's cookie offline.
+pub const CONFIG_COOKIE_KEY: u32 = 6;
+
+/// Bit 63 of a connection key: set for TLS connection keys (user space),
+/// clear for TC flow cookies, so the two key spaces never overlap.
+pub const TLS_KEY_BIT: u64 = 1 << 63;
 
 /// DATA_EVENTS ring buffer shards declared in the eBPF object
 /// (`DATA_EVENTS_0` .. `DATA_EVENTS_15`). User space activates a power-of-two
@@ -331,6 +338,57 @@ pub fn ring_shard(socket_cookie: u64, mask: u32) -> u32 {
     ((socket_cookie.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as u32) & mask
 }
 
+/// Bidirectional flow cookie for a TC packet's 5-tuple: FNV-1a over the
+/// tuple, ordered so both directions get the same cookie, starting from a
+/// basis mixed with the per-boot `key` (CONFIG_COOKIE_KEY). Bit 63 is
+/// always clear: TLS connection keys (user space) have it set, so a TLS
+/// connection object can never alias a TC flow (F18). The socket owner
+/// events (sock_monitor.rs) use the same cookie, which keeps a connection's
+/// events on one ring shard ([`ring_shard`]).
+#[inline(always)]
+pub fn tc_flow_cookie(
+    key: u64,
+    src_addr: u32,
+    dst_addr: u32,
+    src_port: u16,
+    dst_port: u16,
+    ip_proto: u8,
+) -> u64 {
+    let (a_addr, a_port, b_addr, b_port) = if (src_addr, src_port) <= (dst_addr, dst_port) {
+        (src_addr, src_port, dst_addr, dst_port)
+    } else {
+        (dst_addr, dst_port, src_addr, src_port)
+    };
+
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET ^ key;
+    let bytes: [u8; 13] = [
+        (a_addr >> 24) as u8,
+        (a_addr >> 16) as u8,
+        (a_addr >> 8) as u8,
+        a_addr as u8,
+        (a_port >> 8) as u8,
+        a_port as u8,
+        (b_addr >> 24) as u8,
+        (b_addr >> 16) as u8,
+        (b_addr >> 8) as u8,
+        b_addr as u8,
+        (b_port >> 8) as u8,
+        b_port as u8,
+        ip_proto,
+    ];
+
+    let mut i = 0;
+    while i < 13 {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash & !TLS_KEY_BIT
+}
+
 /// Length of the DataEvent record at the start of `bytes` (header plus
 /// `payload_len` payload bytes), or `None` if it is truncated or has invalid
 /// enum fields. Trailing bytes are allowed: a full fixed-size DataEvent (the
@@ -548,6 +606,7 @@ mod tests {
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
         assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
+        assert!(CONFIG_COOKIE_KEY < CONFIG_ENTRIES);
         assert!(DATA_RING_SHARDS.is_power_of_two());
     }
 
@@ -620,6 +679,20 @@ mod record_tests {
                 .all(|&n| n > 0 && n < 2 * 4096 / DATA_RING_SHARDS as u32),
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn tc_flow_cookie_is_symmetric_keyed_and_outside_the_tls_key_space() {
+        let (a, b) = (0x0A00_0001, 0x0A00_0002);
+        let mut keyed_differs = 0;
+        for port in 0..4096u16 {
+            let c = tc_flow_cookie(7, a, b, 40000 + port, 80, 6);
+            assert_eq!(c, tc_flow_cookie(7, b, a, 80, 40000 + port, 6));
+            // F18: a TLS key (bit 63 set) can never equal a TC cookie.
+            assert_eq!(c & TLS_KEY_BIT, 0);
+            keyed_differs += (c != tc_flow_cookie(8, a, b, 40000 + port, 80, 6)) as u32;
+        }
+        assert_eq!(keyed_differs, 4096, "the boot key changes every cookie");
     }
 
     #[test]

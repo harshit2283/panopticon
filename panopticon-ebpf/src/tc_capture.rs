@@ -15,16 +15,17 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN,
-    TCP_FLAG_RST, TlsLibrary,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
+    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary, tc_flow_cookie,
 };
 
 use crate::maps::{CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, IPV6_DROPS, emit_scratch_event};
 
-// ── FNV-1a hash for connection cookie ──────────────────────────────────────
+// ── Connection cookie ──────────────────────────────────────────────────────
 
-/// Compute a deterministic connection cookie from the 5-tuple using FNV-1a.
-/// Normalizes by ordering (addr, port) pairs so both directions get the same cookie.
+/// The flow cookie of a 5-tuple, keyed with this boot's CONFIG_COOKIE_KEY
+/// (see `panopticon_common::tc_flow_cookie`). TC packets and the socket
+/// owner events (sock_monitor.rs) both use it.
 #[inline(always)]
 pub(crate) fn tc_connection_cookie(
     src_addr: u32,
@@ -33,41 +34,8 @@ pub(crate) fn tc_connection_cookie(
     dst_port: u16,
     ip_proto: u8,
 ) -> u64 {
-    // Normalize: smaller (addr, port) pair first for bidirectional consistency
-    let (a_addr, a_port, b_addr, b_port) = if (src_addr, src_port) <= (dst_addr, dst_port) {
-        (src_addr, src_port, dst_addr, dst_port)
-    } else {
-        (dst_addr, dst_port, src_addr, src_port)
-    };
-
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = FNV_OFFSET;
-    // Hash each byte of the 5-tuple
-    let bytes: [u8; 13] = [
-        (a_addr >> 24) as u8,
-        (a_addr >> 16) as u8,
-        (a_addr >> 8) as u8,
-        a_addr as u8,
-        (a_port >> 8) as u8,
-        a_port as u8,
-        (b_addr >> 24) as u8,
-        (b_addr >> 16) as u8,
-        (b_addr >> 8) as u8,
-        b_addr as u8,
-        (b_port >> 8) as u8,
-        b_port as u8,
-        ip_proto,
-    ];
-
-    let mut i = 0;
-    while i < 13 {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    hash
+    let key = CONFIG.get(CONFIG_COOKIE_KEY).copied().unwrap_or(0);
+    tc_flow_cookie(key, src_addr, dst_addr, src_port, dst_port, ip_proto)
 }
 
 // ── Ethernet / IP / TCP / UDP constants ────────────────────────────────────

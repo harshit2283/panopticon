@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK,
-    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
+    CONFIG_RING_SHARD_MASK, CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE,
 };
 
 /// The DATA_EVENTS ring shards in the eBPF object (maps.rs `data_rings!`).
@@ -305,6 +305,12 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
+    // A fresh random key per agent start: flow cookies are not computable
+    // offline. Set before TC is attached (load path), so every cookie of a
+    // run uses the same key.
+    use std::hash::BuildHasher;
+    let cookie_key = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    cfg_map.set(CONFIG_COOKIE_KEY, cookie_key, 0)?;
 
     Ok(())
 }
