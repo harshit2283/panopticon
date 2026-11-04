@@ -4,16 +4,28 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// Sampling mode controls the trade-off between coverage and overhead.
+/// What part of the traffic is captured (`sampling_mode`). Applied by the
+/// workers' capture gate (`capture_gate.rs`) before anything reaches a
+/// parser or a sink.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SamplingMode {
-    /// Track ALL packets for all connections (dedicated monitoring).
+    /// Every connection, whole.
     Full,
-    /// Sample a percentage of connections (low-overhead mode).
+    /// Each connection is kept or dropped whole; `sample_rate` of them kept.
     ConnectionSample,
-    /// Only track first N bytes per connection (header-only mode).
-    HeadOnly { max_bytes: usize },
+    /// Only the first `max_bytes` of each connection, per direction.
+    HeadOnly { max_bytes: u64 },
 }
+
+impl SamplingMode {
+    pub const NAMES: [&'static str; 3] = ["full", "connection_sample", "head_only"];
+}
+
+/// Default `head_only_bytes`.
+pub const DEFAULT_HEAD_ONLY_BYTES: u64 = 4096;
+/// Upper bound for `head_only_bytes`: keeps TCP stream offsets far from
+/// sequence-number wraparound.
+pub const MAX_HEAD_ONLY_BYTES: u64 = 1 << 30;
 
 /// What captured data may leave the agent: the one data-handling setting.
 ///
@@ -136,7 +148,8 @@ pub struct AgentConfig {
     pub capture_enabled: bool,
     /// Network interfaces to attach TC classifiers to.
     pub interfaces: Vec<String>,
-    /// If set, only capture traffic from these PIDs.
+    /// If set, only capture traffic of these processes (PIDs, i.e. kernel
+    /// tgids): at most `MAX_PID_FILTER`, none 0. Restart-only.
     pub pid_filter: Option<Vec<u32>>,
 
     // ── Resource budgets ───────────────────────────
@@ -154,9 +167,10 @@ pub struct AgentConfig {
     pub idle_connection_timeout: Duration,
 
     // ── Sampling ───────────────────────────────────
-    /// Sampling strategy for connections.
+    /// Sampling strategy for connections. Restart-only.
     pub sampling_mode: SamplingMode,
-    /// Fraction of connections to track (0.0–1.0), used with ConnectionSample mode.
+    /// Fraction of connections kept (0.0–1.0) in ConnectionSample mode;
+    /// 1.0 otherwise. Restart-only.
     pub sample_rate: f64,
 
     // ── TLS interception ────────────────────────────
@@ -435,6 +449,7 @@ pub struct AgentConfigFile {
     pub idle_connection_timeout_secs: Option<u64>,
     pub sampling_mode: Option<String>,
     pub sample_rate: Option<f64>,
+    pub head_only_bytes: Option<u64>,
     pub tls_scan_enabled: Option<bool>,
     pub tls_scan_interval_secs: Option<u64>,
     pub privacy: Option<PrivacyConfigFile>,
@@ -534,7 +549,8 @@ pub struct OtlpConfigFile {
 
 impl AgentConfigFile {
     /// Apply non-None fields from this file config onto a base config.
-    pub fn merge_into(self, base: &mut AgentConfig) {
+    /// Fails on a sampling setting that would not do what it says.
+    pub fn merge_into(self, base: &mut AgentConfig) -> anyhow::Result<()> {
         if let Some(v) = self.capture_enabled {
             base.capture_enabled = v;
         }
@@ -559,15 +575,36 @@ impl AgentConfigFile {
         if let Some(v) = self.idle_connection_timeout_secs {
             base.idle_connection_timeout = Duration::from_secs(v);
         }
-        if let Some(v) = self.sampling_mode {
-            base.sampling_mode = match v.as_str() {
-                "connection_sample" => SamplingMode::ConnectionSample,
-                "head_only" => SamplingMode::HeadOnly { max_bytes: 4096 },
-                _ => SamplingMode::Full,
-            };
+        let mode = self.sampling_mode.as_deref().unwrap_or("full");
+        base.sampling_mode = match mode {
+            "full" => SamplingMode::Full,
+            "connection_sample" => SamplingMode::ConnectionSample,
+            "head_only" => SamplingMode::HeadOnly {
+                max_bytes: self.head_only_bytes.unwrap_or(DEFAULT_HEAD_ONLY_BYTES),
+            },
+            other => anyhow::bail!(
+                "sampling_mode = \"{other}\" is not valid; use \"{}\"",
+                SamplingMode::NAMES.join("\", \"")
+            ),
+        };
+        // A rate or a size the mode would ignore: the user expects a
+        // reduction that would not happen.
+        match (self.sample_rate, mode) {
+            (Some(v), "connection_sample") => base.sample_rate = v,
+            (None, "connection_sample") => anyhow::bail!(
+                "sampling_mode = \"connection_sample\" needs sample_rate (0.0 to 1.0)"
+            ),
+            (Some(_), _) => anyhow::bail!(
+                "sample_rate is only used with sampling_mode = \"connection_sample\", \
+                 but sampling_mode is \"{mode}\""
+            ),
+            (None, _) => {}
         }
-        if let Some(v) = self.sample_rate {
-            base.sample_rate = v;
+        if self.head_only_bytes.is_some() && mode != "head_only" {
+            anyhow::bail!(
+                "head_only_bytes is only used with sampling_mode = \"head_only\", \
+                 but sampling_mode is \"{mode}\""
+            );
         }
         if let Some(v) = self.tls_scan_enabled {
             base.tls_scan_enabled = v;
@@ -625,6 +662,7 @@ impl AgentConfigFile {
         if let Some(v) = self.map_pin_path {
             base.map_pin_path = Some(v);
         }
+        Ok(())
     }
 }
 
@@ -705,7 +743,7 @@ pub fn load_config_from_str(content: &str) -> anyhow::Result<AgentConfig> {
     let file_config: AgentConfigFile =
         toml::from_str(content).map_err(|e| anyhow::anyhow!("Invalid TOML config: {}", e))?;
     let mut config = AgentConfig::default();
-    file_config.merge_into(&mut config);
+    file_config.merge_into(&mut config)?;
     validate_config(&config)?;
     Ok(config)
 }
@@ -720,10 +758,55 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     if !(0.0..=1.0).contains(&config.sample_rate) {
         return Err(anyhow::anyhow!("sample_rate must be between 0.0 and 1.0"));
     }
+    if let SamplingMode::HeadOnly { max_bytes } = config.sampling_mode
+        && !(1..=MAX_HEAD_ONLY_BYTES).contains(&max_bytes)
+    {
+        anyhow::bail!("head_only_bytes must be between 1 and {MAX_HEAD_ONLY_BYTES}");
+    }
+    if let Some(pids) = &config.pid_filter {
+        let max = panopticon_common::MAX_PID_FILTER as usize;
+        if pids.is_empty() {
+            anyhow::bail!(
+                "pid_filter = [] would capture nothing; list the process IDs to capture, \
+                 or remove pid_filter to capture every process"
+            );
+        }
+        if pids.len() > max {
+            anyhow::bail!(
+                "pid_filter lists {} PIDs; at most {max} are allowed",
+                pids.len()
+            );
+        }
+        if pids.contains(&0) {
+            anyhow::bail!("pid_filter cannot contain 0 (not a process)");
+        }
+    }
     if config.kubernetes.relist_interval < Duration::from_secs(5) {
         return Err(anyhow::anyhow!(
             "kubernetes.relist_interval_secs must be >= 5"
         ));
+    }
+    Ok(())
+}
+
+/// Settings a `SIGHUP` reload cannot change: the PID filter is loaded into
+/// the kernel and the workers' capture gates are built once, at startup.
+pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<(), String> {
+    let pids = |c: &AgentConfig| {
+        c.pid_filter.as_ref().map(|p| {
+            let mut p = p.clone();
+            p.sort_unstable();
+            p.dedup();
+            p
+        })
+    };
+    if pids(running) != pids(new) {
+        return Err("changing pid_filter needs a restart".into());
+    }
+    if running.sampling_mode != new.sampling_mode || running.sample_rate != new.sample_rate {
+        return Err(
+            "changing sampling_mode, sample_rate or head_only_bytes needs a restart".into(),
+        );
     }
     Ok(())
 }
@@ -988,7 +1071,7 @@ mod tests {
             ..AgentConfigFile::default()
         };
         let mut config = AgentConfig::default();
-        file_config.merge_into(&mut config);
+        file_config.merge_into(&mut config).unwrap();
 
         assert!(!config.capture_enabled);
         // Everything else untouched
@@ -1023,11 +1106,126 @@ mod tests {
 
     #[test]
     fn test_invalid_sample_rate_rejected() {
-        let toml = r#"
-            sample_rate = 1.5
-        "#;
-        let err = load_config_from_str(toml).unwrap_err().to_string();
-        assert!(err.contains("sample_rate must be between 0.0 and 1.0"));
+        for rate in ["1.5", "-0.1", "nan"] {
+            let toml = format!("sampling_mode = \"connection_sample\"\nsample_rate = {rate}\n");
+            let err = load_config_from_str(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("sample_rate must be between 0.0 and 1.0"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sampling_config_errors() {
+        let err = |toml: &str| load_config_from_str(toml).unwrap_err().to_string();
+        // An unknown mode names the valid ones instead of meaning "full".
+        let e = err("sampling_mode = \"headonly\"\n");
+        assert!(
+            e.contains("\"headonly\"")
+                && e.contains("\"full\", \"connection_sample\", \"head_only\""),
+            "{e}"
+        );
+        // A rate or a size that the mode would ignore.
+        for toml in [
+            "sample_rate = 0.5\n",
+            "sampling_mode = \"full\"\nsample_rate = 0.5\n",
+            "sampling_mode = \"head_only\"\nsample_rate = 0.5\n",
+        ] {
+            assert!(err(toml).contains("only used with sampling_mode = \"connection_sample\""));
+        }
+        assert!(err("sampling_mode = \"connection_sample\"\n").contains("needs sample_rate"));
+        for toml in [
+            "head_only_bytes = 100\n",
+            "sampling_mode = \"connection_sample\"\nsample_rate = 1.0\nhead_only_bytes = 100\n",
+        ] {
+            assert!(err(toml).contains("only used with sampling_mode = \"head_only\""));
+        }
+        for n in ["0", "1073741825"] {
+            let e = err(&format!(
+                "sampling_mode = \"head_only\"\nhead_only_bytes = {n}\n"
+            ));
+            assert!(e.contains("head_only_bytes must be between 1 and"), "{e}");
+        }
+    }
+
+    #[test]
+    fn test_sampling_config_values() {
+        let load = |toml: &str| load_config_from_str(toml).unwrap();
+        let c = load("sampling_mode = \"full\"\n");
+        assert_eq!((c.sampling_mode, c.sample_rate), (SamplingMode::Full, 1.0));
+        let c = load("sampling_mode = \"head_only\"\n");
+        assert_eq!(
+            c.sampling_mode,
+            SamplingMode::HeadOnly {
+                max_bytes: DEFAULT_HEAD_ONLY_BYTES
+            }
+        );
+        let c = load("sampling_mode = \"head_only\"\nhead_only_bytes = 300\n");
+        assert_eq!(c.sampling_mode, SamplingMode::HeadOnly { max_bytes: 300 });
+        let c = load("sampling_mode = \"connection_sample\"\nsample_rate = 0\n");
+        assert_eq!(c.sampling_mode, SamplingMode::ConnectionSample);
+        assert_eq!(c.sample_rate, 0.0);
+    }
+
+    #[test]
+    fn test_pid_filter_config() {
+        let c = load_config_from_str("pid_filter = [42, 7]\n").unwrap();
+        assert_eq!(c.pid_filter, Some(vec![42, 7]));
+        let max = panopticon_common::MAX_PID_FILTER as usize;
+        let list = |n: usize| (1..=n).map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+        assert!(load_config_from_str(&format!("pid_filter = [{}]\n", list(max))).is_ok());
+        let err = |toml: &str| load_config_from_str(toml).unwrap_err().to_string();
+        let e = err(&format!("pid_filter = [{}]\n", list(max + 1)));
+        assert!(e.contains(&format!("at most {max}")), "{e}");
+        assert!(err("pid_filter = []\n").contains("would capture nothing"));
+        assert!(err("pid_filter = [1, 0]\n").contains("cannot contain 0"));
+        assert!(err("pid_filter = [-1]\n").contains("Invalid TOML"));
+    }
+
+    #[test]
+    fn test_reload_rejects_restart_only_changes() {
+        let load = |toml: &str| load_config_from_str(toml).unwrap();
+        let running = load(
+            "pid_filter = [10, 20]\nsampling_mode = \"connection_sample\"\nsample_rate = 0.5\n",
+        );
+        // Same settings (the PID list in another order): accepted.
+        let same = load(
+            "pid_filter = [20, 10, 10]\nsampling_mode = \"connection_sample\"\nsample_rate = 0.5\n",
+        );
+        assert_eq!(check_restart_only(&running, &same), Ok(()));
+        for (toml, what) in [
+            (
+                "sampling_mode = \"connection_sample\"\nsample_rate = 0.5\n",
+                "pid_filter",
+            ),
+            (
+                "pid_filter = [10]\nsampling_mode = \"connection_sample\"\nsample_rate = 0.5\n",
+                "pid_filter",
+            ),
+            ("pid_filter = [10, 20]\n", "sampling_mode"),
+            (
+                "pid_filter = [10, 20]\nsampling_mode = \"connection_sample\"\nsample_rate = 0.6\n",
+                "sample_rate",
+            ),
+            (
+                "pid_filter = [10, 20]\nsampling_mode = \"head_only\"\n",
+                "sampling_mode",
+            ),
+        ] {
+            let err = check_restart_only(&running, &load(toml)).unwrap_err();
+            assert!(
+                err.contains(what) && err.contains("needs a restart"),
+                "{err}"
+            );
+        }
+        let head = load("sampling_mode = \"head_only\"\n");
+        let err = check_restart_only(
+            &head,
+            &load("sampling_mode = \"head_only\"\nhead_only_bytes = 9\n"),
+        )
+        .unwrap_err();
+        assert!(err.contains("head_only_bytes"), "{err}");
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {

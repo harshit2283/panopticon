@@ -21,7 +21,7 @@ use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLi
 
 use crate::maps::{
     CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, GoReadKey, SockTuple, TLS_ACTIVE,
-    TLS_CONN_ADDR, TLS_SCRATCH, TlsConnKey, TlsReadArgs, shard_for, shard_reserve,
+    TLS_CONN_ADDR, TLS_SCRATCH, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve,
     shard_submit_flags,
 };
 use crate::sock_monitor::read_sock_tuple;
@@ -500,6 +500,10 @@ fn emit_tls_event<C: EbpfContext>(
     direction: Direction,
     tls_lib: TlsLibrary,
 ) -> Result<(), ()> {
+    // pid_filter: other processes' plaintext never leaves the kernel.
+    if !pid_allowed((bpf_get_current_pid_tgid() >> 32) as u32) {
+        return Ok(());
+    }
     let h = tls_header(conn, direction, tls_lib);
     let use_ringbuf = match CONFIG.get(panopticon_common::CONFIG_USE_RINGBUF) {
         Some(&v) => v != 0,

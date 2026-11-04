@@ -35,6 +35,11 @@ pub struct AgentMetrics {
     pub drops_export_full: Counter<u64>,
     pub worker_panics: Counter<u64>,
     pub tcp_segments_ignored: Counter<u64>,
+    pub pid_filter_dropped_events: Counter<u64>,
+    pub pid_filter_unknown_owner_connections: Counter<u64>,
+    pub sampled_out_connections: Counter<u64>,
+    pub sampled_out_events: Counter<u64>,
+    pub head_only_cut_events: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -118,6 +123,39 @@ impl AgentMetrics {
             tcp_segments_ignored.clone(),
         );
 
+        let register = |registry: &mut Registry, name: &str, help: &str| {
+            let counter = Counter::<u64>::default();
+            registry.register(name, help, counter.clone());
+            counter
+        };
+        let pid_filter_dropped_events = register(
+            &mut registry,
+            "panopticon_pid_filter_dropped_events",
+            "Events dropped by pid_filter in user space (TLS and socket events of \
+             unlisted processes are dropped in the kernel and not counted)",
+        );
+        let pid_filter_unknown_owner_connections = register(
+            &mut registry,
+            "panopticon_pid_filter_unknown_owner_connections",
+            "Packet-captured connections dropped by pid_filter because no listed \
+             process was seen to own them (other processes, or opened before the agent)",
+        );
+        let sampled_out_connections = register(
+            &mut registry,
+            "panopticon_sampled_out_connections",
+            "Connections not captured by connection_sample",
+        );
+        let sampled_out_events = register(
+            &mut registry,
+            "panopticon_sampled_out_events",
+            "Events of connections not captured by connection_sample",
+        );
+        let head_only_cut_events = register(
+            &mut registry,
+            "panopticon_head_only_cut_events",
+            "Events cut or dropped by head_only past a direction's first head_only_bytes",
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -176,6 +214,11 @@ impl AgentMetrics {
             drops_export_full,
             worker_panics,
             tcp_segments_ignored,
+            pid_filter_dropped_events,
+            pid_filter_unknown_owner_connections,
+            sampled_out_connections,
+            sampled_out_events,
+            head_only_cut_events,
             parse_latency,
             ringbuf_approx_pending,
         };
@@ -249,6 +292,26 @@ impl AgentMetrics {
             stats.tcp_segments_ignored.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        for (counter, value) in [
+            (
+                &self.pid_filter_dropped_events,
+                &stats.pid_filter_dropped_events,
+            ),
+            (
+                &self.pid_filter_unknown_owner_connections,
+                &stats.pid_filter_unknown_owner_connections,
+            ),
+            (
+                &self.sampled_out_connections,
+                &stats.sampled_out_connections,
+            ),
+            (&self.sampled_out_events, &stats.sampled_out_events),
+            (&self.head_only_cut_events, &stats.head_only_cut_events),
+        ] {
+            counter
+                .inner()
+                .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
 
         // Approximate queued-but-unprocessed events (dropped ones are gone,
         // not pending)

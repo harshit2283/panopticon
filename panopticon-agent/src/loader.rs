@@ -14,7 +14,8 @@ use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
-    CONFIG_RING_SHARD_MASK, CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE,
+    CONFIG_RING_SHARD_MASK, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF, DATA_RING_SHARDS,
+    MAX_PAYLOAD_SIZE,
 };
 
 /// The DATA_EVENTS ring shards in the eBPF object (maps.rs `data_rings!`).
@@ -297,6 +298,23 @@ pub fn sync_config_to_ebpf(
     config: &AgentConfig,
     caps: &KernelCapabilities,
 ) -> Result<()> {
+    // pid_filter: the list first, then the switch. A failure stops the agent
+    // rather than capturing every process. A pinned map may still hold an
+    // earlier run's list, so it is emptied first.
+    {
+        let mut pids: aya::maps::HashMap<_, u32, u8> = aya::maps::HashMap::try_from(
+            ebpf.map_mut("PID_FILTER")
+                .context("PID_FILTER map not found")?,
+        )?;
+        let stale: Vec<u32> = pids.keys().collect::<Result<_, _>>()?;
+        for pid in stale {
+            pids.remove(&pid)?;
+        }
+        for &pid in config.pid_filter.iter().flatten() {
+            pids.insert(pid, 1, 0)
+                .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
+        }
+    }
     let mut cfg_map: Array<_, u64> =
         Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
 
@@ -304,6 +322,8 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
+    let syn_events = crate::capture_gate::GateConfig::from_config(config).wants_syn();
+    cfg_map.set(CONFIG_TCP_SYN_EVENTS, syn_events as u64, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
     // A fresh random key per agent start: flow cookies are not computable
     // offline. Set before TC is attached (load path), so every cookie of a

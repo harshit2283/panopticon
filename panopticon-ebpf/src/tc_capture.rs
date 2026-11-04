@@ -15,8 +15,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary, tc_flow_cookie,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_TCP_SYN_EVENTS, DataEvent, Direction,
+    EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TlsLibrary,
+    tc_flow_cookie,
 };
 
 use crate::maps::{CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, IPV6_DROPS, emit_scratch_event};
@@ -181,8 +182,12 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     // drop the connection's parser state at once instead of holding it
     // until the idle timeout (which, under connection churn, filled the
     // connection table). Same ring buffer as the data, so a close is never
-    // seen before the connection's last bytes.
-    if payload_len == 0 && tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST) == 0 {
+    // seen before the connection's last bytes. SYNs only in head_only mode,
+    // which counts each direction's bytes from them.
+    if payload_len == 0
+        && tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST) == 0
+        && !(tcp_flags & TCP_FLAG_SYN != 0 && config_flag(CONFIG_TCP_SYN_EVENTS))
+    {
         return Ok(TC_ACT_OK);
     }
     let capture_len = if payload_len > MAX_PAYLOAD_SIZE {
@@ -309,6 +314,11 @@ fn populate_tc_event(
         );
         (*event).payload_len = if ret == 0 { copy_len } else { 0 };
     }
+}
+
+#[inline(always)]
+fn config_flag(index: u32) -> bool {
+    CONFIG.get(index).is_some_and(|&v| v != 0)
 }
 
 #[inline(always)]

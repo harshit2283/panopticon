@@ -8,8 +8,9 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
-    CONFIG_ENTRIES, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN, DATA_RING_SHARDS,
-    DataEvent, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
+    CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
+    DATA_RING_SHARDS, DataEvent, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER,
+    TLS_SCRATCH_SIZE, ring_shard,
 };
 
 /// Events lost because a DATA_EVENTS shard was full (user space not keeping
@@ -189,9 +190,20 @@ pub static PID_CGROUP_MAP: LruHashMap<u32, u64> = LruHashMap::with_max_entries(M
 #[map]
 pub static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_ENTRIES, 0);
 
-/// Optional PID filter — when enabled, only capture traffic from listed PIDs.
+/// `pid_filter`: the processes (tgids) whose TLS and socket events are
+/// emitted while CONFIG_PID_FILTER_ON is set. Filled by the loader.
 #[map]
 pub static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
+
+/// Whether events of process `tgid` may be emitted. TC packets have no
+/// process; user space filters them by their connection's owner.
+#[inline(always)]
+pub fn pid_allowed(tgid: u32) -> bool {
+    match CONFIG.get(CONFIG_PID_FILTER_ON) {
+        Some(&on) if on != 0 => unsafe { PID_FILTER.get(&tgid) }.is_some(),
+        _ => true,
+    }
+}
 
 /// Arguments of an in-flight `SSL_read` / `SSL_read_ex`, saved by the entry
 /// probe for the return probe.

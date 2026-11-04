@@ -26,7 +26,7 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, EventType, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, CONNECTING, DATA_EVENTS_PERF, EVENT_SCRATCH, shard_for, shard_reserve,
+    CONFIG, CONNECTING, DATA_EVENTS_PERF, EVENT_SCRATCH, pid_allowed, shard_for, shard_reserve,
     shard_submit_flags,
 };
 use crate::tc_capture::tc_connection_cookie;
@@ -136,6 +136,11 @@ fn emit_owner<C: EbpfContext>(
     src_port: u16,
     dst_port: u16,
 ) -> Result<(), ()> {
+    // pid_filter: only a listed process may become a connection's owner (the
+    // tracepoint path passes the pid saved in the connecting process).
+    if !pid_allowed((pid_tgid >> 32) as u32) {
+        return Ok(());
+    }
     let cookie = tc_connection_cookie(src_addr, dst_addr, src_port, dst_port, IP_PROTO_TCP);
     emit_sock_event(
         ctx,

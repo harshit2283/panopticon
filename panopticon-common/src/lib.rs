@@ -39,6 +39,10 @@ pub const CONFIG_RING_SHARD_MASK: u32 = 5;
 /// Per-boot random key mixed into TC flow cookies ([`tc_flow_cookie`]),
 /// so a peer cannot compute another flow's cookie offline.
 pub const CONFIG_COOKIE_KEY: u32 = 6;
+/// Non-zero: TC also emits payload-less SYN segments (`sampling_mode =
+/// "head_only"` counts each TCP direction's bytes from its SYN).
+pub const CONFIG_TCP_SYN_EVENTS: u32 = 7;
+const _: () = assert!(CONFIG_TCP_SYN_EVENTS < CONFIG_ENTRIES);
 
 /// Bit 63 of a connection key: set for TLS connection keys (user space),
 /// clear for TC flow cookies, so the two key spaces never overlap.

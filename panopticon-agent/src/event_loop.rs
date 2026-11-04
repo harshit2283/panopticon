@@ -61,6 +61,8 @@ struct WorkerTaskContext {
     raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
     max_body_bytes: usize,
     privacy: Arc<PrivacyGate>,
+    /// pid_filter / sampling settings for the worker's capture gate.
+    gate: crate::capture_gate::GateConfig,
 }
 
 #[cfg(target_os = "linux")]
@@ -169,6 +171,18 @@ pub struct EventStats {
     /// TCP segments ignored whole: retransmissions of bytes already parsed,
     /// or outside the connection's window (forged, or a stale RST / FIN).
     pub tcp_segments_ignored: AtomicU64,
+    /// `pid_filter`: events dropped in user space (not counted: TLS and
+    /// socket events of other processes, which the kernel drops).
+    pub pid_filter_dropped_events: AtomicU64,
+    /// `pid_filter`: TC connections dropped because no listed process was
+    /// seen to own them (other processes' connections, connections opened
+    /// before the agent started).
+    pub pid_filter_unknown_owner_connections: AtomicU64,
+    /// `connection_sample`: connections and events sampled out.
+    pub sampled_out_connections: AtomicU64,
+    pub sampled_out_events: AtomicU64,
+    /// `head_only`: events cut or dropped past the per-direction limit.
+    pub head_only_cut_events: AtomicU64,
 }
 
 impl EventStats {
@@ -190,6 +204,11 @@ impl EventStats {
             drops_export_full: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
             tcp_segments_ignored: AtomicU64::new(0),
+            pid_filter_dropped_events: AtomicU64::new(0),
+            pid_filter_unknown_owner_connections: AtomicU64::new(0),
+            sampled_out_connections: AtomicU64::new(0),
+            sampled_out_events: AtomicU64::new(0),
+            head_only_cut_events: AtomicU64::new(0),
         }
     }
 }
@@ -329,6 +348,7 @@ impl EventLoop {
             raw_capture: None,
             max_body_bytes: self.config.max_body_bytes,
             privacy: Arc::clone(&self.privacy),
+            gate: crate::capture_gate::GateConfig::from_config(&self.config),
         };
         let worker = tokio::spawn(worker_task(0, rx, ctx));
         let mut batch = EventBatch::default();
@@ -382,6 +402,7 @@ impl EventLoop {
 
         // Capacity is configured in events; the channels carry batches.
         let batch_cap = channel_cap.div_ceil(WORKER_BATCH);
+        let gate = crate::capture_gate::GateConfig::from_config(&self.config);
         for worker_id in 0..num_workers {
             let (tx, rx) = mpsc::channel::<EventBatch>(batch_cap);
             senders.push(tx);
@@ -405,6 +426,7 @@ impl EventLoop {
                 raw_capture: self.raw_capture.clone(),
                 max_body_bytes: self.config.max_body_bytes,
                 privacy: Arc::clone(&self.privacy),
+                gate: gate.clone(),
             };
             let handle = tokio::spawn(worker_task(worker_id, rx, worker_ctx));
             worker_handles.push(handle);
@@ -1076,8 +1098,11 @@ async fn perf_reader_task(
 /// Worker task: receives events from its channel, maintains per-connection state.
 #[cfg(target_os = "linux")]
 async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: WorkerTaskContext) {
+    use crate::capture_gate::{CaptureGate, Verdict};
+
     let manager = ConnectionFsmManager::new(ctx.max_connections_tracked);
     let mut owners = OwnerTable::new(ctx.max_connections_tracked);
+    let mut gate = CaptureGate::new(ctx.gate.clone(), ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(5);
 
@@ -1089,132 +1114,51 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
     let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
     while let Some(batch) = rx.recv().await {
         for record in batch.records() {
-            // Read per event (an atomic load): a reload may have tightened it.
-            let privacy = ctx.privacy.get();
-            let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
             if !read_data_event_into(record, &mut scratch) {
                 continue;
             }
-            let event: &DataEvent = &scratch;
-            if let Some(raw) = ctx.raw_capture.as_ref()
-                && privacy == PrivacyMode::Full
-            {
-                raw.record(event);
+            let cookie = connection_key(&scratch);
+            // Owners first: they decide whether the connection's TC packets
+            // pass pid_filter. Only a listed process may name one.
+            if gate.pid_allowed(scratch.pid) {
+                owners.observe(&scratch);
             }
-
-            let cookie = connection_key(event);
-            if event.event_type != EventType::TcPacket && event.event_type != EventType::TlsData {
-                owners.observe(event);
-            }
-
-            ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
-
-            if log_events {
-                let src = format_ipv4(event.src_addr);
-                let dst = format_ipv4(event.dst_addr);
-                info!(
-                    worker = worker_id,
-                    event_type = ?event.event_type,
-                    src = %format!("{}:{}", src, event.src_port),
-                    dst = %format!("{}:{}", dst, event.dst_port),
-                    payload_len = event.payload_len,
-                    pid = event.pid,
-                    tgid = event.tgid,
-                    tls_library = ?event.tls_library,
+            let known = owners
+                .get(cookie)
+                .map_or([None; 2], |o| [o.client, o.server]);
+            // The capture gate (pid_filter, sampling) comes before every
+            // sink: nothing it drops is dumped, logged, parsed or exported.
+            if gate.admit(&mut scratch, cookie, known, &ctx.stats) == Verdict::Process {
+                process_event(
+                    worker_id,
+                    &ctx,
+                    &manager,
+                    &mut owners,
+                    &mut gate,
+                    &scratch,
                     cookie,
-                    "Event"
                 );
             }
-
-            // ── Protocol detection + parsing (Phase 3) ───────────────────
-            let Some(results) =
-                feed_event(&manager, event, cookie, &ctx.stats, worker_id, log_events)
-            else {
-                // A retransmitted or out-of-window TCP segment: its bytes
-                // and its FIN / RST are ignored.
-                ctx.stats
-                    .tcp_segments_ignored
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if !results.is_empty() {
-                let src = sender_endpoint(event);
-                let sender_is_server = manager.server_of(cookie).map(|s| s == src);
-                for result in results {
-                    match result {
-                        FsmResult::Messages(msgs) => {
-                            guarded_handle_messages(
-                                msgs,
-                                &MessageContext {
-                                    worker_id,
-                                    log_events,
-                                    stats: ctx.stats.as_ref(),
-                                    pii_engine: &ctx.pii_engine,
-                                    json_export: &ctx.json_export,
-                                    otlp_export: &ctx.otlp_export,
-                                    audit_log: &ctx.audit_log,
-                                    graph_builder: &ctx.graph_builder,
-                                    event,
-                                    sender_is_server,
-                                    max_body_bytes: ctx.max_body_bytes,
-                                    privacy,
-                                    owners: owners.get(cookie),
-                                },
-                            );
-                        }
-                        FsmResult::MessageComplete(msg) => {
-                            guarded_handle_messages(
-                                [msg],
-                                &MessageContext {
-                                    worker_id,
-                                    log_events,
-                                    stats: ctx.stats.as_ref(),
-                                    pii_engine: &ctx.pii_engine,
-                                    json_export: &ctx.json_export,
-                                    otlp_export: &ctx.otlp_export,
-                                    audit_log: &ctx.audit_log,
-                                    graph_builder: &ctx.graph_builder,
-                                    event,
-                                    sender_is_server,
-                                    max_body_bytes: ctx.max_body_bytes,
-                                    privacy,
-                                    owners: owners.get(cookie),
-                                },
-                            );
-                        }
-                        FsmResult::Error(e) => {
-                            debug!(worker = worker_id, cookie, error = %e, "Parser error, closing connection");
-                            ctx.stats.drops_parser_error.fetch_add(1, Ordering::Relaxed);
-                            if manager.close_connection(cookie) {
-                                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            }
-                        }
-                        FsmResult::WaitingForMore => {}
-                        FsmResult::ConnectionClosed => {
-                            if manager.close_connection(cookie) {
-                                ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            }
-                        }
+            // An accept / connect may name the owner of packets the gate
+            // was holding: they follow, in order.
+            if gate.has_held() {
+                for mut held in gate.release(cookie, known) {
+                    if gate.cut_head(&mut held, cookie, &ctx.stats) == Verdict::Process {
+                        process_event(
+                            worker_id,
+                            &ctx,
+                            &manager,
+                            &mut owners,
+                            &mut gate,
+                            &held,
+                            cookie,
+                        );
                     }
                 }
             }
-
-            // Handle connection close events: socket close, TCP RST, or FIN
-            // from both sides (after this packet's payload was parsed).
-            let closed = match event.event_type {
-                EventType::SockClose => true,
-                EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
-                EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
-                    manager.note_fin(cookie, sender_endpoint(event), event.direction)
-                }
-                _ => false,
-            };
-            if closed {
-                owners.remove(cookie);
-                if manager.close_connection(cookie) {
-                    ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
+        }
+        if gate.has_held() {
+            gate.expire_held(crate::util::monotonic_now_ns(), &ctx.stats);
         }
 
         // Periodic idle connection sweep
@@ -1229,11 +1173,147 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                     .fetch_add(evicted as u64, Ordering::Relaxed);
                 debug!(worker_id, evicted, "Evicted idle connections");
             }
+            gate.sweep(
+                crate::util::monotonic_now_ns(),
+                ctx.idle_timeout.as_nanos() as u64,
+                &ctx.stats,
+            );
             last_sweep = Instant::now();
         }
     }
 
     debug!(worker_id, "Worker shutting down");
+}
+
+/// Everything after the capture gate: raw dump, logging, parsing, PII,
+/// graph and export of one admitted event.
+#[cfg(target_os = "linux")]
+fn process_event(
+    worker_id: usize,
+    ctx: &WorkerTaskContext,
+    manager: &ConnectionFsmManager,
+    owners: &mut OwnerTable,
+    gate: &mut crate::capture_gate::CaptureGate,
+    event: &DataEvent,
+    cookie: u64,
+) {
+    // Read per event (an atomic load): a reload may have tightened it.
+    let privacy = ctx.privacy.get();
+    let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
+    if let Some(raw) = ctx.raw_capture.as_ref()
+        && privacy == PrivacyMode::Full
+    {
+        raw.record(event);
+    }
+
+    ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+
+    if log_events {
+        let src = format_ipv4(event.src_addr);
+        let dst = format_ipv4(event.dst_addr);
+        info!(
+            worker = worker_id,
+            event_type = ?event.event_type,
+            src = %format!("{}:{}", src, event.src_port),
+            dst = %format!("{}:{}", dst, event.dst_port),
+            payload_len = event.payload_len,
+            pid = event.pid,
+            tgid = event.tgid,
+            tls_library = ?event.tls_library,
+            cookie,
+            "Event"
+        );
+    }
+
+    // ── Protocol detection + parsing (Phase 3) ───────────────────
+    let Some(results) = feed_event(manager, event, cookie, &ctx.stats, worker_id, log_events)
+    else {
+        // A retransmitted or out-of-window TCP segment: its bytes
+        // and its FIN / RST are ignored.
+        ctx.stats
+            .tcp_segments_ignored
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if !results.is_empty() {
+        let src = sender_endpoint(event);
+        let sender_is_server = manager.server_of(cookie).map(|s| s == src);
+        for result in results {
+            match result {
+                FsmResult::Messages(msgs) => {
+                    guarded_handle_messages(
+                        msgs,
+                        &MessageContext {
+                            worker_id,
+                            log_events,
+                            stats: ctx.stats.as_ref(),
+                            pii_engine: &ctx.pii_engine,
+                            json_export: &ctx.json_export,
+                            otlp_export: &ctx.otlp_export,
+                            audit_log: &ctx.audit_log,
+                            graph_builder: &ctx.graph_builder,
+                            event,
+                            sender_is_server,
+                            max_body_bytes: ctx.max_body_bytes,
+                            privacy,
+                            owners: owners.get(cookie),
+                        },
+                    );
+                }
+                FsmResult::MessageComplete(msg) => {
+                    guarded_handle_messages(
+                        [msg],
+                        &MessageContext {
+                            worker_id,
+                            log_events,
+                            stats: ctx.stats.as_ref(),
+                            pii_engine: &ctx.pii_engine,
+                            json_export: &ctx.json_export,
+                            otlp_export: &ctx.otlp_export,
+                            audit_log: &ctx.audit_log,
+                            graph_builder: &ctx.graph_builder,
+                            event,
+                            sender_is_server,
+                            max_body_bytes: ctx.max_body_bytes,
+                            privacy,
+                            owners: owners.get(cookie),
+                        },
+                    );
+                }
+                FsmResult::Error(e) => {
+                    debug!(worker = worker_id, cookie, error = %e, "Parser error, closing connection");
+                    ctx.stats.drops_parser_error.fetch_add(1, Ordering::Relaxed);
+                    if manager.close_connection(cookie) {
+                        ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                FsmResult::WaitingForMore => {}
+                FsmResult::ConnectionClosed => {
+                    if manager.close_connection(cookie) {
+                        ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Handle connection close events: socket close, TCP RST, or FIN
+    // from both sides (after this packet's payload was parsed).
+    let closed = match event.event_type {
+        EventType::SockClose => true,
+        EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
+        EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
+            manager.note_fin(cookie, sender_endpoint(event), event.direction)
+        }
+        _ => false,
+    };
+    if closed {
+        owners.remove(cookie);
+        gate.forget(cookie);
+        if manager.close_connection(cookie) {
+            ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Run one parser / PII step so that a panic in it (a bug reachable from
@@ -1615,7 +1695,7 @@ const TLS_PEER: crate::protocol::fsm::Endpoint = (0, 2);
 
 /// Who sent this event's payload. For TLS events the direction is relative
 /// to the observed process: it wrote (`Egress`) or read (`Ingress`).
-fn sender_endpoint(event: &DataEvent) -> crate::protocol::fsm::Endpoint {
+pub(crate) fn sender_endpoint(event: &DataEvent) -> crate::protocol::fsm::Endpoint {
     match event.event_type {
         EventType::TlsData if event.direction == Direction::Egress => TLS_LOCAL,
         EventType::TlsData => TLS_PEER,

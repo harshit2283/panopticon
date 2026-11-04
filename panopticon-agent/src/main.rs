@@ -3,6 +3,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod capture_gate;
 #[cfg(feature = "compression")]
 mod compression;
 mod config;
@@ -254,6 +255,12 @@ async fn main() -> Result<()> {
         }
         let privacy_mode = agent_config.privacy_mode;
         info!(mode = %privacy_mode, "Privacy mode");
+        info!(
+            pid_filter = ?agent_config.pid_filter,
+            sampling_mode = ?agent_config.sampling_mode,
+            sample_rate = agent_config.sample_rate,
+            "Capture scope"
+        );
         if privacy_mode == config::PrivacyMode::Full {
             // Also on stderr: RUST_LOG=error must not hide it.
             eprintln!("panopticon: WARNING: {FULL_MODE_WARNING}");
@@ -565,6 +572,9 @@ async fn main() -> Result<()> {
                                 } else {
                                     Ok(())
                                 }
+                            })
+                            .and_then(|()| {
+                                config::check_restart_only(&config_swap.load(), &new_config)
                             });
                             if let Err(why) = check.and_then(|()| {
                                 privacy
