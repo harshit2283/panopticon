@@ -194,8 +194,13 @@ running config is kept.
   limit is exported with the part before it. For TCP the count starts at
   the connection's SYN, so connections already open when the agent started
   pass nothing. For TLS (uprobes) and UDP it starts at the first byte the
-  agent sees, and a connection idle for longer than
-  `idle_connection_timeout_secs` counts from zero again.
+  agent sees. A count never starts over: the agent sees no close for TLS
+  and UDP connections, so it remembers them (idle or not) until it
+  restarts. Each worker remembers at most `max_connections_tracked`
+  connections; once full, new connections pass nothing (counted as cut)
+  until TCP connections close or go idle and free room. A TLS connection
+  that reuses the library object of an earlier one in the same process
+  continues that one's count.
 
 An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
 `head_only_bytes` without `head_only` stop the agent with an error.

@@ -22,6 +22,10 @@
 //!   pass. TCP is cut at the stream offset counted from the SYN, which the
 //!   kernel delivers in this mode; a TCP connection whose SYN was not seen
 //!   (open before the agent started, or forgotten) passes no bytes at all.
+//!   TLS and UDP count from the first byte seen; having no start marker,
+//!   their state is never forgotten (not when idle, not when the table is
+//!   full), so a count never restarts. A full table admits no new state:
+//!   new connections then pass nothing.
 
 // The workers that use it are Linux-only; the logic is tested everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -130,6 +134,8 @@ struct Side {
 
 struct Head {
     last_ns: u64,
+    /// TCP (counted from the SYN) rather than TLS / UDP (from first sight).
+    tcp: bool,
     sides: [Option<Side>; 2],
 }
 
@@ -309,14 +315,31 @@ impl CaptureGate {
         let live = |last: u64| now_ns.saturating_sub(last) <= idle_ns;
         self.denied.retain(|_, last| live(*last));
         self.sampled_out.retain(|_, last| live(*last));
-        self.heads.retain(|_, h| live(h.last_ns));
+        // Only TCP head state may go when idle: a TCP segment without state
+        // passes nothing. TLS and UDP have no start marker, so forgetting
+        // one would restart its count: they are kept until restart.
+        self.heads.retain(|_, h| !h.tcp || live(h.last_ns));
     }
 
-    /// The connection closed (FIN both ways, RST): its head_only state goes.
-    /// A segment that follows is counted against no head and passes nothing
-    /// (TCP) or starts a new count (other events).
+    /// A TCP connection closed (FIN both ways, RST): its head_only state
+    /// goes, and a segment that follows passes nothing. (TLS and UDP
+    /// connections have no close the agent sees.)
     pub fn forget(&mut self, key: u64) {
         self.heads.remove(&key);
+    }
+
+    /// Add head_only state for `key`. Fails closed when the table is full:
+    /// nothing is evicted (that would restart a TLS / UDP count), the new
+    /// connection gets no state and passes nothing.
+    fn insert_head(&mut self, key: u64, tcp: bool, ts: u64) {
+        if self.heads.len() < self.cap {
+            let head = Head {
+                last_ns: ts,
+                tcp,
+                sides: [None; 2],
+            };
+            self.heads.insert(key, head);
+        }
     }
 
     /// head_only: cut `event` to the bytes before its direction's limit.
@@ -340,11 +363,7 @@ impl CaptureGate {
                 self.heads.remove(&key);
             }
             if !self.heads.contains_key(&key) {
-                let head = Head {
-                    last_ns: ts,
-                    sides: [None; 2],
-                };
-                insert_bounded(&mut self.heads, self.cap, key, head);
+                self.insert_head(key, true, ts);
             }
             if let Some(head) = self.heads.get_mut(&key) {
                 let start = Side {
@@ -357,11 +376,7 @@ impl CaptureGate {
                 }
             }
         } else if !tcp && !self.heads.contains_key(&key) {
-            let head = Head {
-                last_ns: ts,
-                sides: [None; 2],
-            };
-            insert_bounded(&mut self.heads, self.cap, key, head);
+            self.insert_head(key, false, ts);
         }
 
         // Stream offset of the event's first byte; None when unknown (TCP
@@ -646,6 +661,84 @@ mod tests {
         assert_eq!(
             head(&mut g, &mut tcp(c, 7001, ack, b"0123456789AB"), 1).1,
             b"0123456789"
+        );
+    }
+
+    fn tls(dir: Direction, p: &[u8]) -> DataEvent {
+        let mut e = event(EventType::TlsData, p);
+        e.direction = dir;
+        e
+    }
+
+    #[test]
+    fn head_only_idle_connections_never_restart_their_count() {
+        let stats = EventStats::new();
+        let mut g = gate("sampling_mode = \"head_only\"\nhead_only_bytes = 4\n");
+        let (c, ack) = ((1, 40000), TCP_FLAG_ACK);
+        // TLS: the head is used up, then the connection goes idle.
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"abcdef"), 1).1,
+            b"abcd"
+        );
+        // Half a head used on another, then idle too.
+        assert_eq!(head(&mut g, &mut tls(Direction::Egress, b"ab"), 2).1, b"ab");
+        // TCP, idle as well.
+        head(&mut g, &mut tcp(c, 100, TCP_FLAG_SYN, b""), 3);
+        assert_eq!(head(&mut g, &mut tcp(c, 101, ack, b"ab"), 3).1, b"ab");
+        let idle = 30_000_000_000;
+        g.sweep(idle * 10, idle, &stats);
+        // No restart: the cut one stays cut, the other keeps its count.
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"x"), 1).0,
+            Verdict::Drop
+        );
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"cdef"), 2).1,
+            b"cd"
+        );
+        // TCP state went, so the connection passes nothing (fail closed).
+        assert_eq!(
+            head(&mut g, &mut tcp(c, 103, ack, b"c"), 3).0,
+            Verdict::Drop
+        );
+    }
+
+    #[test]
+    fn head_only_full_table_fails_closed_without_evicting() {
+        let mut g = CaptureGate::new(
+            config("sampling_mode = \"head_only\"\nhead_only_bytes = 4\n"),
+            2,
+        );
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"abcdef"), 1).1,
+            b"abcd"
+        );
+        assert_eq!(head(&mut g, &mut tls(Direction::Egress, b"ab"), 2).1, b"ab");
+        // Full: a new connection gets no state and passes nothing...
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"new"), 3).0,
+            Verdict::Drop
+        );
+        let (c, ack) = ((1, 40000), TCP_FLAG_ACK);
+        head(&mut g, &mut tcp(c, 100, TCP_FLAG_SYN, b""), 4);
+        assert_eq!(
+            head(&mut g, &mut tcp(c, 101, ack, b"ab"), 4).0,
+            Verdict::Drop
+        );
+        // ...and the existing ones were not evicted to make room.
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"x"), 1).0,
+            Verdict::Drop
+        );
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"cdef"), 2).1,
+            b"cd"
+        );
+        // Space freed by a close is usable again.
+        g.forget(2);
+        assert_eq!(
+            head(&mut g, &mut tls(Direction::Egress, b"wxyz!"), 5).1,
+            b"wxyz"
         );
     }
 
