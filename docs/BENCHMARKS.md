@@ -677,7 +677,7 @@ change at a time.
   tree, so the baseline binary is built from that same tree. The baseline
   differs from the release code in one way: the JSON export moved after the
   service graph, so that H3 can move the message into it. That move is
-  cost-neutral.
+  expected to be cost-neutral; it was not measured separately.
 
 **Finding 1. Request rate drives the per-request cost, not connection count.**
 At the same fixed rate up to 50K req/s, 4K connections cost the agent about
@@ -753,7 +753,7 @@ Every hypothesis was tested twice:
 | | Prediction | Measured | Verdict |
 |---|---|---|---|
 | **P0**, fixed rate closes the gap | 64 → 4K gap under 1.5x at 20K req/s | 17.6 [17.1-18.0] → 18.9 [18.8-19.2] µs/req at 20K (1.07x). At 50K, 14.4 → 18.2 (1.26x). At 100K, 24.4 vs 12.6 (1.9x), and 13.7 vs 11.5 (1.2x) with H2-len. | **Supported** up to 50K req/s. Above that the gap is Finding 2. |
-| **H1**, regex pool: one `RegexPrefilter` per worker | -1..-4% at 4K, about 0 at 64 | Stage 1: +4.5% at 64×20K, +3.2% at 4K×20K (overlap), **+25%** at 4K×150K (45.0 [44.1-52.7] vs 35.9). Stage 2: **-12.8%** at 4K×150K (12.9 [12.7-13.2] vs 14.8 [14.0-15.8]), +4.6% at 64×50K (overlap). | **Mixed.** It helps only at high concurrency once `len()` is fixed. Alone it makes things worse, because faster PII scanning sends the workers into the contended map more often. The mechanism did engage. In flat profiles at 4K×150K, regex time fell from 5.6 to 2.4 µs/req, the pool (`get_slow` + `put_value`) from 1.7 to 1.2 µs/req, and the lazy-DFA rebuild (`determinize::*`, 2.6 µs/req) dropped below the top 60 symbols. The shared pool discards and rebuilds caches when it is contended. |
+| **H1**, regex pool: one `RegexPrefilter` per worker | -1..-4% at 4K, about 0 at 64 | Stage 1: +4.5% at 64×20K, +3.2% at 4K×20K (overlap), **+25%** at 4K×150K (45.0 [44.1-52.7] vs 35.9). Stage 2: **-12.8%** at 4K×150K (12.9 [12.7-13.2] vs 14.8 [14.0-15.8]), +4.6% at 64×50K (overlap). | **Refuted as specified**: alone it is worse in every cell. **Supported only on top of H2-len** at 4K×150K. Alone it makes things worse because faster PII scanning sends the workers into the contended map more often. The mechanism did engage. In flat profiles at 4K×150K, regex time fell from 5.6 to 2.4 µs/req, the pool (`get_slow` + `put_value`) from 1.7 to 1.2 µs/req, and the lazy-DFA rebuild (`determinize::*`, 2.6 µs/req) dropped below the top 60 symbols. The shared pool discards and rebuilds caches when it is contended. |
 | **H2**, shared graph maps | `lock_shared_slow` mostly from `EdgeAggregator::record` via `len()`; -5..-8% at 4K | Attribution as predicted (Finding 2). H2-len (atomic flow count instead of `len()`): **-55.7%** at 4K×150K (15.9 [14.1-16.0] vs 35.9 [35.6-37.6]), -7.3% at 64×50K, -4.8% at 4K×20K, -2.3% at 64×20K (overlap). Per-worker aggregators (H2-shard): -56% at 150K alone, nothing more on top of H2-len (+0.7%, overlap). Per-thread identity memo (H2-id): no effect in either stage. `ConnectionFsmManager`: no lock waits. | **Supported**, with the size predicted about 10x too low. The fix is `len()`. Sharding and the identity memo add nothing measurable. |
 | **H3**, per-message clones | Clones 5-10% of samples; saving 3-6%, flat across connection counts | `L7Message::clone` is 7.4% (64) and 8.1% (4K) of agent CPU at 20K, and 4.1% at 150K. Stage 1: -2.3% at 64×20K (overlap), **-6.3%** at 4K×20K, -4.4% at 64×50K, -5.0% at 4K×150K (overlap). Stage 2: **-6.8%** at 4K×150K, -4.6% at 64×50K (overlap). | **Supported**, small. |
 | **H4**, cache misses on per-connection state | IPC down 15-25% and LLC misses/request over 2x at 4K vs 64, same 20K rate | User-space IPC 1.44 → 1.26 (-13%), user cycles/request +15% (50.0K → 57.4K), instructions/request equal (71.7K vs 72.1K). `cache-misses`/request 268 [231-304] vs 289 [281-297], and L1d misses/request 861 vs 870, both overlapping. `LLC-loads` and `LLC-load-misses` are not available in the guest. | **Refuted as stated.** IPC drops a little, but the miss counters do not move. The extra 7.4K user cycles per request are the same order as the measured 1.3 µs/req gap (17.6 → 18.9). Where they come from is not identified (see Caveats). |
@@ -766,11 +766,11 @@ and *win1* (H2-len + H3 + H1).
 | Build | 64 conns × 20K | 4K conns × 20K | 64 conns × 50K | 4K conns × 150K |
 |---|---|---|---|---|
 | baseline | 17.6 [17.1-18.0] | 18.9 [18.8-19.2] | 13.7 [13.6-14.9] | 35.9 [35.6-37.6] |
-| H2-len | 17.2 [17.0-17.7], -2% | 18.0 [17.7-18.7], -5% | 12.7 [11.8-13.3], -7% | 15.9 [14.1-16.0], -56%, recall 98.51% |
-| H3 | 17.2 [16.7-17.3], -2% | 17.7 [16.7-17.8], -6% | 13.1 [12.5-13.4], -4% | 34.1 [31.3-37.5], -5% |
+| H2-len | 17.2 [17.0-17.7], -2% (overlap) | 18.0 [17.7-18.7], -5% | 12.7 [11.8-13.3], -7% | 15.9 [14.1-16.0], -56%, recall 98.51% |
+| H3 | 17.2 [16.7-17.3], -2% (overlap) | 17.7 [16.7-17.8], -6% | 13.1 [12.5-13.4], -4% | 34.1 [31.3-37.5], -5% (overlap) |
 | win: H2-len + H3 | 15.9 [15.0-16.8], -10% | 17.3 [17.3-17.6], -8% | 11.8 [11.7-12.2], -14% | 13.6 [13.4-14.6], -62%, recall 98.71% |
 | win1: + H1 | 15.6 [14.7-16.0], -11% | 18.0 [17.4-18.4], -5% | 12.6 [12.6-12.8], -8% | 12.4 [11.6-12.7], -65%, recall 98.89% |
-| all five | 17.0 [15.1-17.5], -3% | 17.6 [17.3-18.2], -7% | 12.5 [12.3-12.8], -9% | 12.3 [11.5-13.3], -66%, recall 98.69% |
+| all five | 17.0 [15.1-17.5], -3% (overlap) | 17.6 [17.3-18.2], -7% | 12.5 [12.3-12.8], -9% | 12.3 [11.5-13.3], -66%, recall 98.69% |
 
 **Next limit after the fix: the JSON export queue.** With H2-len, recall at
 4K×150K falls from 99.99% to 98.3-98.9%. All the loss is `drops_export_full`:
@@ -792,8 +792,9 @@ is the release code plus the cost-neutral sink reorder described under Method.
   - **(b)** `redacted`, every request exported.
   - **(c)** `full` with the JSON export and the raw dump (`capture_raw_path`
     on tmpfs, size cap lifted).
-- **Runs.** Mode (b) has three runs per cell, as does the no-agent baseline.
-  Modes (a1), (a2) and (c) have one run per cell.
+- **Runs.** Mode (b) has three runs per cell. The no-agent baseline has three
+  too, except at 64×20K, which has two after one run was discarded. Modes
+  (a1), (a2) and (c) have one run per cell.
 - **Column notes.**
   - **Drops:** kernel ring / worker channel full / export queue full / raw
     dump.
