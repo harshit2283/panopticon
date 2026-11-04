@@ -196,7 +196,8 @@ panic messages (which can quote the data being processed) are reduced to
 where the panic happened.
 
 Each mode is checked against ground truth: `tests/oracle/run_modes.sh`
-plants unique PII values in HTTP and HTTPS traffic and searches every output
+plants unique PII values and credentials in HTTP, HTTPS, Redis and Kafka
+traffic and searches every output
 (export, raw dump, pcap, audit log, agent log at debug level, `/metrics`,
 `/debug/state`) for them; results are in [`CURRENT-STATE.md`](CURRENT-STATE.md).
 
