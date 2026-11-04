@@ -183,7 +183,7 @@ is rejected with an error and the running config is kept; restart the agent
 to widen it. `--privacy-mode` keeps overriding the file on reload.
 
 In `full` mode the agent logs a warning at startup that decrypted payloads
-are being written unredacted. The JSON export and the raw dump are created
+are being written unredacted. The JSON export, the PII audit log and the raw dump are created
 readable by their owner only (`0600`). In `redacted` and `metrics_only`,
 panic messages (which can quote the data being processed) are reduced to
 where the panic happened.

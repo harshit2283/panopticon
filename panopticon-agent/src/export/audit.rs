@@ -32,11 +32,19 @@ pub struct PiiAuditLog {
 
 impl PiiAuditLog {
     pub fn new(path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        // Owner-only (0600), like the JSON export: findings name services
+        // and PII categories.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(path)
             .with_context(|| format!("Failed to open PII audit log file: {}", path))?;
+        // `mode` only applies on creation; tighten a pre-existing file too.
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .with_context(|| format!("Failed to restrict permissions on {path}"))?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -58,6 +66,19 @@ impl PiiAuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join("panopticon_test_audit_mode.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _log = PiiAuditLog::new(path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn test_audit_log_append_only() {
