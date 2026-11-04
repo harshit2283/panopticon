@@ -26,6 +26,41 @@ pub struct TlsTarget {
     pub pid: u32,
     pub library_path: String,
     pub tls_type: TlsType,
+    /// Identity of the file the probe offsets were read from: the attach
+    /// must hit that same file (see [`open_examined`]).
+    pub file_key: Option<FileKey>,
+}
+
+/// Identity of a file's contents: device, inode, mtime (ns) and size, so a
+/// file replaced or rewritten in place no longer matches.
+pub type FileKey = (u64, u64, i64, u64);
+
+/// The [`FileKey`] of an open file (fstat: the file itself, not a path).
+#[cfg(unix)]
+pub fn file_key(file: &std::fs::File) -> std::io::Result<FileKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    let mtime_ns = m.mtime().saturating_mul(1_000_000_000) + m.mtime_nsec();
+    Ok((m.dev(), m.ino(), mtime_ns, m.size()))
+}
+
+/// Open the file a target's offsets were read from, for the uprobe attach
+/// (F14). `library_path` lies under `/proc/<pid>/root`, which the workload
+/// controls: between the scan and the attach it can swap the file, and the
+/// agent would place probes at offsets examined in one file into another
+/// (possibly one shared with other workloads). The file opened now must be
+/// the one examined, or the attach is refused; the caller attaches through
+/// `/proc/self/fd/<n>` of the returned file, so the kernel resolves exactly
+/// this inode and not the path again.
+#[cfg(unix)]
+pub fn open_examined(target: &TlsTarget) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(&target.library_path)?;
+    if target.file_key.is_none() || target.file_key != Some(file_key(&file)?) {
+        return Err(std::io::Error::other(
+            "the file changed since it was examined",
+        ));
+    }
+    Ok(file)
 }
 
 /// The kind of TLS library discovered, with symbol offsets for uprobe attachment.
@@ -430,11 +465,12 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
             continue;
         }
         let namespace_path = namespace_resolved_path(pid, path);
-        if let Some(tls_type) = examine_cached(path, &namespace_path) {
+        if let Some((tls_type, file_key)) = examine_cached(path, &namespace_path) {
             targets.push(TlsTarget {
                 pid,
                 library_path: namespace_path,
                 tls_type,
+                file_key: Some(file_key),
             });
         }
     }
@@ -442,45 +478,39 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
     targets
 }
 
-/// Identity of a file's contents for the verdict cache: device, inode,
-/// mtime and size, so a binary replaced in place is examined again.
-#[cfg(target_os = "linux")]
-type FileKey = (u64, u64, i64, u64);
-
 /// Bound on cached verdicts; the cache is cleared when it is reached.
 #[cfg(target_os = "linux")]
 const MAX_CACHED_VERDICTS: usize = 8192;
 
-/// TLS verdict for a mapped file, cached per file so each binary's ELF
-/// symbol tables are parsed once, not on every periodic rescan of every
-/// process that maps it. Negative verdicts (not TLS) are cached too: most
-/// files examined are executables without crypto/tls.
+/// TLS verdict for a mapped file, cached per file (its [`FileKey`]) so each
+/// binary's ELF symbol tables are parsed once, not on every periodic rescan
+/// of every process that maps it. Negative verdicts (not TLS) are cached
+/// too: most files examined are executables without crypto/tls.
+///
+/// The file is opened once and parsed through `/proc/self/fd/<n>`, so every
+/// read of the examination sees the same inode as the key it is cached and
+/// attached under (F14), however the workload changes the path meanwhile.
 #[cfg(target_os = "linux")]
-fn examine_cached(path: &str, namespace_path: &str) -> Option<TlsType> {
+fn examine_cached(path: &str, namespace_path: &str) -> Option<(TlsType, FileKey)> {
     use std::collections::HashMap;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::fd::AsRawFd;
     use std::sync::{Mutex, OnceLock};
 
     static VERDICTS: OnceLock<Mutex<HashMap<FileKey, Option<TlsType>>>> = OnceLock::new();
-    let key = std::fs::metadata(namespace_path)
-        .ok()
-        .map(|m| (m.dev(), m.ino(), m.mtime(), m.size()));
+    let file = std::fs::File::open(namespace_path).ok()?;
+    let key = file_key(&file).ok()?;
     let cache = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(key) = key
-        && let Some(verdict) = cache.lock().ok()?.get(&key)
-    {
-        return verdict.clone();
+    if let Some(verdict) = cache.lock().ok()?.get(&key) {
+        return verdict.clone().map(|t| (t, key));
     }
-    let verdict = examine_binary(path, namespace_path);
-    if let Some(key) = key
-        && let Ok(mut cache) = cache.lock()
-    {
+    let verdict = examine_binary(path, &format!("/proc/self/fd/{}", file.as_raw_fd()));
+    if let Ok(mut cache) = cache.lock() {
         if cache.len() >= MAX_CACHED_VERDICTS {
             cache.clear();
         }
         cache.insert(key, verdict.clone());
     }
-    verdict
+    verdict.map(|t| (t, key))
 }
 
 /// Parse a mapped file's ELF to see whether it is a TLS library we hook.
@@ -865,6 +895,43 @@ mod tests {
         assert_eq!(rets, vec![0x4004, 0x400c]);
     }
 
+    /// F14: the attach opens the file the offsets were read from, or
+    /// nothing: not a file swapped in at the same path, nor the same file
+    /// rewritten in place.
+    #[cfg(unix)]
+    #[test]
+    fn test_attach_refuses_a_file_swapped_after_examination() {
+        let dir = std::env::temp_dir().join(format!("panopticon-f14-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("libssl.so.3");
+        std::fs::write(&lib, b"examined").unwrap();
+        let examined = file_key(&std::fs::File::open(&lib).unwrap()).unwrap();
+        let target = |key| TlsTarget {
+            pid: 1,
+            library_path: lib.to_string_lossy().into_owned(),
+            tls_type: TlsType::GoTls {
+                write_offset: 0x1000,
+                read: None,
+                go_version: GoVersion::RegisterAbi,
+            },
+            file_key: key,
+        };
+        assert!(open_examined(&target(Some(examined))).is_ok());
+        assert!(open_examined(&target(None)).is_err(), "never examined");
+
+        // Swapped: another file renamed over the path.
+        let other = dir.join("other");
+        std::fs::write(&other, b"examined").unwrap();
+        std::fs::rename(&other, &lib).unwrap();
+        assert!(open_examined(&target(Some(examined))).is_err());
+
+        // Rewritten in place: same inode, other contents.
+        let swapped = file_key(&std::fs::File::open(&lib).unwrap()).unwrap();
+        std::fs::write(&lib, b"rewritten, longer").unwrap();
+        assert!(open_examined(&target(Some(swapped))).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_dedup_targets_by_file_not_path() {
         let ssl = |pid: u32, path: &str| TlsTarget {
@@ -876,6 +943,7 @@ mod tests {
                 ssl_write_ex_offset: None,
                 ssl_read_ex_offset: None,
             },
+            file_key: None,
         };
         let go = |pid: u32, path: &str| TlsTarget {
             pid,
@@ -885,6 +953,7 @@ mod tests {
                 read: None,
                 go_version: GoVersion::RegisterAbi,
             },
+            file_key: None,
         };
         let mut targets = vec![
             ssl(10, "/proc/10/root/usr/lib/libssl.so.3"),
