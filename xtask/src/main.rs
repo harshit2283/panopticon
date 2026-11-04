@@ -181,7 +181,7 @@ fn validate_required_sections(sections: &HashSet<String>) -> Result<()> {
 
 /// Prints instructions and optionally runs eBPF tests on a Linux system.
 ///
-/// eBPF programs require a Linux kernel (4.15+ minimum, 5.8+ recommended).
+/// eBPF programs require a Linux kernel (5.8+).
 /// This command helps developers test on Linux VMs or bare-metal machines.
 fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
     let workspace_root = workspace_root()?;

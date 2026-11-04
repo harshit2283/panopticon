@@ -36,7 +36,7 @@ production-hardened compliance platform.
 ## Partial
 
 - Linux kernel support:
-  - 5.8+ is the supported floor (validated by loading on 6.18).
+  - 5.8+ is the supported floor. Full accuracy suites pass on 5.15, 6.8 and 7.0 (also loaded on 6.18).
   - 4.15-5.7 does not load today: the PerfEventArray fallback exists in code,
     but the object always creates a RingBuf map and uses 5.5+ helpers.
   - ARM64 support exists but validation remains limited; no arm64 image yet.

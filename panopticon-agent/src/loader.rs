@@ -95,7 +95,17 @@ pub fn load_and_attach(
         );
     }
 
-    let mut ebpf = load_ebpf_bytes(config.map_pin_path.as_deref())?;
+    let mut ebpf = load_ebpf_bytes(config.map_pin_path.as_deref()).map_err(|e| {
+        if caps.has_ringbuf {
+            e
+        } else {
+            e.context(format!(
+                "kernel {}.{}.{} is below the supported floor of 5.8 (BPF ring buffer \
+                 and 5.5+ probe-read helpers are required)",
+                caps.version.0, caps.version.1, caps.version.2
+            ))
+        }
+    })?;
     let mut links: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
 
     // Write initial config to eBPF CONFIG map

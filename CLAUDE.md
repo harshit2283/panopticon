@@ -90,7 +90,7 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 
 ## Prerequisites
 
-- **Linux kernel**: 4.15+ minimum (TC eBPF + PerfEventArray), 5.8+ recommended (RingBuf support)
+- **Linux kernel**: 5.8+ (RingBuf and 5.5+ probe-read helpers). Validated on 5.15, 6.8, 7.0; 5.4 does not load
 - **Toolchain**: Rust nightly, `rust-src` component, bpf-linker (`cargo install bpf-linker`)
 - **System packages**: clang-18, llvm-18, libelf-dev, linux-headers, pkg-config, libssl-dev
 - **ONNX Runtime** (optional): v1.19.2+ at `/opt/onnxruntime` (set `ORT_LIB_LOCATION`)
@@ -100,7 +100,7 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 ## Key Design Decisions
 
 - **`#[repr(C)]` for all shared types** — Required for kernel↔user space ABI compatibility. `DataEvent` is ~4.2KB; must use RingBuf reserve or PerCpuArray scratch (not stack, 512-byte limit).
-- **RingBuf primary, PerfEventArray fallback** — RingBuf (kernel 5.8+) is zero-copy and ordered. PerfEventArray for older kernels uses PerCpuArray scratch maps for the large DataEvent struct.
+- **RingBuf only in practice** — RingBuf (kernel 5.8+) is zero-copy and ordered. PerfEventArray branches exist in the eBPF code, but the single object always creates RingBuf maps, so kernels below 5.8 cannot load it.
 - **FSM-based protocol parsers** — Single-packet parsers fail on real traffic (e.g., PostgreSQL queries spanning 17+ packets). Each connection gets its own `ProtocolFsm` instance managed by `ConnectionFsmManager` (DashMap-backed).
 - **PII pipeline: regex first, then ML** — Regex prefilter (RegexSet, ~1µs) skips ~90% of traffic. Only suspicious payloads go to DistilBERT-NER (ONNX, batched). Inference sampler limits budget per second.
 - **DNS cache for service graph** — Without it, graph shows IPs not names. Fallback chain: observed DNS events → reverse lookup → raw IP. TTL-aware with DashMap.
