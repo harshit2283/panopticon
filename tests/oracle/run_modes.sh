@@ -77,7 +77,7 @@ for mode in $MODES; do
   curl -sf "http://$METRICS/debug/state" >"$D/debug_state.json" || echo "debug scrape failed"
   kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
   if [[ -f $D/raw.pncap ]]; then
-    "$AGENT" --decode-capture "$D/raw.pncap" --pcap "$D/raw.pcap"
+    "$AGENT" --privacy-mode full --decode-capture "$D/raw.pncap" --pcap "$D/raw.pcap"
     if command -v tshark >/dev/null; then
       reqs=$(tshark -r "$D/raw.pcap" -Y 'http.request' 2>/dev/null | wc -l)
       echo "tshark: $reqs HTTP requests decoded from the pcap (TC and TLS plaintext)"

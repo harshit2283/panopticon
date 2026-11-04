@@ -57,7 +57,7 @@ export:
   jsonEvents: true
   piiAuditLog: true
   # Write every captured payload UNREDACTED, decrypted TLS included, to
-  # <hostPath>/raw.pncap (decode with `panopticon-agent --decode-capture`, add
+  # <hostPath>/raw.pncap (decode with `panopticon-agent --privacy-mode full --decode-capture`, add
   # `--pcap out.pcap` for Wireshark). Needs privacy.mode=full. Off by default.
   # Size cap: `capture_raw_max_bytes` in agent.config (default 1 GiB).
   rawCapture: false

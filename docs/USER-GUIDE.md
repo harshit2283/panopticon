@@ -93,8 +93,8 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 | `--kubernetes <auto\|true\|false>` | Kubernetes identity (§5.6); overrides `[kubernetes] enabled`. Also `PANOPTICON_KUBERNETES`. |
 | `--privacy-mode <full\|redacted\|metrics_only>` | What may leave the node (§4.3); overrides `[privacy] mode`. Also `PANOPTICON_PRIVACY_MODE`. Default `redacted`. |
 | `--capture-raw <FILE>` | Write every captured payload, unredacted and with TLS decrypted, to a binary capture file (§5.5). Needs `--privacy-mode full`. |
-| `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root. |
-| `--decode-capture <FILE> --pcap <OUT>` | Convert a raw capture to a pcap file for Wireshark / tshark (§5.5) and exit. |
+| `--decode-capture <FILE>` | Print a raw capture file as JSON lines and exit. Needs no root, but needs `--privacy-mode full` (or `full` in the config file): the output is unredacted. |
+| `--decode-capture <FILE> --pcap <OUT>` | Convert a raw capture to a pcap file for Wireshark / tshark (§5.5) and exit. Also needs `--privacy-mode full`. |
 | `-v, --verbose` | Debug logging (otherwise `RUST_LOG`, default `info`). |
 
 ### 4.2 Config file reference
@@ -173,6 +173,8 @@ the agent at startup with a message saying why:
   `[otlp] enabled` in `metrics_only`;
 - `redacted` with `[pii] enabled = false` or `regex_enabled = false` (nothing
   would be masked);
+- the external PII service in any mode other than `full` (it is sent raw
+  values);
 - `[pii] redact = false` outside `full`. `redact` otherwise follows the mode
   and is best left out. The one combination kept from before the mode
   existed: `redact = true` with `mode = "full"` keeps the event export
@@ -182,10 +184,13 @@ the agent at startup with a message saying why:
 `redacted` → `metrics_only`: exports stop at once, files already written are
 left as they are). It cannot make it wider: a reload asking for a wider mode
 is rejected with an error and the running config is kept; restart the agent
-to widen it. `--privacy-mode` keeps overriding the file on reload.
+to widen it. A reload from `full` to `redacted` is rejected the same way when
+the agent was started without regex PII detection (`[pii] enabled` or
+`regex_enabled` off): it has no redactor to switch on, so restart it. `--privacy-mode` keeps overriding the file on reload.
 
-In `full` mode the agent logs a warning at startup that decrypted payloads
-are being written unredacted. The JSON export, the PII audit log and the raw dump are created
+In `full` mode the agent prints a warning at startup, on stderr and in the
+log (so `RUST_LOG=error` cannot hide it), that decrypted payloads are being
+written unredacted. The JSON export, the PII audit log and the raw dump are created
 readable by their owner only (`0600`). In `redacted` and `metrics_only`,
 panic messages (which can quote the data being processed) are reduced to
 where the panic happened.
@@ -364,14 +369,15 @@ reported, capture the raw bytes. This needs privacy mode `full` (§4.3):
 > exactly as sent: passwords, session tokens, API keys and personal data,
 > and for TLS connections captured through OpenSSL or Go the **decrypted**
 > plaintext. Anyone who can read the file, or the pcap made from it, can
-> read that traffic. The agent warns at startup whenever mode `full` is on.
+> read that traffic. The agent warns at startup whenever mode `full` is on,
+> and decoding a capture needs `--privacy-mode full` too.
 
 ```bash
 sudo panopticon-agent --privacy-mode full --capture-raw /var/lib/panopticon/raw.pncap
 # later, anywhere, without root:
-panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
+panopticon-agent --privacy-mode full --decode-capture /var/lib/panopticon/raw.pncap > raw.jsonl
 # or, for Wireshark / tshark:
-panopticon-agent --decode-capture /var/lib/panopticon/raw.pncap --pcap raw.pcap
+panopticon-agent --privacy-mode full --decode-capture /var/lib/panopticon/raw.pncap --pcap raw.pcap
 ```
 
 **Opening it in Wireshark.** `wireshark raw.pcap` (or `tshark -r raw.pcap`)
