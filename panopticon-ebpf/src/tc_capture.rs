@@ -15,8 +15,8 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary,
+    CONFIG_CAPTURE_ENABLED, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN,
+    TCP_FLAG_RST, TlsLibrary,
 };
 
 use crate::maps::{CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, IPV6_DROPS, emit_scratch_event};
@@ -190,14 +190,11 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
         _ => return Ok(TC_ACT_OK),
     };
 
-    // Skip the agent's own metrics/health traffic (Prometheus scrapes,
-    // kubelet probes) so the observer does not observe itself.
-    if let Some(&ignore) = CONFIG.get(CONFIG_IGNORE_PORT)
-        && ignore != 0
-        && (src_port as u64 == ignore || dst_port as u64 == ignore)
-    {
-        return Ok(TC_ACT_OK);
-    }
+    // No port is exempt, not even the agent's own metrics port: a peer that
+    // used that port as its source port hid its whole connection, and with
+    // the listener on the node IP (the Helm default) masqueraded pod traffic
+    // can carry the node IP and that port too. The agent's own scrapes and
+    // probes are captured like any other traffic.
 
     let ip_payload_end = ip_offset + total_len;
     let payload_len = ip_payload_end.saturating_sub(payload_offset);

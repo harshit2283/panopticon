@@ -491,7 +491,7 @@ real cluster.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. Traffic to the agent's own metrics port is deliberately ignored. |
+| `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. The agent's own metrics/health traffic is captured like any other (no port is exempt, so no peer can hide behind one). |
 | `No --interface given and no IPv4 default route` | Host has no IPv4 default route; pass `-i`. |
 | Fails to start with `has no BPF ring buffer` | Kernel older than 5.8 without the RHEL-style backport. Not supported in this release. |
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |

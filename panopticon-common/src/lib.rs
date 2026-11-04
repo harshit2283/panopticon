@@ -29,9 +29,8 @@ pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
 pub const CONFIG_USE_RINGBUF: u32 = 2;
 pub const CONFIG_PID_FILTER_ON: u32 = 3;
-/// TCP/UDP port whose traffic TC capture ignores (0 = none). Set to the
-/// agent's own metrics/health port so scrapes and probes are not captured.
-pub const CONFIG_IGNORE_PORT: u32 = 4;
+// Index 4 was CONFIG_IGNORE_PORT (a port TC skipped); removed, see
+// tc_capture.rs try_tc_capture.
 /// Active DATA_EVENTS ring shards minus one (a power of two minus one).
 /// 0, the default, sends every event to DATA_EVENTS_0.
 pub const CONFIG_RING_SHARD_MASK: u32 = 5;
@@ -548,7 +547,6 @@ mod tests {
         assert!(CONFIG_MAX_PAYLOAD < CONFIG_ENTRIES);
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
-        assert!(CONFIG_IGNORE_PORT < CONFIG_ENTRIES);
         assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
         assert!(DATA_RING_SHARDS.is_power_of_two());
     }
