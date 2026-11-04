@@ -46,6 +46,15 @@ const FLAG_PRIORITY: u8 = 0x20;
 const MAX_BODY: usize = 64 * 1024;
 /// Concurrent streams tracked per connection; oldest are evicted beyond this.
 const MAX_STREAMS: usize = 1024;
+/// Decoded header bytes kept per stream (name + value + 32 per header, the
+/// RFC 7541 entry size). A small block that indexes one large dynamic-table
+/// entry thousands of times would otherwise decode to hundreds of MB.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Encoded header block bytes buffered across HEADERS + CONTINUATION frames.
+const MAX_HEADER_BLOCK: usize = 64 * 1024;
+/// Largest dynamic-table size update accepted. hpack applies any size the
+/// peer sends; RFC 7541 §6.3 makes one above the SETTINGS limit an error.
+const MAX_HPACK_TABLE: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 struct StreamState {
@@ -55,6 +64,8 @@ struct StreamState {
     grpc_status: Option<u32>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
+    /// Decoded header bytes kept so far, bounded by `MAX_HEADER_BYTES`.
+    header_bytes: usize,
     request_ts: Option<u64>,
     request_size: u64,
     response_size: u64,
@@ -256,7 +267,10 @@ impl Http2Parser {
                 } else {
                     &mut self.server
                 };
-                side.pending_block = Some((stream_id, flags, is_push, block));
+                // An oversized block is dropped; later CONTINUATIONs then
+                // find no pending block and are ignored.
+                side.pending_block =
+                    (block.len() <= MAX_HEADER_BLOCK).then_some((stream_id, flags, is_push, block));
                 if flags & FLAG_END_HEADERS != 0 {
                     return self.finish_header_block(from_client, ts);
                 }
@@ -269,7 +283,11 @@ impl Http2Parser {
                     &mut self.server
                 };
                 if let Some((_, _, _, block)) = side.pending_block.as_mut() {
-                    block.extend_from_slice(payload);
+                    if block.len() + payload.len() > MAX_HEADER_BLOCK {
+                        side.pending_block = None;
+                    } else {
+                        block.extend_from_slice(payload);
+                    }
                 }
                 if flags & FLAG_END_HEADERS != 0 {
                     return self.finish_header_block(from_client, ts);
@@ -339,12 +357,38 @@ impl Http2Parser {
         let Some((stream_id, flags, is_push, block)) = side.pending_block.take() else {
             return FrameEvent::None;
         };
+        if hpack_oversized_table_update(&block) {
+            return FrameEvent::None;
+        }
+        let budget = if is_push {
+            0
+        } else {
+            MAX_HEADER_BYTES
+                .saturating_sub(self.streams.get(&stream_id).map_or(0, |s| s.header_bytes))
+        };
+        let side = if from_client {
+            &mut self.client
+        } else {
+            &mut self.server
+        };
+        // Decode with a byte budget: the callback borrows from the dynamic
+        // table, so headers past the budget are never copied. The whole
+        // block is still decoded to keep the table in sync.
+        let mut decoded = Vec::new();
+        let mut used = 0usize;
         // hpack can panic on malformed input; a failed block still has to be
         // skipped so later frames parse (its table updates are lost).
-        let decoded = std::panic::catch_unwind(AssertUnwindSafe(|| side.decoder.decode(&block)))
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let ok = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            side.decoder.decode_with_cb(&block, |n, v| {
+                used = used.saturating_add(n.len() + v.len() + 32);
+                if used <= budget {
+                    decoded.push((n.into_owned(), v.into_owned()));
+                }
+            })
+        }));
+        if !matches!(ok, Ok(Ok(()))) {
+            decoded.clear();
+        }
         if is_push {
             return FrameEvent::None; // decoded only to keep the server table in sync
         }
@@ -358,6 +402,7 @@ impl Http2Parser {
         if !from_client {
             stream.response_headers_seen = true;
         }
+        stream.header_bytes = stream.header_bytes.saturating_add(used.min(budget));
         for (name, value) in decoded {
             let name = String::from_utf8_lossy(&name).to_lowercase();
             let value = String::from_utf8_lossy(&value).into_owned();
@@ -468,6 +513,58 @@ impl Http2Parser {
 }
 
 /// Body as text for PII scanning (valid UTF-8 prefix; `None` if empty/binary).
+/// HPACK integer with an `prefix`-bit prefix (RFC 7541 §5.1): (value, bytes).
+fn hpack_int(buf: &[u8], prefix: u32) -> Option<(usize, usize)> {
+    let mask = (1usize << prefix) - 1;
+    let first = *buf.first()? as usize & mask;
+    if first < mask {
+        return Some((first, 1));
+    }
+    let mut value = mask;
+    // At most 4 continuation bytes (28 bits): larger values are refused.
+    for (i, &b) in buf.iter().enumerate().skip(1).take(4) {
+        value += ((b & 0x7f) as usize) << (7 * (i - 1));
+        if b & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// True if `block` holds a dynamic-table size update above
+/// `MAX_HPACK_TABLE`, or cannot be walked. hpack accepts any size, so the
+/// representations are walked here first (§6) to clamp it.
+fn hpack_oversized_table_update(block: &[u8]) -> bool {
+    let walk = || -> Option<bool> {
+        let mut i = 0;
+        while i < block.len() {
+            let b = block[i];
+            let prefix = match b {
+                _ if b & 0x80 != 0 => 7, // indexed
+                _ if b & 0x40 != 0 => 6, // literal, incremental indexing
+                _ if b & 0x20 != 0 => 5, // size update
+                _ => 4,                  // literal, not / never indexed
+            };
+            let (n, used) = hpack_int(&block[i..], prefix)?;
+            i += used;
+            match prefix {
+                7 => {}
+                5 if n > MAX_HPACK_TABLE => return Some(true),
+                5 => {}
+                _ => {
+                    // Literal name (index 0) and value strings.
+                    for _ in 0..if n == 0 { 2 } else { 1 } {
+                        let (len, used) = hpack_int(block.get(i..)?, 7)?;
+                        i = i.checked_add(used)?.checked_add(len)?;
+                    }
+                }
+            }
+        }
+        Some(false)
+    };
+    walk().unwrap_or(true)
+}
+
 fn body_text(body: &[u8]) -> Option<String> {
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
@@ -602,6 +699,47 @@ mod tests {
         let mut d = HTTP2_PREFACE.to_vec();
         d.extend(make_frame(FRAME_SETTINGS, 0, 0, &[]));
         d
+    }
+
+    /// F9: one 4000-byte dynamic-table entry indexed 2000 times is ~8 MB
+    /// decoded from a ~6 KB block. Kept headers stay within the budget.
+    #[test]
+    fn test_hpack_bomb_is_capped() {
+        let mut block = vec![0x40, 0x01, b'x', 0x7f]; // literal, incr. indexing, name "x"
+        block.extend([0xa1, 0x1e]); // value length 127 + 3873 = 4000
+        block.extend(std::iter::repeat_n(b'a', 4000));
+        block.extend(std::iter::repeat_n(0xbe, 2000)); // indexed: dynamic entry 62
+        let mut p = Http2Parser::new(false);
+        let mut req = preface();
+        let mut first = make_frame(FRAME_HEADERS, 0, 1, &block[..3000]);
+        first.extend(make_frame(
+            FRAME_CONTINUATION,
+            FLAG_END_HEADERS,
+            1,
+            &block[3000..],
+        ));
+        req.extend(first);
+        p.feed(&req, Direction::Egress, 1000);
+        let kept: usize = p.streams[&1]
+            .headers
+            .iter()
+            .map(|(n, v)| n.len() + v.len() + 32)
+            .sum();
+        assert!(
+            kept > 0 && kept <= MAX_HEADER_BYTES,
+            "kept {kept} header bytes"
+        );
+
+        // A dynamic-table size update above the cap drops the block.
+        let mut p = Http2Parser::new(false);
+        let mut big = vec![0x3f, 0xe1, 0xff, 0x04]; // size update to 81920
+        big.extend(encode(&mut hpack::Encoder::new(), &[(":path", "/x")]));
+        let mut req = preface();
+        req.extend(make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 3, &big));
+        p.feed(&req, Direction::Egress, 1000);
+        assert!(!p.streams.contains_key(&3));
+        assert!(hpack_oversized_table_update(&big));
+        assert!(!hpack_oversized_table_update(&[0x3f, 0xe1, 0x1f])); // 4096
     }
 
     #[test]
