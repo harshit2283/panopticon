@@ -76,6 +76,16 @@ fn build_ebpf(release: bool) -> Result<()> {
         "-Z",
         "build-std=core",
     ]);
+    // Same flags aya_build passes from the agent's build.rs: the eBPF code
+    // selects pt_regs fields with cfg(bpf_target_arch), so without it an
+    // x86_64 build compiles the arm64 branch and fails.
+    cmd.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        format!(
+            "--cfg=bpf_target_arch=\"{}\"\x1f-Cdebuginfo=2\x1f-Clink-arg=--btf",
+            env::consts::ARCH
+        ),
+    );
 
     if release {
         cmd.arg("--release");
