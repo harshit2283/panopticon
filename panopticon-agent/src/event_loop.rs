@@ -34,9 +34,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
 use crate::graph::{ConnectionTuple, GraphBuilder};
-#[cfg(target_os = "linux")]
 use crate::protocol::detect::detect_protocol;
-#[cfg(target_os = "linux")]
 use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
 #[cfg(target_os = "linux")]
 use crate::util::format_ipv4;
@@ -168,6 +166,9 @@ pub struct EventStats {
     pub drops_export_full: AtomicU64,
     /// Parser / PII steps that panicked and were skipped (worker kept running).
     pub worker_panics: AtomicU64,
+    /// TCP segments ignored whole: retransmissions of bytes already parsed,
+    /// or outside the connection's window (forged, or a stale RST / FIN).
+    pub tcp_segments_ignored: AtomicU64,
 }
 
 impl EventStats {
@@ -188,6 +189,7 @@ impl EventStats {
             kernel_drops: AtomicU64::new(0),
             drops_export_full: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
+            tcp_segments_ignored: AtomicU64::new(0),
         }
     }
 }
@@ -1122,76 +1124,20 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
             }
 
             // ── Protocol detection + parsing (Phase 3) ───────────────────
-            let payload = event.payload_bytes();
-            if !payload.is_empty() {
-                // Detect protocol and create FSM if not exists
-                if !manager.contains(cookie)
-                    && let Some(proto) = guarded(&ctx.stats, worker_id, || {
-                        detect_protocol(payload, event.src_port, event.dst_port, event.direction)
-                    })
-                    .flatten()
-                {
-                    use crate::protocol::fsm::CreateResult;
-                    let server = server_endpoint(event, proto, payload);
-                    let result = manager.get_or_create_with_server(cookie, proto, server);
-                    match result {
-                        CreateResult::Created => {
-                            ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-                        }
-                        CreateResult::CreatedWithEviction(evicted) => {
-                            // Created after evicting the oldest connections at capacity
-                            let evicted = evicted as u64;
-                            ctx.stats
-                                .evictions_capacity
-                                .fetch_add(evicted, Ordering::Relaxed);
-                            ctx.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-                            ctx.stats
-                                .active_connections
-                                .fetch_sub(evicted, Ordering::Relaxed);
-                        }
-                        CreateResult::AlreadyExists => {
-                            // Race: another event created it between contains() and get_or_create()
-                        }
-                    }
-                    if log_events {
-                        debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
-                    }
-                }
-
+            let Some(results) =
+                feed_event(&manager, event, cookie, &ctx.stats, worker_id, log_events)
+            else {
+                // A retransmitted or out-of-window TCP segment: its bytes
+                // and its FIN / RST are ignored.
+                ctx.stats
+                    .tcp_segments_ignored
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if !results.is_empty() {
                 let src = sender_endpoint(event);
-                // A parser panic closes the connection instead of the worker.
-                let panicked = || Some(FsmResult::Error("parser panicked".into()));
-                let first = guarded(&ctx.stats, worker_id, || {
-                    manager.process_packet_from(
-                        cookie,
-                        src,
-                        event.direction,
-                        payload,
-                        event.timestamp_ns,
-                    )
-                })
-                .unwrap_or_else(panicked);
-                // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
-                // writes) were never seen: let the parser count them instead of
-                // desynchronising on the next message.
-                let truncated = event.truncated_bytes() as usize;
-                let after_gap = if truncated > 0 {
-                    ctx.stats.truncated_events.fetch_add(1, Ordering::Relaxed);
-                    guarded(&ctx.stats, worker_id, || {
-                        manager.skip_from(
-                            cookie,
-                            src,
-                            event.direction,
-                            truncated,
-                            event.timestamp_ns,
-                        )
-                    })
-                    .unwrap_or_else(panicked)
-                } else {
-                    None
-                };
                 let sender_is_server = manager.server_of(cookie).map(|s| s == src);
-                for result in [first, after_gap].into_iter().flatten() {
+                for result in results {
                     match result {
                         FsmResult::Messages(msgs) => {
                             guarded_handle_messages(
@@ -1302,6 +1248,111 @@ fn guarded<T>(stats: &EventStats, worker_id: usize, f: impl FnOnce() -> T) -> Op
             None
         }
     }
+}
+
+/// The sequence fields of a TC TCP packet; None for other events (UDP,
+/// TLS plaintext, socket events), which have no sequence to check.
+fn tcp_segment(event: &DataEvent) -> Option<crate::protocol::fsm::TcpSegment> {
+    use panopticon_common::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN};
+    const IP_PROTO_TCP: u8 = 6;
+    (event.event_type == EventType::TcPacket && event.ip_proto == IP_PROTO_TCP).then(|| {
+        crate::protocol::fsm::TcpSegment {
+            seq: event.tcp_seq,
+            ack: (event.tcp_flags & TCP_FLAG_ACK != 0).then_some(event.tcp_ack),
+            len: event.orig_len,
+            syn: event.tcp_flags & TCP_FLAG_SYN != 0,
+            fin: event.tcp_flags & TCP_FLAG_FIN != 0,
+            rst: event.tcp_flags & TCP_FLAG_RST != 0,
+        }
+    })
+}
+
+/// Run one event through its connection's parser: detect the protocol and
+/// create the parser on the first payload, keep only the new, in-window
+/// bytes of a TCP segment, and account for bytes that were never captured
+/// (ring drops before it, the capture cap after it). Returns the parser
+/// results in order, or None for a TCP segment that must be ignored whole
+/// (a retransmission, or outside the window: its FIN / RST too).
+fn feed_event(
+    manager: &ConnectionFsmManager,
+    event: &DataEvent,
+    cookie: u64,
+    stats: &EventStats,
+    worker_id: usize,
+    log_events: bool,
+) -> Option<Vec<FsmResult>> {
+    use crate::protocol::fsm::{CreateResult, SegmentVerdict};
+
+    let payload = event.payload_bytes();
+    if !payload.is_empty()
+        && !manager.contains(cookie)
+        && let Some(proto) = guarded(stats, worker_id, || {
+            detect_protocol(payload, event.src_port, event.dst_port, event.direction)
+        })
+        .flatten()
+    {
+        let server = server_endpoint(event, proto, payload);
+        match manager.get_or_create_with_server(cookie, proto, server) {
+            CreateResult::Created => {
+                stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            }
+            CreateResult::CreatedWithEviction(evicted) => {
+                // Created after evicting the oldest connections at capacity
+                let evicted = evicted as u64;
+                stats
+                    .evictions_capacity
+                    .fetch_add(evicted, Ordering::Relaxed);
+                stats.active_connections.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .active_connections
+                    .fetch_sub(evicted, Ordering::Relaxed);
+            }
+            CreateResult::AlreadyExists => {}
+        }
+        if log_events {
+            tracing::debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
+        }
+    }
+
+    let src = sender_endpoint(event);
+    let (gap, trim) = match tcp_segment(event)
+        .and_then(|seg| manager.admit_segment(cookie, src, event.direction, seg))
+    {
+        Some(SegmentVerdict::Drop) => return None,
+        Some(SegmentVerdict::Accept { gap, trim }) => (gap as usize, trim as usize),
+        None => (0, 0),
+    };
+    // A parser panic closes the connection instead of the worker.
+    let panicked = || Some(FsmResult::Error("parser panicked".into()));
+    let skip = |n: usize| {
+        guarded(stats, worker_id, || {
+            manager.skip_from(cookie, src, event.direction, n, event.timestamp_ns)
+        })
+        .unwrap_or_else(panicked)
+    };
+    let mut results = Vec::new();
+    // Bytes of this direction lost before this segment (ring drops).
+    if gap > 0 {
+        results.extend(skip(gap));
+    }
+    let data = &payload[trim.min(payload.len())..];
+    if !data.is_empty() {
+        results.extend(
+            guarded(stats, worker_id, || {
+                manager.process_packet_from(cookie, src, event.direction, data, event.timestamp_ns)
+            })
+            .unwrap_or_else(panicked),
+        );
+    }
+    // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
+    // writes) were never seen: let the parser count them instead of
+    // desynchronising on the next message.
+    let tail = (event.orig_len as usize).saturating_sub(trim.max(payload.len()));
+    if tail > 0 {
+        stats.truncated_events.fetch_add(1, Ordering::Relaxed);
+        results.extend(skip(tail));
+    }
+    Some(results)
 }
 
 #[cfg(target_os = "linux")]
@@ -1943,6 +1994,91 @@ mod tests {
             panopticon_common::tc_flow_cookie(9, 0x0A00_0001, 0x0A00_0002, 40000, 80, 6);
         assert_eq!(connection_key(&tc), tc.socket_cookie);
         assert_eq!(connection_key(&tc) & TLS_KEY_BIT, 0);
+    }
+
+    const CLI: (u32, u16) = (0x0A63_0002, 51000);
+    const SRV: (u32, u16) = (0x0A63_0001, 18090);
+
+    /// A TC TCP packet from `from` to the other end, as tc_capture.rs
+    /// builds it.
+    fn tcp_pkt(from: (u32, u16), seq: u32, ack: u32, flags: u8, payload: &[u8]) -> DataEvent {
+        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        let to = if from == CLI { SRV } else { CLI };
+        e.event_type = EventType::TcPacket;
+        e.direction = if from == CLI {
+            Direction::Ingress
+        } else {
+            Direction::Egress
+        };
+        (e.src_addr, e.src_port, e.dst_addr, e.dst_port) = (from.0, from.1, to.0, to.1);
+        e.ip_proto = 6;
+        e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, 6);
+        e.tcp_seq = seq;
+        e.tcp_ack = ack;
+        e.tcp_flags = flags | panopticon_common::TCP_FLAG_ACK;
+        e.payload[..payload.len()].copy_from_slice(payload);
+        (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
+        e
+    }
+
+    /// Feed events the way worker_task does; the paths of the messages
+    /// they complete, or None for each event ignored whole.
+    fn run_tcp(events: &[DataEvent]) -> (Vec<Option<String>>, Vec<bool>) {
+        let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
+        let (mut paths, mut ignored) = (vec![], vec![]);
+        for e in events {
+            let fed = feed_event(&m, e, connection_key(e), &stats, 0, false);
+            ignored.push(fed.is_none());
+            for r in fed.into_iter().flatten() {
+                match r {
+                    FsmResult::Messages(ms) => paths.extend(ms.into_iter().map(|m| m.path)),
+                    FsmResult::MessageComplete(m) => paths.push(m.path),
+                    _ => {}
+                }
+            }
+        }
+        (paths, ignored)
+    }
+
+    #[test]
+    fn retransmitted_segments_are_parsed_once() {
+        let req = b"GET /orders/7 HTTP/1.1\r\nHost: shop\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (a, b) = req.split_at(20);
+        let (paths, ignored) = run_tcp(&[
+            tcp_pkt(CLI, 100, 900, 0, a),
+            tcp_pkt(CLI, 100, 900, 0, a),          // retransmission
+            tcp_pkt(CLI, 110, 900, 0, &req[10..]), // overlaps the first 10 bytes
+            tcp_pkt(CLI, 100 + 20, 900, 0, b),     // and again, whole
+            tcp_pkt(SRV, 900, 100 + req.len() as u32, 0, resp),
+            tcp_pkt(SRV, 900, 100 + req.len() as u32, 0, resp), // duplicate
+        ]);
+        assert_eq!(paths, vec![Some("/orders/7".to_string())]);
+        assert_eq!(ignored, vec![false, true, false, true, false, true]);
+    }
+
+    #[test]
+    fn forged_out_of_window_request_and_rst_are_ignored() {
+        let req = b"GET /real HTTP/1.1\r\nHost: shop\r\n\r\n";
+        let fake = b"GET /forged HTTP/1.1\r\nHost: shop\r\n\r\n";
+        let resp = b"HTTP/1.1 204 No Content\r\n\r\n";
+        let next = 100 + req.len() as u32;
+        let rst = panopticon_common::TCP_FLAG_RST;
+        let (paths, ignored) = run_tcp(&[
+            tcp_pkt(CLI, 100, 900, 0, req),
+            tcp_pkt(CLI, next + 50_000_000, 900, 0, fake), // guessed sequence
+            tcp_pkt(SRV, 77_777, next, rst, b""),          // spoofed RST
+            tcp_pkt(SRV, 900, next, 0, resp),
+        ]);
+        assert_eq!(paths, vec![Some("/real".to_string())]);
+        assert_eq!(ignored, vec![false, true, true, false]);
+        // The real RST, at the server's next sequence number, counts.
+        let (_, ignored) = run_tcp(&[
+            tcp_pkt(CLI, 100, 900, 0, req),
+            tcp_pkt(SRV, 900, next, rst, b""),
+        ]);
+        assert_eq!(ignored, vec![false, false]);
     }
 
     fn sock_event(kind: EventType, cookie: u64, pid: u32) -> DataEvent {

@@ -277,6 +277,8 @@ unsafe fn populate_sock_event(
         (*event).payload_len = 0;
         (*event).orig_len = 0;
         (*event).tcp_flags = 0;
+        (*event).tcp_seq = 0;
+        (*event).tcp_ack = 0;
         (*event)._pad = [0; 6];
     }
 }

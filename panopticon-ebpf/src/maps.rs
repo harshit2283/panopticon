@@ -37,7 +37,7 @@ pub fn count_kernel_drop() {
 // time so the active ones split a fixed total (loader DATA_RING_TOTAL_BYTES).
 //
 // TC packets are copied in at their captured size (emit_scratch_event), but
-// TLS and socket events keep fixed 4,160-byte reserves (see EVENT_SCRATCH),
+// TLS and socket events keep fixed 4,168-byte reserves (see EVENT_SCRATCH),
 // so one connection's TLS burst has a single shard to fill: ~250 records at
 // 1 MiB per shard on a 64-CPU node, where the single 16 MiB ring held ~3,900.
 
@@ -99,7 +99,7 @@ pub fn shard_for(socket_cookie: u64) -> u32 {
 
 /// Send the event built in a scratch DataEvent to its connection's shard,
 /// copying only the header and `payload_len` payload bytes: a typical
-/// packet record is a few hundred bytes instead of 4,160, so a ring holds
+/// packet record is a few hundred bytes instead of 4,168, so a ring holds
 /// many times more of them. Counts a kernel drop if the shard is full.
 #[inline(always)]
 pub fn emit_scratch_event(event: *const DataEvent) {

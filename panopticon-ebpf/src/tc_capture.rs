@@ -131,7 +131,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     let dst_addr = u32::from_be(ctx.load::<u32>(ip_offset + 16)?);
 
     let transport_offset = ip_offset + ihl;
-    let (src_port, dst_port, payload_offset, tcp_flags) = match ip_proto {
+    let (src_port, dst_port, payload_offset, tcp_flags, tcp_seq, tcp_ack) = match ip_proto {
         IP_PROTO_TCP => {
             if data + transport_offset + TCP_HDR_MIN_LEN > data_end {
                 return Ok(TC_ACT_OK);
@@ -145,7 +145,18 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
                 return Ok(TC_ACT_OK);
             }
             let flags: u8 = ctx.load(transport_offset + 13)?;
-            (sport, dport, transport_offset + tcp_hdr_len, flags)
+            // Sequence and acknowledgment numbers: user space keeps only
+            // the in-window, not yet seen bytes of each direction.
+            let seq = u32::from_be(ctx.load::<u32>(transport_offset + 4)?);
+            let ack = u32::from_be(ctx.load::<u32>(transport_offset + 8)?);
+            (
+                sport,
+                dport,
+                transport_offset + tcp_hdr_len,
+                flags,
+                seq,
+                ack,
+            )
         }
         IP_PROTO_UDP => {
             if data + transport_offset + UDP_HDR_LEN > data_end {
@@ -153,7 +164,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             }
             let sport = u16::from_be(ctx.load::<u16>(transport_offset)?);
             let dport = u16::from_be(ctx.load::<u16>(transport_offset + 2)?);
-            (sport, dport, transport_offset + UDP_HDR_LEN, 0)
+            (sport, dport, transport_offset + UDP_HDR_LEN, 0, 0, 0)
         }
         _ => return Ok(TC_ACT_OK),
     };
@@ -203,6 +214,8 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
         capture_len,
         payload_len as u32,
         tcp_flags,
+        tcp_seq,
+        tcp_ack,
         use_ringbuf,
     );
     if use_ringbuf {
@@ -228,6 +241,8 @@ fn populate_tc_event(
     load_len: u32,
     orig_len: u32,
     tcp_flags: u8,
+    tcp_seq: u32,
+    tcp_ack: u32,
     capture_payload: bool,
 ) {
     unsafe {
@@ -248,6 +263,8 @@ fn populate_tc_event(
         (*event).ip_proto = ip_proto;
         (*event).tls_library = TlsLibrary::None;
         (*event).tcp_flags = tcp_flags;
+        (*event).tcp_seq = tcp_seq;
+        (*event).tcp_ack = tcp_ack;
         (*event)._pad = [0; 6];
         (*event).orig_len = orig_len;
 

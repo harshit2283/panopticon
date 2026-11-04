@@ -22,7 +22,9 @@ pub const TLS_SCRATCH_SIZE: u32 = 8192;
 
 /// `DataEvent::tcp_flags` bits.
 pub const TCP_FLAG_FIN: u8 = 0x01;
+pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_RST: u8 = 0x04;
+pub const TCP_FLAG_ACK: u8 = 0x10;
 
 // Config array indices
 pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
@@ -127,7 +129,7 @@ impl TlsLibrary {
 
 /// Network data event (TC capture or TLS intercept).
 ///
-/// At ~4152 bytes this MUST be allocated via RingBuf reserve in eBPF,
+/// At 4168 bytes this MUST be allocated via RingBuf reserve in eBPF,
 /// never on the 512-byte BPF stack.
 /// Manual `Debug` implementation that omits the 4KB payload array
 /// to avoid flooding logs when debugging events.
@@ -146,6 +148,9 @@ impl core::fmt::Debug for DataEvent {
             .field("src_port", &self.src_port)
             .field("dst_port", &self.dst_port)
             .field("ip_proto", &self.ip_proto)
+            .field("tcp_flags", &self.tcp_flags)
+            .field("tcp_seq", &self.tcp_seq)
+            .field("tcp_ack", &self.tcp_ack)
             .finish()
     }
 }
@@ -175,6 +180,12 @@ pub struct DataEvent {
     /// bytes they never saw instead of silently losing stream sync.
     pub orig_len: u32,
     pub tls_library: TlsLibrary,
+    /// TCP sequence number of a TC packet's first byte (SEG.SEQ), and its
+    /// acknowledgment number (SEG.ACK, valid with `TCP_FLAG_ACK`); 0 for
+    /// other events. User space uses them to drop retransmitted and
+    /// out-of-window segments (protocol/fsm.rs `TcpTracker`).
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
     // 2-byte aligned fields
     pub src_port: u16,
     pub dst_port: u16,
@@ -271,6 +282,8 @@ struct RawDataEvent {
     pub payload_len: u32,
     pub orig_len: u32,
     pub tls_library: u32,
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
@@ -294,6 +307,8 @@ impl RawDataEvent {
             payload_len: self.payload_len,
             orig_len: self.orig_len,
             tls_library: TlsLibrary::from_u32(self.tls_library)?,
+            tcp_seq: self.tcp_seq,
+            tcp_ack: self.tcp_ack,
             src_port: self.src_port,
             dst_port: self.dst_port,
             ip_proto: self.ip_proto,
@@ -443,7 +458,7 @@ mod tests {
     fn test_data_event_size() {
         assert_eq!(
             size_of::<DataEvent>(),
-            4160,
+            4168,
             "DataEvent size changed! This breaks kernel↔userspace ABI."
         );
     }
@@ -498,12 +513,14 @@ mod tests {
         assert_eq!(offset_of!(DataEvent, payload_len), 40);
         assert_eq!(offset_of!(DataEvent, orig_len), 44);
         assert_eq!(offset_of!(DataEvent, tls_library), 48);
-        assert_eq!(offset_of!(DataEvent, src_port), 52);
-        assert_eq!(offset_of!(DataEvent, dst_port), 54);
-        assert_eq!(offset_of!(DataEvent, ip_proto), 56);
-        assert_eq!(offset_of!(DataEvent, tcp_flags), 57);
-        assert_eq!(offset_of!(DataEvent, _pad), 58);
-        assert_eq!(offset_of!(DataEvent, payload), 64);
+        assert_eq!(offset_of!(DataEvent, tcp_seq), 52);
+        assert_eq!(offset_of!(DataEvent, tcp_ack), 56);
+        assert_eq!(offset_of!(DataEvent, src_port), 60);
+        assert_eq!(offset_of!(DataEvent, dst_port), 62);
+        assert_eq!(offset_of!(DataEvent, ip_proto), 64);
+        assert_eq!(offset_of!(DataEvent, tcp_flags), 65);
+        assert_eq!(offset_of!(DataEvent, _pad), 66);
+        assert_eq!(offset_of!(DataEvent, payload), 72);
     }
 
     #[test]
@@ -620,6 +637,7 @@ mod tests {
             + 4 + 4           // src_addr, dst_addr
             + 4 + 4           // payload_len, orig_len
             + 4               // tls_library
+            + 4 + 4           // tcp_seq, tcp_ack
             + 2 + 2           // src_port, dst_port
             + 1 + 1 + 6       // ip_proto, tcp_flags, _pad
             + MAX_PAYLOAD_SIZE;

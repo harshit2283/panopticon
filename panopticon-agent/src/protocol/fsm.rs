@@ -185,6 +185,127 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 /// An `(IPv4 address, port)` pair as carried in `DataEvent`.
 pub type Endpoint = (u32, u16);
 
+/// How far a TCP segment's sequence number may run ahead of the next
+/// expected byte (bytes the agent missed: ring buffer drops) and its
+/// acknowledgment number may differ from the other side's stream, and the
+/// segment still be taken as genuine: about the largest receive window Linux
+/// opens by default (`tcp_rmem`). A blind (off-path) forger has to land both
+/// numbers in range, like RFC 5961 asks of a receiver: about 1 in 2^17 per
+/// guess. A segment further ahead is still accepted once the receiver has
+/// acknowledged up to it.
+const TCP_WINDOW: u32 = 8 << 20;
+
+/// The sequence-relevant fields of one captured TCP segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpSegment {
+    pub seq: u32,
+    /// The acknowledgment number, if the ACK flag is set.
+    pub ack: Option<u32>,
+    /// Payload length on the wire (`orig_len`, not the captured bytes).
+    pub len: u32,
+    pub syn: bool,
+    pub fin: bool,
+    pub rst: bool,
+}
+
+/// What to do with a captured TCP segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentVerdict {
+    /// Process it: first account for `gap` bytes that were never captured,
+    /// then the payload from byte `trim` on (the bytes before `trim` were
+    /// already processed). Its FIN / RST are genuine.
+    Accept { gap: u32, trim: u32 },
+    /// A retransmission of bytes already processed, or outside the window:
+    /// ignore its payload and its flags.
+    Drop,
+}
+
+/// Per-direction TCP sequence tracking for one connection. TC sees every
+/// segment that matches the 5-tuple: retransmissions (parsed twice, they
+/// corrupted the stream: AMQP recall fell to 88-97% on RHEL 8), and forged
+/// segments or RSTs the receiver would reject. Only bytes at the next
+/// expected sequence number reach the parser, once each; a FIN counts only
+/// in window and an RST only at the next expected byte (RFC 5961).
+#[derive(Debug, Default)]
+struct TcpTracker {
+    /// Next expected sequence number from the client (0) / server (1).
+    next: [Option<u32>; 2],
+    /// Highest acknowledgment the other side sent for each side's data:
+    /// bytes it confirms exist, even if the agent never saw them.
+    acked: [Option<u32>; 2],
+}
+
+/// `a - b` in sequence space (RFC 1982 serial arithmetic, so wraparound
+/// at 2^32 is handled): positive when `a` is after `b`.
+fn seq_diff(a: u32, b: u32) -> i32 {
+    a.wrapping_sub(b) as i32
+}
+
+impl TcpTracker {
+    fn admit(&mut self, side: usize, seg: TcpSegment) -> SegmentVerdict {
+        // SYN takes one sequence number before the data, FIN one after.
+        let data_seq = seg.seq.wrapping_add(seg.syn as u32);
+        let span = seg.len + seg.fin as u32;
+        let end = data_seq.wrapping_add(span);
+        // Before any byte of this side was seen, what the peer acknowledged
+        // is where its data must start.
+        let expected = self.next[side].or(self.acked[side]);
+        // The acknowledgment must be about where the other side's stream
+        // is: it may lag by data in flight, or lead by data the agent
+        // missed. Further ahead only on a segment exactly at the next byte
+        // (after a long loss), which a blind forger cannot hit.
+        let ack_ok = match (seg.ack, self.next[1 - side]) {
+            (Some(ack), Some(other)) => {
+                let d = seq_diff(ack, other);
+                d.unsigned_abs() < TCP_WINDOW || (d > 0 && expected == Some(data_seq))
+            }
+            _ => true,
+        };
+        let verdict = match expected {
+            _ if !ack_ok => SegmentVerdict::Drop,
+            None => SegmentVerdict::Accept { gap: 0, trim: 0 },
+            Some(next) => {
+                let off = seq_diff(data_seq, next);
+                let acked_past = self.acked[side].is_some_and(|a| seq_diff(a, data_seq) >= 0);
+                let ahead_ok = if seg.rst {
+                    off == 0 || acked_past
+                } else {
+                    (off as u32) < TCP_WINDOW || acked_past
+                };
+                if off < 0 {
+                    let behind = off.unsigned_abs();
+                    if behind >= span {
+                        SegmentVerdict::Drop // already seen
+                    } else {
+                        SegmentVerdict::Accept {
+                            gap: 0,
+                            trim: behind,
+                        }
+                    }
+                } else if ahead_ok {
+                    SegmentVerdict::Accept {
+                        gap: off as u32,
+                        trim: 0,
+                    }
+                } else {
+                    SegmentVerdict::Drop // out of window: forged or stale
+                }
+            }
+        };
+        if verdict != SegmentVerdict::Drop {
+            let next = self.next[side].unwrap_or(end);
+            self.next[side] = Some(if seq_diff(end, next) > 0 { end } else { next });
+            if let Some(ack) = seg.ack {
+                let acked = &mut self.acked[1 - side];
+                if acked.is_none_or(|a| seq_diff(ack, a) > 0) {
+                    *acked = Some(ack);
+                }
+            }
+        }
+        verdict
+    }
+}
+
 /// Unified entry combining the FSM instance and last-seen timestamp.
 struct ConnectionEntry {
     fsm: Box<dyn ProtocolFsm>,
@@ -196,6 +317,7 @@ struct ConnectionEntry {
     server: Option<Endpoint>,
     /// FIN seen from the client / from the server.
     fin: [bool; 2],
+    tcp: TcpTracker,
 }
 
 impl ConnectionEntry {
@@ -273,6 +395,7 @@ impl ConnectionFsmManager {
                 last_seen: Instant::now(),
                 server,
                 fin: [false; 2],
+                tcp: TcpTracker::default(),
             },
         );
 
@@ -346,6 +469,23 @@ impl ConnectionFsmManager {
             entry.fin = [false; 2];
         }
         Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+    }
+
+    /// Check a TCP segment sent by `src` against the connection's sequence
+    /// state (see [`TcpTracker`]). `None` if the connection is not tracked.
+    pub fn admit_segment(
+        &self,
+        conn_id: u64,
+        src: Endpoint,
+        capture_direction: Direction,
+        seg: TcpSegment,
+    ) -> Option<SegmentVerdict> {
+        let mut entry = self.connections.get_mut(&conn_id)?;
+        let side = match entry.direction_of(src, capture_direction) {
+            Direction::Egress => 0,
+            Direction::Ingress => 1,
+        };
+        Some(entry.tcp.admit(side, seg))
     }
 
     /// `n` bytes sent by `src` were not captured. Lets the parser account for
@@ -503,6 +643,195 @@ mod tests {
         eprintln!(
             "PROBE insert at capacity: {:?} per new connection",
             t.elapsed() / 2_000
+        );
+    }
+
+    fn seg(seq: u32, len: u32) -> TcpSegment {
+        TcpSegment {
+            seq,
+            ack: None,
+            len,
+            syn: false,
+            fin: false,
+            rst: false,
+        }
+    }
+
+    fn rst(seq: u32) -> TcpSegment {
+        TcpSegment {
+            rst: true,
+            ..seg(seq, 0)
+        }
+    }
+
+    const CLIENT: Endpoint = (0x0A00_0002, 51000);
+    const SERVER: Endpoint = (0x0A00_0001, 80);
+
+    fn tcp_manager() -> ConnectionFsmManager {
+        let m = ConnectionFsmManager::new(16);
+        m.get_or_create_with_server(1, Protocol::Http1, Some(SERVER));
+        m
+    }
+
+    fn admit(m: &ConnectionFsmManager, src: Endpoint, s: TcpSegment) -> SegmentVerdict {
+        m.admit_segment(1, src, Direction::Ingress, s).unwrap()
+    }
+
+    const ACCEPT: SegmentVerdict = SegmentVerdict::Accept { gap: 0, trim: 0 };
+
+    #[test]
+    fn tcp_retransmissions_are_dropped_and_overlaps_trimmed() {
+        let m = tcp_manager();
+        assert_eq!(admit(&m, CLIENT, seg(1000, 100)), ACCEPT);
+        assert_eq!(admit(&m, CLIENT, seg(1100, 100)), ACCEPT);
+        // Exact and partial retransmissions of bytes already parsed.
+        assert_eq!(admit(&m, CLIENT, seg(1000, 100)), SegmentVerdict::Drop);
+        assert_eq!(admit(&m, CLIENT, seg(1100, 50)), SegmentVerdict::Drop);
+        // A coalesced retransmission that also carries new bytes: only the
+        // new tail is parsed.
+        assert_eq!(
+            admit(&m, CLIENT, seg(1150, 100)),
+            SegmentVerdict::Accept { gap: 0, trim: 50 }
+        );
+        assert_eq!(admit(&m, CLIENT, seg(1250, 10)), ACCEPT);
+        // The other direction is tracked on its own.
+        assert_eq!(admit(&m, SERVER, seg(5_000_000, 10)), ACCEPT);
+        assert_eq!(admit(&m, SERVER, seg(5_000_000, 10)), SegmentVerdict::Drop);
+        assert_eq!(
+            m.admit_segment(99, CLIENT, Direction::Egress, seg(0, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn tcp_sequence_wraparound() {
+        let m = tcp_manager();
+        assert_eq!(admit(&m, CLIENT, seg(u32::MAX - 49, 100)), ACCEPT);
+        assert_eq!(
+            admit(&m, CLIENT, seg(50, 10)),
+            ACCEPT,
+            "next byte after the wrap"
+        );
+        assert_eq!(
+            admit(&m, CLIENT, seg(u32::MAX - 49, 100)),
+            SegmentVerdict::Drop
+        );
+        assert_eq!(
+            admit(&m, CLIENT, seg(u32::MAX - 9, 80)),
+            SegmentVerdict::Accept { gap: 0, trim: 70 }
+        );
+    }
+
+    #[test]
+    fn tcp_forged_segments_out_of_window_are_dropped() {
+        let m = tcp_manager();
+        assert_eq!(admit(&m, CLIENT, seg(1000, 100)), ACCEPT);
+        // Missed bytes (ring drops) within the window: skipped as a gap.
+        assert_eq!(
+            admit(&m, CLIENT, seg(1100 + 3000, 100)),
+            SegmentVerdict::Accept { gap: 3000, trim: 0 }
+        );
+        // A forged segment far from the stream, ahead or behind.
+        assert_eq!(
+            admit(&m, CLIENT, seg(1_000_000_000, 100)),
+            SegmentVerdict::Drop
+        );
+        assert_eq!(
+            admit(&m, CLIENT, seg(4200 + TCP_WINDOW, 1)),
+            SegmentVerdict::Drop
+        );
+        assert_eq!(
+            admit(&m, CLIENT, seg(4200u32.wrapping_sub(1 << 30), 100)),
+            SegmentVerdict::Drop
+        );
+        // The stream goes on.
+        assert_eq!(admit(&m, CLIENT, seg(4200, 5)), ACCEPT);
+    }
+
+    #[test]
+    fn tcp_rst_counts_only_in_window() {
+        let m = tcp_manager();
+        let mut req = seg(1000, 100);
+        req.ack = Some(7_000_000); // the server's next byte
+        assert_eq!(admit(&m, CLIENT, req), ACCEPT);
+        // The server never sent data: its RST is checked against the
+        // client's acknowledgment. A spoofed one with a guessed sequence
+        // number is out of window...
+        assert_eq!(admit(&m, SERVER, rst(123_456)), SegmentVerdict::Drop);
+        assert_eq!(admit(&m, SERVER, rst(6_999_999)), SegmentVerdict::Drop);
+        // Inside the window but not at the next byte: still not honoured.
+        assert_eq!(admit(&m, SERVER, rst(7_000_010)), SegmentVerdict::Drop);
+        // ...the real one, at the acknowledged sequence number, is.
+        assert_eq!(admit(&m, SERVER, rst(7_000_000)), ACCEPT);
+        // A client RST behind the stream (stale) is dropped.
+        assert_eq!(admit(&m, CLIENT, rst(1050)), SegmentVerdict::Drop);
+        assert_eq!(admit(&m, CLIENT, rst(1100)), ACCEPT);
+    }
+
+    #[test]
+    fn tcp_acknowledgment_must_match_the_other_stream() {
+        let m = tcp_manager();
+        let with_ack = |seq, len, ack| TcpSegment {
+            ack: Some(ack),
+            ..seg(seq, len)
+        };
+        assert_eq!(admit(&m, CLIENT, with_ack(1000, 100, 50_000)), ACCEPT);
+        assert_eq!(admit(&m, SERVER, with_ack(50_000, 10, 1100)), ACCEPT);
+        // A forger whose sequence number landed in the window, but whose
+        // acknowledgment is far from the server's stream, is rejected.
+        assert_eq!(
+            admit(&m, CLIENT, with_ack(1600, 10, 50_010 + TCP_WINDOW)),
+            SegmentVerdict::Drop
+        );
+        assert_eq!(
+            admit(
+                &m,
+                CLIENT,
+                with_ack(1100, 10, 50_010u32.wrapping_sub(TCP_WINDOW))
+            ),
+            SegmentVerdict::Drop,
+            "lagging that far is never genuine"
+        );
+        assert_eq!(admit(&m, CLIENT, with_ack(1100, 10, 50_010)), ACCEPT);
+    }
+
+    #[test]
+    fn tcp_syn_and_fin_take_one_sequence_number() {
+        let m = tcp_manager();
+        // TCP Fast Open: data in the SYN starts at ISN + 1.
+        let mut syn = seg(999, 10);
+        syn.syn = true;
+        assert_eq!(admit(&m, CLIENT, syn), ACCEPT);
+        assert_eq!(admit(&m, CLIENT, seg(1010, 10)), ACCEPT);
+        let mut fin = seg(1020, 0);
+        fin.fin = true;
+        assert_eq!(admit(&m, CLIENT, fin), ACCEPT);
+        assert_eq!(
+            admit(&m, CLIENT, fin),
+            SegmentVerdict::Drop,
+            "retransmitted FIN"
+        );
+    }
+
+    #[test]
+    fn tcp_loss_beyond_the_window_resyncs_on_the_peers_ack() {
+        let m = tcp_manager();
+        assert_eq!(admit(&m, CLIENT, seg(1, 10)), ACCEPT);
+        assert_eq!(admit(&m, SERVER, seg(0, 100)), ACCEPT);
+        // 20 MB of the server's data were lost: out of window...
+        let far = 100 + 20_000_000;
+        assert_eq!(admit(&m, SERVER, seg(far, 100)), SegmentVerdict::Drop);
+        // ...until the client, at its next byte, acknowledges past it. The
+        // same acknowledgment on a guessed sequence number is rejected.
+        let ack = |seq| TcpSegment {
+            ack: Some(far + 100),
+            ..seg(seq, 10)
+        };
+        assert_eq!(admit(&m, CLIENT, ack(5000)), SegmentVerdict::Drop);
+        assert_eq!(admit(&m, CLIENT, ack(11)), ACCEPT);
+        assert_eq!(
+            admit(&m, SERVER, seg(far + 100, 10)),
+            SegmentVerdict::Accept { gap: far, trim: 0 }
         );
     }
 

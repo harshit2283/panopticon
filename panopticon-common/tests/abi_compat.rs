@@ -37,6 +37,8 @@ fn test_data_event_round_trip() {
     event.src_port = 8080;
     event.dst_port = 443;
     event.ip_proto = 6; // TCP
+    event.tcp_seq = 0xFFFF_FFF0;
+    event.tcp_ack = 0x0102_0304;
     event.payload[..5].copy_from_slice(b"hello");
 
     let bytes = as_bytes(&event);
@@ -54,6 +56,8 @@ fn test_data_event_round_trip() {
     assert_eq!(restored.src_port, 8080);
     assert_eq!(restored.dst_port, 443);
     assert_eq!(restored.ip_proto, 6);
+    assert_eq!(restored.tcp_seq, 0xFFFF_FFF0);
+    assert_eq!(restored.tcp_ack, 0x0102_0304);
     assert_eq!(&restored.payload[..5], b"hello");
 }
 
@@ -101,16 +105,22 @@ fn test_data_event_specific_byte_offsets() {
     event.src_port = 0x1F90; // 8080
     event.ip_proto = 6;
     event.orig_len = 65_000;
+    event.tcp_seq = 0xA1B2_C3D4;
+    event.tcp_ack = 0x0506_0708;
 
     let bytes = as_bytes(&event);
+    let u32_at =
+        |o: usize| u32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
     // orig_len at offset 44
-    let orig_len = u32::from_ne_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]);
-    assert_eq!(orig_len, 65_000);
-    // src_port is at offset 52 (2 bytes, little-endian on LE platforms)
-    let src_port = u16::from_ne_bytes([bytes[52], bytes[53]]);
+    assert_eq!(u32_at(44), 65_000);
+    // tcp_seq / tcp_ack at offsets 52 / 56
+    assert_eq!(u32_at(52), 0xA1B2_C3D4);
+    assert_eq!(u32_at(56), 0x0506_0708);
+    // src_port is at offset 60 (2 bytes, native endian)
+    let src_port = u16::from_ne_bytes([bytes[60], bytes[61]]);
     assert_eq!(src_port, 0x1F90);
-    // ip_proto at offset 56
-    assert_eq!(bytes[56], 6);
+    // ip_proto at offset 64
+    assert_eq!(bytes[64], 6);
 }
 
 #[test]
@@ -120,6 +130,6 @@ fn test_max_payload_event() {
     event.payload.fill(0xAA);
 
     let bytes = as_bytes(&event);
-    // Payload starts at offset 64
-    assert!(bytes[64..64 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
+    // Payload starts at offset 72
+    assert!(bytes[72..72 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
 }
