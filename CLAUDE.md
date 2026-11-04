@@ -81,7 +81,7 @@ cargo xtask build-ebpf --release
 cargo build -p panopticon-agent  # Build user-space agent
 cargo build -p panopticon-agent --release
 cargo test --workspace           # Run all tests (eBPF crate excluded - no test harness)
-cargo test -p panopticon-agent   # Agent tests only (291 tests)
+cargo test -p panopticon-agent   # Agent tests only (433 tests)
 cargo clippy -p panopticon-agent -p panopticon-common -p xtask  # Lint (excludes eBPF)
 cargo fmt --all -- --check       # Format check
 cargo bench -p panopticon-agent  # Run Criterion benchmarks
@@ -116,14 +116,14 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 - **All buffer accesses bounded** — Explicit length checks before every read in eBPF to pass the verifier.
 - **Error handling**: `anyhow::Result` in agent, `Result<(), ()>` in eBPF. Probe failures log and skip, never crash the agent.
 - **Logging**: `tracing` crate with structured fields.
-- **Testing**: 319 tests total (291 agent + 21 common + 5 ABI + 2 xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
+- **Testing**: ~470 tests total (433 agent on macOS, more on Linux; plus common, ABI, xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
 - **Backpressure**: Bounded mpsc channels everywhere. If full, drop event + increment counter. Never block the event loop.
 - **Performance targets**: 500K events/sec sustained, P99 < 5ms kernel→user-space, < 200MB RSS (excluding ML model).
 - **Benchmarks**: Criterion benchmarks in `panopticon-agent/benches/` for protocol detection, parser throughput, PII regex.
 
 ## Testing Infrastructure
 
-- **Unit tests**: In each module, run via `cargo test --workspace` (319 tests)
+- **Unit tests**: In each module, run via `cargo test --workspace`
 - **Benchmarks**: `panopticon-agent/benches/` — protocol_detect, parser_throughput, pii_regex (Criterion)
 - **Replay**: `replay.rs` — binary capture format (PNCAP magic) for deterministic event replay
 - **Integration**: `tests/integration/` — docker-compose with nginx, MySQL, PostgreSQL, Redis, traffic generators with PII data, automated validation
@@ -160,7 +160,7 @@ and should not be treated as the canonical public release report.
 
 ## Known Issues
 
-- **macOS development**: eBPF programs compile but cannot be loaded (Linux only). All 319 tests pass on macOS.
+- **macOS development**: eBPF programs compile but cannot be loaded (Linux only). Agent tests pass on macOS.
 - **eBPF tests**: Disabled via `test = false` in Cargo.toml (no test harness for `bpfel-unknown-none` target). Use `cargo xtask test-ebpf` for instructions.
 - **`ort` version**: Pinned to `2.0.0-rc.11` (only RC available for ort 2.x)
 - **Rust 2024 compatibility warnings**: `unsafe_op_in_unsafe_fn` warnings in eBPF crate — cosmetic only, does not affect correctness
