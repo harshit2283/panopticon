@@ -106,7 +106,7 @@ capture_enabled = true
 interfaces = []                     # [] = auto-detect default-route interface(s)
 max_events_per_sec = 500000         # user-space rate limit; excess is dropped and counted
 max_worker_count = 4                # default: number of CPUs
-worker_channel_capacity = 1024
+worker_channel_capacity = 4096        # events queued per worker; excess is dropped and counted
 max_connections_tracked = 65536
 idle_connection_timeout_secs = 30
 max_body_bytes = 4096               # body text kept per exchange for PII scan + export (max 65536)

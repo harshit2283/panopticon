@@ -1,18 +1,19 @@
 //! BPF map definitions shared across all eBPF programs.
 //!
 //! Maps are the primary communication mechanism between eBPF programs and
-//! user-space. RingBuf maps provide zero-copy, ordered event delivery to the
-//! agent. HashMaps track per-connection and per-process state in the kernel.
+//! user-space. RingBuf maps provide ordered event delivery to the agent. HashMaps track per-connection and per-process state in the kernel.
 
 use aya_ebpf::bindings::{BPF_RB_AVAIL_DATA, BPF_RB_FORCE_WAKEUP, BPF_RB_NO_WAKEUP};
 use aya_ebpf::macros::map;
+use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
-    CONFIG_ENTRIES, ConnInfo, DataEvent, MAX_CONNECTIONS, MAX_PID_FILTER, TLS_SCRATCH_SIZE,
+    CONFIG_ENTRIES, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN, DATA_RING_SHARDS,
+    DataEvent, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
 };
 
-/// Events lost because DATA_EVENTS was full (user space not keeping up).
-/// Per-CPU so the drop path needs no atomics; user space sums the CPUs.
+/// Events lost because a DATA_EVENTS shard was full (user space not keeping
+/// up). Per-CPU so the drop path needs no atomics; user space sums the CPUs.
 #[map]
 pub static KERNEL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
@@ -24,17 +25,125 @@ pub fn count_kernel_drop() {
     }
 }
 
-/// Primary event channel for network data (TC captures + TLS intercepts).
-/// 16MB ring buffer — ~4000 fixed-size DataEvents (~4.2KB each) in flight, so
-/// a short user-space stall or traffic burst does not immediately drop events.
-#[map]
-pub static DATA_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+// ── Network event ring buffers, sharded ────────────────────────────────────
+//
+// One ring shared by every CPU serialised all producers on the ring's
+// reserve spinlock: at 4K connections on 64 vCPUs, bpf_ringbuf_reserve's
+// lock slow path took 23% of all CPU. The events are spread over
+// DATA_RING_SHARDS rings instead, chosen per connection (ring_shard: the
+// per-connection order is preserved, see there), each drained by its own
+// user-space thread. User space activates a power-of-two subset sized from
+// the CPU count (CONFIG_RING_SHARD_MASK) and resizes every shard at load
+// time so the active ones split a fixed total (loader DATA_RING_TOTAL_BYTES).
+//
+// TC packets are copied in at their captured size (emit_scratch_event), but
+// TLS and socket events keep fixed 4,160-byte reserves (see EVENT_SCRATCH),
+// so one connection's TLS burst has a single shard to fill: ~250 records at
+// 1 MiB per shard on a 64-CPU node, where the single 16 MiB ring held ~3,900.
 
-/// Pending bytes in DATA_EVENTS at which a producer wakes the consumer.
-/// ~60 events: large enough to batch, small vs. the 16MB ring.
+/// Size each shard is declared with; the loader overrides it.
+const DATA_RING_DECLARED_BYTES: u32 = 1024 * 1024;
+
+macro_rules! data_rings {
+    ($($i:literal => $name:ident),* $(,)?) => {
+        $(
+            #[map]
+            pub static $name: RingBuf = RingBuf::with_byte_size(DATA_RING_DECLARED_BYTES, 0);
+        )*
+
+        /// Copy `record` into shard `shard`. False if the ring is full.
+        #[inline(always)]
+        fn shard_output(shard: u32, record: &[u8]) -> bool {
+            match shard {
+                $($i => ring_output(&$name, record),)*
+                _ => false,
+            }
+        }
+
+        /// Reserve a fixed-size DataEvent in shard `shard`.
+        #[inline(always)]
+        pub fn shard_reserve(shard: u32) -> Option<RingBufEntry<DataEvent>> {
+            match shard {
+                $($i => $name.reserve::<DataEvent>(0),)*
+                _ => None,
+            }
+        }
+
+        /// Submit flags for a DataEvent just reserved in shard `shard`.
+        #[inline(always)]
+        pub fn shard_submit_flags(shard: u32) -> u64 {
+            const RECORD: u64 = ring_record_bytes(core::mem::size_of::<DataEvent>() as u64);
+            let pending = match shard {
+                $($i => $name.query(BPF_RB_AVAIL_DATA as u64),)*
+                _ => 0,
+            };
+            wakeup_flags(pending.saturating_sub(RECORD), RECORD)
+        }
+    };
+}
+
+data_rings!(
+    0 => DATA_EVENTS_0, 1 => DATA_EVENTS_1, 2 => DATA_EVENTS_2, 3 => DATA_EVENTS_3,
+    4 => DATA_EVENTS_4, 5 => DATA_EVENTS_5, 6 => DATA_EVENTS_6, 7 => DATA_EVENTS_7,
+    8 => DATA_EVENTS_8, 9 => DATA_EVENTS_9, 10 => DATA_EVENTS_10, 11 => DATA_EVENTS_11,
+    12 => DATA_EVENTS_12, 13 => DATA_EVENTS_13, 14 => DATA_EVENTS_14, 15 => DATA_EVENTS_15,
+);
+const _: () = assert!(DATA_RING_SHARDS == 16, "data_rings! declares 16 shards");
+
+/// The shard for a connection's events.
+#[inline(always)]
+pub fn shard_for(socket_cookie: u64) -> u32 {
+    let mask = CONFIG.get(CONFIG_RING_SHARD_MASK).map_or(0, |&m| m as u32);
+    ring_shard(socket_cookie, mask & (DATA_RING_SHARDS as u32 - 1))
+}
+
+/// Send the event built in a scratch DataEvent to its connection's shard,
+/// copying only the header and `payload_len` payload bytes: a typical
+/// packet record is a few hundred bytes instead of 4,160, so a ring holds
+/// many times more of them. Counts a kernel drop if the shard is full.
+#[inline(always)]
+pub fn emit_scratch_event(event: *const DataEvent) {
+    // SAFETY: `event` is the per-CPU scratch map value, valid for a DataEvent.
+    let (cookie, len) = unsafe {
+        (
+            (*event).socket_cookie,
+            core::ptr::read_volatile(&(*event).payload_len),
+        )
+    };
+    // The verifier needs the copy length provably within the map value; the
+    // volatile read keeps LLVM from dropping this check as redundant.
+    let len = if len > MAX_PAYLOAD_SIZE as u32 {
+        MAX_PAYLOAD_SIZE
+    } else {
+        len as usize
+    };
+    let record =
+        unsafe { core::slice::from_raw_parts(event as *const u8, DATA_EVENT_HEADER_LEN + len) };
+    if !shard_output(shard_for(cookie), record) {
+        count_kernel_drop();
+    }
+}
+
+#[inline(always)]
+fn ring_output(ring: &RingBuf, record: &[u8]) -> bool {
+    let len = ring_record_bytes(record.len() as u64);
+    let pending = ring.query(BPF_RB_AVAIL_DATA as u64);
+    ring.output::<[u8]>(record, wakeup_flags(pending, len))
+        .is_ok()
+}
+
+/// Bytes a record takes in a ring: 8-byte header + data, rounded up to 8.
+#[inline(always)]
+const fn ring_record_bytes(data_len: u64) -> u64 {
+    (data_len + 8 + 7) & !7
+}
+
+/// Pending bytes in a shard at which a producer wakes its consumer: large
+/// enough to batch, a quarter of the smallest shard the loader creates.
 const WAKEUP_THRESHOLD_BYTES: u64 = 256 * 1024;
 
-/// Submit flags for DATA_EVENTS records.
+/// Submit flags for a record of `record` bytes added to a ring that held
+/// `pending_before` unconsumed bytes.
 ///
 /// A wakeup per record (flags = 0) raises an irq_work self-interrupt on every
 /// event; measured on a VM it was ~90% of the TC program's per-packet cost
@@ -47,11 +156,9 @@ const WAKEUP_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// User space also drains on a short timer, so a missed crossing (racing
 /// producers) only delays delivery by one tick.
 #[inline(always)]
-pub fn data_events_submit_flags() -> u64 {
-    // Ring buffer record = 8-byte header + DataEvent, rounded up to 8.
-    const RECORD: u64 = ((core::mem::size_of::<DataEvent>() as u64 + 8) + 7) & !7;
-    let pending = DATA_EVENTS.query(BPF_RB_AVAIL_DATA as u64);
-    if pending / WAKEUP_THRESHOLD_BYTES != pending.saturating_sub(RECORD) / WAKEUP_THRESHOLD_BYTES {
+fn wakeup_flags(pending_before: u64, record: u64) -> u64 {
+    if (pending_before + record) / WAKEUP_THRESHOLD_BYTES != pending_before / WAKEUP_THRESHOLD_BYTES
+    {
         BPF_RB_FORCE_WAKEUP as u64
     } else {
         BPF_RB_NO_WAKEUP as u64
@@ -189,9 +296,14 @@ pub static PID_TO_CONN: HashMap<u64, ConnInfo> = HashMap::with_max_entries(MAX_C
 #[map]
 pub static IPV6_DROPS: Array<u64> = Array::with_max_entries(1, 0);
 
-/// Per-CPU scratch space for PerfEventArray output path.
-/// DataEvent is ~4.2KB — too large for the 512-byte BPF stack.
-/// The PerfEventArray path writes to this scratch map instead of the stack,
-/// then passes the pointer to `bpf_perf_event_output`.
+/// Per-CPU scratch DataEvent (~4.2KB, far over the 512-byte BPF stack).
+///
+/// TC builds every event here, then emit_scratch_event copies its header and
+/// payload to a ring shard; the PerfEventArray fallback sends it whole. Only
+/// TC uses it on the ring path: TC runs with bottom halves disabled, so
+/// nothing else on the CPU can touch the slot mid-event. The uprobes and
+/// kprobes reserve their events in the ring instead, because a uprobe
+/// program can be preempted (or interrupted by TC) on a preemptible kernel
+/// and another program would then overwrite a shared slot.
 #[map]
-pub static PERF_SCRATCH: PerCpuArray<DataEvent> = PerCpuArray::with_max_entries(1, 0);
+pub static EVENT_SCRATCH: PerCpuArray<DataEvent> = PerCpuArray::with_max_entries(1, 0);

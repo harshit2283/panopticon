@@ -32,10 +32,16 @@ production-hardened compliance platform.
   (`tests/oracle/run_modes.sh`, kernel 7.0).
 - Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
   connections with 99.99% recall, and 8K new connections/s with 99.98%
-  recall and bounded connection state. Drops are counted per cause,
-  including in the kernel ring buffer.
+  recall and bounded connection state, on 4 vCPUs. On 64 vCPUs (agent
+  pinned to 16 of them): 223K requests/s over 1K connections at 100%
+  recall, 237K over 4K connections at 99.8% (about 470K events/s, limited
+  by the load generator), and 200 KB bodies at 99.7-99.9%. Drops are
+  counted per cause, including in the kernel ring buffers.
 - Agent overhead is measured: about 1.2-2µs of kernel time per captured
-  packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run.
+  packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run on
+  4 vCPUs; about 0.7µs per packet under 1K-4K connections on 64 vCPUs,
+  with 176-252 MiB peak RSS (above the 200 MB target at 4K connections and
+  200 KB bodies). Kernel-to-user latency percentiles are not measured.
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 
@@ -76,7 +82,8 @@ production-hardened compliance platform.
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
     without BTF is not validated yet.
   - Go `crypto/tls` reads and writes (Go 1.17+ register ABI) are validated
-    the same way: 100% recall from both processes. Binaries built with `-s`
+    the same way: 100% recall from both processes, except that about 1 run
+    in 5 mispairs one exchange in 500 in the client view. Binaries built with `-s`
     (no symbol table) are not found; arm64 is untested.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not

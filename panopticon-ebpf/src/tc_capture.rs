@@ -1,9 +1,10 @@
 //! TC (Traffic Control) classifier programs for capturing network packets.
 //!
 //! Attached to both ingress and egress hooks on the target interface.
-//! Parses Ethernet → IPv4 → TCP/UDP headers, copies payload into a
-//! DataEvent via RingBuf reserve (never stack — DataEvent is ~4KB),
-//! and always returns TC_ACT_OK (passive observer, never drops packets).
+//! Parses Ethernet → IPv4 → TCP/UDP headers, builds a DataEvent in the
+//! per-CPU scratch map (never stack — DataEvent is ~4KB), sends its header
+//! and captured payload to the connection's ring shard, and always returns
+//! TC_ACT_OK (passive observer, never drops packets).
 
 use aya_ebpf::{
     EbpfContext,
@@ -18,9 +19,7 @@ use panopticon_common::{
     TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary,
 };
 
-use crate::maps::{
-    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, IPV6_DROPS, PERF_SCRATCH, data_events_submit_flags,
-};
+use crate::maps::{CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, IPV6_DROPS, emit_scratch_event};
 
 // ── FNV-1a hash for connection cookie ──────────────────────────────────────
 
@@ -216,57 +215,34 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
         payload_len as u32
     };
 
-    if use_ringbuf {
-        let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
-            crate::maps::count_kernel_drop();
-            return Ok(TC_ACT_OK);
-        };
-
-        let event = entry.as_mut_ptr();
-        populate_tc_event(
-            event,
-            ctx,
-            direction,
-            src_addr,
-            dst_addr,
-            src_port,
-            dst_port,
-            ip_proto,
-            payload_offset,
-            capture_len,
-            payload_len as u32,
-            tcp_flags,
-            true,
-        );
-
-        entry.submit(data_events_submit_flags());
-    } else {
-        // PerfEventArray path: use per-CPU scratch map (DataEvent is ~4.2KB,
-        // far exceeds the 512-byte BPF stack limit).
-        let Some(event) = PERF_SCRATCH.get_ptr_mut(0) else {
-            return Ok(TC_ACT_OK);
-        };
-
+    let Some(event) = EVENT_SCRATCH.get_ptr_mut(0) else {
+        return Ok(TC_ACT_OK);
+    };
+    if !use_ringbuf {
+        // PerfEventArray sends the whole struct: don't leak a previous
+        // event's payload.
         unsafe {
             core::ptr::write_bytes(event as *mut u8, 0, core::mem::size_of::<DataEvent>());
         }
-
-        populate_tc_event(
-            event,
-            ctx,
-            direction,
-            src_addr,
-            dst_addr,
-            src_port,
-            dst_port,
-            ip_proto,
-            payload_offset,
-            capture_len,
-            payload_len as u32,
-            tcp_flags,
-            false,
-        );
-
+    }
+    populate_tc_event(
+        event,
+        ctx,
+        direction,
+        src_addr,
+        dst_addr,
+        src_port,
+        dst_port,
+        ip_proto,
+        payload_offset,
+        capture_len,
+        payload_len as u32,
+        tcp_flags,
+        use_ringbuf,
+    );
+    if use_ringbuf {
+        emit_scratch_event(event);
+    } else {
         DATA_EVENTS_PERF.output(ctx, unsafe { &*event }, 0);
     }
 

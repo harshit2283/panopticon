@@ -74,6 +74,14 @@ keyed by goroutine, because uretprobes break when Go moves goroutine stacks.
 | HTTP/2 (`go-h2` stack), before | 300 | 55–65% / 55–65% | — | — | 0 |
 | HTTP/2 (`go-h2` stack), current, seeds 7, 14, 42 | 300–500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
 
+Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
+64 vCPUs) are not always clean. In 2 runs of 10, the client view scores
+99.8%: one exchange in 500 is missing, and its neighbours on the same
+connection are paired with the wrong responses. The server view stays at
+100%, and no events are dropped. The build before the ring sharding
+behaves the same (also 2 of 10), so this is not new. The cause is not
+established yet.
+
 HTTP/2 over TLS had two problems of its own:
 
 - **Connection keys were reused.** Go and OpenSSL reuse the memory of a closed
@@ -329,6 +337,8 @@ interface. It is not end-to-end latency.
 | Current, packet that is not captured (e.g. ICMP) | ~85 |
 | Under sustained load (~40K packets/s), before the wakeup fix | 6,643 |
 | Under sustained load (~40K packets/s), current | 1,600–1,700 |
+| 64 vCPUs, 1K-4K connections, one shared ring (before sharding) | 14,000–17,900 |
+| 64 vCPUs, 1K-4K connections, sharded rings (current) | 695–716 |
 
 With TLS capture on (`tls_scan_enabled`, the default), two more hooks run on
 **every TCP send and receive on the node**, not only TLS ones, to learn TLS
@@ -397,8 +407,10 @@ scanning, the export queue and the JSON writer. Bodies are now cut to
 `max_body_bytes` (default 4 KB) before any of those stages, so the
 redaction still covers everything that is exported. The remaining drops
 come in bursts, while the load generator saturates the VM's 4 vCPUs.
-Running the ring buffer drain on its own thread (also tried at raised
-priority) did not reduce them measurably here, so that change was not kept.
+On this 4-vCPU VM, running the ring buffer drain on its own thread (also
+tried at raised priority) did not reduce them measurably. On 64 vCPUs the
+single drain thread was the limit, and the ring is now sharded and drained
+by one thread per shard (see [64-vCPU scale test](#64-vcpu-scale-test)).
 
 Connection churn, one request per TCP connection (`run_load.sh 64 30s 0 1`):
 8.4K connections/s with 99.98% recall. Tracked connections stay at 0–36,
@@ -434,9 +446,171 @@ difference from the replay figure is the kernel-to-user hand-off and
 contention for the VM's 4 vCPUs. Plan on roughly one core per 60K
 captured packets per second with JSON export on.
 
-Not measured yet: throughput above ~25K requests/s (the load generator is the
-limit on this VM), kernel-to-export latency percentiles, and memory with the
-ONNX model loaded.
+Not measured yet: kernel-to-export latency percentiles, and memory with the
+ONNX model loaded. Throughput above ~25K requests/s (the load generator is
+the limit on this VM) is measured on 64 vCPUs below.
+
+### 64-vCPU scale test
+
+**Rig.** A 64-vCPU, 64 GB KVM VM (`tests/lab/vm.sh up perf noble-hwe 64 64`,
+kernel 7.0) on a shared host. `tests/load/run_load.sh` drives HTTP/1.1
+keep-alive load through the veth. The agent is pinned to CPUs 0-15 with
+`taskset`, and the load generator, its server and the veth softirqs run on
+CPUs 16-63. JSON export is on, the rate limiter is lifted
+(`max_events_per_sec = 100000000`), and the rest of the config is the
+default. Each row runs for 20 s.
+
+- **Agent cores**: mean `pidstat` CPU of the agent over the loaded samples.
+- **Recall**: requests found in the export / requests sent.
+- **Drops**: kernel ring buffer / worker channel full / export queue full.
+- **Kernel ns/packet**: `tests/oracle/bpf_cost.py`, TC programs.
+
+**Before** (`ecabbe6`: one 16 MiB ring shared by all CPUs, drained on the
+tokio main thread):
+
+| Config | req/s | Recall | Agent cores | Peak RSS | Drops (kernel / channel / export) | Kernel ns/packet |
+|---|---|---|---|---|---|---|
+| 64 keep-alive | 69.5K | 100% | 1.67 | 168 MiB | 0 / 0 / 0 | 1,042 |
+| 1K keep-alive | 214.8K | 99.92% | 6.82 | 190 MiB | 5,150 / 0 / 0 | 14,022 |
+| 4K keep-alive | 222.4K | 94.85% | 8.91 | 266 MiB | 355,565 / 32,574 / 11,639 | 15,744 |
+| 200 KB bodies, 1K conns | 68.3K | 60.69% | 4.08 | 217 MiB | 1,440,284 / 0 / 0 | 19,041 |
+| No agent, 4K | 265.2K | – | – | – | – | – |
+
+The drain thread ran at 98% of a core in the 200 KB row. A re-run of the
+same build on the VM used for the "after" numbers agreed within noise:
+69.6-72.0K / 198.4K / 218.1K / 64.6-66.5K req/s, 100% / 99.93% / 94.80% /
+52-65% recall, and 1,046-1,057 / 17,223 / 15,152 / 16,631-18,669 ns per packet.
+
+Two bottlenecks were measured:
+
+- **Ring reserve lock.** On the load CPUs, `bpf_ringbuf_reserve` →
+  `resilient_queued_spin_lock_slowpath` took 23% of all CPU, mostly from
+  `tc_egress`. Every producer on the node serialised on the one ring's lock.
+- **The drain copied whole events.** Each event was read, rebuilt and moved
+  as a full 4,160-byte struct on one thread. glibc memmove was 15-21% of
+  agent samples.
+
+**What changed:**
+
+- **Sharded ring.** `DATA_EVENTS` is now 16 rings. The loader activates a
+  power of two of them, one per 4 online CPUs (16 here, 2 on 8 vCPUs), and
+  splits 16 MiB across the active ones.
+- **Sharded by connection, not by CPU.** A connection's packets are
+  produced on whichever CPUs its threads and softirqs run on, so CPU shards
+  would let user space see a response before its request. Sharding by the
+  connection cookie puts every event of one connection in one ring: both
+  directions, its connect/accept owner events, and its FIN/RST (all carry
+  the same 5-tuple cookie), or one TLS connection object. So the order seen
+  per connection is that ring's reserve order, exactly as with one ring.
+- **TC records at captured size.** TC builds the event in the per-CPU
+  scratch map and copies the header plus the captured bytes into the ring,
+  instead of reserving a fixed 4,160-byte record. TLS and socket events
+  keep fixed reserves, because a uprobe can be preempted mid-event and a
+  shared scratch slot would be overwritten.
+- **One drain thread per shard.** Draining has its own threads (woken by
+  edge-triggered epoll or the 2 ms tick), not the tokio main loop. Each
+  event is copied once, at header plus `payload_len`, into packed worker
+  batches of up to 64 events or 64 KB. Each drain thread feeds its own
+  subset of the workers, so a worker's channel takes full batches from one
+  producer.
+- **Bigger worker channels.** The default `worker_channel_capacity` is now
+  4,096 events (was 1,024), to absorb a shard drained in one burst. With
+  1,024, the 4K row lost 5% of events to full channels while the workers
+  were half idle.
+
+**After:**
+
+| Config | req/s | Recall | Agent cores | Peak RSS | Drops (kernel / channel / export) | Kernel ns/packet |
+|---|---|---|---|---|---|---|
+| 64 keep-alive | 70.8K | 100% | 0.89 | 129 MiB | 0 / 0 / 0 | 767 |
+| 1K keep-alive | 223.0K | 100.00% | 7.61 | 176 MiB | 0 / 0 / 0 | 695 |
+| 4K keep-alive | 237.0K | 99.79% | 10.89 | 215 MiB | 0 / 7,890 / 5,316 | 708 |
+| 200 KB bodies, 1K conns | 64.3-65.4K | 99.68-99.93% | 6.89-7.52 | 245-252 MiB | 0-32 / 0 / 0-2,933 | 2,726-2,763 |
+| No agent, 4K / 200 KB | 271.6K / 76.4-78.7K | – | – | – | – | – |
+
+- **Kernel cost per packet** fell 20-25x under load, to about 0.7 µs at 1K
+  and 4K connections (from 14-16 µs). On the load CPUs, the ring buffer
+  helpers (`bpf_ringbuf_output`, reserve and commit) are now under 1% of
+  samples, down from 23% in the lock slow path alone.
+- **Kernel drops** went from 355K (4K) and 1.4-2.0M (200 KB) to zero, or a
+  few dozen.
+- **Recall** at 200 KB bodies went from 52-65% to 99.7-99.9%, at 4K
+  connections from 94.8% to 99.8%, and at 1K to 100%.
+- **Workload slowdown with the agent** at 4K connections is now 11-13%
+  (237.0K vs 271.6K without the agent), against 16-20% before. At 200 KB
+  bodies both builds run about 17% below the no-agent rate, but the new
+  build exports nearly twice as many exchanges.
+- **Agent CPU** is higher where it now processes what was dropped before
+  (200 KB: 7 cores, against 4 for half the exchanges). Per event it is
+  lower at 1K connections (18.8 µs against 22.2 µs) and higher at 4K (25.3
+  µs against 22-23 µs).
+
+**Replay, one core** (`--replay-bench`, the 64-connection capture, two runs
+each):
+
+| Pipeline | Before | After |
+|---|---|---|
+| Parse only | 0.63-0.68 µs/event | 0.51-0.54 µs |
+| Parse + PII + graph | 1.60 µs | 1.41-1.45 µs |
+| + JSON export | 2.12-2.13 µs | 1.96-2.02 µs |
+
+**Where the time goes now.** `perf` during the 4K row:
+
+- **Load CPUs:** the load generator's Go garbage collector
+  (`runtime.getempty`) is 44% of samples. At 4K connections this rig
+  saturates on the load side (load CPUs 89-94% busy), not in the kernel
+  probes.
+- **Agent:** `handle_messages` (PII scan, redaction and export for each
+  parsed message, including a clone of each message) is 45% of samples.
+  Contention on the shared connection map (`dashmap` `lock_shared_slow`,
+  7%) and on the shared regex cache pool (`Pool::get_slow`, 3%) follow.
+  memmove is no longer among the top 20 symbols.
+- **At 200 KB bodies:** the agent's time is spread over body copies
+  (`BytesMut` drop 7%, `Vec` clone 4%), regex search (6%) and JSON
+  serialisation (4%).
+
+The next user-space limit is therefore per-message work in the worker, not
+the hand-off from the kernel.
+
+**Targets.** The design targets in the project notes are 500K events/s
+sustained, P99 < 5 ms kernel → user space, and < 200 MB RSS without the ML
+model.
+
+- **500K events/s: not reached on this rig, and not limited by the agent.**
+  The 4K row delivered 9.48M events in 20 s, about 470K events/s, with 99.8%
+  recall. The agent's 16 CPUs were 75% busy, while the load generator was
+  the limit.
+- **P99 < 5 ms kernel → user space: not measured.** The drain tick bounds
+  the time an event waits in the ring at about 2 ms under traffic. Queueing
+  in the worker channels is not measured.
+- **RSS < 200 MB: met at 64 and 1K connections, exceeded above.** The 4K
+  row peaks at 215 MiB and the 200 KB rows at 245-252 MiB. Queued batches
+  are bounded by workers × channel slots × 68 KB. The ring memory is the
+  same 16 MiB as before.
+
+**Small node.** An 8-vCPU VM on kernel 5.15 (`vm.sh up perf jammy 8 8`) runs
+with 2 active shards. The agent is pinned to CPUs 0-1 and the load to 2-7,
+with 64 keep-alive connections, two runs per build, alternating:
+
+| | req/s | Recall | Agent cores | Peak RSS | Drops (kernel / channel / export) | Kernel ns/packet |
+|---|---|---|---|---|---|---|
+| Before | 132.9-165.2K | 95.04-99.66% | 1.07-1.40 | 110-120 MiB | 731-4,060 / 9,619-294,919 / 3,722-13,727 | 699-766 |
+| After | 142.4-143.8K | 99.73-99.80% | 0.91-0.93 | 59-97 MiB | 0 / 0-2,254 / 5,759-6,600 | 497-498 |
+
+Sharding does not cost small nodes anything measurable here. Recall,
+agent CPU, RSS and kernel cost all improve, and the remaining drops are in
+the export queue (the agent has 2 CPUs). All accuracy suites pass on this
+VM (5.15 verifier included).
+
+**Limits.**
+
+- **TLS bursts.** TLS and socket events still use fixed 4,160-byte records,
+  and one connection's events all go to one shard. A shard holds about 250
+  of them on a 64-CPU node (1 MiB per shard), where the single ring held
+  about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy
+  load is not measured.
+- **Go TLS client view flakes.** One exchange in 500 is mispaired in about 1
+  run in 5, with or without this change (2 of 10 runs each), with no drops.
 
 ## 5. Micro-benchmarks
 

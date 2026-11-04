@@ -2,6 +2,8 @@
 // but their callers (EventLoop, consume_data_events, etc.) are Linux-only.
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
@@ -17,9 +19,11 @@ use aya::maps::perf::PerfEventArrayBuffer;
 use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
-use panopticon_common::{DataEvent, Direction, EventType};
+use panopticon_common::{
+    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, data_event_record_len,
+};
 #[cfg(target_os = "linux")]
-use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes};
+use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes, read_data_event_into};
 #[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
 #[cfg(target_os = "linux")]
@@ -318,10 +322,15 @@ impl EventLoop {
             privacy: Arc::clone(&self.privacy),
         };
         let worker = tokio::spawn(worker_task(0, rx, ctx));
-        for chunk in events.chunks(WORKER_BATCH) {
-            if tx.send(chunk.to_vec()).await.is_err() {
+        let mut batch = EventBatch::default();
+        for event in &events {
+            batch.push(event);
+            if batch.is_full() && tx.send(std::mem::take(&mut batch)).await.is_err() {
                 break;
             }
+        }
+        if !batch.is_empty() {
+            let _ = tx.send(batch).await;
         }
         drop(tx);
         worker.await?;
@@ -539,13 +548,13 @@ impl EventLoop {
 async fn consume_data_events(
     event_source: EventSource,
     senders: &[mpsc::Sender<EventBatch>],
-    rate_limiter: &RateLimiter,
-    stats: &EventStats,
+    rate_limiter: &Arc<RateLimiter>,
+    stats: &Arc<EventStats>,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     match event_source {
-        EventSource::RingBuf(ring_buf) => {
-            consume_ringbuf(ring_buf, senders, rate_limiter, stats, tls_rescan_tx).await
+        EventSource::RingBuf(rings) => {
+            consume_ringbufs(rings, senders, rate_limiter, stats, tls_rescan_tx).await
         }
         EventSource::PerfEventArray(perf_array) => {
             consume_perf_array(perf_array, senders, rate_limiter, stats, tls_rescan_tx).await
@@ -553,90 +562,138 @@ async fn consume_data_events(
     }
 }
 
-/// Consume events from a RingBuf (kernel >= 5.8).
+/// Consume the ring buffer shards (kernel >= 5.8), each on its own OS
+/// thread. Draining used to run inside the tokio main loop, where one thread
+/// copying every event capped throughput (98% of a core at 200 KB bodies ×
+/// 1K connections, and every millisecond it lagged became kernel drops).
+/// Each connection's events are in one shard, drained by one thread into
+/// FIFO worker channels, so per-connection order is kept.
 #[cfg(target_os = "linux")]
-async fn consume_ringbuf(
-    ring_buf: RingBuf<aya::maps::MapData>,
+async fn consume_ringbufs(
+    rings: Vec<RingBuf<aya::maps::MapData>>,
+    senders: &[mpsc::Sender<EventBatch>],
+    rate_limiter: &Arc<RateLimiter>,
+    stats: &Arc<EventStats>,
+    tls_rescan_tx: Option<mpsc::Sender<u32>>,
+) -> Result<()> {
+    /// Stops the drain threads when this future ends or is dropped (shutdown
+    /// drops it): they exit within one poll timeout, releasing their worker
+    /// channel senders so the workers can drain and finish.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
+    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<Result<()>>();
+
+    info!(
+        shards = rings.len(),
+        "DATA_EVENTS RingBuf consumer started (Kernel >= 5.8)"
+    );
+    let shards = rings.len();
+    for (shard, ring) in rings.into_iter().enumerate() {
+        let senders = senders.to_vec();
+        let rate_limiter = Arc::clone(rate_limiter);
+        let stats = Arc::clone(stats);
+        let tls_rescan_tx = tls_rescan_tx.clone();
+        let stop = Arc::clone(&stop.0);
+        let exit_tx = exit_tx.clone();
+        std::thread::Builder::new()
+            .name(format!("ring-drain-{shard}"))
+            .spawn(move || {
+                let result = drain_thread(
+                    ring,
+                    (shard, shards),
+                    &senders,
+                    &rate_limiter,
+                    &stats,
+                    tls_rescan_tx.as_ref(),
+                    &stop,
+                );
+                let _ = exit_tx.send(result);
+            })
+            .context("Failed to spawn a ring buffer drain thread")?;
+    }
+    drop(exit_tx);
+    match exit_rx.recv().await {
+        Some(Err(e)) => Err(e),
+        _ => Err(anyhow::anyhow!("RingBuf drain thread exited")),
+    }
+}
+
+/// One shard's drain loop: sleep until the kernel's wakeup or the drain
+/// tick, then drain everything pending.
+///
+/// The kernel only wakes us once a batch is pending (see wakeup_flags in
+/// the eBPF crate): a wakeup per event cost ~90% of per-packet kernel time.
+/// Edge-triggered epoll returns on those wakeups only, not whenever a byte
+/// is pending, so a busy ring is drained in batches rather than spun on.
+/// The tick bounds delivery latency when traffic is too light to reach the
+/// wakeup threshold; it backs off while the ring stays empty so an idle
+/// agent isn't woken 500 times a second.
+#[cfg(target_os = "linux")]
+fn drain_thread(
+    mut ring: RingBuf<aya::maps::MapData>,
+    (shard, shards): (usize, usize),
     senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
-    tls_rescan_tx: Option<mpsc::Sender<u32>>,
+    tls_rescan_tx: Option<&mpsc::Sender<u32>>,
+    stop: &AtomicBool,
 ) -> Result<()> {
-    // Wrap the ring buffer's fd in AsyncFd for epoll-based notification.
-    // This avoids busy-polling: the task sleeps until the kernel signals data.
-    let mut async_fd = AsyncFd::new(ring_buf)?;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    info!("DATA_EVENTS RingBuf consumer started (Kernel >= 5.8)");
-
-    // Retry state for self-healing (7.5): track consecutive readable() failures
-    let mut consecutive_errors: u32 = 0;
-    const MAX_RETRIES: u32 = 3;
-
-    // The kernel only wakes us once a batch is pending (see
-    // data_events_submit_flags in the eBPF crate): a wakeup per event cost
-    // ~90% of per-packet kernel time. The tick bounds delivery latency when
-    // traffic is too light to reach the wakeup threshold; it backs off while
-    // the ring stays empty so an idle agent isn't woken 500 times a second.
-    let mut drain_interval = RINGBUF_DRAIN_INTERVAL;
-    let drain_tick = tokio::time::sleep(drain_interval);
-    tokio::pin!(drain_tick);
-
-    loop {
-        let woken = tokio::select! {
-            ready = async_fd.readable_mut() => Some(ready),
-            _ = &mut drain_tick => None,
-        };
-        match woken {
-            None => {
-                let drained = drain_ringbuf(
-                    async_fd.get_mut(),
-                    senders,
-                    rate_limiter,
-                    stats,
-                    tls_rescan_tx.as_ref(),
-                );
-                drain_interval = next_drain_interval(drain_interval, drained);
-                drain_tick
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + drain_interval);
-            }
-            Some(Ok(mut guard)) => {
-                consecutive_errors = 0;
-                drain_ringbuf(
-                    guard.get_inner_mut(),
-                    senders,
-                    rate_limiter,
-                    stats,
-                    tls_rescan_tx.as_ref(),
-                );
-                // Clear readiness so we wait for the next epoll notification
-                guard.clear_ready();
-                // Traffic is flowing: tighten the latency bound again.
-                drain_interval = RINGBUF_DRAIN_INTERVAL;
-                drain_tick
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + drain_interval);
-            }
-            Some(Err(e)) => {
-                consecutive_errors += 1;
-                if consecutive_errors > MAX_RETRIES {
-                    return Err(anyhow::anyhow!(
-                        "RingBuf readable failed {} consecutive times, last error: {}",
-                        consecutive_errors,
-                        e
-                    ));
-                }
-                let backoff_ms = 100 * 2u64.pow(consecutive_errors);
-                warn!(
-                    error = %e,
-                    attempt = consecutive_errors,
-                    backoff_ms,
-                    "RingBuf readable_mut failed, retrying with backoff"
-                );
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
+    // SAFETY: plain syscalls; the epoll fd is owned (closed on return) and
+    // the ring fd outlives it.
+    let epoll = unsafe {
+        let fd = libc::epoll_create1(libc::EPOLL_CLOEXEC);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("epoll_create1");
         }
+        let epoll = OwnedFd::from_raw_fd(fd);
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            u64: 0,
+        };
+        if libc::epoll_ctl(fd, libc::EPOLL_CTL_ADD, ring.as_raw_fd(), &mut ev) < 0 {
+            return Err(std::io::Error::last_os_error()).context("epoll_ctl on ring buffer");
+        }
+        epoll
+    };
+    // Header and payload of the event being routed; reused for every event.
+    // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
+    let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
+    let mut interval = RINGBUF_DRAIN_INTERVAL;
+    while !stop.load(Ordering::Relaxed) {
+        let mut ev = libc::epoll_event { events: 0, u64: 0 };
+        // SAFETY: one valid epoll_event to fill.
+        let woken =
+            unsafe { libc::epoll_wait(epoll.as_raw_fd(), &mut ev, 1, interval.as_millis() as i32) };
+        if woken < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("epoll_wait on ring buffer");
+        }
+        let drained = drain_ringbuf(
+            &mut ring,
+            &mut scratch,
+            WorkerBatcher::new(senders, stats, shard, shards),
+            rate_limiter,
+            stats,
+            tls_rescan_tx,
+        );
+        // Woken by the kernel: traffic is flowing, keep the tight bound.
+        interval = if woken > 0 {
+            RINGBUF_DRAIN_INTERVAL
+        } else {
+            next_drain_interval(interval, drained)
+        };
     }
+    Ok(())
 }
 
 /// Max delay before buffered ring-buffer events are drained without a kernel
@@ -661,24 +718,27 @@ fn next_drain_interval(current: Duration, drained: usize) -> Duration {
 }
 
 /// Drain every pending event from the ring buffer and route it to workers.
+/// Copies each event's header and payload bytes once into the routing
+/// scratch, and from there into the worker's batch: never a whole 4KB
+/// DataEvent.
 #[cfg(target_os = "linux")]
 fn drain_ringbuf(
     ring: &mut RingBuf<aya::maps::MapData>,
-    senders: &[mpsc::Sender<EventBatch>],
+    scratch: &mut DataEvent,
+    mut batcher: WorkerBatcher<'_>,
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     tls_rescan_tx: Option<&mpsc::Sender<u32>>,
 ) -> usize {
     let mut drained = 0;
-    let mut batcher = WorkerBatcher::new(senders, stats);
+    let mut received = 0;
     while let Some(item) = ring.next() {
         drained += 1;
-        let data: &[u8] = item.as_ref();
-        let Some(event) = parse_data_event_bytes(data) else {
+        if !read_data_event_into(item.as_ref(), scratch) {
             continue; // Malformed event, skip
-        };
-
-        stats.events_received.fetch_add(1, Ordering::Relaxed);
+        }
+        let event: &DataEvent = scratch;
+        received += 1;
 
         // Handle ProcessEvent-typed events differently (they come through
         // PROCESS_EVENTS in the kernel, but we handle routing here)
@@ -717,14 +777,80 @@ fn drain_ringbuf(
         }
 
         // Route to worker by connection key (deterministic affinity).
-        batcher.push(connection_key(&event), event);
+        batcher.push(connection_key(event), event);
     }
     batcher.flush();
+    // One shared-counter update per drain, not per event: every drain
+    // thread bumps it.
+    stats.events_received.fetch_add(received, Ordering::Relaxed);
     drained
 }
 
-/// Events handed to a worker in one channel message.
-type EventBatch = Vec<DataEvent>;
+/// Events handed to a worker in one channel message, packed back to back:
+/// each a DataEvent header plus only its `payload_len` payload bytes. A Vec
+/// of whole DataEvents copied 4,160 bytes per event however small the
+/// packet (glibc memmove was 15-21% of agent CPU).
+#[derive(Default)]
+pub(crate) struct EventBatch {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl EventBatch {
+    /// Append `event`'s header and its captured payload bytes.
+    fn push(&mut self, event: &DataEvent) {
+        if self.bytes.capacity() == 0 {
+            // One fixed-size allocation per batch, never regrown: a batch
+            // is sent once it reaches WORKER_BATCH_BYTES, so this always
+            // fits. Regrowing (32 KB → 512 KB for 64 full-size events)
+            // doubled the memory held by queued batches.
+            self.bytes
+                .reserve_exact(WORKER_BATCH_BYTES + std::mem::size_of::<DataEvent>());
+        }
+        let payload = event.payload_bytes();
+        // SAFETY: DataEvent is repr(C) plain data with no implicit padding;
+        // the header is the first DATA_EVENT_HEADER_LEN bytes.
+        let header = unsafe {
+            std::slice::from_raw_parts(
+                (event as *const DataEvent).cast::<u8>(),
+                DATA_EVENT_HEADER_LEN,
+            )
+        };
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(header);
+        if event.payload_len as usize > MAX_PAYLOAD_SIZE {
+            // payload_bytes() clamped it; the record must say so too.
+            let at = start + std::mem::offset_of!(DataEvent, payload_len);
+            self.bytes[at..at + 4].copy_from_slice(&(payload.len() as u32).to_ne_bytes());
+        }
+        self.bytes.extend_from_slice(payload);
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Ready to send: WORKER_BATCH events or WORKER_BATCH_BYTES bytes.
+    fn is_full(&self) -> bool {
+        self.len >= WORKER_BATCH || self.bytes.len() >= WORKER_BATCH_BYTES
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The packed records, in push order. Load one with
+    /// `read_data_event_into`.
+    fn records(&self) -> impl Iterator<Item = &[u8]> {
+        let mut rest = self.bytes.as_slice();
+        std::iter::from_fn(move || {
+            let (record, tail) = rest.split_at(data_event_record_len(rest)?);
+            rest = tail;
+            Some(record)
+        })
+    }
+}
 
 /// Most events per batch. One send (and at most one worker wakeup) per
 /// batch instead of per event: per-event sends woke a parked worker thread
@@ -732,31 +858,59 @@ type EventBatch = Vec<DataEvent>;
 /// parsing the packet.
 const WORKER_BATCH: usize = 64;
 
+/// Most bytes per batch (plus the event that crosses it). Bounds the memory
+/// a worker's queued batches hold to about channel slots × 68 KB, whatever
+/// the payload size.
+const WORKER_BATCH_BYTES: usize = 64 * 1024;
+
+/// The worker for an event drained from ring shard `shard` of `shards`.
+///
+/// Each drain thread feeds its own subset of the workers (shard,
+/// shard + shards, shard + 2 * shards, ...). Routing every shard to every
+/// worker made each drain thread send a partial batch to nearly every worker
+/// on every drain, so the workers' channel slots filled with small batches:
+/// at 1K-4K connections that dropped 5-30% of events as channel-full while
+/// the workers sat half idle. A connection's events are all in one shard, so
+/// it still always reaches the same worker.
+fn worker_index(routing_key: u64, shard: usize, shards: usize, workers: usize) -> usize {
+    let per_shard = workers.div_ceil(shards.max(1));
+    (shard + shards * (routing_key as usize % per_shard)) % workers
+}
+
 /// Groups events per worker during one ring buffer drain.
 #[cfg(target_os = "linux")]
 struct WorkerBatcher<'a> {
     senders: &'a [mpsc::Sender<EventBatch>],
     pending: Vec<EventBatch>,
     stats: &'a EventStats,
+    shard: usize,
+    shards: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl<'a> WorkerBatcher<'a> {
-    fn new(senders: &'a [mpsc::Sender<EventBatch>], stats: &'a EventStats) -> Self {
+    fn new(
+        senders: &'a [mpsc::Sender<EventBatch>],
+        stats: &'a EventStats,
+        shard: usize,
+        shards: usize,
+    ) -> Self {
         Self {
             senders,
-            pending: senders.iter().map(|_| Vec::new()).collect(),
+            pending: senders.iter().map(|_| EventBatch::default()).collect(),
             stats,
+            shard,
+            shards,
         }
     }
 
-    fn push(&mut self, routing_key: u64, event: DataEvent) {
+    fn push(&mut self, routing_key: u64, event: &DataEvent) {
         if self.senders.is_empty() {
             return;
         }
-        let idx = (routing_key as usize) % self.senders.len();
+        let idx = worker_index(routing_key, self.shard, self.shards, self.senders.len());
         self.pending[idx].push(event);
-        if self.pending[idx].len() >= WORKER_BATCH {
+        if self.pending[idx].is_full() {
             self.send(idx);
         }
     }
@@ -772,7 +926,7 @@ impl<'a> WorkerBatcher<'a> {
     /// try_send: never block the reader. Drop the batch if the worker is
     /// behind.
     fn send(&mut self, idx: usize) {
-        let batch = std::mem::replace(&mut self.pending[idx], Vec::with_capacity(WORKER_BATCH));
+        let batch = std::mem::take(&mut self.pending[idx]);
         let n = batch.len() as u64;
         if self.senders[idx].try_send(batch).is_err() {
             self.stats.events_dropped.fetch_add(n, Ordering::Relaxed);
@@ -847,7 +1001,9 @@ async fn consume_perf_array(
             0
         };
 
-        if senders[worker_idx].try_send(vec![event]).is_err() {
+        let mut batch = EventBatch::default();
+        batch.push(&event);
+        if senders[worker_idx].try_send(batch).is_err() {
             stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
         }
@@ -918,13 +1074,19 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
 
     debug!(worker_id, "Worker started");
 
+    // The event being processed: each record's header and payload bytes are
+    // copied in; past payload_len it keeps earlier bytes, never read.
+    // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
+    let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
     while let Some(batch) = rx.recv().await {
-        // By reference: each DataEvent is ~4KB, so moving it out of the
-        // batch would copy it again.
         // Read once per batch: a reload may have tightened it.
         let privacy = ctx.privacy.get();
         let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
-        for event in &batch {
+        for record in batch.records() {
+            if !read_data_event_into(record, &mut scratch) {
+                continue;
+            }
+            let event: &DataEvent = &scratch;
             if let Some(raw) = ctx.raw_capture.as_ref()
                 && privacy == PrivacyMode::Full
             {
@@ -1408,6 +1570,70 @@ mod tests {
     use super::*;
     use crate::protocol::Protocol;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn worker_index_gives_each_shard_its_own_workers_and_uses_them_all() {
+        for (workers, shards) in [(64, 16), (20, 16), (12, 16), (16, 2), (1, 1), (7, 1)] {
+            let mut used = vec![std::collections::BTreeSet::new(); workers];
+            for shard in 0..shards {
+                for key in 0..1000u64 {
+                    let w = worker_index(key, shard, shards, workers);
+                    assert!(w < workers);
+                    assert_eq!(w, worker_index(key, shard, shards, workers));
+                    used[w].insert(shard);
+                }
+            }
+            assert!(
+                used.iter().all(|s| !s.is_empty()),
+                "{workers}/{shards}: idle worker"
+            );
+            if workers % shards == 0 {
+                // Disjoint: every worker is fed by exactly one drain thread.
+                assert!(used.iter().all(|s| s.len() == 1), "{workers}/{shards}");
+            }
+        }
+    }
+
+    #[test]
+    fn event_batch_packs_header_and_payload_and_reads_back_in_order() {
+        // SAFETY: all-zero is valid for DataEvent.
+        let mut events: Vec<DataEvent> = (0..4).map(|_| unsafe { std::mem::zeroed() }).collect();
+        for (i, (e, len)) in events.iter_mut().zip([0usize, 3, 4096, 9999]).enumerate() {
+            e.socket_cookie = i as u64;
+            e.event_type = EventType::TcPacket;
+            e.direction = Direction::Egress;
+            e.payload_len = len as u32;
+            e.payload[..len.min(4096)].fill(b'a' + i as u8);
+        }
+        let mut batch = EventBatch::default();
+        events.iter().for_each(|e| batch.push(e));
+        assert_eq!(batch.len(), 4);
+        // Header + payload only: 3 + 4096 + 4096 (clamped) payload bytes.
+        assert_eq!(
+            batch.bytes.len(),
+            4 * DATA_EVENT_HEADER_LEN + 3 + 4096 + 4096
+        );
+
+        // SAFETY: as above.
+        let mut scratch: DataEvent = unsafe { std::mem::zeroed() };
+        let mut seen = 0;
+        for (i, record) in batch.records().enumerate() {
+            assert!(panopticon_common::read_data_event_into(
+                record,
+                &mut scratch
+            ));
+            let want = &events[i];
+            assert_eq!(scratch.socket_cookie, want.socket_cookie);
+            assert_eq!(scratch.direction, Direction::Egress);
+            assert_eq!(scratch.payload_bytes(), want.payload_bytes());
+            seen += 1;
+        }
+        assert_eq!(seen, 4);
+        assert_eq!(
+            scratch.payload_len, 4096,
+            "oversized payload_len is clamped in the record"
+        );
+    }
 
     #[test]
     fn test_event_stats_atomic() {
