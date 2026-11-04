@@ -44,7 +44,11 @@ production-hardened compliance platform.
   packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run on
   4 vCPUs; about 0.7µs per packet under 1K-4K connections on 64 vCPUs,
   with 176-252 MiB peak RSS (above the 200 MB target at 4K connections and
-  200 KB bodies). Kernel-to-user latency percentiles are not measured.
+  200 KB bodies). At fixed rates the agent costs about 0.37 cores at 20K
+  requests/s (64 or 4K connections). Kernel-to-worker P99 latency
+  (preliminary) is 2-4 ms at 64 connections and at 4K connections up to
+  20K requests/s, and 8-10 ms at 4K connections from 50K requests/s
+  (docs/BENCHMARKS.md, scaling study).
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 

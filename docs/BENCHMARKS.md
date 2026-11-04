@@ -672,16 +672,23 @@ change at a time.
   rule used raw host load, which counts this VM's own vCPU threads. That would
   have dropped 7 high-rate matrix runs whose steal was below 0.1%, so the rule
   was corrected to other tenants' load. No other run is affected under either
-  version.
+  version. The thresholds were set during the study; they are not in the
+  predictions written before it.
+- **Run order.** Builds were interleaved in a fixed, repeated order, not a
+  randomized one. The combined builds in stage 2 ran later than the stage 1
+  baseline, without baseline runs of their own alongside them.
 - **Experiments.** Each experiment is a compile-time switch in one source
   tree, so the baseline binary is built from that same tree. The baseline
   differs from the release code in one way: the JSON export moved after the
   service graph, so that H3 can move the message into it. That move is
   expected to be cost-neutral; it was not measured separately.
 
-**Finding 1. Request rate drives the per-request cost, not connection count.**
-At the same fixed rate up to 50K req/s, 4K connections cost the agent about
-the same per request as 64. The table shows the baseline agent in mode (b),
+**Finding 1. At low rates connection count does not matter; from about 50K
+req/s it does, probably through Finding 2.** At the same fixed rate of 5K or 20K
+req/s, 4K connections cost the agent the same per request as 64 (the ranges
+overlap). At 50K, 4K connections cost 27% more (18.2 [17.1-18.3] against
+14.4 [13.6-14.9] µs/req, ranges apart), and the gap widens with rate. The
+table shows the baseline agent in mode (b),
 redacted with every request exported, and in mode (a1), metrics only.
 
 | Conns | Rate | (b) redacted + export: µs/req | cores | (a1) metrics_only: µs/req |
@@ -752,7 +759,7 @@ Every hypothesis was tested twice:
 
 | | Prediction | Measured | Verdict |
 |---|---|---|---|
-| **P0**, fixed rate closes the gap | 64 → 4K gap under 1.5x at 20K req/s | 17.6 [17.1-18.0] → 18.9 [18.8-19.2] µs/req at 20K (1.07x). At 50K, 14.4 → 18.2 (1.26x). At 100K, 24.4 vs 12.6 (1.9x), and 13.7 vs 11.5 (1.2x) with H2-len. | **Supported** up to 50K req/s. Above that the gap is Finding 2. |
+| **P0**, fixed rate closes the gap | 64 → 4K gap under 1.5x at 20K req/s | 17.6 [17.1-18.0] → 18.9 [18.8-19.2] µs/req at 20K (1.07x). At 50K, 14.4 → 18.2 (1.26x). At 100K, 24.4 vs 12.6 (1.9x), and 13.7 vs 11.5 (1.2x) with H2-len. | **Supported** at 20K req/s, the rate it named. The 1.26x gap at 50K is under the 1.5x bound but outside noise. The gaps at 100K and above are Finding 2; the 50K gap was not measured with the fix in this study. |
 | **H1**, regex pool: one `RegexPrefilter` per worker | -1..-4% at 4K, about 0 at 64 | Stage 1: +4.5% at 64×20K, +3.2% at 4K×20K (overlap), **+25%** at 4K×150K (45.0 [44.1-52.7] vs 35.9). Stage 2: **-12.8%** at 4K×150K (12.9 [12.7-13.2] vs 14.8 [14.0-15.8]), +4.6% at 64×50K (overlap). | **Refuted as specified**: alone it is worse in every cell. **Supported only on top of H2-len** at 4K×150K. Alone it makes things worse because faster PII scanning sends the workers into the contended map more often. The mechanism did engage. In flat profiles at 4K×150K, regex time fell from 5.6 to 2.4 µs/req, the pool (`get_slow` + `put_value`) from 1.7 to 1.2 µs/req, and the lazy-DFA rebuild (`determinize::*`, 2.6 µs/req) dropped below the top 60 symbols. The shared pool discards and rebuilds caches when it is contended. |
 | **H2**, shared graph maps | `lock_shared_slow` mostly from `EdgeAggregator::record` via `len()`; -5..-8% at 4K | Attribution as predicted (Finding 2). H2-len (atomic flow count instead of `len()`): **-55.7%** at 4K×150K (15.9 [14.1-16.0] vs 35.9 [35.6-37.6]), -7.3% at 64×50K, -4.8% at 4K×20K, -2.3% at 64×20K (overlap). Per-worker aggregators (H2-shard): -56% at 150K alone, nothing more on top of H2-len (+0.7%, overlap). Per-thread identity memo (H2-id): no effect in either stage. `ConnectionFsmManager`: no lock waits. | **Supported**, with the size predicted about 10x too low. The fix is `len()`. Sharding and the identity memo add nothing measurable. |
 | **H3**, per-message clones | Clones 5-10% of samples; saving 3-6%, flat across connection counts | `L7Message::clone` is 7.4% (64) and 8.1% (4K) of agent CPU at 20K, and 4.1% at 150K. Stage 1: -2.3% at 64×20K (overlap), **-6.3%** at 4K×20K, -4.4% at 64×50K, -5.0% at 4K×150K (overlap). Stage 2: **-6.8%** at 4K×150K, -4.6% at 64×50K (overlap). | **Supported**, small. |
@@ -970,6 +977,9 @@ unless noted:
 - **Recall proxy.** Modes (a1) and (a2) use the PII-count recall proxy, which
   cannot see export drops (there is no export in those modes).
 - **Repetition.** Matrix cells outside mode (b) are single runs.
+- **Equal work.** At 4K×150K the faster builds drop 1-2% of exports
+  (export queue full) where the baseline drops almost none, so their µs/req
+  covers slightly less export work.
 - **Untested.** The loadgen's latency from the *scheduled* send time includes
   up to about 0.5 ms of Go timer slop at low rates, so the tables use service
   time instead. The ONNX model path and TLS traffic were not tested.

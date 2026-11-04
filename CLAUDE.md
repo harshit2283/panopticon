@@ -118,7 +118,7 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 - **Logging**: `tracing` crate with structured fields.
 - **Testing**: ~470 tests total (433 agent on macOS, more on Linux; plus common, ABI, xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
 - **Backpressure**: Bounded mpsc channels everywhere. If full, drop event + increment counter. Never block the event loop.
-- **Performance targets** (targets, not all measured): 500K events/sec, P99 < 5ms kernel→user-space, < 200MB RSS. Measured on 64 vCPU: ~470K events/s at 99.8% recall (load-bound), RSS 129–215 MiB up to 4K conns; P99 not measured. See docs/BENCHMARKS.md.
+- **Performance targets** (targets, not all measured): 500K events/sec, P99 < 5ms kernel→user-space, < 200MB RSS. Measured on 64 vCPU: ~470K events/s at 99.8% recall (load-bound), RSS 129–215 MiB up to 4K conns; kernel→worker P99 2–4 ms up to 20K req/s, 8–10 ms at 4K conns × 50K req/s (preliminary). See docs/BENCHMARKS.md.
 - **Benchmarks**: Criterion benchmarks in `panopticon-agent/benches/` for protocol detection, parser throughput, PII regex.
 
 ## Testing Infrastructure
