@@ -241,8 +241,63 @@ pub(crate) fn score_corpus() -> Score {
     s
 }
 
+/// Regression gate: (type, min precision, min recall), set just under what
+/// the current detector achieves on the committed corpus (seed 20261104).
+/// Raise these when detection improves; never lower them to pass.
+const GATE: &[(&str, f64, f64)] = &[
+    ("AADHAAR", 0.98, 0.99),
+    ("API_KEY", 0.99, 0.90),
+    ("AWS_KEY", 0.99, 0.99),
+    ("CREDIT_CARD", 0.99, 0.99),
+    ("EMAIL", 0.99, 0.99),
+    ("GSTIN", 0.99, 0.99),
+    ("IBAN", 0.99, 0.99),
+    ("IP_V4", 0.99, 0.99),
+    ("JWT", 0.99, 0.99),
+    ("PAN", 0.67, 0.99),
+    ("PASSPORT_IN", 0.99, 0.83),
+    ("PHONE", 0.98, 0.88),
+    ("SSN", 0.99, 0.99),
+    ("UPI", 0.99, 0.99),
+];
+/// At most this share of clean payloads may produce a finding.
+const MAX_CLEAN_FPR: f64 = 0.0125;
+/// At most this many labelled values may survive redaction.
+const MAX_SURVIVORS: usize = 60;
+
 #[test]
 fn pii_accuracy() {
     let s = score_corpus();
     s.print();
+    let mut failures = Vec::new();
+    for t in s.per_type.keys() {
+        if !GATE.iter().any(|(g, _, _)| g == t) {
+            failures.push(format!("{t}: no gate entry"));
+        }
+    }
+    for (t, min_p, min_r) in GATE {
+        let (p, r, _) = s.get(t);
+        if p < *min_p || r < *min_r {
+            failures.push(format!(
+                "{t}: precision {p:.3} (min {min_p}), recall {r:.3} (min {min_r})"
+            ));
+        }
+    }
+    if s.fpr() > MAX_CLEAN_FPR {
+        failures.push(format!(
+            "clean-payload FP rate {:.4} > {MAX_CLEAN_FPR}",
+            s.fpr()
+        ));
+    }
+    if s.survivors > MAX_SURVIVORS {
+        failures.push(format!(
+            "{} values survive redaction (max {MAX_SURVIVORS})",
+            s.survivors
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "PII accuracy regressed:\n{}",
+        failures.join("\n")
+    );
 }

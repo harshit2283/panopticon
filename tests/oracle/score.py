@@ -60,14 +60,27 @@ print("  missing (pos>0) by PREVIOUS request on same conn:", dict(prev_kind.most
 
 # Request bodies: every POST must carry its (redacted) body, and no raw PII
 # value from any request body may appear anywhere in the agent's export.
+# Bodies are cut at max_body_bytes (4 KB) before scanning and export. A
+# value past the cut is never exported, so it needs no placeholder: Go's
+# encoder sorts keys (email, note, ssn), which puts the SSN of the 5 KB
+# POSTs past the cut. A complete JSON body ends with "}"; a cut one does not.
 posts = [k for k in found if truth[k]["method"] == "POST"]
 with_body = [k for k in posts if seen[k][0].get("request_body")]
-redacted = [k for k in with_body if "<EMAIL>" in seen[k][0]["request_body"]
-            and "<SSN>" in seen[k][0]["request_body"]]
+redacted, cut = [], []
+for k in with_body:
+    body = seen[k][0]["request_body"]
+    complete = body.rstrip().endswith("}")
+    marks = [("<EMAIL>" if "@" in v else "<SSN>") in body for v in truth[k]["body_pii"]]
+    if all(marks):
+        redacted.append(k)
+    elif not complete:
+        cut.append(k)
 export_text = open(sys.argv[2]).read()
 leaks = [v for t in truth.values() for v in t.get("body_pii", []) if v in export_text]
 print(f"  request bodies: captured {len(with_body)}/{len(posts)} POSTs, "
-      f"PII redacted in {len(redacted)}/{len(with_body)}, raw PII values leaked: {len(leaks)}")
+      f"PII redacted in {len(redacted)}/{len(with_body) - len(cut)} "
+      f"({len(cut)} cut at max_body_bytes before a PII value, never exported), "
+      f"raw PII values leaked: {len(leaks)}")
 
 # Optional gate: score.py truth agent MIN_RECALL (e.g. 0.99) exits 1 below it.
 if len(sys.argv) > 3 and leaks:

@@ -144,6 +144,7 @@ fn parse_category(s: &str) -> Option<PiiCategory> {
     match s.to_uppercase().as_str() {
         "EMAIL" => Some(PiiCategory::Email),
         "PHONE_US" | "PHONEUS" => Some(PiiCategory::PhoneUs),
+        "PHONE_IN" | "PHONEIN" => Some(PiiCategory::PhoneIn),
         "PHONE_INTL" | "PHONEINTL" => Some(PiiCategory::PhoneIntl),
         "SSN" => Some(PiiCategory::Ssn),
         "CREDIT_CARD" | "CREDITCARD" => Some(PiiCategory::CreditCard),
@@ -153,6 +154,10 @@ fn parse_category(s: &str) -> Option<PiiCategory> {
         "AWS_KEY" | "AWSKEY" => Some(PiiCategory::AwsKey),
         "AADHAAR" => Some(PiiCategory::Aadhaar),
         "PAN" => Some(PiiCategory::Pan),
+        "UPI" | "VPA" => Some(PiiCategory::Upi),
+        "GSTIN" => Some(PiiCategory::Gstin),
+        "PASSPORT_IN" | "PASSPORTIN" => Some(PiiCategory::PassportIn),
+        "IBAN" => Some(PiiCategory::Iban),
         "PERSON_NAME" | "PERSONNAME" => Some(PiiCategory::PersonName),
         "LOCATION" => Some(PiiCategory::Location),
         "ORGANIZATION" => Some(PiiCategory::Organization),
