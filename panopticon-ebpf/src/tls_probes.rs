@@ -20,8 +20,9 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS, DATA_EVENTS_PERF, GO_READ_ARGS, GoReadKey, PERF_SCRATCH, SockTuple,
-    TLS_ACTIVE, TLS_CONN_ADDR, TLS_SCRATCH, TlsConnKey, TlsReadArgs, data_events_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, GoReadKey, SockTuple, TLS_ACTIVE,
+    TLS_CONN_ADDR, TLS_SCRATCH, TlsConnKey, TlsReadArgs, shard_for, shard_reserve,
+    shard_submit_flags,
 };
 use crate::sock_monitor::read_sock_tuple;
 
@@ -507,7 +508,7 @@ fn emit_tls_event<C: EbpfContext>(
     if !use_ringbuf {
         // PerfEventArray path (kernels < 5.8): one event per call, on the
         // per-CPU scratch map (DataEvent far exceeds the BPF stack).
-        let Some(event) = PERF_SCRATCH.get_ptr_mut(0) else {
+        let Some(event) = EVENT_SCRATCH.get_ptr_mut(0) else {
             return Ok(());
         };
         unsafe {
@@ -524,6 +525,8 @@ fn emit_tls_event<C: EbpfContext>(
     // e.g. HTTP/2 can only recover from by resetting (losing HPACK state).
     // The last chunk's orig_len carries whatever is left uncaptured. The
     // loop body is kept branch-light: the verifier walks every iteration.
+    // Every chunk of one connection object goes to the same shard, in order.
+    let shard = shard_for(conn);
     let mut off = 0usize;
     for i in 0..MAX_TLS_CHUNKS {
         if off >= len {
@@ -535,12 +538,12 @@ fn emit_tls_event<C: EbpfContext>(
         } else {
             MAX_PAYLOAD_SIZE
         };
-        let Some(mut entry) = DATA_EVENTS.reserve::<DataEvent>(0) else {
+        let Some(mut entry) = shard_reserve(shard) else {
             crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
         populate_tls_event(entry.as_mut_ptr(), &h, unsafe { buf.add(off) }, chunk);
-        entry.submit(data_events_submit_flags());
+        entry.submit(shard_submit_flags(shard));
         off += MAX_PAYLOAD_SIZE;
     }
     Ok(())

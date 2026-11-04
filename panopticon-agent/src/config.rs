@@ -34,7 +34,9 @@ pub struct AgentConfig {
     pub max_events_per_sec: u64,
     /// Fixed worker pool size. Each worker drains a bounded channel.
     pub max_worker_count: usize,
-    /// Per-worker bounded channel capacity. try_send drops if full.
+    /// Per-worker bounded channel capacity, in events (queued in batches of
+    /// up to 64 events / 64 KB). try_send drops if full. 4096 absorbs a
+    /// ring shard drained in one burst; 1024 dropped 5% at 4K connections.
     pub worker_channel_capacity: usize,
     /// DashMap capacity hint for connection tracking.
     pub max_connections_tracked: usize,
@@ -121,7 +123,7 @@ impl Default for AgentConfig {
 
             max_events_per_sec: 500_000,
             max_worker_count: num_cpus(),
-            worker_channel_capacity: 1024,
+            worker_channel_capacity: 4096,
             max_connections_tracked: 65_536,
             idle_connection_timeout: Duration::from_secs(30),
 
@@ -583,7 +585,7 @@ mod tests {
         assert!(config.capture_enabled);
         assert_eq!(config.max_events_per_sec, 500_000);
         assert!(config.max_worker_count >= 1);
-        assert_eq!(config.worker_channel_capacity, 1024);
+        assert_eq!(config.worker_channel_capacity, 4096);
         assert_eq!(config.max_connections_tracked, 65_536);
         assert_eq!(config.idle_connection_timeout, Duration::from_secs(30));
         assert_eq!(config.sampling_mode, SamplingMode::Full);

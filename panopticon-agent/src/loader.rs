@@ -14,11 +14,48 @@ use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
-    CONFIG_USE_RINGBUF, MAX_PAYLOAD_SIZE,
+    CONFIG_RING_SHARD_MASK, CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE,
 };
 
-const PINNED_MAP_NAMES: [&str; 12] = [
-    "DATA_EVENTS",
+/// The DATA_EVENTS ring shards in the eBPF object (maps.rs `data_rings!`).
+const DATA_RING_NAMES: [&str; DATA_RING_SHARDS] = [
+    "DATA_EVENTS_0",
+    "DATA_EVENTS_1",
+    "DATA_EVENTS_2",
+    "DATA_EVENTS_3",
+    "DATA_EVENTS_4",
+    "DATA_EVENTS_5",
+    "DATA_EVENTS_6",
+    "DATA_EVENTS_7",
+    "DATA_EVENTS_8",
+    "DATA_EVENTS_9",
+    "DATA_EVENTS_10",
+    "DATA_EVENTS_11",
+    "DATA_EVENTS_12",
+    "DATA_EVENTS_13",
+    "DATA_EVENTS_14",
+    "DATA_EVENTS_15",
+];
+
+/// Ring buffer memory split over the active shards. Records carry only the
+/// captured payload, so this holds many more small packets than the same
+/// bytes of fixed 4KB records did.
+const DATA_RING_TOTAL_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Active DATA_EVENTS shards: one per 4 online CPUs, as a power of two in
+/// 1..=16 (64 CPUs: 16, 8 CPUs: 2). Every CPU of the node produces into the
+/// rings, so this counts the node's CPUs, not the agent's affinity mask.
+pub fn ring_shard_count() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
+    (cpus / 4).clamp(1, DATA_RING_SHARDS).next_power_of_two()
+}
+
+fn pinned_map_names() -> impl Iterator<Item = &'static str> {
+    PINNED_MAP_NAMES.into_iter().chain(DATA_RING_NAMES)
+}
+
+const PINNED_MAP_NAMES: [&str; 11] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
     "CONN_MAP",
@@ -29,7 +66,7 @@ const PINNED_MAP_NAMES: [&str; 12] = [
     "GO_ABI_MAP",
     "PID_TO_CONN",
     "IPV6_DROPS",
-    "PERF_SCRATCH",
+    "EVENT_SCRATCH",
 ];
 
 /// Detected kernel capabilities that determine which eBPF features are available.
@@ -265,6 +302,7 @@ pub fn sync_config_to_ebpf(
         .and_then(|b| b.parse::<std::net::SocketAddr>().ok())
         .map_or(0, |a| a.port());
     cfg_map.set(CONFIG_IGNORE_PORT, ignore_port as u64, 0)?;
+    cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
 
     Ok(())
 }
@@ -522,21 +560,27 @@ fn try_attach_uretprobe(
 // ── Event Source Abstraction ──────────────────────────────────────────────
 
 /// Abstraction over the kernel-to-user event delivery mechanism.
-/// Modern kernels use `RingBuf`, older kernels fall back to `PerfEventArray`.
+/// Modern kernels use the active `RingBuf` shards, older kernels fall back
+/// to `PerfEventArray`.
 pub enum EventSource {
-    RingBuf(aya::maps::RingBuf<aya::maps::MapData>),
+    RingBuf(Vec<aya::maps::RingBuf<aya::maps::MapData>>),
     PerfEventArray(aya::maps::PerfEventArray<aya::maps::MapData>),
 }
 
 /// Extract the appropriate event source map from the eBPF object based on capabilities.
 pub fn take_event_source(ebpf: &mut Ebpf, caps: &KernelCapabilities) -> Result<EventSource> {
     if caps.has_ringbuf {
-        let map = ebpf
-            .take_map("DATA_EVENTS")
-            .context("DATA_EVENTS map not found in eBPF object")?;
-        Ok(EventSource::RingBuf(
-            aya::maps::RingBuf::try_from(map).context("Failed to cast DATA_EVENTS to RingBuf")?,
-        ))
+        let rings = DATA_RING_NAMES[..ring_shard_count()]
+            .iter()
+            .map(|name| {
+                let map = ebpf
+                    .take_map(name)
+                    .with_context(|| format!("{name} map not found in eBPF object"))?;
+                aya::maps::RingBuf::try_from(map)
+                    .with_context(|| format!("Failed to cast {name} to RingBuf"))
+            })
+            .collect::<Result<_>>()?;
+        Ok(EventSource::RingBuf(rings))
     } else {
         let map = ebpf
             .take_map("DATA_EVENTS_PERF")
@@ -571,6 +615,17 @@ fn load_ebpf_bytes(map_pin_path: Option<&str>) -> Result<Ebpf> {
     // include_bytes_aligned! embeds it into the agent binary.
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
 
+    let mut loader = EbpfLoader::new();
+    // Split the ring memory over the active shards; the inactive ones are
+    // never written (CONFIG_RING_SHARD_MASK), so they get a single page.
+    let shards = ring_shard_count();
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u32;
+    let shard_bytes = (DATA_RING_TOTAL_BYTES / shards as u32).max(page);
+    for (i, name) in DATA_RING_NAMES.into_iter().enumerate() {
+        loader.map_max_entries(name, if i < shards { shard_bytes } else { page });
+    }
+
     let ebpf = match map_pin_path {
         Some(pin_path) => {
             // Verify bpffs is mounted before attempting to pin
@@ -593,13 +648,12 @@ fn load_ebpf_bytes(map_pin_path: Option<&str>) -> Result<Ebpf> {
                 "eBPF map pinning enabled — maps will persist across restarts"
             );
 
-            let mut loader = EbpfLoader::new();
-            for map_name in PINNED_MAP_NAMES {
+            for map_name in pinned_map_names() {
                 loader.map_pin_path(map_name, pin_dir.as_path());
             }
             loader.load(bytes)?
         }
-        None => aya::Ebpf::load(bytes)?,
+        None => loader.load(bytes)?,
     };
 
     Ok(ebpf)
@@ -640,7 +694,7 @@ pub fn unpin_maps(pin_path: &str) -> Result<usize> {
         .with_context(|| format!("Failed to read pin directory: {}", pin_dir.display()))?;
 
     let mut removed = 0;
-    for map_name in PINNED_MAP_NAMES {
+    for map_name in pinned_map_names() {
         let path = pin_dir.join(map_name);
         if path.exists() && std::fs::remove_file(&path).is_ok() {
             removed += 1;
@@ -1111,7 +1165,7 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         let _ = std::fs::create_dir_all(&dir);
 
         // Create some test files
-        std::fs::write(dir.join("DATA_EVENTS"), b"fake").unwrap();
+        std::fs::write(dir.join("DATA_EVENTS_0"), b"fake").unwrap();
         std::fs::write(dir.join("CONFIG"), b"fake").unwrap();
         std::fs::write(dir.join("CONN_MAP"), b"fake").unwrap();
 

@@ -32,6 +32,14 @@ pub const CONFIG_PID_FILTER_ON: u32 = 3;
 /// TCP/UDP port whose traffic TC capture ignores (0 = none). Set to the
 /// agent's own metrics/health port so scrapes and probes are not captured.
 pub const CONFIG_IGNORE_PORT: u32 = 4;
+/// Active DATA_EVENTS ring shards minus one (a power of two minus one).
+/// 0, the default, sends every event to DATA_EVENTS_0.
+pub const CONFIG_RING_SHARD_MASK: u32 = 5;
+
+/// DATA_EVENTS ring buffer shards declared in the eBPF object
+/// (`DATA_EVENTS_0` .. `DATA_EVENTS_15`). User space activates a power-of-two
+/// subset at load time, sized from the node's CPU count.
+pub const DATA_RING_SHARDS: usize = 16;
 
 // ── Enums ──────────────────────────────────────────────────────────────────
 
@@ -303,6 +311,67 @@ pub fn parse_data_event_bytes(bytes: &[u8]) -> Option<DataEvent> {
     raw.to_data_event()
 }
 
+/// Bytes of a DataEvent before its payload. Ring records carry this header
+/// plus only `payload_len` payload bytes.
+pub const DATA_EVENT_HEADER_LEN: usize = core::mem::offset_of!(DataEvent, payload);
+
+/// The ring shard an event goes to, from its `socket_cookie`.
+///
+/// Keyed by connection, not by CPU: a connection's packets are produced on
+/// whichever CPUs its threads and softirqs run on, so CPU shards would let
+/// user space see a response before its request, or a body's packets out of
+/// order. With this key every event of one connection (both directions,
+/// its SockConnect/SockAccept owner events and its FIN/RST, which all carry
+/// the same 5-tuple cookie; or one TLS connection object) lands in the same
+/// ring, so the order user space sees per connection is that ring's reserve
+/// order, as it was with a single ring. The multiply takes the high bits so
+/// that cookies with constant low bits (16-byte aligned SSL* pointers) still
+/// spread over the shards.
+#[inline(always)]
+pub fn ring_shard(socket_cookie: u64, mask: u32) -> u32 {
+    ((socket_cookie.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as u32) & mask
+}
+
+/// Length of the DataEvent record at the start of `bytes` (header plus
+/// `payload_len` payload bytes), or `None` if it is truncated or has invalid
+/// enum fields. Trailing bytes are allowed: a full fixed-size DataEvent (the
+/// PerfEventArray path, capture files) is a record followed by unused payload.
+pub fn data_event_record_len(bytes: &[u8]) -> Option<usize> {
+    use core::mem::offset_of;
+    if bytes.len() < DATA_EVENT_HEADER_LEN {
+        return None;
+    }
+    let field = |off: usize| {
+        u32::from_ne_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
+    EventType::from_u32(field(offset_of!(DataEvent, event_type)))?;
+    Direction::from_u32(field(offset_of!(DataEvent, direction)))?;
+    TlsLibrary::from_u32(field(offset_of!(DataEvent, tls_library)))?;
+    let payload_len = field(offset_of!(DataEvent, payload_len)) as usize;
+    if payload_len > MAX_PAYLOAD_SIZE {
+        return None;
+    }
+    let len = DATA_EVENT_HEADER_LEN + payload_len;
+    (len <= bytes.len()).then_some(len)
+}
+
+/// Copy the DataEvent record at the start of `bytes` into `out`: its header
+/// and `payload_len` payload bytes, not the whole 4KB struct. `out.payload`
+/// past `payload_len` keeps what it held. Returns false, leaving `out`
+/// untouched, if the record is invalid (see [`data_event_record_len`]).
+pub fn read_data_event_into(bytes: &[u8], out: &mut DataEvent) -> bool {
+    let Some(len) = data_event_record_len(bytes) else {
+        return false;
+    };
+    // SAFETY: len <= size_of::<DataEvent>() (header + at most
+    // MAX_PAYLOAD_SIZE), the enum fields were validated above and every
+    // other field is plain integers/bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), (out as *mut DataEvent).cast::<u8>(), len);
+    }
+    true
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -480,6 +549,8 @@ mod tests {
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
         assert!(CONFIG_IGNORE_PORT < CONFIG_ENTRIES);
+        assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
+        assert!(DATA_RING_SHARDS.is_power_of_two());
     }
 
     // ── No Implicit Padding ────────────────────────────────────────────
@@ -520,6 +591,96 @@ mod tests {
             expected,
             "ConnInfo has implicit padding — check field ordering"
         );
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use core::mem::size_of;
+
+    fn as_bytes(e: &DataEvent) -> &[u8] {
+        // SAFETY: DataEvent is repr(C), Copy, with no implicit padding.
+        unsafe {
+            core::slice::from_raw_parts((e as *const DataEvent).cast(), size_of::<DataEvent>())
+        }
+    }
+
+    #[test]
+    fn ring_shard_stays_in_mask_and_spreads_aligned_pointers() {
+        let mut seen = [0u32; DATA_RING_SHARDS];
+        for i in 0..4096u64 {
+            let ssl_ptr = 0x5555_0000_0000 + i * 0x4a0; // 16-byte aligned, like SSL*
+            let s = ring_shard(ssl_ptr, (DATA_RING_SHARDS - 1) as u32);
+            seen[s as usize] += 1;
+            assert_eq!(ring_shard(ssl_ptr, 0), 0);
+            assert!(ring_shard(ssl_ptr, 3) <= 3);
+        }
+        // Every shard used, none with more than twice its fair share.
+        assert!(
+            seen.iter()
+                .all(|&n| n > 0 && n < 2 * 4096 / DATA_RING_SHARDS as u32),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn record_round_trip_copies_header_and_payload_only() {
+        // SAFETY: all-zero is valid for DataEvent.
+        let mut e: DataEvent = unsafe { core::mem::zeroed() };
+        e.event_type = EventType::TlsData;
+        e.direction = Direction::Egress;
+        e.tls_library = TlsLibrary::OpenSsl;
+        e.socket_cookie = 42;
+        e.payload_len = 3;
+        e.orig_len = 9;
+        e.payload[..3].copy_from_slice(b"abc");
+        let bytes = &as_bytes(&e)[..DATA_EVENT_HEADER_LEN + 3];
+        assert_eq!(
+            data_event_record_len(bytes),
+            Some(DATA_EVENT_HEADER_LEN + 3)
+        );
+
+        let mut out: DataEvent = unsafe { core::mem::zeroed() };
+        out.payload.fill(0xEE);
+        assert!(read_data_event_into(bytes, &mut out));
+        assert_eq!(out.event_type, EventType::TlsData);
+        assert_eq!(out.direction, Direction::Egress);
+        assert_eq!((out.socket_cookie, out.orig_len), (42, 9));
+        assert_eq!(out.payload_bytes(), b"abc");
+        assert_eq!(
+            out.payload[3], 0xEE,
+            "payload past payload_len is not written"
+        );
+
+        // A full fixed-size event is a record followed by unused bytes.
+        assert_eq!(
+            data_event_record_len(as_bytes(&e)),
+            Some(DATA_EVENT_HEADER_LEN + 3)
+        );
+    }
+
+    #[test]
+    fn record_rejects_truncated_oversized_and_invalid() {
+        let mut e: DataEvent = unsafe { core::mem::zeroed() };
+        e.payload_len = 10;
+        assert_eq!(
+            data_event_record_len(&as_bytes(&e)[..DATA_EVENT_HEADER_LEN + 9]),
+            None
+        );
+        assert_eq!(
+            data_event_record_len(&as_bytes(&e)[..DATA_EVENT_HEADER_LEN - 1]),
+            None
+        );
+        e.payload_len = MAX_PAYLOAD_SIZE as u32 + 1;
+        assert_eq!(data_event_record_len(as_bytes(&e)), None);
+        let mut bytes = [0u8; DATA_EVENT_HEADER_LEN];
+        bytes[16..20].copy_from_slice(&9999u32.to_ne_bytes()); // event_type
+        assert_eq!(data_event_record_len(&bytes), None);
+        let mut out: DataEvent = unsafe { core::mem::zeroed() };
+        out.pid = 7;
+        assert!(!read_data_event_into(&bytes, &mut out));
+        assert_eq!(out.pid, 7);
     }
 }
 
