@@ -1116,7 +1116,12 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
         let pii_report = ctx
             .pii_engine
             .as_ref()
-            .and_then(|e| e.scan_message_with(&mut msg, ctx.privacy != PrivacyMode::Full));
+            // Redact unless the mode is full, and in full too if the config
+            // asks for a redacted export ([pii] redact = true).
+            .and_then(|e| {
+                let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
+                e.scan_message_with(&mut msg, redact)
+            });
         if let Some(report) = pii_report.as_ref() {
             ctx.stats
                 .pii_detections

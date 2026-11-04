@@ -680,29 +680,18 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
 ///
 /// Sets `pii.redact` from the mode and fails with a clear message on any
 /// setting that would contradict it, so the mode is the only thing a reader
-/// of the config has to check.
+/// of the config has to check. The one combination kept from the old flags:
+/// `[pii] redact = true` under `full` keeps the event export redacted while
+/// the raw dump stays unredacted (a setting may narrow the mode, never widen).
 pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
     let mode = config.privacy_mode;
-    let redact = mode != PrivacyMode::Full;
-    if let Some(setting) = config.pii_redact_setting
-        && setting != redact
-    {
+    if mode != PrivacyMode::Full && config.pii_redact_setting == Some(false) {
         anyhow::bail!(
-            "[pii] redact = {setting} contradicts [privacy] mode = \"{mode}\", which {}. \
-             Remove `redact`: the privacy mode decides redaction{}",
-            if redact {
-                "redacts PII"
-            } else {
-                "exports unredacted"
-            },
-            if redact {
-                " (use mode = \"full\" for unredacted export)"
-            } else {
-                ""
-            }
+            "[pii] redact = false contradicts [privacy] mode = \"{mode}\", which never \
+             exports PII values. Remove `redact`, or use mode = \"full\" for unredacted export"
         );
     }
-    config.pii.redact = redact;
+    config.pii.redact = mode != PrivacyMode::Full || config.pii_redact_setting == Some(true);
 
     if mode != PrivacyMode::Full && config.capture_raw_path.is_some() {
         anyhow::bail!(
@@ -727,7 +716,7 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
             ] {
                 if enabled {
                     anyhow::bail!(
-                        "{setting} sends per-request data off the node, which \
+                        "{setting} exports per-request data, which \
                          [privacy] mode = \"metrics_only\" does not allow"
                     );
                 }
@@ -992,17 +981,27 @@ mod tests {
     }
 
     #[test]
-    fn test_privacy_redact_must_agree_with_mode() {
-        // Agreeing legacy settings are accepted.
-        assert!(privacy("[pii]\nredact = true\n").is_ok());
-        assert!(privacy("[privacy]\nmode = \"full\"\n[pii]\nredact = false\n").is_ok());
-        let err = privacy("[pii]\nredact = false\n").unwrap_err().to_string();
+    fn test_privacy_redact_may_narrow_never_widen() {
+        assert!(privacy("[pii]\nredact = true\n").unwrap().pii.redact);
+        let full = "[privacy]\nmode = \"full\"\n[pii]\n";
         assert!(
-            err.contains("contradicts") && err.contains("redacted"),
-            "{err}"
+            !privacy(&format!("{full}redact = false\n"))
+                .unwrap()
+                .pii
+                .redact
         );
-        let err = privacy("[privacy]\nmode = \"full\"\n[pii]\nredact = true\n").unwrap_err();
-        assert!(err.to_string().contains("contradicts"), "{err}");
+        // full with a redacted export (the raw dump stays unredacted).
+        assert!(
+            privacy(&format!("{full}redact = true\n"))
+                .unwrap()
+                .pii
+                .redact
+        );
+        for mode in ["redacted", "metrics_only"] {
+            let toml = format!("[privacy]\nmode = \"{mode}\"\n[pii]\nredact = false\n");
+            let err = privacy(&toml).unwrap_err().to_string();
+            assert!(err.contains("contradicts") && err.contains(mode), "{err}");
+        }
     }
 
     #[test]

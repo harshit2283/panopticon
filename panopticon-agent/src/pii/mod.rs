@@ -302,6 +302,11 @@ impl PiiEngine {
         }
     }
 
+    /// Whether the engine's config asks for redaction (`pii.redact`).
+    pub fn redacts(&self) -> bool {
+        self.config.redact
+    }
+
     /// Scan text for PII. Returns None if PII detection is disabled or no PII found.
     pub fn scan(&self, text: &str) -> Option<PiiReport> {
         self.scan_with(text, self.config.redact)
