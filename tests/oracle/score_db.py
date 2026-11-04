@@ -5,12 +5,14 @@ path / payload / request body):
   recall, duplicates, command-verb accuracy, error-flag accuracy,
   recall by transport ("via": simple / extended / pipeline / text),
   PII visibility: operations that sent PII whose agent record has a PII finding,
-  leaks: raw PII values present anywhere in the export.
+  leaks: raw PII values present anywhere in the export, and the server
+  password (env ORACLE_PASSWORD, if set: Redis sends it in AUTH) anywhere in it.
 
 Usage: score_db.py TRUTH AGENT_JSONL [MIN_RECALL]
 """
 import collections
 import json
+import os
 import re
 import sys
 
@@ -69,6 +71,9 @@ for k in with_pii:
     pii_by_via[truth[k].get("via") or "-"][0] += k in pii_seen
 print("  PII visibility by transport:", {v: f"{a}/{b}" for v, (a, b) in sorted(pii_by_via.items())})
 
+password = os.environ.get("ORACLE_PASSWORD")
+if password and password in export_text:
+    sys.exit("the server password reached the export")
 if len(sys.argv) > 3 and leaks:
     sys.exit(f"{len(leaks)} raw PII values reached the export")
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):

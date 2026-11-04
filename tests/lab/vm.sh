@@ -9,9 +9,12 @@
 # Needs only qemu-system-x86_64, qemu-img, ssh and membership of the kvm
 # group: user-mode networking with an SSH hostfwd on 127.0.0.1, and the
 # cloud-init seed served from a directory as a vvfat drive labelled cidata.
-# Everything lives under $LAB (default /tmp/panopticon-lab).
+# Everything lives under $LAB (default ~/.cache/panopticon-lab), which must be
+# a directory owned by you; it is kept at mode 0700. The SSH key in it gets
+# passwordless root in every VM, so a shared path such as /tmp is unsafe on a
+# multi-user host: set LAB=/tmp/panopticon-lab only on a single-user box.
 set -euo pipefail
-LAB=${LAB:-/tmp/panopticon-lab}
+LAB=${LAB:-${XDG_CACHE_HOME:-$HOME/.cache}/panopticon-lab}
 KEY=$LAB/id_ed25519
 IMG=$LAB/images
 VMS=$LAB/vms
@@ -19,6 +22,22 @@ URL=https://cloud-images.ubuntu.com
 ROCKY=https://dl.rockylinux.org/pub/rocky
 
 die() { echo "vm.sh: $*" >&2; exit 1; }
+owned() { [[ ! -L $1 && $(stat -c %u "$1") == "$(id -u)" ]]; } # not a symlink, ours
+
+check_lab() { # refuse a lab dir (or key) another user created or could write
+  [[ -e $LAB || -L $LAB ]] || { mkdir -p "$(dirname "$LAB")"; mkdir -m 700 "$LAB"; }
+  if [[ ! -d $LAB ]] || ! owned "$LAB"; then
+    die "$LAB is not a directory owned by $(id -un); refusing"
+  fi
+  # Tightening our own dir is safe; anything planted while it was looser is
+  # caught by the ownership checks on the key below.
+  [[ $(stat -c %a "$LAB") == 700 ]] || chmod 700 "$LAB"
+  local f
+  for f in "$KEY" "$KEY.pub"; do
+    [[ -e $f || -L $f ]] && ! owned "$f" && die "$f is not owned by $(id -un); refusing to use it"
+  done
+  return 0
+}
 vmdir() { [[ -d $VMS/$1 ]] || die "no VM named $1"; echo "$VMS/$1"; }
 running() { [[ -f $1/pid ]] && kill -0 "$(cat "$1/pid")" 2>/dev/null; }
 
@@ -132,6 +151,7 @@ destroy_all() {
 }
 
 cmd=${1:-}; shift || true
+case $cmd in up | ssh | port | down | list | destroy-all) check_lab ;; esac
 case $cmd in
   up) up "$@" ;;
   ssh) d=$(vmdir "${1:?name}"); shift; sshvm "$d" "$@" ;;

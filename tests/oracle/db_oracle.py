@@ -19,6 +19,7 @@ CLOSE, the binary protocol Go, JDBC and most ORMs use), PII travelling as
 bound parameters; literal SQL stays on the text protocol.
 
 Usage: python db_oracle.py {redis|postgres|mysql} HOST N OUT [SEED]
+Env: ORACLE_PASSWORD, the servers' password (run_protocols.sh sets it per run).
 Needs: redis, psycopg[binary], pymysql (mysql-connector-python for
 MYSQL_MODE=prepared).
 """
@@ -29,6 +30,7 @@ import sys
 
 PROTO, HOST, N, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 SEED = int(sys.argv[5]) if len(sys.argv) > 5 else 1234
+PASSWORD = os.environ["ORACLE_PASSWORD"]
 rnd = random.Random(SEED)
 truth = []
 
@@ -41,7 +43,7 @@ def record(i, verb, error=False, pii=None, via=""):
 def run_redis():
     import redis
 
-    r = redis.Redis(host=HOST, port=6379)
+    r = redis.Redis(host=HOST, port=6379, password=PASSWORD)
     r.flushdb()  # keys from earlier runs would collide (WRONGTYPE)
     i = 0
     while i < N:
@@ -134,7 +136,7 @@ def run_sql(execute, simple, prepared=None):
 def run_postgres():
     import psycopg
 
-    conn = psycopg.connect(host=HOST, user="postgres", password="oracle", dbname="oracle",
+    conn = psycopg.connect(host=HOST, user="postgres", password=PASSWORD, dbname="oracle",
                            autocommit=True)
     conn.execute("DROP TABLE IF EXISTS users")
     conn.execute("CREATE TABLE users (id int, email text, note text)")
@@ -165,7 +167,7 @@ def run_mysql():
 
     # MySQL 8 clients negotiate TLS by default, which hides the protocol from
     # packet capture entirely; disable it to score the plaintext parser.
-    conn = pymysql.connect(host=HOST, user="root", password="oracle", database="oracle",
+    conn = pymysql.connect(host=HOST, user="root", password=PASSWORD, database="oracle",
                            autocommit=True, ssl_disabled=True)
     cur = conn.cursor()
     cur.execute("DROP TABLE IF EXISTS users")
@@ -187,7 +189,7 @@ def run_mysql():
 def run_mysql_prepared():
     import mysql.connector
 
-    conn = mysql.connector.connect(host=HOST, user="root", password="oracle",
+    conn = mysql.connector.connect(host=HOST, user="root", password=PASSWORD,
                                    database="oracle", autocommit=True, ssl_disabled=True)
     text = conn.cursor()
     text.execute("DROP TABLE IF EXISTS users")
