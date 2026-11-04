@@ -38,7 +38,9 @@ Depth varies — see the support matrix in the [README](../README.md).
 
 ## 2. Requirements
 
-- Linux **kernel 5.8 or newer** (x86_64; arm64 is untested).
+- Linux **kernel 5.8 or newer**, or RHEL 8 / 9 (their 4.18 and 5.14 kernels carry
+  the BPF ring buffer backport; validated on Rocky Linux 8.10 and 9.8). x86_64;
+  arm64 is untested.
 - Root, or the capabilities `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN` (plus
   `CAP_SYS_PTRACE` for TLS library discovery in other processes).
 - tracefs mounted at `/sys/kernel/tracing` for process events (most distros
@@ -467,7 +469,7 @@ real cluster.
 |---|---|
 | `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. Traffic to the agent's own metrics port is deliberately ignored. |
 | `No --interface given and no IPv4 default route` | Host has no IPv4 default route; pass `-i`. |
-| Fails to start below kernel 5.8 | Not supported in this release. |
+| Fails to start with `has no BPF ring buffer` | Kernel older than 5.8 without the RHEL-style backport. Not supported in this release. |
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
 | `Failed to attach kprobe` | Socket lifecycle events unavailable on this kernel/VM; HTTP/DB capture via TC still works. |
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (Go 1.17+, binaries with a symbol table). Other statically linked TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) and Go binaries built with `-ldflags=-s` appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |

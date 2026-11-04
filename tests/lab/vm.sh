@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unprivileged KVM lab for running the agent on several kernels.
 #
-#   vm.sh up <name> <noble|noble-hwe|jammy|focal> [vcpus=32] [mem_gb=32]
+#   vm.sh up <name> <noble|noble-hwe|jammy|focal|rocky8|rocky9> [vcpus=32] [mem_gb=32]
 #   vm.sh ssh <name> [cmd...]      vm.sh down <name>
 #   vm.sh port <name>              vm.sh list
 #   vm.sh destroy-all              (kills every lab VM, rm -rf $LAB)
@@ -16,6 +16,7 @@ KEY=$LAB/id_ed25519
 IMG=$LAB/images
 VMS=$LAB/vms
 URL=https://cloud-images.ubuntu.com
+ROCKY=https://dl.rockylinux.org/pub/rocky
 
 die() { echo "vm.sh: $*" >&2; exit 1; }
 vmdir() { [[ -d $VMS/$1 ]] || die "no VM named $1"; echo "$VMS/$1"; }
@@ -59,19 +60,22 @@ free_port() { # first port from 2230 not used by a lab VM or any listener
 }
 
 up() {
-  local name=${1:?name} rel=${2:?release} vcpus=${3:-32} mem=${4:-32} base d t
+  local name=${1:?name} rel=${2:?release} vcpus=${3:-32} mem=${4:-32} base src d t
   case $rel in
     noble | noble-hwe) base=noble ;;
-    jammy | focal) base=$rel ;;
-    *) die "release must be noble, noble-hwe, jammy or focal" ;;
+    jammy | focal | rocky8 | rocky9) base=$rel ;;
+    *) die "release must be noble, noble-hwe, jammy, focal, rocky8 or rocky9" ;;
   esac
+  src=$URL/$base/current/$base-server-cloudimg-amd64.img
+  # Latest Rocky 8.x / 9.x GenericCloud qcow2 (RHEL 8: 4.18, RHEL 9: 5.14).
+  [[ $base == rocky* ]] &&
+    src=$ROCKY/${base#rocky}/images/x86_64/Rocky-${base#rocky}-GenericCloud-Base.latest.x86_64.qcow2
   d=$VMS/$name
   [[ -e $d ]] && die "$name exists; vm.sh down $name first"
   mkdir -p "$IMG" "$VMS"
   [[ -f $KEY ]] || ssh-keygen -q -t ed25519 -N '' -C panopticon-lab -f "$KEY"
   if [[ ! -f $IMG/$base.img ]]; then
-    curl -fsSL --retry 3 -o "$IMG/$base.img.part" \
-      "$URL/$base/current/$base-server-cloudimg-amd64.img"
+    curl -fsSL --retry 3 -o "$IMG/$base.img.part" "$src"
     mv "$IMG/$base.img.part" "$IMG/$base.img"
   fi
   mkdir -p "$d/seed"

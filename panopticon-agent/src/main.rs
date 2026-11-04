@@ -247,8 +247,8 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 missing = ?missing_caps,
                 "Missing Linux capabilities — eBPF attachment may fail. \
-                 Kernel >= 5.8 needs CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN; \
-                 older kernels need CAP_SYS_ADMIN."
+                 Kernels with CAP_BPF (5.8+, RHEL 8's 4.18) need CAP_BPF + \
+                 CAP_PERFMON + CAP_NET_ADMIN; older kernels need CAP_SYS_ADMIN."
             );
         }
 
