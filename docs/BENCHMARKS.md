@@ -504,7 +504,7 @@ Two bottlenecks were measured:
   per connection is that ring's reserve order, exactly as with one ring.
 - **TC records at captured size.** TC builds the event in the per-CPU
   scratch map and copies the header plus the captured bytes into the ring,
-  instead of reserving a fixed 4,160-byte record. TLS and socket events
+  instead of reserving a fixed 4,168-byte record. TLS and socket events
   keep fixed reserves, because a uprobe can be preempted mid-event and a
   shared scratch slot would be overwritten.
 - **One drain thread per shard.** Draining has its own threads (woken by
@@ -604,7 +604,7 @@ VM (5.15 verifier included).
 
 **Limits.**
 
-- **TLS bursts.** TLS and socket events still use fixed 4,160-byte records,
+- **TLS bursts.** TLS and socket events still use fixed 4,168-byte records,
   and one connection's events all go to one shard. A shard holds about 250
   of them on a 64-CPU node (1 MiB per shard), where the single ring held
   about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy

@@ -109,6 +109,13 @@ impl PrivacyGate {
         PrivacyMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Whether a record produced under `mode` may still be written: `mode`
+    /// is at least as strict as the mode now in effect. Exporters check it
+    /// per record, so what was queued before a tighten is not written after.
+    pub fn allows(&self, mode: PrivacyMode) -> bool {
+        mode as u8 <= self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Switch to `mode` if it is at least as strict as the current one.
     /// Returns false (and changes nothing) for a wider mode.
     pub fn tighten(&self, mode: PrivacyMode) -> bool {
@@ -1120,6 +1127,18 @@ mod tests {
         assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
         assert!(!gate.tighten(PrivacyMode::Redacted));
         assert_eq!(gate.get(), PrivacyMode::MetricsOnly);
+    }
+
+    #[test]
+    fn test_privacy_gate_allows_only_records_as_strict_as_the_mode() {
+        use PrivacyMode::*;
+        let gate = PrivacyGate::new(Full);
+        assert!(gate.allows(Full) && gate.allows(Redacted));
+        gate.tighten(Redacted);
+        assert!(!gate.allows(Full), "queued unredacted before the tighten");
+        assert!(gate.allows(Redacted) && gate.allows(MetricsOnly));
+        gate.tighten(MetricsOnly);
+        assert!(!gate.allows(Redacted));
     }
 
     #[test]

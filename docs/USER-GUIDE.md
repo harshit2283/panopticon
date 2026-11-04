@@ -163,7 +163,7 @@ setting covers that range, `[privacy] mode` in the config file or
 |---|---|
 | `full` | Everything: the event export unredacted (login secrets still masked unless `mask_credentials = false`, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
 | `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
-| `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols. |
+| `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols; the audit log names them by Kubernetes workload or `ip:port` only. |
 
 The mode is enforced, not advisory. Settings that would contradict it stop
 the agent at startup with a message saying why:
@@ -182,7 +182,10 @@ the agent at startup with a message saying why:
 
 **Reloading (`SIGHUP`)** can make the mode stricter at runtime (for example
 `redacted` → `metrics_only`: exports stop at once, files already written are
-left as they are). It cannot make it wider: a reload asking for a wider mode
+left as they are). Records already queued for an exporter when the mode
+tightens are checked again before they are written, and dropped if the new
+mode forbids them; on `metrics_only` the JSON export and the raw dump close
+their files. It cannot make it wider: a reload asking for a wider mode
 is rejected with an error and the running config is kept; restart the agent
 to widen it. A reload from `full` to `redacted` is rejected the same way when
 the agent was started without regex PII detection (`[pii] enabled` or
@@ -257,12 +260,15 @@ One JSON object per completed exchange. A real record (body shortened):
 One line per finding, with no values:
 
 ```json
-{"timestamp_ns":1805288389778,"category":"Email","source":"Regex","confidence":1.0,"action":"Redacted","service_identity":"payments/checkout"}
+{"timestamp_ns":1805288389778,"category":"Email","source":"Regex","confidence":1.0,"action":"Redacted","service_identity":"payments/checkout","service_addr":"10.244.1.5:8080"}
 ```
 
 `service_identity` is the server end of the exchange, named like the service
 graph names it: Kubernetes workload when known, else DNS name, else `ip:port`
 (`unknown` only for TLS exchanges whose socket addresses were not learned).
+In `metrics_only` it is never a DNS name. `service_addr` is always the
+server end's `ip:port`: a DNS name comes from answers seen in the traffic
+(§5.6 says how far they are trusted), the address does not.
 
 `action` is `Redacted` when the value was masked (privacy modes `redacted`
 and `metrics_only`), `Detected` in `full` mode (unless `[pii] redact = true`).
@@ -373,6 +379,7 @@ use `metrics_only`.
 | `panopticon_worker_panics_total` | Parser or PII steps that panicked on captured data. The step is skipped (a parser panic closes that connection) and the worker keeps running. Any increase is a bug: please report it |
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
+| `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_active_connections` | Connections being parsed |
@@ -443,8 +450,9 @@ Each decoded line is one captured packet or TLS buffer:
 - The file is created readable by its owner only (`0600`), truncated at
   startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
   agent logs a warning at startup whenever raw capture is on.
-- If a reload tightens the mode away from `full`, recording stops at once;
-  the file keeps what was written.
+- If a reload tightens the mode away from `full`, recording stops at once
+  and the file is closed: events still queued for it are not written, and
+  the file keeps what was written before.
 - Group packets of one connection by `connection_id`; `direction` and the
   addresses tell you which side sent each one. For TLS events, `pid`
   identifies the process and `connection_id` is the TLS library's connection
@@ -473,6 +481,14 @@ and in the event log's `src_workload` / `dst_workload`:
 | A Service ClusterIP | `svc:namespace/service` | `svc:payments/checkout` |
 | A node (host-network pods, node processes) | `node:name` | `node:worker-1` |
 | Anything else | DNS name seen in traffic, else `ip:port` (servers) / `ip` (clients) | `10.0.0.9:5432` |
+
+A DNS name is taken only from an answer to a query seen on the same flow
+(same transaction ID and question name), only if it is a plain hostname
+(not an address, nor anything shaped like the names above), for at most an
+hour whatever its TTL, and, unless the mode is `full`, only if it holds no
+PII. Any process can still look up a name of its choosing at a resolver it
+controls, so a DNS name says what the client asked for, not who answered:
+the audit log keeps the address next to it (`service_addr`).
 
 The workload is the pod's controller: a ReplicaSet named
 `<deployment>-<pod-template-hash>` counts as its Deployment; StatefulSets,
@@ -511,7 +527,7 @@ real cluster.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. Traffic to the agent's own metrics port is deliberately ignored. |
+| `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. The agent's own metrics/health traffic is captured like any other (no port is exempt, so no peer can hide behind one). |
 | `No --interface given and no IPv4 default route` | Host has no IPv4 default route; pass `-i`. |
 | Fails to start with `has no BPF ring buffer` | Kernel older than 5.8 without the RHEL-style backport. Not supported in this release. |
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
@@ -524,5 +540,8 @@ real cluster.
 ## 7. Limits worth knowing
 
 IPv4 only; Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
-OpenSSL/Go; PII detection is regex-based by default; see
+OpenSSL/Go; PII detection is regex-based by default; TCP checksums are not
+verified, so a forger who knows a connection's sequence numbers (on path)
+can still slip a segment in; DNS-derived names say what a client asked for
+(§5.6); see
 [`CURRENT-STATE.md`](CURRENT-STATE.md) for the full list.

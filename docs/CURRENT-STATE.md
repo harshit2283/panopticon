@@ -61,11 +61,13 @@ production-hardened compliance platform.
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and
     captured nothing.
-  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 88-95% over four lab runs
-    (other AMQP methods 100%). The broker-to-consumer stream there carried
-    TCP retransmissions and GSO segments up to 18 KB; the agent has no TCP
-    sequence tracking, so a retransmitted segment is parsed twice
-    (duplicate deliveries) and frames past the 4 KB capture window are lost.
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 77-98% over seven lab
+    runs (other AMQP methods 100%). The broker-to-consumer stream there
+    carries GSO segments up to 18 KB, and frames past the 4 KB capture window
+    are lost. Retransmitted segments are now parsed once (see TCP stream
+    integrity below), so deliveries are no longer duplicated; replaying two
+    of these captures with and without sequence tracking gave the same
+    deliveries, so the remaining loss is the capture window.
     RHEL 9 passed (100%, one earlier run at 85%).
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
@@ -88,6 +90,24 @@ production-hardened compliance platform.
     the same way: 100% recall from both processes, except that about 1 run
     in 5 mispairs one exchange in 500 in the client view. Binaries built with `-s`
     (no symbol table) are not found; arm64 is untested.
+- TCP stream integrity (TC capture):
+  - Each direction's next expected sequence number is tracked
+    (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,
+    segments whose sequence or acknowledgment number is far from the stream
+    (blind forgeries) are ignored, and an RST counts only at the next
+    expected byte. Bytes the agent never saw are skipped as a gap, up to
+    8 MiB ahead, or further once the peer acknowledges them.
+  - TCP and IP checksums are not checked: TC ingress runs before the kernel
+    validates them, and with checksum offload the packet's checksum state is
+    not reliable there. A segment with a bad checksum and the right sequence
+    numbers is parsed although the receiver discards it, and the genuine
+    retransmission is then dropped as a duplicate. Forging one needs the
+    connection's current sequence numbers (an on-path attacker).
+  - Segments are not reordered: one that arrives before an earlier one is
+    taken as a gap, and the earlier one is then ignored. SYNs are not
+    captured, so a new connection on a 5-tuple whose old state is still held
+    (its FIN or RST not seen) is ignored until that state expires
+    (`idle_connection_timeout`, 30 s).
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
@@ -111,7 +131,12 @@ production-hardened compliance platform.
     TLS, Redis AUTH and Kafka client ids; SQL password clauses and AMQP
     metadata are covered by unit tests only.
 - Service graphing:
-  - DNS/IP-based identity works.
+  - DNS/IP-based identity works. DNS names come only from answers to
+    queries seen on the same flow, are validated hostnames, last at most an
+    hour, and are dropped when they hold PII (except in `full`); there is no
+    list of trusted resolvers, so a workload can still name an address of
+    its choosing through a resolver it runs. The audit log records the
+    address beside the name (`service_addr`).
   - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,
     `node:name`) is implemented and tested against a fake API server only;
     not yet validated on a real cluster.

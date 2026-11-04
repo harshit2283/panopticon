@@ -22,19 +22,27 @@ pub const TLS_SCRATCH_SIZE: u32 = 8192;
 
 /// `DataEvent::tcp_flags` bits.
 pub const TCP_FLAG_FIN: u8 = 0x01;
+pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_RST: u8 = 0x04;
+pub const TCP_FLAG_ACK: u8 = 0x10;
 
 // Config array indices
 pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
 pub const CONFIG_USE_RINGBUF: u32 = 2;
 pub const CONFIG_PID_FILTER_ON: u32 = 3;
-/// TCP/UDP port whose traffic TC capture ignores (0 = none). Set to the
-/// agent's own metrics/health port so scrapes and probes are not captured.
-pub const CONFIG_IGNORE_PORT: u32 = 4;
+// Index 4 was CONFIG_IGNORE_PORT (a port TC skipped); removed, see
+// tc_capture.rs try_tc_capture.
 /// Active DATA_EVENTS ring shards minus one (a power of two minus one).
 /// 0, the default, sends every event to DATA_EVENTS_0.
 pub const CONFIG_RING_SHARD_MASK: u32 = 5;
+/// Per-boot random key mixed into TC flow cookies ([`tc_flow_cookie`]),
+/// so a peer cannot compute another flow's cookie offline.
+pub const CONFIG_COOKIE_KEY: u32 = 6;
+
+/// Bit 63 of a connection key: set for TLS connection keys (user space),
+/// clear for TC flow cookies, so the two key spaces never overlap.
+pub const TLS_KEY_BIT: u64 = 1 << 63;
 
 /// DATA_EVENTS ring buffer shards declared in the eBPF object
 /// (`DATA_EVENTS_0` .. `DATA_EVENTS_15`). User space activates a power-of-two
@@ -121,7 +129,7 @@ impl TlsLibrary {
 
 /// Network data event (TC capture or TLS intercept).
 ///
-/// At ~4152 bytes this MUST be allocated via RingBuf reserve in eBPF,
+/// At 4168 bytes this MUST be allocated via RingBuf reserve in eBPF,
 /// never on the 512-byte BPF stack.
 /// Manual `Debug` implementation that omits the 4KB payload array
 /// to avoid flooding logs when debugging events.
@@ -140,6 +148,9 @@ impl core::fmt::Debug for DataEvent {
             .field("src_port", &self.src_port)
             .field("dst_port", &self.dst_port)
             .field("ip_proto", &self.ip_proto)
+            .field("tcp_flags", &self.tcp_flags)
+            .field("tcp_seq", &self.tcp_seq)
+            .field("tcp_ack", &self.tcp_ack)
             .finish()
     }
 }
@@ -169,6 +180,12 @@ pub struct DataEvent {
     /// bytes they never saw instead of silently losing stream sync.
     pub orig_len: u32,
     pub tls_library: TlsLibrary,
+    /// TCP sequence number of a TC packet's first byte (SEG.SEQ), and its
+    /// acknowledgment number (SEG.ACK, valid with `TCP_FLAG_ACK`); 0 for
+    /// other events. User space uses them to drop retransmitted and
+    /// out-of-window segments (protocol/fsm.rs `TcpTracker`).
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
     // 2-byte aligned fields
     pub src_port: u16,
     pub dst_port: u16,
@@ -265,6 +282,8 @@ struct RawDataEvent {
     pub payload_len: u32,
     pub orig_len: u32,
     pub tls_library: u32,
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
@@ -288,6 +307,8 @@ impl RawDataEvent {
             payload_len: self.payload_len,
             orig_len: self.orig_len,
             tls_library: TlsLibrary::from_u32(self.tls_library)?,
+            tcp_seq: self.tcp_seq,
+            tcp_ack: self.tcp_ack,
             src_port: self.src_port,
             dst_port: self.dst_port,
             ip_proto: self.ip_proto,
@@ -330,6 +351,57 @@ pub const DATA_EVENT_HEADER_LEN: usize = core::mem::offset_of!(DataEvent, payloa
 #[inline(always)]
 pub fn ring_shard(socket_cookie: u64, mask: u32) -> u32 {
     ((socket_cookie.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as u32) & mask
+}
+
+/// Bidirectional flow cookie for a TC packet's 5-tuple: FNV-1a over the
+/// tuple, ordered so both directions get the same cookie, starting from a
+/// basis mixed with the per-boot `key` (CONFIG_COOKIE_KEY). Bit 63 is
+/// always clear: TLS connection keys (user space) have it set, so a TLS
+/// connection object can never alias a TC flow (F18). The socket owner
+/// events (sock_monitor.rs) use the same cookie, which keeps a connection's
+/// events on one ring shard ([`ring_shard`]).
+#[inline(always)]
+pub fn tc_flow_cookie(
+    key: u64,
+    src_addr: u32,
+    dst_addr: u32,
+    src_port: u16,
+    dst_port: u16,
+    ip_proto: u8,
+) -> u64 {
+    let (a_addr, a_port, b_addr, b_port) = if (src_addr, src_port) <= (dst_addr, dst_port) {
+        (src_addr, src_port, dst_addr, dst_port)
+    } else {
+        (dst_addr, dst_port, src_addr, src_port)
+    };
+
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET ^ key;
+    let bytes: [u8; 13] = [
+        (a_addr >> 24) as u8,
+        (a_addr >> 16) as u8,
+        (a_addr >> 8) as u8,
+        a_addr as u8,
+        (a_port >> 8) as u8,
+        a_port as u8,
+        (b_addr >> 24) as u8,
+        (b_addr >> 16) as u8,
+        (b_addr >> 8) as u8,
+        b_addr as u8,
+        (b_port >> 8) as u8,
+        b_port as u8,
+        ip_proto,
+    ];
+
+    let mut i = 0;
+    while i < 13 {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash & !TLS_KEY_BIT
 }
 
 /// Length of the DataEvent record at the start of `bytes` (header plus
@@ -386,7 +458,7 @@ mod tests {
     fn test_data_event_size() {
         assert_eq!(
             size_of::<DataEvent>(),
-            4160,
+            4168,
             "DataEvent size changed! This breaks kernel↔userspace ABI."
         );
     }
@@ -441,12 +513,14 @@ mod tests {
         assert_eq!(offset_of!(DataEvent, payload_len), 40);
         assert_eq!(offset_of!(DataEvent, orig_len), 44);
         assert_eq!(offset_of!(DataEvent, tls_library), 48);
-        assert_eq!(offset_of!(DataEvent, src_port), 52);
-        assert_eq!(offset_of!(DataEvent, dst_port), 54);
-        assert_eq!(offset_of!(DataEvent, ip_proto), 56);
-        assert_eq!(offset_of!(DataEvent, tcp_flags), 57);
-        assert_eq!(offset_of!(DataEvent, _pad), 58);
-        assert_eq!(offset_of!(DataEvent, payload), 64);
+        assert_eq!(offset_of!(DataEvent, tcp_seq), 52);
+        assert_eq!(offset_of!(DataEvent, tcp_ack), 56);
+        assert_eq!(offset_of!(DataEvent, src_port), 60);
+        assert_eq!(offset_of!(DataEvent, dst_port), 62);
+        assert_eq!(offset_of!(DataEvent, ip_proto), 64);
+        assert_eq!(offset_of!(DataEvent, tcp_flags), 65);
+        assert_eq!(offset_of!(DataEvent, _pad), 66);
+        assert_eq!(offset_of!(DataEvent, payload), 72);
     }
 
     #[test]
@@ -548,8 +622,8 @@ mod tests {
         assert!(CONFIG_MAX_PAYLOAD < CONFIG_ENTRIES);
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
-        assert!(CONFIG_IGNORE_PORT < CONFIG_ENTRIES);
         assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
+        assert!(CONFIG_COOKIE_KEY < CONFIG_ENTRIES);
         assert!(DATA_RING_SHARDS.is_power_of_two());
     }
 
@@ -563,6 +637,7 @@ mod tests {
             + 4 + 4           // src_addr, dst_addr
             + 4 + 4           // payload_len, orig_len
             + 4               // tls_library
+            + 4 + 4           // tcp_seq, tcp_ack
             + 2 + 2           // src_port, dst_port
             + 1 + 1 + 6       // ip_proto, tcp_flags, _pad
             + MAX_PAYLOAD_SIZE;
@@ -622,6 +697,20 @@ mod record_tests {
                 .all(|&n| n > 0 && n < 2 * 4096 / DATA_RING_SHARDS as u32),
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn tc_flow_cookie_is_symmetric_keyed_and_outside_the_tls_key_space() {
+        let (a, b) = (0x0A00_0001, 0x0A00_0002);
+        let mut keyed_differs = 0;
+        for port in 0..4096u16 {
+            let c = tc_flow_cookie(7, a, b, 40000 + port, 80, 6);
+            assert_eq!(c, tc_flow_cookie(7, b, a, 80, 40000 + port, 6));
+            // F18: a TLS key (bit 63 set) can never equal a TC cookie.
+            assert_eq!(c & TLS_KEY_BIT, 0);
+            keyed_differs += (c != tc_flow_cookie(8, a, b, 40000 + port, 80, 6)) as u32;
+        }
+        assert_eq!(keyed_differs, 4096, "the boot key changes every cookie");
     }
 
     #[test]

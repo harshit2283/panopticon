@@ -28,6 +28,31 @@ impl DnsCacheEntry {
     }
 }
 
+/// Longest TTL an observed answer is kept for. DNS answers come from the
+/// traffic: a forged one with a TTL of years must not name an address for
+/// good.
+pub const MAX_DNS_TTL: Duration = Duration::from_secs(3600);
+
+/// Whether `name` may name a service: a hostname (letters, digits, `-`,
+/// `_`, labels of 1-63 bytes, at most 253 bytes) whose last label is not
+/// all digits. That excludes everything that imitates the agent's other
+/// identity formats: `svc:ns/name`, `node:name`, `ns/workload` (`:` and
+/// `/`), and addresses (`10.0.0.5`, `10.0.0.5:80`).
+pub fn is_service_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    name.len() <= 253
+        && name.split('.').all(label_ok)
+        && !name
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Thread-safe DNS cache mapping IPs to observed domain names.
 pub struct DnsCache {
     ip_to_domain: DashMap<u32, DnsCacheEntry>,
@@ -42,15 +67,22 @@ impl DnsCache {
         }
     }
 
-    /// Insert a DNS observation (called by the DNS parser on A/AAAA responses).
-    pub fn insert_observed(&self, domain: &str, ip: u32, ttl: Duration) {
+    /// Insert a DNS observation (an A record answering a query seen on the
+    /// same flow). Names that are not plain hostnames are refused (see
+    /// [`is_service_name`]) and the TTL is capped at [`MAX_DNS_TTL`].
+    /// Returns whether the name was cached.
+    pub fn insert_observed(&self, domain: &str, ip: u32, ttl: Duration) -> bool {
+        if !is_service_name(domain) {
+            return false;
+        }
         let entry = DnsCacheEntry {
             domain: domain.to_string(),
             inserted_at: Instant::now(),
-            ttl,
+            ttl: ttl.min(MAX_DNS_TTL),
         };
         self.ip_to_domain.insert(ip, entry);
         self.domain_to_ip.insert(domain.to_string(), ip);
+        true
     }
 
     /// Resolve an IP to a cached domain name. Returns `None` if not found or expired.
@@ -148,6 +180,39 @@ mod tests {
 
         assert_eq!(cache.resolve_domain("postgres.svc"), Some(0x0A000003));
         assert_eq!(cache.resolve_domain("unknown.svc"), None);
+    }
+
+    #[test]
+    fn test_names_imitating_identities_or_carrying_junk_are_refused() {
+        let cache = DnsCache::new();
+        for bad in [
+            "svc:payments/checkout",
+            "node:worker-1",
+            "payments/checkout",
+            "10.0.0.5",
+            "10.0.0.5:443",
+            "api stripe.com",
+            "a..b",
+            "",
+            "evil.com\n{\"x\":1}",
+            &format!("{}.com", "a".repeat(64)),
+        ] {
+            assert!(
+                !cache.insert_observed(bad, 0x0A000001, Duration::from_secs(60)),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(cache.resolve(0x0A000001), None);
+        assert!(cache.insert_observed("api.stripe.com.", 1, Duration::from_secs(60)));
+        assert!(cache.insert_observed("_grpc._tcp.svc-1.local", 2, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_ttl_is_capped() {
+        let cache = DnsCache::new();
+        // ~68 years, the largest TTL a forged answer can carry.
+        assert!(cache.insert_observed("api.stripe.com", 1, Duration::from_secs(u32::MAX as u64)));
+        assert_eq!(cache.ip_to_domain.get(&1).unwrap().ttl, MAX_DNS_TTL);
     }
 
     #[test]

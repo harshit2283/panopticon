@@ -233,8 +233,12 @@ journalctl -u panopticon -f
   `orig_len`, 4160 bytes) and several map types. If you enabled
   `map_pin_path`, remove the old pins before upgrading:
   `rm -rf /sys/fs/bpf/panopticon`.
-- Replay capture files (`PNCAP`) are now format version 2; version 1 files
-  are rejected.
+- **After 0.1.0 the event format changed again**: `DataEvent` gained
+  `tcp_seq` and `tcp_ack` (4168 bytes), used to drop retransmitted and
+  forged TCP segments. With `map_pin_path`, remove the old pins before
+  upgrading, as above.
+- Replay capture files (`PNCAP`) are now format version 3 (0.1.0 wrote
+  version 2); older files are rejected.
 
 ## 8. Releasing (maintainers)
 

@@ -97,16 +97,47 @@ impl GraphBuilder {
         );
     }
 
+    /// Feed the DNS cache from a parsed DNS message: its `dns_a_record`
+    /// headers (`domain|ip_u32|ttl_secs`), which the DNS parser adds only
+    /// for answers to a query seen on the same flow, and which the PII scan
+    /// removes when a name holds PII. The cache refuses names that are not
+    /// plain hostnames and caps the TTL.
+    pub fn observe_dns(&self, msg: &L7Message) {
+        if msg.protocol != Protocol::Dns {
+            return;
+        }
+        for (key, value) in &msg.headers {
+            if key != "dns_a_record" {
+                continue;
+            }
+            let mut parts = value.splitn(3, '|');
+            if let (Some(domain), Some(Ok(ip)), Some(Ok(ttl))) = (
+                parts.next(),
+                parts.next().map(str::parse::<u32>),
+                parts.next().map(str::parse::<u64>),
+            ) {
+                self.dns_cache
+                    .insert_observed(domain, ip, Duration::from_secs(ttl));
+            }
+        }
+    }
+
     /// Name of the server end of a connection, as the graph names it
-    /// (Kubernetes workload, DNS name, else `ip:port`).
+    /// (Kubernetes workload, DNS name, else `ip:port`), or without the DNS
+    /// name when `dns` is false, and whether that name came from DNS.
     pub fn server_identity(
         &self,
         conn: &ConnectionTuple,
         src_is_server: Option<bool>,
         protocol: Protocol,
-    ) -> String {
+        dns: bool,
+    ) -> identity::ServiceIdentity {
         let (_, (addr, port)) = orient(conn, src_is_server, protocol);
-        self.identity.resolve(addr, port).name
+        if dns {
+            self.identity.resolve(addr, port)
+        } else {
+            self.identity.resolve_without_dns(addr, port)
+        }
     }
 
     /// Flush the current aggregation window, update the DAG, and return flows.
@@ -311,14 +342,71 @@ mod tests {
             pid: 1,
         };
         assert_eq!(
-            gb.server_identity(&resp, Some(true), Protocol::Http1),
+            gb.server_identity(&resp, Some(true), Protocol::Http1, true)
+                .name,
             "10.99.0.1:18090"
         );
         // Unknown orientation: the port heuristic picks the lower port.
         assert_eq!(
-            gb.server_identity(&resp, None, Protocol::Http1),
+            gb.server_identity(&resp, None, Protocol::Http1, true).name,
             "10.99.0.1:18090"
         );
+    }
+
+    /// F8 / F12: a DNS answer nobody asked for on that flow must not rename
+    /// an address; the answer to a query seen on it does.
+    #[test]
+    fn test_unsolicited_dns_answer_does_not_rename_an_ip() {
+        use crate::protocol::{ParseResult, ProtocolParser, dns::DnsParser};
+        let gb = make_builder();
+        let exfil = ConnectionTuple {
+            src_addr: 0x0A000001,
+            dst_addr: 0xCB007105, // 203.0.113.5
+            src_port: 40000,
+            dst_port: 443,
+            pid: 1,
+        };
+        let server = |gb: &GraphBuilder| {
+            gb.server_identity(&exfil, Some(false), Protocol::Http1, true)
+                .name
+        };
+        let wire = |id: u16, query: bool| {
+            let mut m = id.to_be_bytes().to_vec();
+            m.extend(if query { [0u8, 0] } else { [0x80, 0] }); // QR
+            m.extend([0, 1, 0, if query { 0 } else { 1 }, 0, 0, 0, 0]);
+            for label in ["api", "stripe", "com"] {
+                m.push(label.len() as u8);
+                m.extend(label.as_bytes());
+            }
+            m.extend([0, 0, 1, 0, 1]); // root, A, IN
+            if !query {
+                m.extend([0xC0, 12, 0, 1, 0, 1]); // name ptr, A, IN
+                m.extend(u32::MAX.to_be_bytes()); // a TTL of ~68 years
+                m.extend([0, 4, 203, 0, 113, 5]);
+            }
+            m
+        };
+        let feed = |gb: &GraphBuilder, p: &mut DnsParser, bytes: &[u8], dir| {
+            if let ParseResult::Messages(msgs) = p.feed(bytes, dir, 1) {
+                msgs.iter().for_each(|m| gb.observe_dns(m));
+            }
+        };
+        // A forged answer arrives on a flow that asked nothing.
+        feed(
+            &gb,
+            &mut DnsParser::new(),
+            &wire(0x4242, false),
+            Direction::Ingress,
+        );
+        assert_eq!(gb.dns_cache.resolve(0xCB007105), None);
+        assert_eq!(server(&gb), "203.0.113.5:443");
+
+        // A real query and its answer on one flow name it.
+        let gb = make_builder();
+        let mut p = DnsParser::new();
+        feed(&gb, &mut p, &wire(0x4243, true), Direction::Egress);
+        feed(&gb, &mut p, &wire(0x4243, false), Direction::Ingress);
+        assert_eq!(server(&gb), "api.stripe.com");
     }
 
     #[test]

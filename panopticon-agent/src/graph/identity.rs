@@ -82,15 +82,8 @@ impl IdentityResolver {
         // Kubernetes first, unmemoized (a lock-free probe of the current
         // index): the index is the source of truth for pod IPs and follows
         // pod churn.
-        if let Some(ep) = self.k8s.as_ref().and_then(|k| k.lookup(ip)) {
-            return ServiceIdentity {
-                name: ep.display.to_string(),
-                kind: match ep.kind {
-                    EndpointKind::Pod => ServiceKind::Workload,
-                    EndpointKind::Service => ServiceKind::KubeService,
-                    EndpointKind::Node => ServiceKind::Node,
-                },
-            };
+        if let Some(id) = self.k8s_identity(ip) {
+            return id;
         }
 
         let key = (ip, port);
@@ -114,6 +107,26 @@ impl IdentityResolver {
         identity
     }
 
+    /// Like [`resolve`](Self::resolve), never naming the address from DNS:
+    /// a Kubernetes name, else the address itself. DNS names come from the
+    /// traffic, so `metrics_only` keeps them out of the audit log.
+    pub fn resolve_without_dns(&self, ip: u32, port: u16) -> ServiceIdentity {
+        self.k8s_identity(ip)
+            .unwrap_or_else(|| address_identity(ip, port))
+    }
+
+    fn k8s_identity(&self, ip: u32) -> Option<ServiceIdentity> {
+        let ep = self.k8s.as_ref()?.lookup(ip)?;
+        Some(ServiceIdentity {
+            name: ep.display.to_string(),
+            kind: match ep.kind {
+                EndpointKind::Pod => ServiceKind::Workload,
+                EndpointKind::Service => ServiceKind::KubeService,
+                EndpointKind::Node => ServiceKind::Node,
+            },
+        })
+    }
+
     fn do_resolve(&self, ip: u32, port: u16) -> ServiceIdentity {
         // 1. Check DNS cache
         if let Some(domain) = self.dns_cache.resolve(ip) {
@@ -122,19 +135,8 @@ impl IdentityResolver {
                 kind: ServiceKind::Service,
             };
         }
-
-        // 2. Format as IP string, with the port for servers (port 0 = a
-        //    client, identified by address only)
-        let ip_str = format_ipv4(ip);
-        let name = if port == 0 {
-            ip_str
-        } else {
-            format!("{}:{}", ip_str, port)
-        };
-        ServiceIdentity {
-            name,
-            kind: ServiceKind::External,
-        }
+        // 2. The address itself
+        address_identity(ip, port)
     }
 
     /// Number of cached resolutions (for stats).
@@ -156,6 +158,21 @@ impl IdentityResolver {
     }
 }
 
+/// An address as an identity: `ip:port` for servers, `ip` for clients
+/// (port 0, identified by address only).
+pub fn address_identity(ip: u32, port: u16) -> ServiceIdentity {
+    let ip_str = format_ipv4(ip);
+    let name = if port == 0 {
+        ip_str
+    } else {
+        format!("{}:{}", ip_str, port)
+    };
+    ServiceIdentity {
+        name,
+        kind: ServiceKind::External,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +191,17 @@ mod tests {
         let id = resolver.resolve(0x0A000001, 80);
         assert_eq!(id.name, "nginx.svc");
         assert_eq!(id.kind, ServiceKind::Service);
+    }
+
+    #[test]
+    fn test_resolve_without_dns_ignores_dns_names() {
+        let (dns, resolver) = make_resolver();
+        dns.insert_observed("api.stripe.com", 0x0A000001, Duration::from_secs(60));
+        assert_eq!(resolver.resolve(0x0A000001, 443).name, "api.stripe.com");
+        assert_eq!(
+            resolver.resolve_without_dns(0x0A000001, 443).name,
+            "10.0.0.1:443"
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub struct AgentMetrics {
     pub kernel_drops: Counter<u64>,
     pub drops_export_full: Counter<u64>,
     pub worker_panics: Counter<u64>,
+    pub tcp_segments_ignored: Counter<u64>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -109,6 +110,14 @@ impl AgentMetrics {
             worker_panics.clone(),
         );
 
+        let tcp_segments_ignored = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_segments_ignored",
+            "TCP segments not parsed: retransmissions of bytes already parsed, or \
+             outside the connection's sequence window (forged segments, stale RST / FIN)",
+            tcp_segments_ignored.clone(),
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -166,6 +175,7 @@ impl AgentMetrics {
             kernel_drops,
             drops_export_full,
             worker_panics,
+            tcp_segments_ignored,
             parse_latency,
             ringbuf_approx_pending,
         };
@@ -233,6 +243,10 @@ impl AgentMetrics {
         );
         self.worker_panics.inner().store(
             stats.worker_panics.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_segments_ignored.inner().store(
+            stats.tcp_segments_ignored.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
 

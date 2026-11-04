@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
+use crate::config::{PrivacyGate, PrivacyMode};
 use crate::k8s::K8sMetadata;
 use crate::pii::PiiReport;
 use crate::protocol::{Direction, L7Message, Protocol};
@@ -267,6 +268,8 @@ pub struct ExportEvent {
     pub msg: L7Message,
     pub pii: Option<PiiReport>,
     pub context: TransportContext,
+    /// The privacy mode the record was produced under.
+    pub mode: PrivacyMode,
 }
 
 /// How often the export writer drains its channel while events flow (bounds
@@ -290,8 +293,17 @@ impl JsonExportHandle {
     /// blocking pool: file writes on a runtime thread stalled the parser
     /// workers sharing it. It polls every EXPORT_POLL_INTERVAL instead of
     /// blocking on the channel, so workers' sends never have to wake it.
-    pub fn spawn(path: &str, buffer_size: usize) -> Result<(Self, tokio::task::JoinHandle<()>)> {
-        Self::spawn_with_k8s(path, buffer_size, None)
+    ///
+    /// Each record is checked against the privacy mode now in effect
+    /// (`privacy`): one produced under a wider mode before a reload
+    /// tightened it is dropped, not written. Once the mode is
+    /// `metrics_only` the writer stops and closes the file.
+    pub fn spawn(
+        path: &str,
+        buffer_size: usize,
+        privacy: Arc<PrivacyGate>,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
+        Self::spawn_with_k8s(path, buffer_size, None, privacy)
     }
 
     /// Like [`spawn`](Self::spawn), adding Kubernetes workload names.
@@ -299,6 +311,7 @@ impl JsonExportHandle {
         path: &str,
         buffer_size: usize,
         k8s: Option<Arc<K8sMetadata>>,
+        privacy: Arc<PrivacyGate>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
         let mut exporter = JsonExporter::new(path)?.with_k8s(k8s);
         let (tx, mut rx) = mpsc::channel::<ExportEvent>(buffer_size);
@@ -309,7 +322,11 @@ impl JsonExportHandle {
             loop {
                 let mut wrote = false;
                 let closed = loop {
+                    if privacy.get() == PrivacyMode::MetricsOnly {
+                        break true; // no per-request export any more
+                    }
                     match rx.try_recv() {
+                        Ok(event) if !privacy.allows(event.mode) => {}
                         Ok(event) => {
                             if let Err(e) =
                                 exporter.emit(&event.msg, event.pii.as_ref(), Some(&event.context))
@@ -327,6 +344,9 @@ impl JsonExportHandle {
                     tracing::warn!(error = %e, "JSON export flush failed");
                 }
                 if closed {
+                    if privacy.get() == PrivacyMode::MetricsOnly {
+                        tracing::warn!("Privacy mode is metrics_only: JSON export closed");
+                    }
                     break;
                 }
                 // Back off while idle (a fixed 5ms poll cost ~1% of a core
@@ -343,14 +363,23 @@ impl JsonExportHandle {
         Ok((Self { tx }, handle))
     }
 
-    /// Send an event to the writer task. Returns false if the channel is full (backpressure).
+    /// Send an event, produced under privacy mode `mode`, to the writer
+    /// task. Returns false if the channel is full (backpressure).
     pub fn try_send(
         &self,
         msg: L7Message,
         pii: Option<PiiReport>,
         context: TransportContext,
+        mode: PrivacyMode,
     ) -> bool {
-        self.tx.try_send(ExportEvent { msg, pii, context }).is_ok()
+        self.tx
+            .try_send(ExportEvent {
+                msg,
+                pii,
+                context,
+                mode,
+            })
+            .is_ok()
     }
 }
 
@@ -379,6 +408,42 @@ mod tests {
             server_pid: None,
             tls_library: None,
         }
+    }
+
+    /// Codex #2: records queued under a wider mode are not written after a
+    /// reload tightened it, and `metrics_only` closes the export.
+    #[test]
+    fn test_writer_drops_records_the_tightened_mode_forbids() {
+        let path =
+            std::env::temp_dir().join(format!("panopticon_json_tight_{}", std::process::id()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let gate = Arc::new(PrivacyGate::new(PrivacyMode::Full));
+        let written = rt.block_on(async {
+            let (h, writer) =
+                JsonExportHandle::spawn(path.to_str().unwrap(), 64, Arc::clone(&gate)).unwrap();
+            let rec = |p: &str, mode| {
+                let mut msg = make_test_msg();
+                msg.path = Some(p.to_string());
+                assert!(h.try_send(msg, None, make_transport_context(), mode));
+            };
+            // Queued unredacted under full, then the reload tightens.
+            gate.tighten(PrivacyMode::Redacted);
+            rec("/raw?ssn=123-45-6789", PrivacyMode::Full);
+            rec("/redacted?ssn=<SSN>", PrivacyMode::Redacted);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            gate.tighten(PrivacyMode::MetricsOnly);
+            rec("/after-metrics-only", PrivacyMode::Redacted);
+            // The writer stops on its own (the handle is still alive).
+            tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+                .await
+                .expect("writer closed on metrics_only")
+                .unwrap();
+            std::fs::read_to_string(&path).unwrap()
+        });
+        std::fs::remove_file(&path).ok();
+        assert!(!written.contains("123-45-6789"), "{written}");
+        assert!(!written.contains("after-metrics-only"), "{written}");
+        assert!(written.contains("/redacted"), "{written}");
     }
 
     #[cfg(unix)]

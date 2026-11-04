@@ -8,6 +8,10 @@
 # export to it. Also reports kernel-measured TC cost per packet and the
 # agent's user-space CPU time and peak RSS over the run.
 #
+# Last, a request sent from the agent's own metrics port (F2: a peer that
+# picked that port as its source port used to be skipped by TC) must still
+# be captured.
+#
 # Usage: sudo tests/oracle/run.sh [requests=2000] [seed=1234] [min_recall=0.99]
 # Needs: root, a built agent (target/release/panopticon-agent), python3 with
 # pyroute2 (pip install pyroute2), nsenter.
@@ -26,6 +30,7 @@ AGENT=${AGENT:-$ROOT/target/release/panopticon-agent}
 OUT=$(mktemp -d)
 PY=${PYTHON:-python3}
 PORT=18090
+MPORT=19435  # the agent's --metrics-bind port
 
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
@@ -39,7 +44,8 @@ sysctl -qw kernel.bpf_stats_enabled=1
 "$PY" "$HERE/netns.py" up
 MODE=server HOST=$HOST_IP python3 -I "$HERE/http_oracle.py" "$PORT" &
 SP=$!
-"$AGENT" -i "$IFACE" --json-export "$OUT/agent.jsonl" >"$OUT/agent.log" 2>&1 &
+"$AGENT" -i "$IFACE" --json-export "$OUT/agent.jsonl" --metrics-bind "$HOST_IP:$MPORT" \
+  >"$OUT/agent.log" 2>&1 &
 AP=$!
 sleep 4
 START=$(date +%s.%N)  # seconds since epoch, compared with time.time()
@@ -49,6 +55,8 @@ SEED=$SEED MODE=client HOST=$HOST_IP nsenter --net=/var/run/netns/$NS \
   python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$OUT/truth.jsonl" &
 CP=$!
 wait "$CP"
+nsenter --net=/var/run/netns/$NS curl -s -o /dev/null --local-port "$MPORT" \
+  "http://$HOST_IP:$PORT/f2probe" || echo "f2 probe request failed"
 python3 -I "$HERE/bpf_cost.py" "$AP"
 sleep 1
 # utime+stime (fields 14/15) cover the whole run, startup included.
@@ -69,4 +77,10 @@ c = sum(r.get("client_pid") == client for r in recs)
 s = sum(r.get("server_pid") == server for r in recs)
 print(f"  process attribution: client_pid {c}/{len(recs)}, server_pid {s}/{len(recs)}")
 EOF
+if grep -q '"path":"/f2probe"' "$OUT/agent.jsonl"; then
+  echo "  metrics source port: a request from port $MPORT was captured"
+else
+  echo "FAIL: a request sent from the agent's metrics port $MPORT was not captured"
+  exit 1
+fi
 echo "artifacts: $OUT"

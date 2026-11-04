@@ -22,76 +22,14 @@ use std::mem;
 use std::path::Path;
 
 use panopticon_common::DataEvent;
-#[cfg(target_os = "linux")]
 use panopticon_common::parse_data_event_bytes;
-#[cfg(not(target_os = "linux"))]
-use panopticon_common::{Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 /// Magic bytes identifying a Panopticon capture file.
 const MAGIC: &[u8; 6] = b"PNCAP\x01";
 
-/// Current file format version. v2: DataEvent gained `orig_len` (4160 bytes).
-const FORMAT_VERSION: u32 = 2;
-
-#[cfg(not(target_os = "linux"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RawDataEvent {
-    pub timestamp_ns: u64,
-    pub socket_cookie: u64,
-    pub event_type: u32,
-    pub direction: u32,
-    pub pid: u32,
-    pub tgid: u32,
-    pub src_addr: u32,
-    pub dst_addr: u32,
-    pub payload_len: u32,
-    pub orig_len: u32,
-    pub tls_library: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub ip_proto: u8,
-    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
-    pub tcp_flags: u8,
-    pub _pad: [u8; 6],
-    pub payload: [u8; MAX_PAYLOAD_SIZE],
-}
-
-#[cfg(not(target_os = "linux"))]
-impl RawDataEvent {
-    fn to_data_event(self) -> Option<DataEvent> {
-        Some(DataEvent {
-            timestamp_ns: self.timestamp_ns,
-            socket_cookie: self.socket_cookie,
-            event_type: EventType::from_u32(self.event_type)?,
-            direction: Direction::from_u32(self.direction)?,
-            pid: self.pid,
-            tgid: self.tgid,
-            src_addr: self.src_addr,
-            dst_addr: self.dst_addr,
-            payload_len: self.payload_len,
-            orig_len: self.orig_len,
-            tls_library: TlsLibrary::from_u32(self.tls_library)?,
-            src_port: self.src_port,
-            dst_port: self.dst_port,
-            ip_proto: self.ip_proto,
-            tcp_flags: self.tcp_flags,
-            _pad: self._pad,
-            payload: self.payload,
-        })
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn parse_data_event_bytes(bytes: &[u8]) -> Option<DataEvent> {
-    if bytes.len() != mem::size_of::<RawDataEvent>() {
-        return None;
-    }
-    // SAFETY: `RawDataEvent` is repr(C) with plain integer/byte fields, and
-    // `bytes` length is checked to exactly match the struct size.
-    let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawDataEvent) };
-    raw.to_data_event()
-}
+/// Current file format version. v2: DataEvent gained `orig_len` (4160
+/// bytes). v3: `tcp_seq` and `tcp_ack` (4168 bytes).
+const FORMAT_VERSION: u32 = 3;
 
 /// File header metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]

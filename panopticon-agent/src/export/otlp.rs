@@ -15,7 +15,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::sync::mpsc;
 
-use crate::config::OtlpConfig;
+use crate::config::{OtlpConfig, PrivacyGate, PrivacyMode};
 use crate::protocol::L7Message;
 
 /// An event to be exported via OTLP.
@@ -34,14 +34,18 @@ pub enum OtlpEvent {
 /// Cloneable, bounded-channel OTLP export handle.
 #[derive(Clone)]
 pub struct OtlpExportHandle {
-    tx: mpsc::Sender<OtlpEvent>,
+    /// Each event with the privacy mode it was produced under.
+    tx: mpsc::Sender<(PrivacyMode, OtlpEvent)>,
 }
 
 impl OtlpExportHandle {
-    /// Spawn OTLP exporter task.
+    /// Spawn OTLP exporter task. An event produced under a wider privacy
+    /// mode than the one now in effect (`privacy`, tightened by a reload
+    /// while it was queued) is dropped, not exported.
     pub fn spawn(
         config: &OtlpConfig,
         buffer_size: usize,
+        privacy: std::sync::Arc<PrivacyGate>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
         let endpoint = config.endpoint.clone();
         let service_name = config.service_name.clone();
@@ -61,12 +65,17 @@ impl OtlpExportHandle {
             .build();
         let tracer = provider.tracer("panopticon-agent.otlp");
 
-        let (tx, mut rx) = mpsc::channel::<OtlpEvent>(buffer_size);
+        let (tx, mut rx) = mpsc::channel::<(PrivacyMode, OtlpEvent)>(buffer_size);
         let handle = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                emit_event(&tracer, event);
-                while let Ok(event) = rx.try_recv() {
+            let emit = |(mode, event)| {
+                if privacy.allows(mode) {
                     emit_event(&tracer, event);
+                }
+            };
+            while let Some(event) = rx.recv().await {
+                emit(event);
+                while let Ok(event) = rx.try_recv() {
+                    emit(event);
                 }
             }
 
@@ -81,24 +90,30 @@ impl OtlpExportHandle {
         Ok((Self { tx }, handle))
     }
 
-    /// Try to enqueue a span. Returns false if queue is full.
-    pub fn try_send_span(&self, msg: L7Message) -> bool {
-        self.tx.try_send(OtlpEvent::Span(msg)).is_ok()
+    /// Try to enqueue a span produced under privacy mode `mode`. Returns
+    /// false if queue is full.
+    pub fn try_send_span(&self, msg: L7Message, mode: PrivacyMode) -> bool {
+        self.tx.try_send((mode, OtlpEvent::Span(msg))).is_ok()
     }
 
-    /// Try to enqueue a PII finding event. Returns false if queue is full.
+    /// Try to enqueue a PII finding event produced under privacy mode
+    /// `mode`. Returns false if queue is full.
     pub fn try_send_pii_finding(
         &self,
         timestamp_ns: u64,
         category: String,
         confidence: f32,
+        mode: PrivacyMode,
     ) -> bool {
         self.tx
-            .try_send(OtlpEvent::PiiFinding {
-                timestamp_ns,
-                category,
-                confidence,
-            })
+            .try_send((
+                mode,
+                OtlpEvent::PiiFinding {
+                    timestamp_ns,
+                    category,
+                    confidence,
+                },
+            ))
             .is_ok()
     }
 }
@@ -244,9 +259,14 @@ mod tests {
         let config = OtlpConfig::default();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (exporter, handle) = OtlpExportHandle::spawn(&config, 100).unwrap();
+            let (exporter, handle) = OtlpExportHandle::spawn(
+                &config,
+                100,
+                std::sync::Arc::new(PrivacyGate::new(PrivacyMode::Redacted)),
+            )
+            .unwrap();
             let msg = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
-            assert!(exporter.try_send_span(msg));
+            assert!(exporter.try_send_span(msg, PrivacyMode::Redacted));
             drop(exporter);
             handle.abort();
         });
@@ -259,8 +279,8 @@ mod tests {
 
         let msg1 = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
         let msg2 = L7Message::new(Protocol::Http1, Direction::Egress, 2000);
-        assert!(exporter.try_send_span(msg1));
-        assert!(!exporter.try_send_span(msg2));
+        assert!(exporter.try_send_span(msg1, PrivacyMode::Redacted));
+        assert!(!exporter.try_send_span(msg2, PrivacyMode::Redacted));
     }
 
     #[test]
@@ -268,8 +288,18 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let exporter = OtlpExportHandle { tx };
 
-        assert!(exporter.try_send_pii_finding(1_000, "email".to_string(), 0.95));
-        assert!(!exporter.try_send_pii_finding(2_000, "ssn".to_string(), 0.91));
+        assert!(exporter.try_send_pii_finding(
+            1_000,
+            "email".to_string(),
+            0.95,
+            PrivacyMode::Redacted
+        ));
+        assert!(!exporter.try_send_pii_finding(
+            2_000,
+            "ssn".to_string(),
+            0.91,
+            PrivacyMode::Redacted
+        ));
     }
 
     #[test]

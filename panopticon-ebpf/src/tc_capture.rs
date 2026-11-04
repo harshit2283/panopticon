@@ -15,16 +15,17 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
+    TCP_FLAG_FIN, TCP_FLAG_RST, TlsLibrary, tc_flow_cookie,
 };
 
 use crate::maps::{CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, IPV6_DROPS, emit_scratch_event};
 
-// ── FNV-1a hash for connection cookie ──────────────────────────────────────
+// ── Connection cookie ──────────────────────────────────────────────────────
 
-/// Compute a deterministic connection cookie from the 5-tuple using FNV-1a.
-/// Normalizes by ordering (addr, port) pairs so both directions get the same cookie.
+/// The flow cookie of a 5-tuple, keyed with this boot's CONFIG_COOKIE_KEY
+/// (see `panopticon_common::tc_flow_cookie`). TC packets and the socket
+/// owner events (sock_monitor.rs) both use it.
 #[inline(always)]
 pub(crate) fn tc_connection_cookie(
     src_addr: u32,
@@ -33,41 +34,8 @@ pub(crate) fn tc_connection_cookie(
     dst_port: u16,
     ip_proto: u8,
 ) -> u64 {
-    // Normalize: smaller (addr, port) pair first for bidirectional consistency
-    let (a_addr, a_port, b_addr, b_port) = if (src_addr, src_port) <= (dst_addr, dst_port) {
-        (src_addr, src_port, dst_addr, dst_port)
-    } else {
-        (dst_addr, dst_port, src_addr, src_port)
-    };
-
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = FNV_OFFSET;
-    // Hash each byte of the 5-tuple
-    let bytes: [u8; 13] = [
-        (a_addr >> 24) as u8,
-        (a_addr >> 16) as u8,
-        (a_addr >> 8) as u8,
-        a_addr as u8,
-        (a_port >> 8) as u8,
-        a_port as u8,
-        (b_addr >> 24) as u8,
-        (b_addr >> 16) as u8,
-        (b_addr >> 8) as u8,
-        b_addr as u8,
-        (b_port >> 8) as u8,
-        b_port as u8,
-        ip_proto,
-    ];
-
-    let mut i = 0;
-    while i < 13 {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    hash
+    let key = CONFIG.get(CONFIG_COOKIE_KEY).copied().unwrap_or(0);
+    tc_flow_cookie(key, src_addr, dst_addr, src_port, dst_port, ip_proto)
 }
 
 // ── Ethernet / IP / TCP / UDP constants ────────────────────────────────────
@@ -163,7 +131,7 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     let dst_addr = u32::from_be(ctx.load::<u32>(ip_offset + 16)?);
 
     let transport_offset = ip_offset + ihl;
-    let (src_port, dst_port, payload_offset, tcp_flags) = match ip_proto {
+    let (src_port, dst_port, payload_offset, tcp_flags, tcp_seq, tcp_ack) = match ip_proto {
         IP_PROTO_TCP => {
             if data + transport_offset + TCP_HDR_MIN_LEN > data_end {
                 return Ok(TC_ACT_OK);
@@ -177,7 +145,18 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
                 return Ok(TC_ACT_OK);
             }
             let flags: u8 = ctx.load(transport_offset + 13)?;
-            (sport, dport, transport_offset + tcp_hdr_len, flags)
+            // Sequence and acknowledgment numbers: user space keeps only
+            // the in-window, not yet seen bytes of each direction.
+            let seq = u32::from_be(ctx.load::<u32>(transport_offset + 4)?);
+            let ack = u32::from_be(ctx.load::<u32>(transport_offset + 8)?);
+            (
+                sport,
+                dport,
+                transport_offset + tcp_hdr_len,
+                flags,
+                seq,
+                ack,
+            )
         }
         IP_PROTO_UDP => {
             if data + transport_offset + UDP_HDR_LEN > data_end {
@@ -185,19 +164,16 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
             }
             let sport = u16::from_be(ctx.load::<u16>(transport_offset)?);
             let dport = u16::from_be(ctx.load::<u16>(transport_offset + 2)?);
-            (sport, dport, transport_offset + UDP_HDR_LEN, 0)
+            (sport, dport, transport_offset + UDP_HDR_LEN, 0, 0, 0)
         }
         _ => return Ok(TC_ACT_OK),
     };
 
-    // Skip the agent's own metrics/health traffic (Prometheus scrapes,
-    // kubelet probes) so the observer does not observe itself.
-    if let Some(&ignore) = CONFIG.get(CONFIG_IGNORE_PORT)
-        && ignore != 0
-        && (src_port as u64 == ignore || dst_port as u64 == ignore)
-    {
-        return Ok(TC_ACT_OK);
-    }
+    // No port is exempt, not even the agent's own metrics port: a peer that
+    // used that port as its source port hid its whole connection, and with
+    // the listener on the node IP (the Helm default) masqueraded pod traffic
+    // can carry the node IP and that port too. The agent's own scrapes and
+    // probes are captured like any other traffic.
 
     let ip_payload_end = ip_offset + total_len;
     let payload_len = ip_payload_end.saturating_sub(payload_offset);
@@ -238,6 +214,8 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
         capture_len,
         payload_len as u32,
         tcp_flags,
+        tcp_seq,
+        tcp_ack,
         use_ringbuf,
     );
     if use_ringbuf {
@@ -263,6 +241,8 @@ fn populate_tc_event(
     load_len: u32,
     orig_len: u32,
     tcp_flags: u8,
+    tcp_seq: u32,
+    tcp_ack: u32,
     capture_payload: bool,
 ) {
     unsafe {
@@ -283,6 +263,8 @@ fn populate_tc_event(
         (*event).ip_proto = ip_proto;
         (*event).tls_library = TlsLibrary::None;
         (*event).tcp_flags = tcp_flags;
+        (*event).tcp_seq = tcp_seq;
+        (*event).tcp_ack = tcp_ack;
         (*event)._pad = [0; 6];
         (*event).orig_len = orig_len;
 

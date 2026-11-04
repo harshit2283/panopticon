@@ -14,7 +14,8 @@ DIR holds the run's sinks and one truth file per traffic leg:
   raw.pncap      raw dump          (full only), raw.pcap its pcap conversion
 
 Planted values: every PII value in the truth (body, query string, header,
-Content-Type parameter, Kafka client id) and every planted credential
+Content-Type parameter, Kafka client id, the SSN in a DNS name that resolves
+to the Kafka server) and every planted credential
 (X-Vault-Token, the tail of a JWT after an overlapping access_token=, Redis
 AUTH / HELLO AUTH passwords).
 Fails when a planted value is in a sink the mode forbids, when the full-mode

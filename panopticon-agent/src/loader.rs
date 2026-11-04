@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::config::AgentConfig;
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_IGNORE_PORT, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
     CONFIG_RING_SHARD_MASK, CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE,
 };
 
@@ -304,13 +304,13 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
-    let ignore_port = config
-        .metrics_bind
-        .as_deref()
-        .and_then(|b| b.parse::<std::net::SocketAddr>().ok())
-        .map_or(0, |a| a.port());
-    cfg_map.set(CONFIG_IGNORE_PORT, ignore_port as u64, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
+    // A fresh random key per agent start: flow cookies are not computable
+    // offline. Set before TC is attached (load path), so every cookie of a
+    // run uses the same key.
+    use std::hash::BuildHasher;
+    let cookie_key = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    cfg_map.set(CONFIG_COOKIE_KEY, cookie_key, 0)?;
 
     Ok(())
 }
@@ -319,7 +319,43 @@ pub fn sync_config_to_ebpf(
 
 /// Attach TLS uprobes to a discovered target.
 /// Returns the number of successfully attached probes.
+///
+/// The probes go into the file the offsets were read from, opened again
+/// and checked against its examined identity, and attached through
+/// `/proc/self/fd/<n>`: the kernel resolves that magic link to the open
+/// inode, not the workload-controlled path (F14).
 pub fn attach_tls_uprobes(
+    ebpf: &mut Ebpf,
+    target: &TlsTarget,
+    links: &mut Vec<Box<dyn std::any::Any + Send>>,
+) -> usize {
+    use std::os::fd::AsRawFd;
+    let file = match crate::platform::proc_scanner::open_examined(target) {
+        Ok(file) => file,
+        Err(e) => {
+            warn!(pid = target.pid, path = %target.library_path, error = %e, "Not attaching TLS uprobes");
+            return 0;
+        }
+    };
+    let pinned = TlsTarget {
+        library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
+        ..target.clone()
+    };
+    let attached = attach_tls_uprobes_to(ebpf, &pinned, links);
+    drop(file); // the uprobes hold the inode now
+    if attached > 0 {
+        info!(
+            pid = target.pid,
+            path = %target.library_path,
+            probes = attached,
+            "TLS uprobes attached"
+        );
+    }
+    attached
+}
+
+/// Attach the target's probes at `target.library_path` (an fd path).
+fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
@@ -446,15 +482,6 @@ pub fn attach_tls_uprobes(
                 }
             }
         }
-    }
-
-    if attached > 0 {
-        info!(
-            pid = target.pid,
-            path = %target.library_path,
-            probes = attached,
-            "TLS uprobes attached"
-        );
     }
 
     attached

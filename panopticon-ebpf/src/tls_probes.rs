@@ -573,6 +573,8 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).ip_proto = h.ip_proto;
         (*event).tls_library = h.tls_lib;
         (*event).tcp_flags = 0;
+        (*event).tcp_seq = 0;
+        (*event).tcp_ack = 0;
         (*event)._pad = [0; 6];
         (*event).orig_len = len as u32;
 
