@@ -100,13 +100,13 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 ## Key Design Decisions
 
 - **`#[repr(C)]` for all shared types** — Required for kernel↔user space ABI compatibility. `DataEvent` is ~4.2KB; must use RingBuf reserve or PerCpuArray scratch (not stack, 512-byte limit).
-- **RingBuf only in practice** — RingBuf (kernel 5.8+) is zero-copy and ordered. PerfEventArray branches exist in the eBPF code, but the single object always creates RingBuf maps, so kernels below 5.8 cannot load it.
+- **Sharded RingBuf** — `DATA_EVENTS_0..15`, one active ring per 4 CPUs, shard chosen by connection cookie (`ring_shard`) so each connection's events stay ordered in one ring; one drain thread per ring. TC copies header + captured bytes via `bpf_ringbuf_output` from `EVENT_SCRATCH`; TLS/socket events reserve fixed records. RingBuf support is probed, not version-gated (RHEL 8's 4.18 has it). The PerfEventArray branches exist but are not a working fallback.
 - **FSM-based protocol parsers** — Single-packet parsers fail on real traffic (e.g., PostgreSQL queries spanning 17+ packets). Each connection gets its own `ProtocolFsm` instance managed by `ConnectionFsmManager` (DashMap-backed).
 - **PII pipeline: regex first, then ML** — Regex prefilter (RegexSet, ~1µs) skips ~90% of traffic. Only suspicious payloads go to DistilBERT-NER (ONNX, batched). Inference sampler limits budget per second.
 - **DNS cache for service graph** — Without it, graph shows IPs not names. Fallback chain: observed DNS events → reverse lookup → raw IP. TTL-aware with DashMap.
 - **Query template normalization** — SQL literals → `?`, HTTP UUIDs → `?`. Achieves ~90% event reduction via deduplication before export.
 - **TC_ACT_OK always** — Never drop packets; passive observer only.
-- **PerCpuArray scratch for PerfEventArray path** — DataEvent is ~4.2KB, far exceeding the 512-byte BPF stack limit. All eBPF files use `PERF_SCRATCH: PerCpuArray<DataEvent>` for the fallback path.
+- **PerCpuArray scratch for PerfEventArray path** — DataEvent is ~4.2KB, far exceeding the 512-byte BPF stack limit. TC builds events in `EVENT_SCRATCH: PerCpuArray<DataEvent>`.
 - **Generic `EbpfContext` in emit functions** — `emit_tls_event<C: EbpfContext>` and `emit_sock_event<C: EbpfContext>` handle both ProbeContext and RetProbeContext callers.
 
 ## Code Conventions
@@ -118,7 +118,7 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 - **Logging**: `tracing` crate with structured fields.
 - **Testing**: ~470 tests total (433 agent on macOS, more on Linux; plus common, ABI, xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
 - **Backpressure**: Bounded mpsc channels everywhere. If full, drop event + increment counter. Never block the event loop.
-- **Performance targets**: 500K events/sec sustained, P99 < 5ms kernel→user-space, < 200MB RSS (excluding ML model).
+- **Performance targets** (targets, not all measured): 500K events/sec, P99 < 5ms kernel→user-space, < 200MB RSS. Measured on 64 vCPU: ~470K events/s at 99.8% recall (load-bound), RSS 129–215 MiB up to 4K conns; P99 not measured. See docs/BENCHMARKS.md.
 - **Benchmarks**: Criterion benchmarks in `panopticon-agent/benches/` for protocol detection, parser throughput, PII regex.
 
 ## Testing Infrastructure
