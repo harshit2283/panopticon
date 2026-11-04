@@ -7,6 +7,8 @@
 //!   (`panopticon_raw_capture_dropped_total`).
 //! - The file is created owner-only (0600) and truncated at startup.
 //! - Writing stops at `max_bytes` so a forgotten flag cannot fill the disk.
+//! - Writing stops, and the file is closed, as soon as a reload tightens
+//!   the privacy mode below `full`: events still queued are not written.
 //! - Payloads are the captured bytes: up to 4096 per packet / TLS buffer;
 //!   `orig_len` in each record says how large the original was.
 //!
@@ -25,6 +27,7 @@ use base64::Engine as _;
 use panopticon_common::DataEvent;
 use tracing::{error, info, warn};
 
+use crate::config::{PrivacyGate, PrivacyMode};
 use crate::replay::{CaptureReader, CaptureWriter};
 
 /// Bytes per record in the file: u32 length prefix + fixed-size DataEvent.
@@ -71,12 +74,14 @@ impl RawCaptureHandle {
     }
 }
 
-/// Open `path` and start the writer thread.
+/// Open `path` and start the writer thread. It writes only while
+/// `privacy` is `full`.
 pub fn spawn(
     path: &str,
     max_bytes: u64,
     queue_capacity: usize,
     start_timestamp_ns: u64,
+    privacy: Arc<PrivacyGate>,
 ) -> Result<(RawCaptureHandle, JoinHandle<()>)> {
     let file = super::open_private(path, false).context("raw capture file")?;
     let writer = CaptureWriter::new(file, start_timestamp_ns)
@@ -94,7 +99,7 @@ pub fn spawn(
     let path = path.to_string();
     let thread = std::thread::Builder::new()
         .name("raw-capture".into())
-        .spawn(move || writer_loop(writer, rx, max_bytes, &path, &stopped, &shutdown))
+        .spawn(move || writer_loop(writer, rx, max_bytes, &path, &stopped, &shutdown, &privacy))
         .context("failed to spawn raw capture writer thread")?;
     Ok((handle, thread))
 }
@@ -106,9 +111,19 @@ fn writer_loop<W: Write>(
     path: &str,
     stopped: &AtomicBool,
     shutdown: &AtomicBool,
+    privacy: &PrivacyGate,
 ) {
     let mut written = HEADER_BYTES;
     let mut write = |writer: &mut CaptureWriter<W>, event: &DataEvent| -> bool {
+        // Checked per record: what was queued under `full` is not written
+        // once a reload has tightened the mode.
+        if privacy.get() != PrivacyMode::Full {
+            warn!(
+                path,
+                "Privacy mode tightened — raw capture stopped and closed"
+            );
+            return false;
+        }
         if written + RECORD_BYTES > max_bytes {
             warn!(
                 path,
@@ -133,6 +148,13 @@ fn writer_loop<W: Write>(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = writer.flush();
+                if privacy.get() != PrivacyMode::Full {
+                    warn!(
+                        path,
+                        "Privacy mode tightened — raw capture stopped and closed"
+                    );
+                    break;
+                }
                 if shutdown.load(Ordering::Relaxed) {
                     // Drain whatever is still queued, then exit.
                     while let Ok(event) = rx.try_recv() {
@@ -223,6 +245,34 @@ mod tests {
         e
     }
 
+    fn full() -> Arc<PrivacyGate> {
+        Arc::new(PrivacyGate::new(PrivacyMode::Full))
+    }
+
+    /// Codex #2: a tighten below `full` stops the writer and closes the
+    /// file; events queued afterwards are never written.
+    #[test]
+    fn tighten_stops_and_closes_the_raw_capture() {
+        let path = tmp_path("tighten");
+        let gate = full();
+        let (handle, thread) = spawn(&path, 1 << 20, 64, 0, Arc::clone(&gate)).unwrap();
+        handle.record(&event(b"before", 6));
+        std::thread::sleep(Duration::from_millis(300));
+        gate.tighten(PrivacyMode::Redacted);
+        handle.record(&event(b"ssn=123-45-6789", 15)); // queued after the tighten
+        thread.join().unwrap(); // stops on its own, without shutdown()
+        let mut out = Vec::new();
+        let n = decode_to_jsonl(std::fs::File::open(&path).unwrap(), &mut out).unwrap();
+        assert_eq!(n, 1, "only the event written under full");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains(&b64.encode(b"ssn=123-45-6789"))
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir()
             .join(format!("panopticon-raw-{name}-{}", std::process::id()))
@@ -233,7 +283,7 @@ mod tests {
     #[test]
     fn records_round_trip_unredacted_with_0600_permissions() {
         let path = tmp_path("roundtrip");
-        let (handle, thread) = spawn(&path, 1 << 20, 64, 7).unwrap();
+        let (handle, thread) = spawn(&path, 1 << 20, 64, 7, full()).unwrap();
         handle.record(&event(b"password=hunter2&ssn=123-45-6789", 32));
         handle.record(&event(b"partial", 9000));
         handle.shutdown();
@@ -266,7 +316,8 @@ mod tests {
     fn stops_at_size_limit() {
         let path = tmp_path("limit");
         // Room for the header and exactly two records.
-        let (handle, thread) = spawn(&path, HEADER_BYTES + 2 * RECORD_BYTES, 64, 0).unwrap();
+        let (handle, thread) =
+            spawn(&path, HEADER_BYTES + 2 * RECORD_BYTES, 64, 0, full()).unwrap();
         for _ in 0..5 {
             handle.record(&event(b"x", 1));
         }
@@ -285,7 +336,7 @@ mod tests {
     #[test]
     fn truncated_final_record_is_tolerated() {
         let path = tmp_path("partial");
-        let (handle, thread) = spawn(&path, 1 << 20, 64, 0).unwrap();
+        let (handle, thread) = spawn(&path, 1 << 20, 64, 0, full()).unwrap();
         handle.record(&event(b"one", 3));
         handle.record(&event(b"two", 3));
         handle.shutdown();
@@ -300,7 +351,7 @@ mod tests {
     #[test]
     fn full_queue_counts_drops_without_blocking() {
         let path = tmp_path("drops");
-        let (handle, thread) = spawn(&path, 1 << 30, 1, 0).unwrap();
+        let (handle, thread) = spawn(&path, 1 << 30, 1, 0, full()).unwrap();
         for _ in 0..10_000 {
             handle.record(&event(b"burst", 5));
         }

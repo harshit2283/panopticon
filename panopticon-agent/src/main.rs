@@ -362,6 +362,10 @@ async fn main() -> Result<()> {
         // Starts a background sync and returns at once; never fails startup.
         let k8s_metadata = k8s::K8sMetadata::start(&agent_config.kubernetes);
 
+        // The privacy mode in effect, shared by the workers and every writer:
+        // a reload can only tighten it, and the writers check each record.
+        let privacy = Arc::new(config::PrivacyGate::new(agent_config.privacy_mode));
+
         let (json_export_handle, json_writer_handle) = match &agent_config.json_export_path {
             Some(path) => {
                 info!(path = %path, "JSON export enabled");
@@ -369,6 +373,7 @@ async fn main() -> Result<()> {
                     path,
                     4096,
                     k8s_metadata.clone(),
+                    Arc::clone(&privacy),
                 )?;
                 (Some(handle), Some(writer))
             }
@@ -380,7 +385,11 @@ async fn main() -> Result<()> {
                 service_name = %agent_config.otlp.service_name,
                 "OTLP gRPC export enabled"
             );
-            match export::otlp::OtlpExportHandle::spawn(&agent_config.otlp, 4096) {
+            match export::otlp::OtlpExportHandle::spawn(
+                &agent_config.otlp,
+                4096,
+                Arc::clone(&privacy),
+            ) {
                 Ok((handle, worker)) => (Some(handle), Some(worker)),
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to initialize OTLP exporter");
@@ -416,13 +425,13 @@ async fn main() -> Result<()> {
         // 7. Construct event loop (needed before HTTP server for shared stats access)
         let event_loop = event_loop::EventLoop::new(
             agent_config.clone(),
+            Arc::clone(&privacy),
             pii_engine,
             json_export_handle,
             otlp_export_handle,
             pii_audit_log,
             graph_builder,
         );
-        let privacy = Arc::clone(event_loop.privacy());
 
         // A panic message can quote the data being processed (e.g. a string
         // slice out of a payload): print only where it happened unless the
@@ -452,6 +461,7 @@ async fn main() -> Result<()> {
                     agent_config.capture_raw_max_bytes,
                     16_384,
                     util::monotonic_now_ns(),
+                    Arc::clone(&privacy),
                 )?;
                 tracing::warn!(
                     path = %path,
@@ -814,9 +824,11 @@ async fn replay_bench(config: &config::AgentConfig, path: &str) -> Result<()> {
         .pii
         .enabled
         .then(|| pii::PiiEngine::new(&config.pii, &config.pii_external_url_allowlist));
+    let privacy = std::sync::Arc::new(config::PrivacyGate::new(config.privacy_mode));
     let (json, writer) = match &config.json_export_path {
         Some(p) => {
-            let (h, w) = export::json::JsonExportHandle::spawn(p, 4096)?;
+            let (h, w) =
+                export::json::JsonExportHandle::spawn(p, 4096, std::sync::Arc::clone(&privacy))?;
             (Some(h), Some(w))
         }
         None => (None, None),
@@ -825,7 +837,8 @@ async fn replay_bench(config: &config::AgentConfig, path: &str) -> Result<()> {
         .graph
         .enabled
         .then(|| graph::GraphBuilder::new(&config.graph));
-    let event_loop = event_loop::EventLoop::new(config.clone(), pii, json, None, None, graph);
+    let event_loop =
+        event_loop::EventLoop::new(config.clone(), privacy, pii, json, None, None, graph);
 
     let n = events.len();
     let start = std::time::Instant::now();

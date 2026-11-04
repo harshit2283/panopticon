@@ -182,7 +182,10 @@ the agent at startup with a message saying why:
 
 **Reloading (`SIGHUP`)** can make the mode stricter at runtime (for example
 `redacted` → `metrics_only`: exports stop at once, files already written are
-left as they are). It cannot make it wider: a reload asking for a wider mode
+left as they are). Records already queued for an exporter when the mode
+tightens are checked again before they are written, and dropped if the new
+mode forbids them; on `metrics_only` the JSON export and the raw dump close
+their files. It cannot make it wider: a reload asking for a wider mode
 is rejected with an error and the running config is kept; restart the agent
 to widen it. A reload from `full` to `redacted` is rejected the same way when
 the agent was started without regex PII detection (`[pii] enabled` or
@@ -427,8 +430,9 @@ Each decoded line is one captured packet or TLS buffer:
 - The file is created readable by its owner only (`0600`), truncated at
   startup, and writing stops at `capture_raw_max_bytes` (default 1 GiB). The
   agent logs a warning at startup whenever raw capture is on.
-- If a reload tightens the mode away from `full`, recording stops at once;
-  the file keeps what was written.
+- If a reload tightens the mode away from `full`, recording stops at once
+  and the file is closed: events still queued for it are not written, and
+  the file keeps what was written before.
 - Group packets of one connection by `connection_id`; `direction` and the
   addresses tell you which side sent each one. For TLS events, `pid`
   identifies the process and `connection_id` is the TLS library's connection

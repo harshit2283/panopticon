@@ -278,8 +278,11 @@ pub struct EventLoop {
 
 #[cfg(target_os = "linux")]
 impl EventLoop {
+    /// `privacy` is the gate the exporters were started with, so a reload
+    /// that tightens it reaches the workers and every writer at once.
     pub fn new(
         config: AgentConfig,
+        privacy: Arc<PrivacyGate>,
         pii_engine: Option<PiiEngine>,
         json_export_handle: Option<JsonExportHandle>,
         otlp_export_handle: Option<OtlpExportHandle>,
@@ -287,7 +290,7 @@ impl EventLoop {
         graph_builder: Option<GraphBuilder>,
     ) -> Self {
         Self {
-            privacy: Arc::new(PrivacyGate::new(config.privacy_mode)),
+            privacy,
             config,
             stats: Arc::new(EventStats::new()),
             pii_engine,
@@ -1085,10 +1088,10 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
     // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
     let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
     while let Some(batch) = rx.recv().await {
-        // Read once per batch: a reload may have tightened it.
-        let privacy = ctx.privacy.get();
-        let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
         for record in batch.records() {
+            // Read per event (an atomic load): a reload may have tightened it.
+            let privacy = ctx.privacy.get();
+            let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
             if !read_data_event_into(record, &mut scratch) {
                 continue;
             }
@@ -1442,6 +1445,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                     server_pid: ctx.owners.and_then(|o| o.server),
                     ..crate::export::json::TransportContext::from_data_event(ctx.event)
                 },
+                ctx.privacy,
             )
         {
             ctx.stats.drops_export_full.fetch_add(1, Ordering::Relaxed);
@@ -1453,7 +1457,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
 
         // OTLP export (channel-based — drop when full, never block workers)
         if let Some(handle) = ctx.otlp_export.as_ref().filter(|_| !metrics_only) {
-            if !handle.try_send_span(msg.clone()) {
+            if !handle.try_send_span(msg.clone(), ctx.privacy) {
                 debug!(
                     worker = ctx.worker_id,
                     "OTLP span dropped due to exporter backpressure"
@@ -1465,6 +1469,7 @@ fn handle_messages(msgs: &[crate::protocol::L7Message], ctx: &MessageContext<'_>
                         msg.timestamp_ns,
                         entity.category.to_string(),
                         entity.confidence,
+                        ctx.privacy,
                     ) {
                         debug!(
                             worker = ctx.worker_id,
