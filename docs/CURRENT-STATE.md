@@ -24,6 +24,12 @@ production-hardened compliance platform.
   prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
   every request that carried it, and no raw PII values in the export
   (`tests/oracle/run_protocols.sh`).
+- The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
+  `redacted`, `metrics_only`) are checked with planted PII in HTTP and
+  OpenSSL TLS traffic, searched for in every output (export, raw dump and
+  its pcap conversion, audit log, agent log at debug level, `/metrics`,
+  `/debug/state`): values appear only where the mode allows, recall 100%
+  (`tests/oracle/run_modes.sh`, kernel 7.0).
 - Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
   connections with 99.99% recall, and 8K new connections/s with 99.98%
   recall and bounded connection state. Drops are counted per cause,
@@ -63,6 +69,9 @@ production-hardened compliance platform.
 - PII detection:
   - Regex-first scanning is the stable baseline.
   - ONNX-backed ML inference is optional and throughput-sensitive.
+  - In `redacted` mode, header values are scanned for HTTP, HTTP/2 and gRPC
+    only; other protocols' metadata is exported as parsed. The leak test
+    covers HTTP and OpenSSL TLS, not the database or messaging protocols.
 - Service graphing:
   - DNS/IP-based identity works.
   - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,
