@@ -33,6 +33,15 @@ production-hardened compliance platform.
   its pcap conversion, audit log, agent log at debug level, `/metrics`,
   `/debug/state`): values appear only where the mode allows, recall 100%
   (`tests/oracle/run_modes.sh`, kernel 7.0).
+- The capture-scope settings are checked the same way, with every sink on
+  (`tests/oracle/run_sampling.sh`, kernel 7.0): `pid_filter` naming the
+  HTTP and TLS servers captures 100% of their exchanges and nothing of the
+  TLS client process; naming an unrelated process exports nothing and
+  leaves none of 6,440 planted values in any sink. `connection_sample`
+  at 0.0, 0.5 and 1.0 kept 0, 47 and 96 of 96 connections, never part of
+  one. `head_only` kept no direction past its limit, captured every
+  connection's first request, and left none of the values planted past
+  the limit in any sink. Not yet run on 5.15 or the RHEL kernels.
 - Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
   connections with 99.99% recall, and 8K new connections/s with 99.98%
   recall and bounded connection state, on 4 vCPUs. On 64 vCPUs (agent
@@ -109,7 +118,8 @@ production-hardened compliance platform.
     connection's current sequence numbers (an on-path attacker).
   - Segments are not reordered: one that arrives before an earlier one is
     taken as a gap, and the earlier one is then ignored. SYNs are not
-    captured, so a new connection on a 5-tuple whose old state is still held
+    tracked (`sampling_mode = "head_only"` captures them, but only to count
+    each direction's bytes), so a new connection on a 5-tuple whose old state is still held
     (its FIN or RST not seen) is ignored until that state expires
     (`idle_connection_timeout`, 30 s).
 - Protocol depth:

@@ -104,6 +104,10 @@ All keys are optional. Example with the defaults:
 ```toml
 capture_enabled = true
 interfaces = []                     # [] = auto-detect default-route interface(s)
+# pid_filter = [1234, 5678]         # default: unset (every process); see "Capture scope" below
+sampling_mode = "full"              # "full" | "connection_sample" | "head_only"
+# sample_rate = 0.1                 # connection_sample only, and required there
+# head_only_bytes = 4096            # head_only only (default 4096)
 max_events_per_sec = 500000         # user-space rate limit; excess is dropped and counted
 max_worker_count = 4                # default: number of CPUs
 worker_channel_capacity = 4096        # events queued per worker; excess is dropped and counted
@@ -146,11 +150,59 @@ relist_interval_secs = 300  # full re-list of pods and services (min 5)
 watch = true           # stream changes between re-lists; false = refresh only by re-listing
 ```
 
-Accepted but **not yet acted on** (so you are not surprised):
-`pid_filter`, `sampling_mode`, `sample_rate`; `SIGHUP` re-reads the file but
-applies only a stricter privacy mode (§4.3) — restart the agent for anything
-else. Unknown keys are ignored silently (except inside `[privacy]`, where
-they are an error), so check spelling.
+**Capture scope.** `pid_filter` and `sampling_mode` narrow what is captured
+at all. They apply before anything else: what they drop never reaches the
+parsers, PII scanning, the service graph, the event export, OTLP, the PII
+audit log, the raw dump (and so `--decode-capture` / `--pcap`),
+`--log-events` or the agent's logs. They work the same in every privacy
+mode (§4.3) and only ever reduce what the mode allows. They are
+restart-only: a `SIGHUP` reload that changes them is rejected and the
+running config is kept.
+
+- `pid_filter = [1234, ...]`: capture only these processes (PIDs as the
+  node sees them, i.e. in the host PID namespace; at most 4096, not empty,
+  no 0). TLS plaintext and the connect / accept events of other processes
+  are dropped in the kernel. Packets captured on an interface carry no
+  process: a connection's packets pass only once a listed process has been
+  seen to `connect()` or `accept()` it. So:
+  - Connections that were already open when the agent started, and
+    connections of processes not in the list, are dropped and counted in
+    `panopticon_pid_filter_unknown_owner_connections_total`.
+  - A server's `accept()` can return after the client's first bytes have
+    arrived. Those packets are held (at most 8 per connection and 256 per
+    worker, for about a second) until the accept is seen, and dropped if it
+    is not.
+  - Processes started after the agent, including children a listed process
+    forks later (pre-fork workers, helpers), have new PIDs and are **not**
+    captured. The filter does not follow process trees: list them and
+    restart the agent.
+- `sampling_mode = "connection_sample"` with `sample_rate = r` (required,
+  0.0 to 1.0): each connection is captured whole or not at all, decided once
+  from a keyed hash of the connection (the key is drawn at agent start, so
+  which connections are kept cannot be predicted or steered from outside).
+  `0.0` captures nothing; `1.0` is the same as `full`. Dropped connections
+  and their events are counted in `panopticon_sampled_out_connections_total`
+  and `panopticon_sampled_out_events_total`. A TLS connection seen through
+  the uprobes and the same connection's packets on the wire have different
+  keys and are sampled independently. Sampled-out traffic is still copied
+  out of the kernel and counts against `max_events_per_sec`; the saving is
+  in parsing and export.
+- `sampling_mode = "head_only"` with `head_only_bytes = N` (default 4096,
+  1 to 1073741824): only the first N bytes of each direction of each
+  connection pass; the rest is dropped and counted in
+  `panopticon_head_only_cut_events_total`. An exchange that straddles the
+  limit is exported with the part before it. For TCP the count starts at
+  the connection's SYN, so connections already open when the agent started
+  pass nothing. For TLS (uprobes) and UDP it starts at the first byte the
+  agent sees, and a connection idle for longer than
+  `idle_connection_timeout_secs` counts from zero again.
+
+An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
+`head_only_bytes` without `head_only` stop the agent with an error.
+
+`SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3) —
+restart the agent for anything else. Unknown keys are ignored silently
+(except inside `[privacy]`, where they are an error), so check spelling.
 
 ### 4.3 Privacy modes
 
@@ -381,6 +433,11 @@ use `metrics_only`.
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
+| `panopticon_pid_filter_dropped_events_total` | `pid_filter`: events dropped in user space. TLS and connect / accept events of other processes are dropped in the kernel and not counted |
+| `panopticon_pid_filter_unknown_owner_connections_total` | `pid_filter`: packet-captured connections dropped because no listed process was seen to own them (other processes' connections, or opened before the agent started) |
+| `panopticon_sampled_out_connections_total` | `connection_sample`: connections not captured |
+| `panopticon_sampled_out_events_total` | `connection_sample`: events of those connections |
+| `panopticon_head_only_cut_events_total` | `head_only`: events cut or dropped past a direction's first `head_only_bytes` |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_active_connections` | Connections being parsed |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |

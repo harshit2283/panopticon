@@ -793,9 +793,9 @@ is the release code plus the cost-neutral sink reorder described under Method.
 
 - **Modes.**
   - **(a1)** `metrics_only`.
-  - **(a2)** `redacted` with the JSON export off. Export sampling does not
-    exist in the config: `sampling_mode` and `sample_rate` are parsed but
-    nothing reads them. So "export off" stands in for "export sampled".
+  - **(a2)** `redacted` with the JSON export off. In the measured build
+    `sampling_mode` and `sample_rate` were parsed but not acted on, so
+    "export off" stands in for "export sampled".
   - **(b)** `redacted`, every request exported.
   - **(c)** `full` with the JSON export and the raw dump (`capture_raw_path`
     on tmpfs, size cap lifted).
