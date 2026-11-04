@@ -133,20 +133,24 @@ static SECRET_CLAUSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::n
     .expect("SECRET_CLAUSE")
 });
 
+thread_local! {
+    // Per-thread clone, so workers don't contend for one match-cache pool
+    // (see `pii::regex_prefilter`'s LOCAL).
+    static SECRET_CLAUSE_LOCAL: regex::Regex = SECRET_CLAUSE.clone();
+}
+
 /// `text` with every [`SECRET_CLAUSE`] value replaced by
 /// [`REDACTED_CREDENTIAL`], or None when there is none. Shared by the SQL
 /// parsers and `PiiEngine::scan_message_with`.
 pub fn mask_secrets(text: &str) -> Option<String> {
-    if !SECRET_CLAUSE.is_match(text) {
-        return None;
-    }
-    Some(
-        SECRET_CLAUSE
-            .replace_all(text, |c: &regex::Captures<'_>| {
+    SECRET_CLAUSE_LOCAL.with(|re| {
+        re.is_match(text).then(|| {
+            re.replace_all(text, |c: &regex::Captures<'_>| {
                 format!("{}{}{REDACTED_CREDENTIAL}", &c[1], &c[2])
             })
-            .into_owned(),
-    )
+            .into_owned()
+        })
+    })
 }
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine

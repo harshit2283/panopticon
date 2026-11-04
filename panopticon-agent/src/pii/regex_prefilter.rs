@@ -80,51 +80,68 @@ fn pattern_defs() -> Vec<(PiiCategory, String)> {
     ]
 }
 
-/// Fast regex-based PII scanner (16 patterns).
-pub struct RegexPrefilter {
+/// The compiled patterns. Cloning shares the compiled program but gives the
+/// clone its own match-cache pool.
+#[derive(Clone)]
+struct Compiled {
     set: RegexSet,
     patterns: Vec<(PiiCategory, Regex)>,
 }
 
-impl Default for RegexPrefilter {
-    fn default() -> Self {
-        Self::new()
-    }
+static COMPILED: std::sync::LazyLock<Compiled> = std::sync::LazyLock::new(|| {
+    // ASCII-only matching: Unicode `\d`/`\s`/`\b` would accept multi-byte
+    // digits (U+0967 ...) and the validators index candidates by byte.
+    let defs: Vec<(PiiCategory, String)> = pattern_defs()
+        .into_iter()
+        .map(|(cat, p)| (cat, format!("(?-u){p}")))
+        .collect();
+    let set = RegexSet::new(defs.iter().map(|(_, p)| p)).expect("invalid regex in PII pattern set");
+    let patterns = defs
+        .into_iter()
+        .map(|(cat, p)| (cat, Regex::new(&p).expect("invalid regex in PII pattern")))
+        .collect();
+    Compiled { set, patterns }
+});
+
+thread_local! {
+    // One clone per thread: a regex shared by all workers hands its match
+    // cache out from a pool, and a worker that loses the race gets a fresh
+    // cache and rebuilds its lazy DFA (25% of agent CPU at 150K req/s,
+    // docs/BENCHMARKS.md). A per-thread clone owns its pool's fast path.
+    static LOCAL: Compiled = COMPILED.clone();
 }
+
+/// Fast regex-based PII scanner (16 patterns).
+#[derive(Default)]
+pub struct RegexPrefilter;
 
 impl RegexPrefilter {
     pub fn new() -> Self {
-        // ASCII-only matching: Unicode `\d`/`\s`/`\b` would accept multi-byte
-        // digits (U+0967 ...) and the validators index candidates by byte.
-        let defs: Vec<(PiiCategory, String)> = pattern_defs()
-            .into_iter()
-            .map(|(cat, p)| (cat, format!("(?-u){p}")))
-            .collect();
-        let set =
-            RegexSet::new(defs.iter().map(|(_, p)| p)).expect("invalid regex in PII pattern set");
-        let patterns = defs
-            .into_iter()
-            .map(|(cat, p)| (cat, Regex::new(&p).expect("invalid regex in PII pattern")))
-            .collect();
-        Self { set, patterns }
+        // Compile now, so a bad pattern fails at startup, not on first use.
+        std::sync::LazyLock::force(&COMPILED);
+        Self
     }
 
     /// Quick check: can text contain PII? (May be true for candidates that
     /// `scan` then rejects.)
     pub fn has_pii(&self, text: &str) -> bool {
-        self.set.is_match(text)
+        LOCAL.with(|c| c.set.is_match(text))
     }
 
     /// Extract all PII entities from text, ordered by position.
     pub fn scan(&self, text: &str) -> Vec<PiiEntity> {
-        let matches = self.set.matches(text);
+        LOCAL.with(|c| Self::scan_with(c, text))
+    }
+
+    fn scan_with(compiled: &Compiled, text: &str) -> Vec<PiiEntity> {
+        let matches = compiled.set.matches(text);
         if !matches.matched_any() {
             return Vec::new();
         }
 
         let mut candidates: Vec<(usize, PiiEntity)> = Vec::new();
         for idx in matches.iter() {
-            let (category, regex) = &self.patterns[idx];
+            let (category, regex) = &compiled.patterns[idx];
             for m in regex.find_iter(text) {
                 if !validate(*category, text, m.start(), m.end()) {
                     continue;

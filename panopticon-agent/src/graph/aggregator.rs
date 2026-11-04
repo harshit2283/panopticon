@@ -72,12 +72,22 @@ pub const MAX_FLOWS_PER_WINDOW: usize = 20_000;
 /// Template that absorbs flows beyond [`MAX_FLOWS_PER_WINDOW`].
 pub const OVERFLOW_TEMPLATE: &str = "<other>";
 
+static UUID_RE_SHARED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        .expect("UUID regex is valid")
+});
+
+thread_local! {
+    // Per-thread clone, so workers don't contend for one match-cache pool
+    // (see `pii::regex_prefilter`'s LOCAL).
+    static UUID_RE: Regex = UUID_RE_SHARED.clone();
+}
+
 /// Concurrent edge aggregator using a DashMap for lock-free per-key updates.
 pub struct EdgeAggregator {
     current_window: DashMap<FlowKey, FlowStats>,
     window_start: AtomicU64,
     window_duration: Duration,
-    uuid_re: Regex,
     /// Observations folded into OVERFLOW_TEMPLATE (cumulative).
     overflowed: AtomicU64,
     /// Entries in `current_window`. `DashMap::len()` read-locks every shard,
@@ -92,10 +102,6 @@ impl EdgeAggregator {
             current_window: DashMap::new(),
             window_start: AtomicU64::new(now_epoch_ms()),
             window_duration,
-            uuid_re: Regex::new(
-                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-            )
-            .expect("UUID regex is valid"),
             overflowed: AtomicU64::new(0),
             flows: AtomicUsize::new(0),
         }
@@ -254,7 +260,11 @@ impl EdgeAggregator {
             None => (path, None),
         };
         // Replace UUIDs
-        let result = self.uuid_re.replace_all(path, "?");
+        let replaced = UUID_RE.with(|re| {
+            re.is_match(path)
+                .then(|| re.replace_all(path, "?").into_owned())
+        });
+        let result = replaced.as_deref().unwrap_or(path);
 
         // Replace id-like path segments: /users/123/posts -> /users/?/posts
         let mut out = String::with_capacity(result.len());
