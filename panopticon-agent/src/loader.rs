@@ -10,13 +10,44 @@ use aya::{
 };
 use tracing::{debug, info, warn};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, CaptureBackend, SamplingMode};
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
+use crate::scope_loader::{self, ScopeSetup};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_MAX_PAYLOAD, CONFIG_PID_FILTER_ON,
-    CONFIG_RING_SHARD_MASK, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF, DATA_RING_SHARDS,
-    MAX_PAYLOAD_SIZE,
+    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
+    CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD,
+    CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF,
+    DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, scope,
 };
+
+/// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
+/// CONFIG_SAMPLE_THRESHOLD, CONFIG_HEAD_BYTES)`. All zero on the TC backend,
+/// where the kernel scope rules stay off and nothing changes.
+pub fn scope_config(config: &AgentConfig) -> (u64, u64, u64) {
+    if config.capture_backend != CaptureBackend::CgroupSkb {
+        return (0, 0, 0);
+    }
+    let mut mode = 0;
+    if config.pid_filter.is_some() {
+        mode |= scope::SCOPE_SEL_PID;
+    }
+    let mut threshold = 0;
+    let mut head = 0;
+    match config.sampling_mode {
+        SamplingMode::Full => {}
+        // Rate 1 is `full` (DESIGN §3.4), which keeps TLS plaintext.
+        SamplingMode::ConnectionSample if config.sample_rate >= 1.0 => {}
+        SamplingMode::ConnectionSample => {
+            mode |= scope::SCOPE_SAMPLE;
+            threshold = scope::sample_threshold(config.sample_rate);
+        }
+        SamplingMode::HeadOnly { max_bytes } => {
+            mode |= scope::SCOPE_HEAD;
+            head = max_bytes;
+        }
+    }
+    (mode, threshold, head)
+}
 
 /// The DATA_EVENTS ring shards in the eBPF object (maps.rs `data_rings!`).
 const DATA_RING_NAMES: [&str; DATA_RING_SHARDS] = [
@@ -157,9 +188,25 @@ pub fn load_and_attach(
     // Write initial config to eBPF CONFIG map
     sync_config_to_ebpf(&mut ebpf, config, caps)?;
 
+    // ── cgroup_skb backend: scope writers, then capture (DESIGN §7) ───
+    let cgroup_backend = config.capture_backend == CaptureBackend::CgroupSkb;
+    let mut exit_tp_attached = false;
+    if cgroup_backend {
+        let setup = ScopeSetup {
+            mode: scope_config(config).0,
+            tls: config.tls_scan_enabled,
+            cgroup2_path: config.cgroup2_path.clone(),
+        };
+        let (_root, exit_tp) = scope_loader::load_and_attach(&mut ebpf, &setup, &mut links)?;
+        exit_tp_attached = exit_tp;
+    }
+    let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };
+
     // ── TC classifiers (ingress + egress) per interface ───────────────
-    ensure_tc_program_loaded(&mut ebpf, "tc_ingress")?;
-    ensure_tc_program_loaded(&mut ebpf, "tc_egress")?;
+    if !cgroup_backend {
+        ensure_tc_program_loaded(&mut ebpf, "tc_ingress")?;
+        ensure_tc_program_loaded(&mut ebpf, "tc_egress")?;
+    }
     let mut tc_links_attached = 0usize;
     for iface in interfaces {
         if attach_tc_classifier(
@@ -243,13 +290,15 @@ pub fn load_and_attach(
         "sched_process_exec",
         &mut links,
     );
-    attach_tracepoint(
-        &mut ebpf,
-        "sched_process_exit",
-        "sched",
-        "sched_process_exit",
-        &mut links,
-    );
+    if !exit_tp_attached {
+        attach_tracepoint(
+            &mut ebpf,
+            "sched_process_exit",
+            "sched",
+            "sched_process_exit",
+            &mut links,
+        );
+    }
 
     info!(
         probes_attached = links.len(),
@@ -259,7 +308,9 @@ pub fn load_and_attach(
         interfaces = ?interfaces,
         "eBPF programs loaded and attached"
     );
-    if interfaces.is_empty() {
+    if cgroup_backend {
+        info!("cgroup_skb backend: TC classifiers not attached");
+    } else if interfaces.is_empty() {
         info!("No TC interfaces requested; skipping TC degraded-state warnings");
     } else if tc_links_attached == 0 {
         warn!(
@@ -331,6 +382,17 @@ pub fn sync_config_to_ebpf(
     use std::hash::BuildHasher;
     let cookie_key = std::collections::hash_map::RandomState::new().hash_one(0u8);
     cfg_map.set(CONFIG_COOKIE_KEY, cookie_key, 0)?;
+
+    // Capture scope (cgroup_skb backend; all zero on TC). Set before any
+    // program is attached. The epoch is random per start so `pid_bits`
+    // never outlive the pid_filter they were computed under (§3.1).
+    let (mode, threshold, head) = scope_config(config);
+    let epoch = (std::collections::hash_map::RandomState::new().hash_one(1u8) as u32).max(1);
+    cfg_map.set(CONFIG_PID_EPOCH, epoch as u64, 0)?;
+    cfg_map.set(CONFIG_SAMPLE_THRESHOLD, threshold, 0)?;
+    cfg_map.set(CONFIG_HEAD_BYTES, head, 0)?;
+    cfg_map.set(CONFIG_SCOPE_GEN, 1, 0)?;
+    cfg_map.set(CONFIG_SCOPE_MODE, mode, 0)?;
 
     Ok(())
 }

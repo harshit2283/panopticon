@@ -21,6 +21,18 @@ impl SamplingMode {
     pub const NAMES: [&'static str; 3] = ["full", "connection_sample", "head_only"];
 }
 
+/// Where packets are captured (`[capture] backend`). Restart-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureBackend {
+    /// TC classifiers on `interfaces` (the current behaviour).
+    #[default]
+    Tc,
+    /// `cgroup_skb` on the cgroup v2 root, with scope decided in the kernel
+    /// from per-socket state (DESIGN: capture scope from socket state).
+    /// Kernel side only so far; off unless chosen.
+    CgroupSkb,
+}
+
 /// Default `head_only_bytes`.
 pub const DEFAULT_HEAD_ONLY_BYTES: u64 = 4096;
 /// Upper bound for `head_only_bytes`: keeps TCP stream offsets far from
@@ -151,6 +163,11 @@ pub struct AgentConfig {
     /// If set, only capture traffic of these processes (PIDs, i.e. kernel
     /// tgids): at most `MAX_PID_FILTER`, none 0. Restart-only.
     pub pid_filter: Option<Vec<u32>>,
+    /// `[capture] backend`. Restart-only.
+    pub capture_backend: CaptureBackend,
+    /// `[capture] cgroup2_path`: the cgroup v2 root the cgroup_skb backend
+    /// attaches to, or `"auto"`. Restart-only.
+    pub cgroup2_path: String,
 
     // ── Resource budgets ───────────────────────────
     /// Rate limit in events/sec. 0 = unlimited. Events beyond this are dropped.
@@ -256,6 +273,8 @@ impl Default for AgentConfig {
             // Empty = auto-detect default-route interface(s) at startup.
             interfaces: Vec::new(),
             pid_filter: None,
+            capture_backend: CaptureBackend::Tc,
+            cgroup2_path: "auto".into(),
 
             max_events_per_sec: 500_000,
             max_worker_count: num_cpus(),
@@ -442,6 +461,7 @@ pub struct AgentConfigFile {
     pub capture_enabled: Option<bool>,
     pub interfaces: Option<Vec<String>>,
     pub pid_filter: Option<Vec<u32>>,
+    pub capture: Option<CaptureConfigFile>,
     pub max_events_per_sec: Option<u64>,
     pub max_worker_count: Option<usize>,
     pub worker_channel_capacity: Option<usize>,
@@ -496,6 +516,16 @@ pub struct GraphConfigFile {
     pub aggregation_window_secs: Option<u64>,
     pub stale_edge_timeout_secs: Option<u64>,
     pub identity_cache_ttl_secs: Option<u64>,
+}
+
+/// `[capture]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaptureConfigFile {
+    /// `"tc"` (default) or `"cgroup_skb"`.
+    pub backend: Option<String>,
+    /// `"auto"` or a cgroup v2 mount point.
+    pub cgroup2_path: Option<String>,
 }
 
 /// TOML-friendly Kubernetes config subset.
@@ -559,6 +589,18 @@ impl AgentConfigFile {
         }
         if let Some(v) = self.pid_filter {
             base.pid_filter = Some(v);
+        }
+        if let Some(capture) = self.capture {
+            match capture.backend.as_deref() {
+                None | Some("tc") => base.capture_backend = CaptureBackend::Tc,
+                Some("cgroup_skb") => base.capture_backend = CaptureBackend::CgroupSkb,
+                Some(other) => anyhow::bail!(
+                    "[capture] backend = \"{other}\" is not valid; use \"tc\" or \"cgroup_skb\""
+                ),
+            }
+            if let Some(path) = capture.cgroup2_path {
+                base.cgroup2_path = path;
+            }
         }
         if let Some(v) = self.max_events_per_sec {
             base.max_events_per_sec = v;
@@ -802,6 +844,9 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     };
     if pids(running) != pids(new) {
         return Err("changing pid_filter needs a restart".into());
+    }
+    if running.capture_backend != new.capture_backend || running.cgroup2_path != new.cgroup2_path {
+        return Err("changing [capture] backend or cgroup2_path needs a restart".into());
     }
     if running.sampling_mode != new.sampling_mode || running.sample_rate != new.sample_rate {
         return Err(
@@ -1226,6 +1271,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("head_only_bytes"), "{err}");
+    }
+
+    #[test]
+    fn test_capture_backend_config() {
+        let load = |toml: &str| load_config_from_str(toml).unwrap();
+        let tc = load("");
+        assert_eq!(tc.capture_backend, CaptureBackend::Tc); // off by default
+        assert_eq!(tc.cgroup2_path, "auto");
+        let cg = load("[capture]\nbackend = \"cgroup_skb\"\ncgroup2_path = \"/x\"\n");
+        assert_eq!(cg.capture_backend, CaptureBackend::CgroupSkb);
+        assert_eq!(cg.cgroup2_path, "/x");
+        let err = load_config_from_str("[capture]\nbackend = \"xdp\"\n").unwrap_err();
+        assert!(err.to_string().contains("not valid"), "{err}");
+        assert!(load_config_from_str("[capture]\nbogus = 1\n").is_err());
+        let err = check_restart_only(&tc, &cg).unwrap_err();
+        assert!(err.contains("[capture] backend"), "{err}");
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {

@@ -18,6 +18,8 @@ mod pii;
 mod platform;
 mod protocol;
 pub mod replay;
+#[cfg(target_os = "linux")]
+mod scope_loader;
 mod util;
 
 /// Panopticon Agent — eBPF-powered network observability
@@ -269,7 +271,9 @@ async fn main() -> Result<()> {
         if let Some(ref path) = args.replay_bench {
             return replay_bench(&agent_config, path).await;
         }
-        if agent_config.interfaces.is_empty() {
+        if agent_config.interfaces.is_empty()
+            && agent_config.capture_backend == config::CaptureBackend::Tc
+        {
             let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
             agent_config.interfaces = util::default_route_interfaces(&route);
             if agent_config.interfaces.is_empty() {
