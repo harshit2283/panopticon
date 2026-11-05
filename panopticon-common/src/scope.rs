@@ -3,6 +3,76 @@
 //! Every function here errs toward capturing less: an input it cannot trust
 //! yields "capture nothing", never a guess.
 
+/// Per-socket scope state, kept in a `BPF_MAP_TYPE_SK_STORAGE` map created
+/// with `BPF_F_CLONE`, so an accepted child starts with a copy of its
+/// listener's value. Fields marked "reset" are rewritten by the child's own
+/// ESTABLISHED callback before `init_cookie` is published.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SockState {
+    /// This socket's cookie once initialised; written last.
+    pub init_cookie: u64,
+    /// One aligned 64-bit store: `(scope_gen << 8) | verdict`. 0 = stale. Reset.
+    pub verdict_word: u64,
+    /// UDP `head_only` budgets, reserved with fetch-and-add.
+    pub udp_sent: u64,
+    pub udp_rcvd: u64,
+    /// Creator tgid (`cgroup/sock_create`), or the listener's on a child.
+    pub owner_tgid: u32,
+    /// Tgid that `accept()`ed this child. Reset.
+    pub acceptor_tgid: u32,
+    /// `CONFIG_PID_EPOCH` that `pid_bits` were computed under.
+    pub pid_epoch: u32,
+    /// `bpf_get_prandom_u32()` drawn at initialisation. Redrawn per child.
+    pub sample: u32,
+    /// Stream origins (ISN + 1), derived at ESTABLISHED. Reset.
+    pub rcv_base: u32,
+    pub snd_base: u32,
+    /// `OWNER_LISTED` | `ACCEPTOR_LISTED`.
+    pub pid_bits: u8,
+    /// `FLAG_*` bits.
+    pub flags: u8,
+    /// Our SYN's count in `bytes_acked`: 1 active, 0 passive. Reset.
+    pub syn_adj: u8,
+    pub _pad: u8,
+}
+
+pub const OWNER_LISTED: u8 = 1 << 0;
+pub const ACCEPTOR_LISTED: u8 = 1 << 1;
+
+/// Stream origins are valid (`head_only` may use them). Reset per child.
+pub const FLAG_BASELINE: u8 = 1 << 0;
+pub const FLAG_ROLE_CLIENT: u8 = 1 << 1;
+pub const FLAG_ROLE_SERVER: u8 = 1 << 2;
+/// Sticky, never cleared: the socket attached a ULP (kernel TLS).
+pub const FLAG_KTLS: u8 = 1 << 5;
+/// Sticky: TCP repair was used, so the stream history is unknown.
+pub const FLAG_REPAIRED: u8 = 1 << 6;
+/// Sticky: the socket went through `TCP_CLOSE` and may be reconnected.
+pub const FLAG_REUSED: u8 = 1 << 7;
+/// Flags a child's ESTABLISHED reset keeps.
+pub const FLAGS_STICKY: u8 = FLAG_KTLS | FLAG_REPAIRED | FLAG_REUSED;
+
+pub const VERDICT_IN: u8 = 1;
+pub const VERDICT_OUT_PID: u8 = 2;
+pub const VERDICT_OUT_CGROUP: u8 = 3;
+pub const VERDICT_OUT_SAMPLE: u8 = 4;
+
+/// Pack a verdict with the scope generation it was computed under.
+#[inline(always)]
+pub fn verdict_word(generation: u32, verdict: u8) -> u64 {
+    ((generation as u64) << 8) | verdict as u64
+}
+
+/// The cached verdict, if `word` was computed under generation `gen`.
+#[inline(always)]
+pub fn cached_verdict(word: u64, generation: u32) -> Option<u8> {
+    if word == 0 || (word >> 8) != generation as u64 {
+        return None;
+    }
+    Some(word as u8)
+}
+
 /// A socket is initialised only when its stored `init_cookie` is its own
 /// cookie. A child cloned from a listener (`BPF_F_CLONE`) carries the
 /// listener's cookie, so it reads as uninitialised until its own
@@ -94,6 +164,27 @@ mod tests {
 
     fn seq_at(done: u64) -> u32 {
         BASE_SEQ.wrapping_add(done as u32)
+    }
+
+    #[test]
+    fn sock_state_layout_is_stable() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<SockState>(), 64);
+        assert_eq!(align_of::<SockState>(), 8);
+        assert_eq!(offset_of!(SockState, verdict_word) % 8, 0);
+        assert_eq!(offset_of!(SockState, pid_bits), 56);
+    }
+
+    #[test]
+    fn verdict_word_is_valid_only_for_its_generation() {
+        let w = verdict_word(7, VERDICT_IN);
+        assert_eq!(cached_verdict(w, 7), Some(VERDICT_IN));
+        assert_eq!(cached_verdict(w, 8), None); // older writer: stale
+        assert_eq!(cached_verdict(0, 0), None); // reset
+        assert_eq!(
+            cached_verdict(verdict_word(u32::MAX, VERDICT_OUT_SAMPLE), u32::MAX),
+            Some(VERDICT_OUT_SAMPLE)
+        );
     }
 
     #[test]
