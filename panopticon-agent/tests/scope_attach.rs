@@ -156,6 +156,23 @@ fn hold_in_exit() -> std::process::Child {
     child
 }
 
+/// `sleep 30` running as `pid` (through ns_last_pid), if it can be placed.
+fn spawn_sleep_at(pid: u32) -> Option<std::process::Child> {
+    for _ in 0..50 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1)).unwrap();
+        let mut c = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        if c.id() == pid {
+            return Some(c);
+        }
+        c.kill().unwrap();
+        c.wait().unwrap();
+    }
+    None
+}
+
 /// Let a held process finish exiting, and reap it.
 fn release(mut child: std::process::Child) {
     // SAFETY: our tracee, stopped at PTRACE_EVENT_EXIT.
@@ -270,16 +287,28 @@ fn scope_programs_load_attach_and_hold() {
     gone.wait().unwrap();
     let held_early = hold_in_exit(); // finishes exiting between attach and arm
     let held_late = hold_in_exit(); // finishes exiting after arm
-    let (sel_pid, gone_pid) = (sel.id(), gone.id());
+    // P: running when the config is read, then exits and is reaped before
+    // the attach, and Q takes its PID
+    let mut p = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (sel_pid, gone_pid, p_pid) = (sel.id(), gone.id(), p.id());
     let (early_pid, late_pid) = (held_early.id(), held_late.id());
-    let candidates = [sel_pid, gone_pid, early_pid, late_pid];
+    let candidates = snapshot_candidates(&[sel_pid, gone_pid, early_pid, late_pid, p_pid]);
+    assert_eq!(candidates[1], (gone_pid, None), "not running at read");
+    p.kill().unwrap();
+    p.wait().unwrap();
+    // Start times are in clock ticks: let one pass so Q's differs.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut q = spawn_sleep_at(p_pid).expect("Q reuses P's pid");
 
     // ── production attach, disarmed
     let mut links = Vec::new();
     let (_, exit_attached) =
         attach_disarmed(&mut ebpf, &setup, Some(&candidates), &mut links).expect("attach");
     assert!(exit_attached);
-    for p in candidates {
+    for &(p, _) in &candidates {
         assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
         assert!(!pid_listed(&ebpf, p), "nothing published before arm");
     }
@@ -353,12 +382,21 @@ fn scope_programs_load_attach_and_hold() {
         excluded.contains(&(early_pid, EXITED_RECORDED)),
         "{excluded:?}"
     );
+    assert!(excluded.contains(&(gone_pid, NOT_RUNNING)), "{excluded:?}");
     assert!(
-        excluded.contains(&(gone_pid, EXITED_BEFORE_ATTACH)),
+        excluded.contains(&(p_pid, IDENTITY_CHANGED)),
         "{excluded:?}"
     );
-    assert_eq!(excluded.len(), 2, "{excluded:?}");
-    for p in candidates {
+    assert_eq!(excluded.len(), 3, "{excluded:?}");
+    assert!(
+        !pid_listed(&ebpf, p_pid),
+        "Q, reusing P's pid, is not selected"
+    );
+    assert!(q.try_wait().unwrap().is_none(), "Q still running");
+    q.kill().unwrap();
+    q.wait().unwrap();
+    println!("IDENTITY reused_before_attach=OK");
+    for &(p, _) in &candidates {
         assert!(!in_map(&ebpf, "PID_CANDIDATES", p), "candidates cleared");
     }
 

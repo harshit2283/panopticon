@@ -323,7 +323,7 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
 pub fn attach_disarmed(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
-    pids: Option<&[u32]>,
+    pids: Option<&[Candidate]>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
     // Disarmed whatever CONFIG held before (a pinned CONFIG survives
@@ -346,7 +346,7 @@ pub fn attach_disarmed(
     }
     if let Some(pids) = pids {
         let mut map = pid_map(ebpf, "PID_CANDIDATES")?;
-        for &pid in pids {
+        for &(pid, _) in pids {
             map.insert(pid, 1, 0)
                 .with_context(|| format!("cannot add PID {pid} to PID_CANDIDATES"))?;
         }
@@ -401,36 +401,89 @@ fn pid_map<'a>(
 }
 
 /// Why [`arm`] left a listed process out.
+pub const NOT_RUNNING: &str = "not running when pid_filter was read";
 pub const EXITED_RECORDED: &str = "exit recorded by sched_process_exit during startup";
-pub const EXITED_BEFORE_ATTACH: &str = "gone or exiting before sched_process_exit was attached";
+pub const IDENTITY_CHANGED: &str = "gone, or its PID reused, since pid_filter was read";
+pub const EXITED_BEFORE_ATTACH: &str = "exiting before sched_process_exit was attached";
+
+/// A configured `pid_filter` process: its PID and its start time (clock
+/// ticks since boot, `/proc/<pid>/stat` field 22) when the agent read the
+/// config, or None if it was not running then.
+pub type Candidate = (u32, Option<u64>);
+
+/// Fields of `/proc/<pid>/stat`, from field 3 (state) on: the ones after
+/// the comm, split after the last ')' since comm may hold spaces and ')'.
+fn stat_fields(pid: u32) -> Option<Vec<u64>> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn parse_stat(stat: &str) -> Option<Vec<u64>> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // state (field 3) is a letter; keep its slot so indices stay aligned
+    Some(
+        rest.split_whitespace()
+            .map(|f| f.parse().unwrap_or(u64::MAX))
+            .collect(),
+    )
+}
+
+/// Field `n` (1-based, as in proc(5)) of `/proc/<pid>/stat`, n >= 4.
+fn stat_field(fields: &[u64], n: usize) -> Option<u64> {
+    fields.get(n - 3).copied().filter(|&v| v != u64::MAX)
+}
+
+/// Snapshot the configured PIDs' identities. Call it when the agent first
+/// reads `pid_filter`, before anything is attached. A PID already reused
+/// before this read cannot be told from the operator's target: that is
+/// inherent to a numeric pid_filter.
+// ponytail: start time has clock-tick (USER_HZ) resolution, so an exit and
+// reuse within one tick of the original start is missed; a pidfd taken
+// here would close that where pidfd_open exists (5.3+).
+pub fn snapshot_candidates(pids: &[u32]) -> Vec<Candidate> {
+    pids.iter()
+        .map(|&pid| (pid, stat_fields(pid).and_then(|f| stat_field(&f, 22))))
+        .collect()
+}
 
 /// Publish `pid_filter` and arm: the last write of startup. Must follow
-/// [`attach_disarmed`] with the same `pids`. Returns the listed processes
-/// that were left out, and why.
+/// [`attach_disarmed`] with the same candidates. Returns the listed
+/// processes that were left out, and why.
 ///
 /// For each candidate: insert into PID_FILTER, THEN look in PID_EXITED and
 /// remove the entry if the exit tracepoint recorded the process. The
 /// tracepoint records before it removes (process_monitor.rs), so whichever
-/// way the two race the entry ends up absent.
-pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<Vec<(u32, &'static str)>> {
+/// way the two race the entry ends up absent. A candidate not recorded is
+/// still left out if its start time changed since the config was read (it
+/// exited, unseen, before the tracepoint was attached, and the PID may be
+/// reused) or if it was already exiting.
+pub fn arm(ebpf: &mut Ebpf, pids: Option<&[Candidate]>) -> Result<Vec<(u32, &'static str)>> {
+    const PF_EXITING: u64 = 0x4;
     let mut excluded = Vec::new();
     if let Some(pids) = pids {
         let mut filter = pid_map(ebpf, "PID_FILTER")?;
-        for &pid in pids {
+        for &(pid, start) in pids {
+            if start.is_none() {
+                excluded.push((pid, NOT_RUNNING));
+                continue;
+            }
             filter
                 .insert(pid, 1, 0)
                 .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
         }
         let exited = pid_map(ebpf, "PID_EXITED")?;
-        for &pid in pids {
+        for &(pid, start) in pids {
+            let Some(start) = start else { continue };
             match exited.get(&pid, 0) {
                 Ok(_) => excluded.push((pid, EXITED_RECORDED)),
                 Err(aya::maps::MapError::KeyNotFound) => {
-                    // The exit tracepoint is attached now, so a process not
-                    // yet exiting will have its exit recorded. One already
-                    // exiting (PF_EXITING is set before the tracepoint runs)
-                    // or gone may have passed it unseen.
-                    if exited_before_attach(pid) {
+                    // The exit tracepoint is attached now, so the process it
+                    // was, if still running and not yet exiting, will have
+                    // its exit recorded. PF_EXITING is set before the
+                    // tracepoint runs. Unreadable counts as gone.
+                    let fields = stat_fields(pid).unwrap_or_default();
+                    if stat_field(&fields, 22) != Some(start) {
+                        excluded.push((pid, IDENTITY_CHANGED));
+                    } else if stat_field(&fields, 9).is_none_or(|f| f & PF_EXITING != 0) {
                         excluded.push((pid, EXITED_BEFORE_ATTACH));
                     }
                 }
@@ -451,10 +504,7 @@ pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<Vec<(u32, &'static s
         let mut filter = pid_map(ebpf, "PID_FILTER")?;
         for &(pid, why) in &excluded {
             warn!(pid, reason = why, "pid_filter process not selected");
-            match filter.remove(&pid) {
-                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
-                Err(e) => return Err(e).context(format!("cannot remove PID {pid}")),
-            }
+            remove_pid(&mut filter, pid)?;
         }
     }
     config_array(ebpf)?.set(CONFIG_SCOPE_ARMED, 1, 0)?;
@@ -462,38 +512,35 @@ pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<Vec<(u32, &'static s
     if let Some(pids) = pids {
         // Armed: the exit tracepoint no longer reads the candidates.
         let mut candidates = pid_map(ebpf, "PID_CANDIDATES")?;
-        for pid in pids {
-            match candidates.remove(pid) {
-                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
-                Err(e) => return Err(e).context(format!("cannot clear candidate {pid}")),
-            }
+        for &(pid, _) in pids {
+            remove_pid(&mut candidates, pid)?;
         }
     }
     Ok(excluded)
 }
 
-/// Gone, or PF_EXITING set: `do_exit` sets it before sched_process_exit
-/// fires, so a process without it after the tracepoint was attached has
-/// its exit still ahead, where PID_EXITED records it. Unreadable counts as
-/// exited (errs toward drop).
-fn exited_before_attach(pid: u32) -> bool {
-    const PF_EXITING: u64 = 0x4;
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return true;
-    };
-    // "pid (comm) state ppid pgrp session tty_nr tpgid flags ...": flags is
-    // the seventh field after the last ')'.
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(6))
-        .and_then(|f| f.parse::<u64>().ok())
-        .is_none_or(|flags| flags & PF_EXITING != 0)
+/// Remove `pid`. Already absent is fine: never inserted (not running at
+/// read), or removed meanwhile by the exit tracepoint.
+fn remove_pid(
+    map: &mut aya::maps::HashMap<&mut aya::maps::MapData, u32, u8>,
+    pid: u32,
+) -> Result<()> {
+    match map.remove(&pid) {
+        Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+        Err(aya::maps::MapError::SyscallError(e))
+            if e.io_error.raw_os_error() == Some(libc::ENOENT) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).context(format!("cannot remove PID {pid}")),
+    }
 }
 
 /// Attach (disarmed), then arm. The production startup path.
 pub fn load_and_attach(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
-    pids: Option<&[u32]>,
+    pids: Option<&[Candidate]>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
     let r = attach_disarmed(ebpf, setup, pids, links)?;
@@ -762,6 +809,17 @@ pub fn remove_stale_legacy(ebpf: &Ebpf, cgroup: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_fields_survive_a_hostile_comm() {
+        // comm "a) 9 (b": fields must be counted after the last ')'.
+        let stat = "42 (a) 9 (b) S 1 42 42 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0";
+        let f = parse_stat(stat).unwrap();
+        assert_eq!(stat_field(&f, 9), Some(4194560));
+        assert_eq!(stat_field(&f, 22), Some(987654));
+        assert_eq!(stat_field(&f, 3), None); // the state letter
+        assert_eq!(stat_field(&f, 60), None);
+    }
 
     #[test]
     fn refusals_name_the_settings() {

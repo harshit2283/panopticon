@@ -263,6 +263,12 @@ async fn main() -> Result<()> {
             sample_rate = agent_config.sample_rate,
             "Capture scope"
         );
+        // pid_filter identities, read before anything is attached: arm leaves
+        // out a PID whose process has changed since (scope_loader::arm).
+        let pid_candidates = agent_config
+            .pid_filter
+            .as_deref()
+            .map(scope_loader::snapshot_candidates);
         if privacy_mode == config::PrivacyMode::Full {
             // Also on stderr: RUST_LOG=error must not hide it.
             eprintln!("panopticon: WARNING: {FULL_MODE_WARNING}");
@@ -305,7 +311,12 @@ async fn main() -> Result<()> {
             );
         }
 
-        let mut programs = loader::load_and_attach(&agent_config.interfaces, &caps, &agent_config)?;
+        let mut programs = loader::load_and_attach(
+            &agent_config.interfaces,
+            &caps,
+            &agent_config,
+            pid_candidates.as_deref(),
+        )?;
 
         // 1. Extract EventSource (RingBuf or PerfEventArray) BEFORE wrapping Ebpf in Arc<Mutex>.
         //    This breaks the borrow chain — event loop no longer needs &mut Ebpf.

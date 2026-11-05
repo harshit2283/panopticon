@@ -163,6 +163,7 @@ pub fn load_and_attach(
     interfaces: &[String],
     caps: &KernelCapabilities,
     config: &AgentConfig,
+    pid_candidates: Option<&[scope_loader::Candidate]>,
 ) -> Result<LoadedPrograms> {
     if !caps.has_tc_ebpf {
         anyhow::bail!(
@@ -199,12 +200,8 @@ pub fn load_and_attach(
             tls: config.tls_scan_enabled,
             cgroup2_path: config.cgroup2_path.clone(),
         };
-        let (_root, exit_tp) = scope_loader::load_and_attach(
-            &mut ebpf,
-            &setup,
-            config.pid_filter.as_deref(),
-            &mut links,
-        )?;
+        let (_root, exit_tp) =
+            scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, &mut links)?;
         exit_tp_attached = exit_tp;
     }
     let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };

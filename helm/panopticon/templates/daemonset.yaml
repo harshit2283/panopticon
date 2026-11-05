@@ -161,6 +161,10 @@ spec:
               mountPath: /sys/kernel/tracing
             - name: debugfs
               mountPath: /sys/kernel/debug
+            # Host inode for the cgroup_skb backend's instance lock
+            # (/run/panopticon/scope.lock), shared by every agent on the node.
+            - name: run-panopticon
+              mountPath: /run/panopticon
             {{- if .Values.agent.config }}
             - name: config
               mountPath: /etc/panopticon
@@ -182,6 +186,10 @@ spec:
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug
+            type: DirectoryOrCreate
+        - name: run-panopticon
+          hostPath:
+            path: /run/panopticon
             type: DirectoryOrCreate
         {{- if .Values.agent.config }}
         - name: config
