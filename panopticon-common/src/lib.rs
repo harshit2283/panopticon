@@ -58,7 +58,11 @@ pub const CONFIG_SAMPLE_THRESHOLD: u32 = 10;
 pub const CONFIG_HEAD_BYTES: u32 = 11;
 /// `scope::SCOPE_*` bits. 0 is unscoped `full`, the legacy behaviour.
 pub const CONFIG_SCOPE_MODE: u32 = 12;
-const _: () = assert!(CONFIG_SCOPE_MODE < CONFIG_ENTRIES);
+/// Non-zero once startup is complete (the loader's last write). While 0 the
+/// scope writers publish no initialisation, so a socket created or
+/// established during startup stays uninitialised for life.
+pub const CONFIG_SCOPE_ARMED: u32 = 13;
+const _: () = assert!(CONFIG_SCOPE_ARMED < CONFIG_ENTRIES);
 
 /// Bit 63 of a connection key: set for TLS connection keys (user space),
 /// clear for TC flow cookies, so the two key spaces never overlap.
@@ -701,6 +705,7 @@ mod tests {
             CONFIG_SAMPLE_THRESHOLD,
             CONFIG_HEAD_BYTES,
             CONFIG_SCOPE_MODE,
+            CONFIG_SCOPE_ARMED,
         ];
         for (i, &idx) in scope.iter().enumerate() {
             assert!(idx < CONFIG_ENTRIES);

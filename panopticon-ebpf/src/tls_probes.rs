@@ -502,17 +502,22 @@ fn emit_tls_event<C: EbpfContext>(
     direction: Direction,
     tls_lib: TlsLibrary,
 ) -> Result<(), ()> {
-    // pid_filter: other processes' plaintext never leaves the kernel.
+    // Decided here, before any reserve or copy, for every TLS writer.
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if !pid_allowed(tgid) {
-        return Ok(());
-    }
-    // Capture scope (cgroup_skb backend, DESIGN §3.5): decided here, before
-    // any reserve or copy, for every TLS writer. Mode 0 (unscoped full, and
-    // the TC backend) keeps the behaviour above unchanged.
     let mode = crate::sock_capture::scope_mode();
-    let mut scope_gen = 0;
-    if !panopticon_common::scope::is_unscoped_full(mode) {
+    // Stamped from the map in both branches: a constant 0 on one path and a
+    // map value on the other doubles the states the verifier walks through
+    // the chunk loop below (ssl_read_ret hit the 1M limit on RHEL 8).
+    let mut scope_gen = crate::sock_capture::scope_gen();
+    if panopticon_common::scope::is_unscoped_full(mode) {
+        // TC backend (and unscoped full): pid_filter as before, other
+        // processes' plaintext never leaves the kernel.
+        if !pid_allowed(tgid) {
+            return Ok(());
+        }
+    } else {
+        // cgroup_skb backend, restricted (DESIGN §3.5, §3.6): the selector
+        // union and the mode alone decide, and every drop is counted.
         match crate::sock_capture::tls_call_scope(mode, tgid) {
             Ok(g) => scope_gen = g,
             Err(reason) => {

@@ -30,8 +30,8 @@ use aya_ebpf::{
 };
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_HEAD_BYTES, CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD,
-    CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    TlsLibrary,
+    CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, DataEvent, Direction, EventType,
+    MAX_PAYLOAD_SIZE, TlsLibrary,
     scope::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_NO_BASELINE,
         DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE, FLAG_KTLS, FLAG_REPAIRED,
@@ -115,6 +115,19 @@ pub(crate) fn scope_gen() -> u32 {
 #[inline(always)]
 pub(crate) fn scope_mode() -> u64 {
     cfg(CONFIG_SCOPE_MODE)
+}
+
+/// Startup is complete (CONFIG_SCOPE_ARMED). Until then the writers below
+/// create and publish nothing: a socket created or established during
+/// startup is treated exactly like one that predates the agent. That closes
+/// every window in which a dependency of initialised state was not yet in
+/// place: the capture hooks and UDP budgets (a UDP socket could otherwise
+/// move bytes before accounting starts), the tcp_set_ulp marker (a socket
+/// could attach kTLS unmarked), and the exit cleanup and PID_FILTER (pid
+/// bits computed from an incomplete list).
+#[inline(always)]
+fn armed() -> bool {
+    cfg(CONFIG_SCOPE_ARMED) != 0
 }
 
 #[inline(always)]
@@ -224,7 +237,7 @@ fn try_sock_create(ctx: &SockContext) {
     let sk = ctx.sock;
     let (ty, proto) = unsafe { ((*sk).type_, (*sk).protocol) };
     let udp = ty == SOCK_DGRAM && proto == IPPROTO_UDP;
-    if !(udp || ty == SOCK_STREAM && proto == IPPROTO_TCP) {
+    if !(udp || ty == SOCK_STREAM && proto == IPPROTO_TCP) || !armed() {
         return;
     }
     let st = state_of(sk as *mut c_void, true);
@@ -276,9 +289,18 @@ pub fn scope_sockops(ctx: SockOpsContext) -> u32 {
 fn on_established(ctx: &SockOpsContext, active: bool) {
     let ops = ctx.ops;
     let sk = unsafe { (*ops).__bindgen_anon_2.sk };
-    if sk.is_null() {
+    if sk.is_null() || !armed() {
         return;
     }
+    // Why this is safe after arming, whenever the socket was created: a TCP
+    // socket created during startup has no state (sock_create was
+    // disarmed), so as an active socket it stays uninitialised; a child is
+    // a new socket and reaches here only after arming, when the capture
+    // hooks and the tcp_set_ulp marker are live. The origins are derived
+    // here from the kernel counters, not from anything seen earlier, and
+    // kTLS can only attach to an established socket, i.e. after this point,
+    // when the marker is already live.
+    //
     // A child of a pre-agent listener has nothing to clone: it is a new
     // socket, so it gets fresh state here. Its owner is unknown (epoch 0
     // never matches), so pid_filter selects it only from accept() on
@@ -538,8 +560,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         let mut off = STREAM_OFF_UNKNOWN;
         if initialised && !udp && rd!(st, flags) & FLAG_BASELINE != 0 {
             if let Some(o) = tcp_offset(tp, st, direction, pkt.seq) {
-                // A segment from before the origin has no position.
-                off = if o < 0 { STREAM_OFF_UNKNOWN } else { o as u64 };
+                off = position(o);
             }
         }
         let st = if initialised { st } else { null_mut() };
@@ -589,23 +610,41 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Err(reason) => return drop(reason),
     };
 
-    // ── head cut
+    // ── TCP stream offset (every mode), then the head cut
+    let tcp_off = if !udp && flags & FLAG_BASELINE != 0 {
+        tcp_offset(tp, st, direction, pkt.seq)
+    } else {
+        None
+    };
+    if let Some(o) = tcp_off {
+        off = position(o);
+    }
     if head {
         if !udp {
             if flags & FLAG_BASELINE == 0 {
                 return drop(DROP_NO_BASELINE);
             }
-            let Some(o) = tcp_offset(tp, st, direction, pkt.seq) else {
+            let Some(o) = tcp_off else {
                 return drop(DROP_HEAD_INCOHERENT);
             };
             take = head_take(o, pkt.payload_len, n);
-            off = o as u64;
         }
         if take == 0 {
             return drop(DROP_HEAD_CUT);
         }
     }
     emit(ctx, sk, st, cookie, direction, udp, &pkt, take, off, g)
+}
+
+/// `DataEvent::stream_off` for an offset: a segment from before the origin
+/// has no position.
+#[inline(always)]
+fn position(off: i64) -> u64 {
+    if off < 0 {
+        STREAM_OFF_UNKNOWN
+    } else {
+        off as u64
+    }
 }
 
 #[inline(always)]
