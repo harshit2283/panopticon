@@ -456,6 +456,7 @@ struct TlsHeader {
     ip_proto: u8,
     direction: Direction,
     tls_lib: TlsLibrary,
+    scope_gen: u32,
 }
 
 #[inline(always)]
@@ -473,6 +474,7 @@ fn tls_header(conn: u64, direction: Direction, tls_lib: TlsLibrary) -> TlsHeader
         ip_proto: 0,
         direction,
         tls_lib,
+        scope_gen: 0,
     };
     // Addresses are known once this connection has done socket I/O inside a
     // hooked call (see try_tls_tcp_io); zero until then.
@@ -501,10 +503,26 @@ fn emit_tls_event<C: EbpfContext>(
     tls_lib: TlsLibrary,
 ) -> Result<(), ()> {
     // pid_filter: other processes' plaintext never leaves the kernel.
-    if !pid_allowed((bpf_get_current_pid_tgid() >> 32) as u32) {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if !pid_allowed(tgid) {
         return Ok(());
     }
-    let h = tls_header(conn, direction, tls_lib);
+    // Capture scope (cgroup_skb backend, DESIGN §3.5): decided here, before
+    // any reserve or copy, for every TLS writer. Mode 0 (unscoped full, and
+    // the TC backend) keeps the behaviour above unchanged.
+    let mode = crate::sock_capture::scope_mode();
+    let mut scope_gen = 0;
+    if !panopticon_common::scope::is_unscoped_full(mode) {
+        match crate::sock_capture::tls_call_scope(mode, tgid) {
+            Ok(g) => scope_gen = g,
+            Err(reason) => {
+                crate::maps::count_scope_drop(reason);
+                return Ok(());
+            }
+        }
+    }
+    let mut h = tls_header(conn, direction, tls_lib);
+    h.scope_gen = scope_gen;
     let use_ringbuf = match CONFIG.get(panopticon_common::CONFIG_USE_RINGBUF) {
         Some(&v) => v != 0,
         None => true,
@@ -580,6 +598,7 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).tcp_seq = 0;
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
+        (*event).scope_gen = h.scope_gen;
         (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE. The u32

@@ -1,8 +1,10 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)]
 
 mod maps;
 mod process_monitor;
+mod sock_capture;
 mod sock_monitor;
 mod tc_capture;
 mod tls_probes;

@@ -16,7 +16,7 @@ use aya_ebpf::{
 };
 use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
 
-use crate::maps::{PID_CGROUP_MAP, PROCESS_EVENTS};
+use crate::maps::{PID_CGROUP_MAP, PID_FILTER, PROCESS_EVENTS};
 
 // ── Process Exec ───────────────────────────────────────────────────────────
 
@@ -96,6 +96,12 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     if pid != tgid {
         return Ok(());
     }
+
+    // pid_filter: forget the process before anything that can fail (comm
+    // read, ring reserve), so a reused PID never inherits its selection
+    // (DESIGN §3.1). `pid` here is the tgid (high half of pid_tgid), the
+    // PID_FILTER key.
+    let _ = PID_FILTER.remove(&pid);
 
     let comm = read_comm(ctx)?;
 
