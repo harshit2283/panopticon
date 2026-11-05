@@ -117,82 +117,184 @@ fn load_any(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     }
 }
 
+fn pid_listed(ebpf: &Ebpf, pid: u32) -> bool {
+    let m: HashMap<&MapData, u32, u8> = HashMap::try_from(ebpf.map("PID_FILTER").unwrap()).unwrap();
+    m.get(&pid, 0).is_ok()
+}
+
+/// `setsockopt(TCP_ULP, "tls")`; false if the kernel has no tls ULP.
+fn set_tls_ulp(fd: &impl AsRawFd) -> bool {
+    // SAFETY: valid fd and buffer; SOL_TCP = 6, TCP_ULP = 31.
+    unsafe { libc::setsockopt(fd.as_raw_fd(), 6, 31, b"tls".as_ptr().cast(), 3) == 0 }
+}
+
+/// Spawn a process that sends `payload` to `port`, trying to make it reuse
+/// `pid` (through ns_last_pid). Returns whether the pid was reused.
+fn spawn_with_pid(pid: u32, port: u16, payload: &str) -> bool {
+    for _ in 0..50 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1)).unwrap();
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; printf {payload} >&3; sleep 0.3");
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .spawn()
+            .unwrap();
+        if child.id() == pid {
+            child.wait().unwrap();
+            return true;
+        }
+        child.wait().unwrap();
+    }
+    false
+}
+
 #[test]
 #[ignore = "needs root on a Linux lab kernel"]
 fn scope_programs_load_attach_and_hold() {
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");
 
-    // ── every program through the verifier
+    // ── the production load-check for a restricted config with TLS: every
+    // program it needs (capture, writers, exit tracepoint, TLS uprobes)
+    let setup = ScopeSetup {
+        mode: SCOPE_SEL_PID | SCOPE_HEAD,
+        tls: true,
+        cgroup2_path: std::env::var("PANOPTICON_CGROUP2").unwrap_or_else(|_| "auto".into()),
+    };
+    let report = load_check(&mut ebpf, &setup).expect("production load_check");
+    assert!(report.writers && report.exit_tp, "{report:?}");
+    let accept = report.accept.expect("one inet_csk_accept variant loads");
+    let other_accept = if accept == ACCEPT4 { ACCEPT2 } else { ACCEPT4 };
+
+    // ── every other program in the object through the verifier; the only
+    // allowed failure is the other accept arity
     let names: Vec<String> = ebpf.programs().map(|(n, _)| n.to_string()).collect();
-    let mut loaded = Vec::new();
+    let mut failed = Vec::new();
     for name in &names {
         match load_any(&mut ebpf, name) {
-            Ok(()) => loaded.push(name.clone()),
-            Err(e) => println!("MATRIX {name} load=FAIL ({e})"),
+            Ok(()) => println!("MATRIX {name} load=OK"),
+            Err(e) => {
+                println!("MATRIX {name} load=FAIL ({e})");
+                failed.push(name.clone());
+            }
         }
     }
+    assert_eq!(failed, vec![other_accept.to_string()], "load failures");
 
     // Sockets that predate the attach: a listener and a connected client.
     let pre_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut pre_client = TcpStream::connect(pre_listener.local_addr().unwrap()).unwrap();
     let (_pre_server, _) = pre_listener.accept().unwrap();
 
-    // ── scope programs onto the cgroup2 root (writers first)
-    let root = discover_cgroup_root(
-        &std::env::var("PANOPTICON_CGROUP2").unwrap_or_else(|_| "auto".into()),
-    )
-    .expect("cgroup2 root");
-    println!("ROOT {root:?}");
-    let cgroup = File::open(root.path()).unwrap();
-    let mut links = Vec::new();
-    let order = [
-        SOCK_CREATE,
-        SOCKOPS,
-        ACCEPT4,
-        ACCEPT2,
-        SET_ULP,
-        EXIT_TP,
-        SKB_INGRESS,
-        SKB_EGRESS,
-    ];
-    let mut attached = Vec::new();
-    for p in order {
-        if !loaded.iter().any(|n| n == p) {
-            continue;
-        }
-        match attach_program(&mut ebpf, p, &cgroup, &mut links) {
-            Ok(()) => {
-                attached.push(p);
-                println!("MATRIX {p} load=OK attach=OK");
-            }
-            Err(e) => println!("MATRIX {p} load=OK attach=FAIL ({e:#})"),
-        }
-    }
-    for n in &loaded {
-        if !order.contains(&n.as_str()) {
-            println!("MATRIX {n} load=OK attach=n/a");
-        }
-    }
-    for p in [SOCK_CREATE, SOCKOPS, SET_ULP, SKB_INGRESS, SKB_EGRESS] {
-        assert!(attached.contains(&p), "{p} must load and attach");
-    }
-    let accept = attached.iter().any(|p| *p == ACCEPT4 || *p == ACCEPT2);
-    assert!(accept, "one inet_csk_accept variant must attach");
-    assert!(
-        !(attached.contains(&ACCEPT4) && attached.contains(&ACCEPT2)),
-        "exactly one accept variant loads"
-    );
-
-    // ── runtime: unscoped full
+    // Config as sync_config_to_ebpf writes it: restricted, disarmed.
     let me = std::process::id();
     set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
     set(&mut ebpf, CONFIG_USE_RINGBUF, 1);
     set(&mut ebpf, CONFIG_RING_SHARD_MASK, 0);
     set(&mut ebpf, CONFIG_SCOPE_GEN, 1);
     set(&mut ebpf, CONFIG_PID_EPOCH, 77);
-    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    set(&mut ebpf, CONFIG_HEAD_BYTES, 1 << 20);
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_HEAD);
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 0);
     let mut ring = RingBuf::try_from(ebpf.take_map("DATA_EVENTS_0").unwrap()).unwrap();
+
+    // ── legacy attach path (RHEL 8): an earlier agent's attachments, left
+    // behind as after a SIGKILL, are found and removed before attaching
+    let root = discover_cgroup_root(&setup.cgroup2_path).expect("cgroup2 root");
+    println!("ROOT {root:?}");
+    let cgroup = File::open(root.path()).unwrap();
+    if !uses_links() {
+        let mut stale = EbpfLoader::new().load(bytes).unwrap();
+        let mut stale_links = Vec::new();
+        for (p, _) in CGROUP_PROGRAMS {
+            load_program(&mut stale, p, None).unwrap();
+            attach_program(&mut stale, p, &cgroup, &mut stale_links).unwrap();
+        }
+        std::mem::forget(stale_links);
+        std::mem::forget(stale); // attached, and never detached by us
+        for (_, t) in CGROUP_PROGRAMS {
+            assert_eq!(attached_ids(&cgroup, t).unwrap().len(), 1);
+        }
+    }
+
+    // ── production attach, disarmed
+    let mut links = Vec::new();
+    let (_, exit_attached) = attach_disarmed(&mut ebpf, &setup, &mut links).expect("attach");
+    assert!(exit_attached);
+    for (p, t) in CGROUP_PROGRAMS {
+        let ours = ebpf.program(p).unwrap().info().unwrap().id();
+        let ids = attached_ids(&cgroup, t).unwrap();
+        assert!(ids.contains(&ours), "{p} attached");
+        if !uses_links() {
+            assert_eq!(ids, vec![ours], "{p}: the stale copy was removed");
+        }
+        println!("MATRIX {p} attach=OK");
+    }
+    for p in [EXIT_TP, SET_ULP, accept] {
+        println!("MATRIX {p} attach=OK"); // required by attach_disarmed here
+    }
+
+    // ── the startup window: sockets created (and established) before
+    // arming stay uninitialised for life
+    let lw = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut tw = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
+    let (mut tw_srv, _) = lw.accept().unwrap();
+    let ulp = set_tls_ulp(&tw);
+    println!("WINDOW tls_ulp={ulp}");
+    let ru_w = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let su_w = UdpSocket::bind("127.0.0.1:0").unwrap();
+    su_w.connect(ru_w.local_addr().unwrap()).unwrap();
+
+    // ── arm: a live selected process and one that already exited
+    let mut sel = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let (sel_pid, gone_pid) = (sel.id(), gone.id());
+    arm(&mut ebpf, Some(&[sel_pid, gone_pid])).unwrap();
+    assert!(pid_listed(&ebpf, sel_pid));
+    assert!(!pid_listed(&ebpf, gone_pid), "a dead pid is not published");
+
+    let uninit0 = drops(&ebpf, DROP_UNINIT);
+    let mut buf = [0u8; 64];
+    tw.write_all(b"window").unwrap();
+    let _ = tw_srv.read(&mut buf).unwrap();
+    su_w.send(b"window").unwrap();
+    let _ = ru_w.recv(&mut buf).unwrap();
+    let ev = drain(&mut ring);
+    for c in [cookie(&tw), cookie(&tw_srv), cookie(&su_w), cookie(&ru_w)] {
+        assert!(
+            !ev.iter().any(|e| e.0 == c),
+            "window socket exported: {ev:?}"
+        );
+    }
+    assert!(state(&ebpf, &tw).is_none() && state(&ebpf, &su_w).is_none());
+    assert!(
+        drops(&ebpf, DROP_UNINIT) >= uninit0 + 4,
+        "window sockets counted uninit"
+    );
+
+    // After arming: a socket that attaches the tls ULP is marked, and its
+    // payload dropped outside unscoped full.
+    if ulp {
+        let mut tk = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
+        let (mut tk_srv, _) = lw.accept().unwrap();
+        assert!(set_tls_ulp(&tk));
+        assert_ne!(
+            state(&ebpf, &tk).unwrap().flags & FLAG_KTLS,
+            0,
+            "KTLS marked"
+        );
+        let k0 = drops(&ebpf, DROP_KTLS_PAYLOAD);
+        tk.write_all(b"ktls").unwrap();
+        let _ = tk_srv.read(&mut buf).unwrap();
+        assert!(!drain(&mut ring).iter().any(|e| e.0 == cookie(&tk)));
+        assert!(drops(&ebpf, DROP_KTLS_PAYLOAD) > k0);
+    }
+
+    // ── runtime: unscoped full
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -343,12 +445,46 @@ fn scope_programs_load_attach_and_hold() {
     let _ = s4.read(&mut buf).unwrap();
     let ev = drain(&mut ring);
     assert!(
-        ev.iter().any(|e| e.0 == cookie(&c4) && e.3 == b"listed"),
-        "listed creator: captured {ev:?}"
+        ev.iter()
+            .any(|e| e.0 == cookie(&c4) && e.2 == 0 && e.3 == b"listed"),
+        "listed creator: captured, with its offset outside head_only: {ev:?}"
     );
     assert!(
         !ev.iter().any(|e| e.0 == cookie(&c3)),
         "old verdict stays OUT"
+    );
+
+    // ── a selected process exits; its pid is reused by another process
+    sel.kill().unwrap();
+    sel.wait().unwrap();
+    assert!(!pid_listed(&ebpf, sel_pid), "exit removed the pid");
+    {
+        // Unlist this process, so the server side below is out of scope too.
+        let mut pids: HashMap<_, u32, u8> =
+            HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+        pids.remove(&me).unwrap();
+    }
+    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = rl.local_addr().unwrap().port();
+    rl.set_nonblocking(true).unwrap();
+    let reused = spawn_with_pid(sel_pid, port, "reuse");
+    println!("PID_REUSE reused={reused}");
+    assert!(reused, "could not reuse pid {sel_pid}");
+    let mut got = Vec::new();
+    while let Ok((mut c, _)) = rl.accept() {
+        c.set_nonblocking(false).unwrap();
+        let mut b = Vec::new();
+        let _ = c.read_to_end(&mut b);
+        got.extend(b);
+    }
+    assert!(
+        got.ends_with(b"reuse"),
+        "the reusing process connected: {got:?}"
+    );
+    let ev = drain(&mut ring);
+    assert!(
+        !ev.iter().any(|e| e.3.as_slice() == b"reuse"),
+        "a reused pid is not selected: {ev:?}"
     );
 
     for r in 0..SCOPE_DROP_REASONS {
