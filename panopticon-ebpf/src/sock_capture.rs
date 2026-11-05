@@ -79,9 +79,10 @@ pub static SOCK_STATE: SockStateMap = SockStateMap {
 
 const SK_STORAGE_GET_F_CREATE: u64 = 1;
 
-/// The socket's state, or null. Only `cgroup/sock_create` creates state,
-/// so "state exists" means "created while this agent ran": a socket that
-/// predates the agent never gets state and is never initialised (§2.1).
+/// The socket's state, or null. State is created only for sockets created
+/// while this agent runs: by `cgroup/sock_create`, and by PASSIVE_ESTABLISHED
+/// for a child of a listener that predates the agent (§3.1). A socket that
+/// itself predates the agent never gets state and is never initialised (§2.1).
 #[inline(always)]
 fn state_of(sk: *mut c_void, create: bool) -> *mut SockState {
     let flags = if create { SK_STORAGE_GET_F_CREATE } else { 0 };
@@ -278,9 +279,14 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
     if sk.is_null() {
         return;
     }
-    let st = state_of(sk as *mut c_void, false);
+    // A child of a pre-agent listener has nothing to clone: it is a new
+    // socket, so it gets fresh state here. Its owner is unknown (epoch 0
+    // never matches), so pid_filter selects it only from accept() on
+    // (no_owner before, §3.1). An active socket without state predates the
+    // agent and stays uninitialised.
+    let st = state_of(sk as *mut c_void, !active);
     if st.is_null() {
-        return; // predates the agent, or a child of a listener that does
+        return;
     }
     let old_flags = rd!(st, flags);
     if old_flags & FLAG_REUSED != 0 {
@@ -532,7 +538,8 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         let mut off = STREAM_OFF_UNKNOWN;
         if initialised && !udp && rd!(st, flags) & FLAG_BASELINE != 0 {
             if let Some(o) = tcp_offset(tp, st, direction, pkt.seq) {
-                off = o as u64;
+                // A segment from before the origin has no position.
+                off = if o < 0 { STREAM_OFF_UNKNOWN } else { o as u64 };
             }
         }
         let st = if initialised { st } else { null_mut() };

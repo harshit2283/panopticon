@@ -133,6 +133,11 @@ fn scope_programs_load_attach_and_hold() {
         }
     }
 
+    // Sockets that predate the attach: a listener and a connected client.
+    let pre_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut pre_client = TcpStream::connect(pre_listener.local_addr().unwrap()).unwrap();
+    let (_pre_server, _) = pre_listener.accept().unwrap();
+
     // ── scope programs onto the cgroup2 root (writers first)
     let root = discover_cgroup_root(
         &std::env::var("PANOPTICON_CGROUP2").unwrap_or_else(|_| "auto".into()),
@@ -235,6 +240,21 @@ fn scope_programs_load_attach_and_hold() {
             && e.3 == b"hello"),
         "server ingress at offset 0: {ev:?}"
     );
+
+    // Pre-agent sockets: no state, ever. A new child of a pre-agent
+    // listener is initialised; its owner is unknown, its acceptor recorded.
+    pre_client.write_all(b"old").unwrap();
+    assert!(
+        state(&ebpf, &pre_client).is_none(),
+        "pre-agent socket has no state"
+    );
+    assert!(state(&ebpf, &pre_listener).is_none());
+    let late = TcpStream::connect(pre_listener.local_addr().unwrap()).unwrap();
+    let (late_child, _) = pre_listener.accept().unwrap();
+    let lc = state(&ebpf, &late_child).expect("child of a pre-agent listener");
+    assert_eq!(lc.init_cookie, cookie(&late_child));
+    assert_eq!((lc.owner_tgid, lc.acceptor_tgid, lc.pid_epoch), (0, me, 77));
+    drop(late);
 
     // connect(AF_UNSPEC): revoked for good (REUSED).
     let unspec = libc::sockaddr {
