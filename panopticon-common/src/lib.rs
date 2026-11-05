@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod scope;
+
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// Maximum payload bytes captured per event.
