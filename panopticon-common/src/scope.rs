@@ -57,6 +57,131 @@ pub const VERDICT_IN: u8 = 1;
 pub const VERDICT_OUT_PID: u8 = 2;
 pub const VERDICT_OUT_CGROUP: u8 = 3;
 pub const VERDICT_OUT_SAMPLE: u8 = 4;
+/// `pid_filter` only, and no owner or acceptor recorded under this epoch.
+pub const VERDICT_OUT_NO_OWNER: u8 = 5;
+
+// `CONFIG_SCOPE_MODE` bits. 0 is unscoped `full`: capture as before, no
+// socket state needed. Any bit set is a restricted mode.
+/// `pid_filter` is a selector.
+pub const SCOPE_SEL_PID: u64 = 1 << 0;
+/// `cgroup_filter` / `pod_filter` is a selector (`CGROUP_ALLOW`).
+pub const SCOPE_SEL_CGROUP: u64 = 1 << 1;
+/// `sampling_mode = "connection_sample"`.
+pub const SCOPE_SAMPLE: u64 = 1 << 2;
+/// `sampling_mode = "head_only"`.
+pub const SCOPE_HEAD: u64 = 1 << 3;
+
+/// Unscoped `full`: the only mode that captures sockets without state,
+/// kTLS payload, and TLS plaintext from every process.
+#[inline(always)]
+pub fn is_unscoped_full(mode: u64) -> bool {
+    mode == 0
+}
+
+/// Only `full` (scoped or not) exports TLS plaintext (DESIGN §3.5).
+#[inline(always)]
+pub fn tls_mode_allowed(mode: u64) -> bool {
+    mode & (SCOPE_SAMPLE | SCOPE_HEAD) == 0
+}
+
+// `SCOPE_DROPS` indices (DESIGN §5). `ring_full` stays `KERNEL_DROPS`.
+pub const DROP_NOT_ELIGIBLE: u32 = 0;
+pub const DROP_UNINIT: u32 = 1;
+pub const DROP_NO_OWNER: u32 = 2;
+pub const DROP_OUT_OF_SCOPE: u32 = 3;
+pub const DROP_SAMPLED_OUT: u32 = 4;
+pub const DROP_NO_BASELINE: u32 = 5;
+pub const DROP_HEAD_CUT: u32 = 6;
+pub const DROP_HEAD_INCOHERENT: u32 = 7;
+pub const DROP_TLS_MODE: u32 = 8;
+pub const DROP_TLS_OUT_OF_SCOPE: u32 = 9;
+pub const DROP_KTLS_PAYLOAD: u32 = 10;
+pub const SCOPE_DROP_REASONS: u32 = 11;
+/// Metric label of each `DROP_*` index.
+pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
+    "not_eligible",
+    "uninit",
+    "no_owner",
+    "out_of_scope",
+    "sampled_out",
+    "no_baseline",
+    "head_cut",
+    "head_incoherent",
+    "tls_mode",
+    "tls_out_of_scope",
+    "ktls_payload",
+];
+
+/// `DataEvent::role`.
+pub const ROLE_UNKNOWN: u8 = 0;
+pub const ROLE_CLIENT: u8 = 1;
+pub const ROLE_SERVER: u8 = 2;
+
+/// `DataEvent::stream_off` when no offset was computed.
+pub const STREAM_OFF_UNKNOWN: u64 = u64::MAX;
+
+/// The event role from `SockState::flags`.
+#[inline(always)]
+pub fn role_of(flags: u8) -> u8 {
+    if flags & FLAG_ROLE_CLIENT != 0 {
+        ROLE_CLIENT
+    } else if flags & FLAG_ROLE_SERVER != 0 {
+        ROLE_SERVER
+    } else {
+        ROLE_UNKNOWN
+    }
+}
+
+/// `pid_filter` inputs of one socket, judged under the current epoch: a
+/// different epoch means nothing recorded counts (`no_owner`).
+/// Returns `(listed, owner_known)`.
+#[inline(always)]
+pub fn pid_inputs(s: &SockState, epoch: u32) -> (bool, bool) {
+    if s.pid_epoch != epoch {
+        return (false, false);
+    }
+    (
+        s.pid_bits & (OWNER_LISTED | ACCEPTOR_LISTED) != 0,
+        s.owner_tgid != 0 || s.acceptor_tgid != 0,
+    )
+}
+
+/// The scope verdict of an initialised socket in restricted `mode`.
+/// Selectors combine as a union; sampling applies after scope.
+#[inline(always)]
+pub fn verdict(
+    mode: u64,
+    pid_listed: bool,
+    pid_owner_known: bool,
+    cgroup_in: bool,
+    sampled_in: bool,
+) -> u8 {
+    let pid_sel = mode & SCOPE_SEL_PID != 0;
+    let cg_sel = mode & SCOPE_SEL_CGROUP != 0;
+    if (pid_sel || cg_sel) && !((pid_sel && pid_listed) || (cg_sel && cgroup_in)) {
+        return if cg_sel {
+            VERDICT_OUT_CGROUP
+        } else if pid_owner_known {
+            VERDICT_OUT_PID
+        } else {
+            VERDICT_OUT_NO_OWNER
+        };
+    }
+    if mode & SCOPE_SAMPLE != 0 && !sampled_in {
+        return VERDICT_OUT_SAMPLE;
+    }
+    VERDICT_IN
+}
+
+/// The `SCOPE_DROPS` index for an OUT verdict.
+#[inline(always)]
+pub fn drop_reason(verdict: u8) -> u32 {
+    match verdict {
+        VERDICT_OUT_SAMPLE => DROP_SAMPLED_OUT,
+        VERDICT_OUT_NO_OWNER => DROP_NO_OWNER,
+        _ => DROP_OUT_OF_SCOPE,
+    }
+}
 
 /// Pack a verdict with the scope generation it was computed under.
 #[inline(always)]
@@ -150,10 +275,30 @@ pub fn reserved_take(prev: u64, len: u32, n: u64) -> u32 {
 }
 
 /// `true` if a socket's draw is in a sample whose threshold is
-/// `rate * 2^32` (computed in user space; rate 1 is `full`, never sampled).
+/// `rate * 2^32` ([`sample_threshold`]). u64, so rate 1 (2^32) takes every draw.
 #[inline(always)]
-pub fn in_sample(draw: u32, threshold: u32) -> bool {
-    draw < threshold
+pub fn in_sample(draw: u32, threshold: u64) -> bool {
+    (draw as u64) < threshold
+}
+
+/// `CONFIG_SAMPLE_THRESHOLD` for `sample_rate`: `rate * 2^32`, clamped to
+/// `[0, 2^32]`; NaN gives 0 (sample nothing).
+pub fn sample_threshold(rate: f64) -> u64 {
+    const FULL: f64 = (1u64 << 32) as f64;
+    if rate.is_nan() || rate <= 0.0 {
+        return 0;
+    }
+    if rate >= 1.0 {
+        return 1 << 32;
+    }
+    (rate * FULL) as u64
+}
+
+/// UDP `head_only` pre-check (DESIGN §3.3): once the budget counter holds
+/// `n` or more, a datagram reserves nothing, so the counter never wraps.
+#[inline(always)]
+pub fn udp_should_reserve(counter: u64, n: u64) -> bool {
+    counter < n
 }
 
 #[cfg(test)]
@@ -265,6 +410,109 @@ mod tests {
     fn sample_threshold_is_strict() {
         assert!(!in_sample(0, 0)); // rate 0 takes nothing
         assert!(in_sample(0, 1));
-        assert!(!in_sample(u32::MAX, u32::MAX));
+        assert!(!in_sample(u32::MAX, u32::MAX as u64));
+        assert!(in_sample(u32::MAX, sample_threshold(1.0))); // rate 1 takes all
+    }
+
+    #[test]
+    fn sample_threshold_clamps() {
+        assert_eq!(sample_threshold(0.0), 0);
+        assert_eq!(sample_threshold(-1.0), 0);
+        assert_eq!(sample_threshold(f64::NAN), 0);
+        assert_eq!(sample_threshold(0.5), 1 << 31);
+        assert_eq!(sample_threshold(1.0), 1 << 32);
+        assert_eq!(sample_threshold(7.0), 1 << 32);
+    }
+
+    #[test]
+    fn udp_pre_check_stops_the_counter_near_n() {
+        // Every CPU passes the pre-check at most once more after the counter
+        // crosses N, so it ends below N + one datagram per CPU, far from wrap.
+        let n = 4096u64;
+        let mut counter = 0u64;
+        let mut copied = 0u64;
+        for _ in 0..10_000 {
+            let len = 65_507u32; // largest UDP payload
+            if udp_should_reserve(counter, n) {
+                copied += reserved_take(counter, len, n) as u64;
+                counter += len as u64;
+            }
+        }
+        assert_eq!(copied, n);
+        assert!(counter < n + 65_507);
+        assert!(!udp_should_reserve(u64::MAX, n));
+    }
+
+    #[test]
+    fn modes() {
+        assert!(is_unscoped_full(0));
+        assert!(!is_unscoped_full(SCOPE_SEL_PID));
+        assert!(tls_mode_allowed(SCOPE_SEL_PID | SCOPE_SEL_CGROUP));
+        assert!(!tls_mode_allowed(SCOPE_SAMPLE));
+        assert!(!tls_mode_allowed(SCOPE_HEAD | SCOPE_SEL_PID));
+    }
+
+    #[test]
+    fn pid_inputs_need_the_current_epoch() {
+        let mut s = SockState {
+            pid_epoch: 7,
+            pid_bits: OWNER_LISTED,
+            owner_tgid: 42,
+            ..Default::default()
+        };
+        assert_eq!(pid_inputs(&s, 7), (true, true));
+        assert_eq!(pid_inputs(&s, 8), (false, false)); // other start: no_owner
+        s.pid_bits = 0;
+        assert_eq!(pid_inputs(&s, 7), (false, true));
+        s.owner_tgid = 0;
+        assert_eq!(pid_inputs(&s, 7), (false, false));
+        s.acceptor_tgid = 9;
+        s.pid_bits = ACCEPTOR_LISTED;
+        assert_eq!(pid_inputs(&s, 7), (true, true));
+    }
+
+    #[test]
+    fn verdict_is_a_union_then_a_sample() {
+        let pid = SCOPE_SEL_PID;
+        let cg = SCOPE_SEL_CGROUP;
+        assert_eq!(verdict(pid, true, true, false, false), VERDICT_IN);
+        assert_eq!(verdict(pid, false, true, true, true), VERDICT_OUT_PID);
+        assert_eq!(verdict(pid, false, false, true, true), VERDICT_OUT_NO_OWNER);
+        assert_eq!(verdict(cg, true, true, false, true), VERDICT_OUT_CGROUP);
+        assert_eq!(verdict(cg, false, false, true, true), VERDICT_IN);
+        assert_eq!(verdict(pid | cg, false, false, true, true), VERDICT_IN);
+        assert_eq!(verdict(pid | cg, true, true, false, true), VERDICT_IN);
+        assert_eq!(
+            verdict(pid | cg, false, false, false, true),
+            VERDICT_OUT_CGROUP
+        );
+        // Sampling applies only after scope.
+        let s = SCOPE_SAMPLE;
+        assert_eq!(verdict(s, false, false, false, false), VERDICT_OUT_SAMPLE);
+        assert_eq!(verdict(s, false, false, false, true), VERDICT_IN);
+        assert_eq!(verdict(pid | s, false, true, false, true), VERDICT_OUT_PID);
+        assert_eq!(
+            verdict(pid | s, true, true, false, false),
+            VERDICT_OUT_SAMPLE
+        );
+        // head_only alone selects everything (the cut is separate).
+        assert_eq!(verdict(SCOPE_HEAD, false, false, false, false), VERDICT_IN);
+    }
+
+    #[test]
+    fn drop_reasons_cover_every_out_verdict() {
+        assert_eq!(drop_reason(VERDICT_OUT_PID), DROP_OUT_OF_SCOPE);
+        assert_eq!(drop_reason(VERDICT_OUT_CGROUP), DROP_OUT_OF_SCOPE);
+        assert_eq!(drop_reason(VERDICT_OUT_SAMPLE), DROP_SAMPLED_OUT);
+        assert_eq!(drop_reason(VERDICT_OUT_NO_OWNER), DROP_NO_OWNER);
+        assert_eq!(SCOPE_DROP_NAMES[DROP_KTLS_PAYLOAD as usize], "ktls_payload");
+        assert_eq!(SCOPE_DROP_NAMES.len(), SCOPE_DROP_REASONS as usize);
+    }
+
+    #[test]
+    fn roles() {
+        assert_eq!(role_of(FLAG_ROLE_CLIENT | FLAG_BASELINE), ROLE_CLIENT);
+        assert_eq!(role_of(FLAG_ROLE_SERVER | FLAG_KTLS), ROLE_SERVER);
+        assert_eq!(role_of(FLAG_REUSED), ROLE_UNKNOWN);
     }
 }

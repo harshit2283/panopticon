@@ -284,6 +284,6 @@ unsafe fn populate_sock_event(
         (*event).tcp_flags = 0;
         (*event).tcp_seq = 0;
         (*event).tcp_ack = 0;
-        (*event)._pad = [0; 6];
+        crate::maps::clear_scope_fields(event);
     }
 }

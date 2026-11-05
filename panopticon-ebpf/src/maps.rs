@@ -9,8 +9,9 @@ use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
-    DATA_RING_SHARDS, DataEvent, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER,
-    TLS_SCRATCH_SIZE, ring_shard,
+    DATA_RING_SHARDS, DataEvent, MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE,
+    MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
+    scope::{SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
 /// Events lost because a DATA_EVENTS shard was full (user space not keeping
@@ -23,6 +24,42 @@ pub static KERNEL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 pub fn count_kernel_drop() {
     if let Some(n) = KERNEL_DROPS.get_ptr_mut(0) {
         unsafe { *n += 1 };
+    }
+}
+
+// ── Capture scope (sock_capture.rs) ────────────────────────────────────────
+// Never pinned (DESIGN §2.1): each agent start begins with empty state.
+
+/// Events the scope rules dropped, per `scope::DROP_*` reason, per CPU.
+#[map]
+pub static SCOPE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(SCOPE_DROP_REASONS, 0);
+
+/// Count one event dropped for `reason` (`scope::DROP_*`).
+#[inline(always)]
+pub fn count_scope_drop(reason: u32) {
+    if let Some(n) = SCOPE_DROPS.get_ptr_mut(reason) {
+        unsafe { *n += 1 };
+    }
+}
+
+/// `cgroup_filter` / `pod_filter`: selected cgroup v2 ids. User space
+/// updates it, then bumps CONFIG_SCOPE_GEN.
+#[map]
+pub static CGROUP_ALLOW: HashMap<u64, u8> = HashMap::with_max_entries(MAX_CGROUP_ALLOW, 0);
+
+/// Zero the DataEvent fields only the cgroup_skb backend fills, so other
+/// producers never leak a previous event's values (ring memory and the
+/// scratch map are not zeroed).
+#[inline(always)]
+pub fn clear_scope_fields(event: *mut DataEvent) {
+    unsafe {
+        (*event).cgroup_id = 0;
+        (*event).stream_off = STREAM_OFF_UNKNOWN;
+        (*event).owner_tgid = 0;
+        (*event).acceptor_tgid = 0;
+        (*event).scope_gen = 0;
+        (*event).role = 0;
+        (*event)._pad = [0; 1];
     }
 }
 

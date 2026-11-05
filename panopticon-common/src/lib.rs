@@ -19,6 +19,9 @@ pub const CONFIG_ENTRIES: u32 = 16;
 /// Maximum entries in the PID filter map.
 pub const MAX_PID_FILTER: u32 = 4096;
 
+/// Maximum entries in the CGROUP_ALLOW map (selected cgroup ids).
+pub const MAX_CGROUP_ALLOW: u32 = 4096;
+
 /// Size of the per-CPU TLS scratch map.
 pub const TLS_SCRATCH_SIZE: u32 = 8192;
 
@@ -44,7 +47,18 @@ pub const CONFIG_COOKIE_KEY: u32 = 6;
 /// Non-zero: TC also emits payload-less SYN segments (`sampling_mode =
 /// "head_only"` counts each TCP direction's bytes from its SYN).
 pub const CONFIG_TCP_SYN_EVENTS: u32 = 7;
-const _: () = assert!(CONFIG_TCP_SYN_EVENTS < CONFIG_ENTRIES);
+/// Capture-scope generation (`scope::verdict_word`). User space updates
+/// `CGROUP_ALLOW` first, then increments this.
+pub const CONFIG_SCOPE_GEN: u32 = 8;
+/// Random per agent start; `SockState::pid_bits` are valid only under it.
+pub const CONFIG_PID_EPOCH: u32 = 9;
+/// `connection_sample` threshold, `sample_rate * 2^32` (`scope::sample_threshold`).
+pub const CONFIG_SAMPLE_THRESHOLD: u32 = 10;
+/// `head_only_bytes` (N).
+pub const CONFIG_HEAD_BYTES: u32 = 11;
+/// `scope::SCOPE_*` bits. 0 is unscoped `full`, the legacy behaviour.
+pub const CONFIG_SCOPE_MODE: u32 = 12;
+const _: () = assert!(CONFIG_SCOPE_MODE < CONFIG_ENTRIES);
 
 /// Bit 63 of a connection key: set for TLS connection keys (user space),
 /// clear for TC flow cookies, so the two key spaces never overlap.
@@ -135,7 +149,7 @@ impl TlsLibrary {
 
 /// Network data event (TC capture or TLS intercept).
 ///
-/// At 4168 bytes this MUST be allocated via RingBuf reserve in eBPF,
+/// At 4192 bytes this MUST be allocated via RingBuf reserve in eBPF,
 /// never on the 512-byte BPF stack.
 /// Manual `Debug` implementation that omits the 4KB payload array
 /// to avoid flooding logs when debugging events.
@@ -171,6 +185,11 @@ pub struct DataEvent {
     /// per-connection object (OpenSSL `SSL*`, Go `*tls.Conn`): unique per live
     /// connection within the process and shared by its reads and writes.
     pub socket_cookie: u64,
+    /// cgroup v2 id of the socket (cgroup_skb backend); 0 otherwise.
+    pub cgroup_id: u64,
+    /// Stream offset of the first captured byte (TCP), or the UDP budget
+    /// reservation's start; `scope::STREAM_OFF_UNKNOWN` if not computed.
+    pub stream_off: u64,
     // 4-byte aligned fields
     pub event_type: EventType,
     pub direction: Direction,
@@ -192,6 +211,12 @@ pub struct DataEvent {
     /// out-of-window segments (protocol/fsm.rs `TcpTracker`).
     pub tcp_seq: u32,
     pub tcp_ack: u32,
+    /// Socket creator tgid (`SockState::owner_tgid`); 0 if unknown.
+    pub owner_tgid: u32,
+    /// Tgid that accepted the socket; 0 if none or unknown.
+    pub acceptor_tgid: u32,
+    /// `CONFIG_SCOPE_GEN` the event's scope verdict was computed under.
+    pub scope_gen: u32,
     // 2-byte aligned fields
     pub src_port: u16,
     pub dst_port: u16,
@@ -199,7 +224,9 @@ pub struct DataEvent {
     pub ip_proto: u8,
     /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
     pub tcp_flags: u8,
-    pub _pad: [u8; 6],
+    /// `scope::ROLE_*`.
+    pub role: u8,
+    pub _pad: [u8; 1],
     // Payload last (largest field)
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
@@ -279,6 +306,8 @@ impl ProcessEvent {
 struct RawDataEvent {
     pub timestamp_ns: u64,
     pub socket_cookie: u64,
+    pub cgroup_id: u64,
+    pub stream_off: u64,
     pub event_type: u32,
     pub direction: u32,
     pub pid: u32,
@@ -290,12 +319,16 @@ struct RawDataEvent {
     pub tls_library: u32,
     pub tcp_seq: u32,
     pub tcp_ack: u32,
+    pub owner_tgid: u32,
+    pub acceptor_tgid: u32,
+    pub scope_gen: u32,
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
     /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
     pub tcp_flags: u8,
-    pub _pad: [u8; 6],
+    pub role: u8,
+    pub _pad: [u8; 1],
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -304,6 +337,8 @@ impl RawDataEvent {
         Some(DataEvent {
             timestamp_ns: self.timestamp_ns,
             socket_cookie: self.socket_cookie,
+            cgroup_id: self.cgroup_id,
+            stream_off: self.stream_off,
             event_type: EventType::from_u32(self.event_type)?,
             direction: Direction::from_u32(self.direction)?,
             pid: self.pid,
@@ -315,10 +350,14 @@ impl RawDataEvent {
             tls_library: TlsLibrary::from_u32(self.tls_library)?,
             tcp_seq: self.tcp_seq,
             tcp_ack: self.tcp_ack,
+            owner_tgid: self.owner_tgid,
+            acceptor_tgid: self.acceptor_tgid,
+            scope_gen: self.scope_gen,
             src_port: self.src_port,
             dst_port: self.dst_port,
             ip_proto: self.ip_proto,
             tcp_flags: self.tcp_flags,
+            role: self.role,
             _pad: self._pad,
             payload: self.payload,
         })
@@ -464,7 +503,7 @@ mod tests {
     fn test_data_event_size() {
         assert_eq!(
             size_of::<DataEvent>(),
-            4168,
+            4192,
             "DataEvent size changed! This breaks kernel↔userspace ABI."
         );
     }
@@ -510,23 +549,49 @@ mod tests {
     fn test_data_event_field_offsets() {
         assert_eq!(offset_of!(DataEvent, timestamp_ns), 0);
         assert_eq!(offset_of!(DataEvent, socket_cookie), 8);
-        assert_eq!(offset_of!(DataEvent, event_type), 16);
-        assert_eq!(offset_of!(DataEvent, direction), 20);
-        assert_eq!(offset_of!(DataEvent, pid), 24);
-        assert_eq!(offset_of!(DataEvent, tgid), 28);
-        assert_eq!(offset_of!(DataEvent, src_addr), 32);
-        assert_eq!(offset_of!(DataEvent, dst_addr), 36);
-        assert_eq!(offset_of!(DataEvent, payload_len), 40);
-        assert_eq!(offset_of!(DataEvent, orig_len), 44);
-        assert_eq!(offset_of!(DataEvent, tls_library), 48);
-        assert_eq!(offset_of!(DataEvent, tcp_seq), 52);
-        assert_eq!(offset_of!(DataEvent, tcp_ack), 56);
-        assert_eq!(offset_of!(DataEvent, src_port), 60);
-        assert_eq!(offset_of!(DataEvent, dst_port), 62);
-        assert_eq!(offset_of!(DataEvent, ip_proto), 64);
-        assert_eq!(offset_of!(DataEvent, tcp_flags), 65);
-        assert_eq!(offset_of!(DataEvent, _pad), 66);
-        assert_eq!(offset_of!(DataEvent, payload), 72);
+        assert_eq!(offset_of!(DataEvent, cgroup_id), 16);
+        assert_eq!(offset_of!(DataEvent, stream_off), 24);
+        assert_eq!(offset_of!(DataEvent, event_type), 32);
+        assert_eq!(offset_of!(DataEvent, direction), 36);
+        assert_eq!(offset_of!(DataEvent, pid), 40);
+        assert_eq!(offset_of!(DataEvent, tgid), 44);
+        assert_eq!(offset_of!(DataEvent, src_addr), 48);
+        assert_eq!(offset_of!(DataEvent, dst_addr), 52);
+        assert_eq!(offset_of!(DataEvent, payload_len), 56);
+        assert_eq!(offset_of!(DataEvent, orig_len), 60);
+        assert_eq!(offset_of!(DataEvent, tls_library), 64);
+        assert_eq!(offset_of!(DataEvent, tcp_seq), 68);
+        assert_eq!(offset_of!(DataEvent, tcp_ack), 72);
+        assert_eq!(offset_of!(DataEvent, owner_tgid), 76);
+        assert_eq!(offset_of!(DataEvent, acceptor_tgid), 80);
+        assert_eq!(offset_of!(DataEvent, scope_gen), 84);
+        assert_eq!(offset_of!(DataEvent, src_port), 88);
+        assert_eq!(offset_of!(DataEvent, dst_port), 90);
+        assert_eq!(offset_of!(DataEvent, ip_proto), 92);
+        assert_eq!(offset_of!(DataEvent, tcp_flags), 93);
+        assert_eq!(offset_of!(DataEvent, role), 94);
+        assert_eq!(offset_of!(DataEvent, _pad), 95);
+        assert_eq!(offset_of!(DataEvent, payload), 96);
+        assert_eq!(DATA_EVENT_HEADER_LEN, 96);
+    }
+
+    #[test]
+    fn raw_data_event_mirrors_data_event() {
+        use core::mem::offset_of;
+        assert_eq!(size_of::<RawDataEvent>(), size_of::<DataEvent>());
+        assert_eq!(
+            offset_of!(RawDataEvent, payload),
+            offset_of!(DataEvent, payload)
+        );
+        assert_eq!(offset_of!(RawDataEvent, role), offset_of!(DataEvent, role));
+        assert_eq!(
+            offset_of!(RawDataEvent, scope_gen),
+            offset_of!(DataEvent, scope_gen)
+        );
+        assert_eq!(
+            offset_of!(RawDataEvent, event_type),
+            offset_of!(DataEvent, event_type)
+        );
     }
 
     #[test]
@@ -630,6 +695,18 @@ mod tests {
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
         assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
         assert!(CONFIG_COOKIE_KEY < CONFIG_ENTRIES);
+        let scope = [
+            CONFIG_SCOPE_GEN,
+            CONFIG_PID_EPOCH,
+            CONFIG_SAMPLE_THRESHOLD,
+            CONFIG_HEAD_BYTES,
+            CONFIG_SCOPE_MODE,
+        ];
+        for (i, &idx) in scope.iter().enumerate() {
+            assert!(idx < CONFIG_ENTRIES);
+            assert!(idx > CONFIG_TCP_SYN_EVENTS, "scope index {idx} reuses one");
+            assert!(!scope[..i].contains(&idx), "duplicate index {idx}");
+        }
         assert!(DATA_RING_SHARDS.is_power_of_two());
     }
 
@@ -638,14 +715,16 @@ mod tests {
     #[test]
     fn test_data_event_no_implicit_padding() {
         let expected = 8 + 8 // timestamp_ns, socket_cookie
+            + 8 + 8           // cgroup_id, stream_off
             + 4 + 4           // event_type, direction
             + 4 + 4           // pid, tgid
             + 4 + 4           // src_addr, dst_addr
             + 4 + 4           // payload_len, orig_len
             + 4               // tls_library
             + 4 + 4           // tcp_seq, tcp_ack
+            + 4 + 4 + 4       // owner_tgid, acceptor_tgid, scope_gen
             + 2 + 2           // src_port, dst_port
-            + 1 + 1 + 6       // ip_proto, tcp_flags, _pad
+            + 1 + 1 + 1 + 1   // ip_proto, tcp_flags, role, _pad
             + MAX_PAYLOAD_SIZE;
         assert_eq!(
             size_of::<DataEvent>(),
@@ -770,7 +849,8 @@ mod record_tests {
         e.payload_len = MAX_PAYLOAD_SIZE as u32 + 1;
         assert_eq!(data_event_record_len(as_bytes(&e)), None);
         let mut bytes = [0u8; DATA_EVENT_HEADER_LEN];
-        bytes[16..20].copy_from_slice(&9999u32.to_ne_bytes()); // event_type
+        let at = core::mem::offset_of!(DataEvent, event_type);
+        bytes[at..at + 4].copy_from_slice(&9999u32.to_ne_bytes());
         assert_eq!(data_event_record_len(&bytes), None);
         let mut out: DataEvent = unsafe { core::mem::zeroed() };
         out.pid = 7;
@@ -882,8 +962,9 @@ mod user_tests {
     #[test]
     fn test_parse_data_event_bytes_rejects_invalid_enum() {
         let mut bytes = [0u8; size_of::<DataEvent>()];
-        // event_type offset = 16, set to invalid discriminant 9999
-        bytes[16..20].copy_from_slice(&9999u32.to_ne_bytes());
+        // set event_type to the invalid discriminant 9999
+        let at = core::mem::offset_of!(DataEvent, event_type);
+        bytes[at..at + 4].copy_from_slice(&9999u32.to_ne_bytes());
         assert!(parse_data_event_bytes(&bytes).is_none());
     }
 }

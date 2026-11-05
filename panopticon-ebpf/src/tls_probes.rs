@@ -579,7 +579,7 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).tcp_flags = 0;
         (*event).tcp_seq = 0;
         (*event).tcp_ack = 0;
-        (*event)._pad = [0; 6];
+        crate::maps::clear_scope_fields(event);
         (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE. The u32

@@ -107,20 +107,28 @@ fn test_data_event_specific_byte_offsets() {
     event.orig_len = 65_000;
     event.tcp_seq = 0xA1B2_C3D4;
     event.tcp_ack = 0x0506_0708;
+    event.cgroup_id = 0x1122_3344_5566_7788;
+    event.stream_off = 4095;
+    event.owner_tgid = 31;
+    event.acceptor_tgid = 32;
+    event.scope_gen = 33;
+    event.role = 2;
 
     let bytes = as_bytes(&event);
     let u32_at =
         |o: usize| u32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-    // orig_len at offset 44
-    assert_eq!(u32_at(44), 65_000);
-    // tcp_seq / tcp_ack at offsets 52 / 56
-    assert_eq!(u32_at(52), 0xA1B2_C3D4);
-    assert_eq!(u32_at(56), 0x0506_0708);
-    // src_port is at offset 60 (2 bytes, native endian)
-    let src_port = u16::from_ne_bytes([bytes[60], bytes[61]]);
+    let u64_at = |o: usize| u64::from_ne_bytes(bytes[o..o + 8].try_into().unwrap());
+    assert_eq!(u64_at(16), 0x1122_3344_5566_7788); // cgroup_id
+    assert_eq!(u64_at(24), 4095); // stream_off
+    assert_eq!(u32_at(60), 65_000); // orig_len
+    assert_eq!(u32_at(68), 0xA1B2_C3D4); // tcp_seq
+    assert_eq!(u32_at(72), 0x0506_0708); // tcp_ack
+    assert_eq!((u32_at(76), u32_at(80), u32_at(84)), (31, 32, 33)); // owner, acceptor, gen
+    // src_port is at offset 88 (2 bytes, native endian)
+    let src_port = u16::from_ne_bytes([bytes[88], bytes[89]]);
     assert_eq!(src_port, 0x1F90);
-    // ip_proto at offset 64
-    assert_eq!(bytes[64], 6);
+    assert_eq!(bytes[92], 6); // ip_proto
+    assert_eq!(bytes[94], 2); // role
 }
 
 #[test]
@@ -130,6 +138,6 @@ fn test_max_payload_event() {
     event.payload.fill(0xAA);
 
     let bytes = as_bytes(&event);
-    // Payload starts at offset 72
-    assert!(bytes[72..72 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
+    // Payload starts at offset 96
+    assert!(bytes[96..96 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
 }

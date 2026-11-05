@@ -28,8 +28,10 @@ use panopticon_common::parse_data_event_bytes;
 const MAGIC: &[u8; 6] = b"PNCAP\x01";
 
 /// Current file format version. v2: DataEvent gained `orig_len` (4160
-/// bytes). v3: `tcp_seq` and `tcp_ack` (4168 bytes).
-const FORMAT_VERSION: u32 = 3;
+/// bytes). v3: `tcp_seq` and `tcp_ack` (4168 bytes). v4: capture-scope
+/// fields (`cgroup_id`, `stream_off`, owner/acceptor, `scope_gen`, `role`;
+/// 4192 bytes).
+const FORMAT_VERSION: u32 = 4;
 
 /// File header metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]

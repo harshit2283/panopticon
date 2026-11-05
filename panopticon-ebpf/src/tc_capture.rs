@@ -270,7 +270,7 @@ fn populate_tc_event(
         (*event).tcp_flags = tcp_flags;
         (*event).tcp_seq = tcp_seq;
         (*event).tcp_ack = tcp_ack;
-        (*event)._pad = [0; 6];
+        crate::maps::clear_scope_fields(event);
         (*event).orig_len = orig_len;
 
         if !capture_payload {
