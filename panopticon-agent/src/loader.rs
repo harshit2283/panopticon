@@ -163,7 +163,7 @@ pub fn load_and_attach(
     interfaces: &[String],
     caps: &KernelCapabilities,
     config: &AgentConfig,
-    pid_candidates: Option<&[scope_loader::Candidate]>,
+    pid_candidates: Option<Vec<scope_loader::Candidate>>,
 ) -> Result<LoadedPrograms> {
     if !caps.has_tc_ebpf {
         anyhow::bail!(

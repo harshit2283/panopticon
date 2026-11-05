@@ -295,12 +295,21 @@ fn scope_programs_load_attach_and_hold() {
         .unwrap();
     let (sel_pid, gone_pid, p_pid) = (sel.id(), gone.id(), p.id());
     let (early_pid, late_pid) = (held_early.id(), held_late.id());
-    let candidates = snapshot_candidates(&[sel_pid, gone_pid, early_pid, late_pid, p_pid]);
-    assert_eq!(candidates[1], (gone_pid, None), "not running at read");
+    let pids = [sel_pid, gone_pid, early_pid, late_pid, p_pid];
+    let candidates = snapshot_candidates(&pids);
+    let pidfd = candidates[0].pidfd.is_some();
+    println!("METHOD {}", if pidfd { "pidfd" } else { "start_time" });
+    assert!(
+        candidates[1].pidfd.is_none() && candidates[1].start.is_none(),
+        "not running at read"
+    );
     p.kill().unwrap();
     p.wait().unwrap();
-    // Start times are in clock ticks: let one pass so Q's differs.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    if !pidfd {
+        // Start times are in clock ticks: let one pass so Q's differs. With
+        // a pidfd, Q follows P at once.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let mut q = spawn_sleep_at(p_pid).expect("Q reuses P's pid");
 
     // ── production attach, disarmed
@@ -308,7 +317,7 @@ fn scope_programs_load_attach_and_hold() {
     let (_, exit_attached) =
         attach_disarmed(&mut ebpf, &setup, Some(&candidates), &mut links).expect("attach");
     assert!(exit_attached);
-    for &(p, _) in &candidates {
+    for p in pids {
         assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
         assert!(!pid_listed(&ebpf, p), "nothing published before arm");
     }
@@ -366,7 +375,7 @@ fn scope_programs_load_attach_and_hold() {
     su_w.connect(ru_w.local_addr().unwrap()).unwrap();
 
     // ── arm
-    let excluded = arm(&mut ebpf, Some(&candidates)).unwrap();
+    let excluded = arm(&mut ebpf, Some(candidates)).unwrap();
     println!("ARM excluded={excluded:?}");
     assert!(pid_listed(&ebpf, sel_pid));
     assert!(
@@ -396,7 +405,7 @@ fn scope_programs_load_attach_and_hold() {
     q.kill().unwrap();
     q.wait().unwrap();
     println!("IDENTITY reused_before_attach=OK");
-    for &(p, _) in &candidates {
+    for p in pids {
         assert!(!in_map(&ebpf, "PID_CANDIDATES", p), "candidates cleared");
     }
 

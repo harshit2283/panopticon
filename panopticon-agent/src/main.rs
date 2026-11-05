@@ -315,7 +315,7 @@ async fn main() -> Result<()> {
             &agent_config.interfaces,
             &caps,
             &agent_config,
-            pid_candidates.as_deref(),
+            pid_candidates,
         )?;
 
         // 1. Extract EventSource (RingBuf or PerfEventArray) BEFORE wrapping Ebpf in Arc<Mutex>.

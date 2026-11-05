@@ -346,7 +346,7 @@ pub fn attach_disarmed(
     }
     if let Some(pids) = pids {
         let mut map = pid_map(ebpf, "PID_CANDIDATES")?;
-        for &(pid, _) in pids {
+        for &Candidate { pid, .. } in pids {
             map.insert(pid, 1, 0)
                 .with_context(|| format!("cannot add PID {pid} to PID_CANDIDATES"))?;
         }
@@ -406,10 +406,22 @@ pub const EXITED_RECORDED: &str = "exit recorded by sched_process_exit during st
 pub const IDENTITY_CHANGED: &str = "gone, or its PID reused, since pid_filter was read";
 pub const EXITED_BEFORE_ATTACH: &str = "exiting before sched_process_exit was attached";
 
-/// A configured `pid_filter` process: its PID and its start time (clock
-/// ticks since boot, `/proc/<pid>/stat` field 22) when the agent read the
-/// config, or None if it was not running then.
-pub type Candidate = (u32, Option<u64>);
+/// A configured `pid_filter` process as the agent found it when it read the
+/// config: a pidfd (the identity, where pidfd_open exists: 5.3+) and its
+/// start time (clock ticks since boot, `/proc/<pid>/stat` field 22; the
+/// identity without pidfd_open). Neither: not running then.
+#[derive(Debug)]
+pub struct Candidate {
+    pub pid: u32,
+    pub start: Option<u64>,
+    pub pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+impl Candidate {
+    fn running(&self) -> bool {
+        self.pidfd.is_some() || self.start.is_some()
+    }
+}
 
 /// Fields of `/proc/<pid>/stat`, from field 3 (state) on: the ones after
 /// the comm, split after the last ')' since comm may hold spaces and ')'.
@@ -432,62 +444,146 @@ fn stat_field(fields: &[u64], n: usize) -> Option<u64> {
     fields.get(n - 3).copied().filter(|&v| v != u64::MAX)
 }
 
-/// Snapshot the configured PIDs' identities. Call it when the agent first
-/// reads `pid_filter`, before anything is attached. A PID already reused
-/// before this read cannot be told from the operator's target: that is
-/// inherent to a numeric pid_filter.
-// ponytail: start time has clock-tick (USER_HZ) resolution, so an exit and
-// reuse within one tick of the original start is missed; a pidfd taken
-// here would close that where pidfd_open exists (5.3+).
+const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
+const SYS_PIDFD_OPEN: libc::c_long = 434;
+
+fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain syscall; a non-negative result is a new fd we own.
+    let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as libc::pid_t, 0u32) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// The pidfd's process has not exited: signal 0 reaches it (ESRCH once it
+/// is gone) and the pidfd is not readable (it becomes readable when the
+/// process exits). Any error counts as exited.
+fn pidfd_alive(fd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid pidfd; signal 0 with no siginfo only checks.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_PIDFD_SEND_SIGNAL,
+            fd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, no wait.
+    unsafe { libc::poll(&mut p, 1, 0) == 0 }
+}
+
+/// Snapshot the configured PIDs' identities: a pidfd each, or their start
+/// times where pidfd_open does not exist (ENOSYS). Call it when the agent
+/// first reads `pid_filter`, before anything is attached, and hand the
+/// result to [`arm`], which closes the pidfds. A PID already reused before
+/// this read cannot be told from the operator's target: that is inherent to
+/// a numeric pid_filter.
+// ponytail: the start-time fallback has clock-tick (USER_HZ) resolution, so
+// on kernels without pidfd_open an exit and reuse within one tick of the
+// original start is missed.
 pub fn snapshot_candidates(pids: &[u32]) -> Vec<Candidate> {
-    pids.iter()
-        .map(|&pid| (pid, stat_fields(pid).and_then(|f| stat_field(&f, 22))))
-        .collect()
+    let mut pidfd_supported = true;
+    let out: Vec<Candidate> = pids
+        .iter()
+        .map(|&pid| {
+            let start = stat_fields(pid).and_then(|f| stat_field(&f, 22));
+            match pidfd_open(pid) {
+                Ok(fd) => Candidate {
+                    pid,
+                    start,
+                    pidfd: Some(fd),
+                },
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                    pidfd_supported = false;
+                    Candidate {
+                        pid,
+                        start,
+                        pidfd: None,
+                    }
+                }
+                // ESRCH (gone), EINVAL (not a process), ...: not selectable.
+                Err(_) => Candidate {
+                    pid,
+                    start: None,
+                    pidfd: None,
+                },
+            }
+        })
+        .collect();
+    if !pids.is_empty() {
+        let method = if pidfd_supported {
+            "pidfd"
+        } else {
+            "start time (no pidfd_open)"
+        };
+        info!(method, "pid_filter process identity");
+    }
+    out
 }
 
 /// Publish `pid_filter` and arm: the last write of startup. Must follow
-/// [`attach_disarmed`] with the same candidates. Returns the listed
-/// processes that were left out, and why.
+/// [`attach_disarmed`] with the same candidates; closes their pidfds.
+/// Returns the listed processes that were left out, and why.
 ///
 /// For each candidate: insert into PID_FILTER, THEN look in PID_EXITED and
 /// remove the entry if the exit tracepoint recorded the process. The
 /// tracepoint records before it removes (process_monitor.rs), so whichever
 /// way the two race the entry ends up absent. A candidate not recorded is
-/// still left out if its start time changed since the config was read (it
-/// exited, unseen, before the tracepoint was attached, and the PID may be
-/// reused) or if it was already exiting.
-pub fn arm(ebpf: &mut Ebpf, pids: Option<&[Candidate]>) -> Result<Vec<(u32, &'static str)>> {
+/// still left out if it is no longer the process the config was read
+/// against (it exited, unseen, before the tracepoint was attached, and the
+/// PID may be reused) or if it was already exiting.
+pub fn arm(ebpf: &mut Ebpf, pids: Option<Vec<Candidate>>) -> Result<Vec<(u32, &'static str)>> {
     const PF_EXITING: u64 = 0x4;
     let mut excluded = Vec::new();
-    if let Some(pids) = pids {
+    if let Some(pids) = &pids {
         let mut filter = pid_map(ebpf, "PID_FILTER")?;
-        for &(pid, start) in pids {
-            if start.is_none() {
-                excluded.push((pid, NOT_RUNNING));
+        for c in pids {
+            if !c.running() {
+                excluded.push((c.pid, NOT_RUNNING));
                 continue;
             }
             filter
-                .insert(pid, 1, 0)
-                .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
+                .insert(c.pid, 1, 0)
+                .with_context(|| format!("cannot add PID {} to the PID_FILTER map", c.pid))?;
         }
         let exited = pid_map(ebpf, "PID_EXITED")?;
-        for &(pid, start) in pids {
-            let Some(start) = start else { continue };
-            match exited.get(&pid, 0) {
-                Ok(_) => excluded.push((pid, EXITED_RECORDED)),
+        for c in pids.iter().filter(|c| c.running()) {
+            match exited.get(&c.pid, 0) {
+                Ok(_) => excluded.push((c.pid, EXITED_RECORDED)),
                 Err(aya::maps::MapError::KeyNotFound) => {
-                    // The exit tracepoint is attached now, so the process it
-                    // was, if still running and not yet exiting, will have
-                    // its exit recorded. PF_EXITING is set before the
-                    // tracepoint runs. Unreadable counts as gone.
-                    let fields = stat_fields(pid).unwrap_or_default();
-                    if stat_field(&fields, 22) != Some(start) {
-                        excluded.push((pid, IDENTITY_CHANGED));
+                    // The exit tracepoint is attached now, so the process,
+                    // if still running and not yet exiting, will have its
+                    // exit recorded. PF_EXITING is set before the tracepoint
+                    // runs. The stat is read before the identity check: a
+                    // pidfd still alive afterwards means it was this
+                    // process's. Unreadable counts as gone.
+                    let fields = stat_fields(c.pid).unwrap_or_default();
+                    let same = match &c.pidfd {
+                        Some(fd) => pidfd_alive(fd),
+                        None => stat_field(&fields, 22) == c.start,
+                    };
+                    if !same {
+                        excluded.push((c.pid, IDENTITY_CHANGED));
                     } else if stat_field(&fields, 9).is_none_or(|f| f & PF_EXITING != 0) {
-                        excluded.push((pid, EXITED_BEFORE_ATTACH));
+                        excluded.push((c.pid, EXITED_BEFORE_ATTACH));
                     }
                 }
-                Err(e) => return Err(e).context(format!("cannot read PID_EXITED for {pid}")),
+                Err(e) => {
+                    return Err(e).context(format!("cannot read PID_EXITED for {}", c.pid));
+                }
             }
         }
         let lost: aya::maps::Array<_, u64> = aya::maps::Array::try_from(
@@ -512,10 +608,10 @@ pub fn arm(ebpf: &mut Ebpf, pids: Option<&[Candidate]>) -> Result<Vec<(u32, &'st
     if let Some(pids) = pids {
         // Armed: the exit tracepoint no longer reads the candidates.
         let mut candidates = pid_map(ebpf, "PID_CANDIDATES")?;
-        for &(pid, _) in pids {
-            remove_pid(&mut candidates, pid)?;
+        for c in &pids {
+            remove_pid(&mut candidates, c.pid)?;
         }
-    }
+    } // the pidfds close here
     Ok(excluded)
 }
 
@@ -540,10 +636,10 @@ fn remove_pid(
 pub fn load_and_attach(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
-    pids: Option<&[Candidate]>,
+    pids: Option<Vec<Candidate>>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
-    let r = attach_disarmed(ebpf, setup, pids, links)?;
+    let r = attach_disarmed(ebpf, setup, pids.as_deref(), links)?;
     arm(ebpf, pids)?;
     Ok(r)
 }
