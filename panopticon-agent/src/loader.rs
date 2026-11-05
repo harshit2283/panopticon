@@ -87,13 +87,15 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
     PINNED_MAP_NAMES.into_iter().chain(DATA_RING_NAMES)
 }
 
-const PINNED_MAP_NAMES: [&str; 11] = [
+/// Never a capture-scope map (SOCK_STATE, CGROUP_ALLOW, SCOPE_DROPS and the
+/// pid_filter maps): their contents are only valid for the run that wrote
+/// them. CONFIG is pinned, so its scope words are rewritten at every start.
+const PINNED_MAP_NAMES: [&str; 10] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
     "CONN_MAP",
     "PID_CGROUP_MAP",
     "CONFIG",
-    "PID_FILTER",
     "TLS_SCRATCH",
     "GO_ABI_MAP",
     "PID_TO_CONN",
@@ -1332,6 +1334,21 @@ CapPrm:\t00000000ffffffff
     }
 
     // ── Map pinning / bpffs tests ─────────────────────────────────────
+
+    #[test]
+    fn scope_maps_are_never_pinned() {
+        for m in [
+            "SOCK_STATE",
+            "CGROUP_ALLOW",
+            "SCOPE_DROPS",
+            "PID_FILTER",
+            "PID_CANDIDATES",
+            "PID_EXITED",
+            "PID_EXITED_LOST",
+        ] {
+            assert!(!pinned_map_names().any(|n| n == m), "{m} is pinned");
+        }
+    }
 
     #[test]
     fn test_bpffs_mounted_with_bpf_entry() {

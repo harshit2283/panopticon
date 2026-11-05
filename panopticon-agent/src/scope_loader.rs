@@ -307,12 +307,12 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
     Ok(())
 }
 
-/// Attach everything `setup` needs, with the scope writers disarmed
-/// (CONFIG_SCOPE_ARMED must be 0, as `sync_config_to_ebpf` leaves it), in
+/// Attach everything `setup` needs, with the scope writers disarmed, in
 /// dependency order:
 /// 1. load-check everything (nothing attached if any required program fails);
-/// 2. sched_process_exit, so no listed process can exit unseen once
-///    PID_FILTER is published;
+/// 2. write the `pid_filter` candidates (PID_CANDIDATES), then attach
+///    sched_process_exit, so every candidate exit from here on is recorded
+///    in PID_EXITED for [`arm`];
 /// 3. the tcp_set_ulp marker, so no socket attaches kTLS unmarked;
 /// 4. both capture hooks and fexit accept;
 /// 5. sock_create and sockops.
@@ -323,8 +323,12 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
 pub fn attach_disarmed(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
+    pids: Option<&[u32]>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
+    // Disarmed whatever CONFIG held before (a pinned CONFIG survives
+    // restarts); sync_config_to_ebpf writes 0 too.
+    config_array(ebpf)?.set(CONFIG_SCOPE_ARMED, 0, 0)?;
     let report = load_check(ebpf, setup)?;
     let root = discover_cgroup_root(&setup.cgroup2_path)?;
     if setup.mode & SCOPE_SEL_CGROUP != 0 && matches!(root, CgroupRoot::Private(_)) {
@@ -337,7 +341,15 @@ pub fn attach_disarmed(
     let cgroup = File::open(root.path())
         .with_context(|| format!("cannot open cgroup root {}", root.path().display()))?;
     if !uses_links() {
+        take_instance_lock()?;
         remove_stale_legacy(ebpf, &cgroup)?;
+    }
+    if let Some(pids) = pids {
+        let mut map = pid_map(ebpf, "PID_CANDIDATES")?;
+        for &pid in pids {
+            map.insert(pid, 1, 0)
+                .with_context(|| format!("cannot add PID {pid} to PID_CANDIDATES"))?;
+        }
     }
     let restricted = setup.mode != 0;
     let settings = mode_settings(setup.mode);
@@ -372,49 +384,109 @@ pub fn attach_disarmed(
     Ok((root, exit_attached))
 }
 
-/// Publish `pid_filter`, drop every listed process that is not alive (it
-/// may have exited before the exit tracepoint was attached, and its PID
-/// could be reused), then arm: the last write of startup.
-pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<()> {
+fn config_array(ebpf: &mut Ebpf) -> Result<aya::maps::Array<&mut aya::maps::MapData, u64>> {
+    Ok(aya::maps::Array::try_from(
+        ebpf.map_mut("CONFIG").context("CONFIG map not found")?,
+    )?)
+}
+
+fn pid_map<'a>(
+    ebpf: &'a mut Ebpf,
+    name: &str,
+) -> Result<aya::maps::HashMap<&'a mut aya::maps::MapData, u32, u8>> {
+    Ok(aya::maps::HashMap::try_from(
+        ebpf.map_mut(name)
+            .with_context(|| format!("{name} map not found"))?,
+    )?)
+}
+
+/// Why [`arm`] left a listed process out.
+pub const EXITED_RECORDED: &str = "exit recorded by sched_process_exit during startup";
+pub const EXITED_BEFORE_ATTACH: &str = "gone or exiting before sched_process_exit was attached";
+
+/// Publish `pid_filter` and arm: the last write of startup. Must follow
+/// [`attach_disarmed`] with the same `pids`. Returns the listed processes
+/// that were left out, and why.
+///
+/// For each candidate: insert into PID_FILTER, THEN look in PID_EXITED and
+/// remove the entry if the exit tracepoint recorded the process. The
+/// tracepoint records before it removes (process_monitor.rs), so whichever
+/// way the two race the entry ends up absent.
+pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<Vec<(u32, &'static str)>> {
+    let mut excluded = Vec::new();
     if let Some(pids) = pids {
-        let mut map: aya::maps::HashMap<_, u32, u8> = aya::maps::HashMap::try_from(
-            ebpf.map_mut("PID_FILTER")
-                .context("PID_FILTER map not found")?,
-        )?;
+        let mut filter = pid_map(ebpf, "PID_FILTER")?;
         for &pid in pids {
-            map.insert(pid, 1, 0)
+            filter
+                .insert(pid, 1, 0)
                 .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
         }
+        let exited = pid_map(ebpf, "PID_EXITED")?;
         for &pid in pids {
-            if !process_alive(pid) {
-                warn!(pid, "pid_filter process is not running; not selected");
-                match map.remove(&pid) {
-                    Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
-                    Err(e) => return Err(e).context(format!("cannot remove PID {pid}")),
+            match exited.get(&pid, 0) {
+                Ok(_) => excluded.push((pid, EXITED_RECORDED)),
+                Err(aya::maps::MapError::KeyNotFound) => {
+                    // The exit tracepoint is attached now, so a process not
+                    // yet exiting will have its exit recorded. One already
+                    // exiting (PF_EXITING is set before the tracepoint runs)
+                    // or gone may have passed it unseen.
+                    if exited_before_attach(pid) {
+                        excluded.push((pid, EXITED_BEFORE_ATTACH));
+                    }
                 }
+                Err(e) => return Err(e).context(format!("cannot read PID_EXITED for {pid}")),
+            }
+        }
+        let lost: aya::maps::Array<_, u64> = aya::maps::Array::try_from(
+            ebpf.map("PID_EXITED_LOST")
+                .context("PID_EXITED_LOST map not found")?,
+        )?;
+        let lost = lost.get(&0, 0)?;
+        if lost != 0 {
+            bail!(
+                "refusing pid_filter: {lost} exits of listed processes could not be recorded \
+                 during startup (PID_EXITED full), so a reused PID could be selected"
+            );
+        }
+        let mut filter = pid_map(ebpf, "PID_FILTER")?;
+        for &(pid, why) in &excluded {
+            warn!(pid, reason = why, "pid_filter process not selected");
+            match filter.remove(&pid) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+                Err(e) => return Err(e).context(format!("cannot remove PID {pid}")),
             }
         }
     }
-    let mut cfg: aya::maps::Array<_, u64> =
-        aya::maps::Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
-    cfg.set(CONFIG_SCOPE_ARMED, 1, 0)?;
+    config_array(ebpf)?.set(CONFIG_SCOPE_ARMED, 1, 0)?;
     info!("capture scope armed");
-    Ok(())
+    if let Some(pids) = pids {
+        // Armed: the exit tracepoint no longer reads the candidates.
+        let mut candidates = pid_map(ebpf, "PID_CANDIDATES")?;
+        for pid in pids {
+            match candidates.remove(pid) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+                Err(e) => return Err(e).context(format!("cannot clear candidate {pid}")),
+            }
+        }
+    }
+    Ok(excluded)
 }
 
-/// Live and not a zombie: a zombie has already passed sched_process_exit.
-pub fn process_alive(pid: u32) -> bool {
+/// Gone, or PF_EXITING set: `do_exit` sets it before sched_process_exit
+/// fires, so a process without it after the tracepoint was attached has
+/// its exit still ahead, where PID_EXITED records it. Unreadable counts as
+/// exited (errs toward drop).
+fn exited_before_attach(pid: u32) -> bool {
+    const PF_EXITING: u64 = 0x4;
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
+        return true;
     };
-    // "pid (comm) S ...": the state follows the last ')'.
-    match stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.trim_start().chars().next())
-    {
-        Some('Z' | 'X' | 'x') | None => false,
-        Some(_) => true,
-    }
+    // "pid (comm) state ppid pgrp session tty_nr tpgid flags ...": flags is
+    // the seventh field after the last ')'.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(6))
+        .and_then(|f| f.parse::<u64>().ok())
+        .is_none_or(|flags| flags & PF_EXITING != 0)
 }
 
 /// Attach (disarmed), then arm. The production startup path.
@@ -424,9 +496,49 @@ pub fn load_and_attach(
     pids: Option<&[u32]>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
-    let r = attach_disarmed(ebpf, setup, links)?;
+    let r = attach_disarmed(ebpf, setup, pids, links)?;
     arm(ebpf, pids)?;
     Ok(r)
+}
+
+// ── Instance lock ──────────────────────────────────────────────────────────
+
+/// Host path of the instance lock.
+pub const INSTANCE_LOCK: &str = "/run/panopticon/scope.lock";
+
+static LOCK: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+
+/// One agent instance owns the legacy (outliving) cgroup attachments: take
+/// an exclusive lock, held for the life of the process, before removing
+/// any. Held by another instance: refuse to start.
+pub fn take_instance_lock() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if LOCK.get().is_some() {
+        return Ok(());
+    }
+    let path = Path::new(INSTANCE_LOCK);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("cannot open {INSTANCE_LOCK}"))?;
+    // SAFETY: flock on an fd we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        bail!(
+            "refusing to start: cannot lock {INSTANCE_LOCK} ({e}); another agent instance \
+             owns the cgroup attachments"
+        );
+    }
+    let _ = LOCK.set(f);
+    Ok(())
 }
 
 // ── Stale legacy attachments (RHEL 8) ──────────────────────────────────────
@@ -504,47 +616,135 @@ pub fn attached_ids(cgroup: &File, attach_type: u32) -> Result<Vec<u32>> {
     Ok(ids)
 }
 
+const BPF_PROG_GET_FD_BY_ID: libc::c_long = 13;
+const BPF_OBJ_GET_INFO_BY_FD: libc::c_long = 15;
+
+#[repr(C)]
+#[derive(Default)]
+struct GetFdByIdAttr {
+    id: u32,
+    next_id: u32,
+    open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct InfoAttr {
+    bpf_fd: u32,
+    info_len: u32,
+    info: u64,
+}
+
+/// The prefix of `struct bpf_prog_info` up to `name` (4.15+).
+#[repr(C)]
+#[derive(Default)]
+struct ProgInfo {
+    prog_type: u32,
+    id: u32,
+    tag: [u8; 8],
+    jited_prog_len: u32,
+    xlated_prog_len: u32,
+    jited_prog_insns: u64,
+    xlated_prog_insns: u64,
+    load_time: u64,
+    created_by_uid: u32,
+    nr_map_ids: u32,
+    map_ids: u64,
+    name: [u8; 16],
+}
+
+impl ProgInfo {
+    fn name(&self) -> &[u8] {
+        let n = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.name[..n]
+    }
+}
+
+fn prog_info(fd: std::os::fd::BorrowedFd<'_>) -> Result<ProgInfo> {
+    use std::os::fd::AsRawFd;
+    let mut info = ProgInfo::default();
+    let mut attr = InfoAttr {
+        bpf_fd: fd.as_raw_fd() as u32,
+        info_len: std::mem::size_of::<ProgInfo>() as u32,
+        info: &mut info as *mut ProgInfo as u64,
+    };
+    bpf(BPF_OBJ_GET_INFO_BY_FD, &mut attr).context("BPF_OBJ_GET_INFO_BY_FD")?;
+    Ok(info)
+}
+
+fn prog_fd_by_id(id: u32) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let mut attr = GetFdByIdAttr {
+        id,
+        ..Default::default()
+    };
+    // SAFETY: attr is a valid bpf_attr prefix of the given size.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_GET_FD_BY_ID,
+            &mut attr as *mut GetFdByIdAttr,
+            std::mem::size_of::<GetFdByIdAttr>() as u32,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("BPF_PROG_GET_FD_BY_ID");
+    }
+    // SAFETY: the kernel returned a new fd that nothing else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
 /// On the legacy attach path an attachment outlives the agent (SIGKILL,
-/// crash). Before attaching, detach only programs that are provably ours:
-/// the same name and the same instruction tag (the kernel's hash of the
-/// program with map fds zeroed, so identical across loads of this object)
-/// as the program this agent just loaded. A program with our name but
-/// another tag (another build) is not ours to remove: refuse to start.
+/// crash). Before attaching, and holding the instance lock, detach only
+/// programs that are provably ours: the same name and the same instruction
+/// tag (the kernel's hash of the program with map fds zeroed, so identical
+/// across loads of this object) as the program this agent loaded. Every
+/// failure to enumerate or identify refuses to start: a program with our
+/// name and another tag (another build), one with our name that this agent
+/// did not load and so cannot compare, and any query or lookup error.
 /// Other tools' programs are never touched.
 pub fn remove_stale_legacy(ebpf: &Ebpf, cgroup: &File) -> Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     for (name, attach_type) in CGROUP_PROGRAMS {
-        let Some(prog) = ebpf.program(name) else {
-            continue;
-        };
-        let Ok(ours) = prog.info() else {
-            continue; // not loaded: nothing of ours to compare against
-        };
-        let short = &name[..name.len().min(15)]; // BPF_OBJ_NAME_LEN - 1
-        for id in attached_ids(cgroup, attach_type)? {
-            if id == ours.id() {
-                continue;
+        let ours = match ebpf.program(name).map(|p| p.fd()) {
+            Some(Ok(fd)) => {
+                Some(prog_info(fd.as_fd()).with_context(|| format!("cannot identify our {name}"))?)
             }
-            let Some(info) = aya::programs::loaded_programs()
-                .filter_map(|p| p.ok())
-                .find(|p| p.id() == id)
-            else {
-                continue; // gone meanwhile
+            _ => None,
+        };
+        let short = &name.as_bytes()[..name.len().min(15)]; // BPF_OBJ_NAME_LEN - 1
+        for id in attached_ids(cgroup, attach_type)? {
+            let refuse = || {
+                format!(
+                    "refusing to start: cannot identify program id {id} attached to the \
+                     cgroup root for {name}"
+                )
             };
-            if info.name_as_str() != Some(short) {
+            let fd = prog_fd_by_id(id).with_context(refuse)?;
+            let info = prog_info(fd.as_fd()).with_context(refuse)?;
+            if info.name() != short {
                 continue; // another tool's program
             }
-            if info.tag() != ours.tag() {
+            let Some(ours) = &ours else {
+                bail!(
+                    "refusing to start: program {name} (id {id}) is attached to the cgroup root \
+                     but this agent did not load {name} to compare it against; detach it with \
+                     `bpftool cgroup detach`"
+                );
+            };
+            if info.id == ours.id {
+                continue;
+            }
+            if info.tag != ours.tag {
                 bail!(
                     "refusing to start: program {name} (id {id}) from another panopticon build \
                      is attached to the cgroup root and cannot be identified as stale; \
                      detach it with `bpftool cgroup detach`"
                 );
             }
-            let fd = info.fd().map_err(describe)?;
             let mut attr = DetachAttr {
                 target_fd: cgroup.as_raw_fd() as u32,
-                attach_bpf_fd: fd.as_fd().as_raw_fd() as u32,
+                attach_bpf_fd: fd.as_raw_fd() as u32,
                 attach_type,
                 ..Default::default()
             };

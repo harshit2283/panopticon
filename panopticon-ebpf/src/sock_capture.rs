@@ -126,7 +126,7 @@ pub(crate) fn scope_mode() -> u64 {
 /// could attach kTLS unmarked), and the exit cleanup and PID_FILTER (pid
 /// bits computed from an incomplete list).
 #[inline(always)]
-fn armed() -> bool {
+pub(crate) fn armed() -> bool {
     cfg(CONFIG_SCOPE_ARMED) != 0
 }
 

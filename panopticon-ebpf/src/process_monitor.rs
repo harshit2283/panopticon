@@ -16,7 +16,9 @@ use aya_ebpf::{
 };
 use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
 
-use crate::maps::{PID_CGROUP_MAP, PID_FILTER, PROCESS_EVENTS};
+use crate::maps::{
+    PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROCESS_EVENTS,
+};
 
 // ── Process Exec ───────────────────────────────────────────────────────────
 
@@ -101,6 +103,21 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     // read, ring reserve), so a reused PID never inherits its selection
     // (DESIGN §3.1). `pid` here is the tgid (high half of pid_tgid), the
     // PID_FILTER key.
+    //
+    // During startup a candidate's exit is recorded in PID_EXITED first and
+    // only then removed from PID_FILTER. `arm` does the mirror image: insert
+    // into PID_FILTER, then look in PID_EXITED. If our record lands before
+    // arm's lookup, arm sees it and removes the entry; if it lands after,
+    // arm's insert also came before our remove below. Either way the entry
+    // ends up absent. Removing first and recording second would let arm
+    // insert between the two and miss the record.
+    if !crate::sock_capture::armed() && unsafe { PID_CANDIDATES.get(&pid) }.is_some() {
+        if PID_EXITED.insert(&pid, &1, 0).is_err() {
+            if let Some(n) = PID_EXITED_LOST.get_ptr_mut(0) {
+                unsafe { *n += 1 };
+            }
+        }
+    }
     let _ = PID_FILTER.remove(&pid);
 
     let comm = read_comm(ctx)?;

@@ -232,6 +232,21 @@ pub static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_ENTRIES, 0);
 #[map]
 pub static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
 
+/// `pid_filter` startup record (cgroup_skb backend). The loader writes the
+/// configured tgids here before sched_process_exit is attached; until the
+/// scope is armed, the exit tracepoint records each candidate's exit in
+/// PID_EXITED, which `arm` consults after publishing PID_FILTER. Neither map
+/// is read once armed.
+#[map]
+pub static PID_CANDIDATES: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
+
+#[map]
+pub static PID_EXITED: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILTER, 0);
+
+/// Failed PID_EXITED inserts; nonzero makes `arm` refuse pid_filter.
+#[map]
+pub static PID_EXITED_LOST: Array<u64> = Array::with_max_entries(1, 0);
+
 /// Whether events of process `tgid` may be emitted. TC packets have no
 /// process; user space filters them by their connection's owner.
 #[inline(always)]

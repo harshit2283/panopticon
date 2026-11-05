@@ -117,9 +117,52 @@ fn load_any(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     }
 }
 
-fn pid_listed(ebpf: &Ebpf, pid: u32) -> bool {
-    let m: HashMap<&MapData, u32, u8> = HashMap::try_from(ebpf.map("PID_FILTER").unwrap()).unwrap();
+fn in_map(ebpf: &Ebpf, map: &str, pid: u32) -> bool {
+    let m: HashMap<&MapData, u32, u8> = HashMap::try_from(ebpf.map(map).unwrap()).unwrap();
     m.get(&pid, 0).is_ok()
+}
+
+fn pid_listed(ebpf: &Ebpf, pid: u32) -> bool {
+    in_map(ebpf, "PID_FILTER", pid)
+}
+
+/// A process held inside do_exit: `cat` traced with PTRACE_O_TRACEEXIT, its
+/// stdin closed so it exits on its own (no fatal signal, which could skip
+/// the stop). It is stopped at PTRACE_EVENT_EXIT, which do_exit reaches
+/// before setting PF_EXITING and before sched_process_exit fires.
+fn hold_in_exit() -> std::process::Child {
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: ptrace/waitpid on our own child.
+    unsafe {
+        let opts = libc::PTRACE_O_TRACEEXIT as usize;
+        assert_eq!(
+            libc::ptrace(libc::PTRACE_SEIZE, pid, 0usize, opts),
+            0,
+            "PTRACE_SEIZE"
+        );
+        drop(child.stdin.take());
+        let mut st = 0;
+        assert_eq!(libc::waitpid(pid, &mut st, libc::__WALL), pid);
+        assert_eq!(
+            st >> 8,
+            libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8),
+            "held at PTRACE_EVENT_EXIT (status {st:#x})"
+        );
+    }
+    child
+}
+
+/// Let a held process finish exiting, and reap it.
+fn release(mut child: std::process::Child) {
+    // SAFETY: our tracee, stopped at PTRACE_EVENT_EXIT.
+    unsafe {
+        libc::ptrace(libc::PTRACE_CONT, child.id() as libc::pid_t, 0usize, 0usize);
+    }
+    child.wait().unwrap();
 }
 
 /// `setsockopt(TCP_ULP, "tls")`; false if the kernel has no tls ULP.
@@ -216,10 +259,42 @@ fn scope_programs_load_attach_and_hold() {
         }
     }
 
+    // ── pid_filter candidates, chosen before the attach (as configured):
+    // a live process; one gone before the exit tracepoint is attached; two
+    // held inside do_exit (PTRACE_EVENT_EXIT), short of the tracepoint
+    let mut sel = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let held_early = hold_in_exit(); // finishes exiting between attach and arm
+    let held_late = hold_in_exit(); // finishes exiting after arm
+    let (sel_pid, gone_pid) = (sel.id(), gone.id());
+    let (early_pid, late_pid) = (held_early.id(), held_late.id());
+    let candidates = [sel_pid, gone_pid, early_pid, late_pid];
+
     // ── production attach, disarmed
     let mut links = Vec::new();
-    let (_, exit_attached) = attach_disarmed(&mut ebpf, &setup, &mut links).expect("attach");
+    let (_, exit_attached) =
+        attach_disarmed(&mut ebpf, &setup, Some(&candidates), &mut links).expect("attach");
     assert!(exit_attached);
+    for p in candidates {
+        assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
+        assert!(!pid_listed(&ebpf, p), "nothing published before arm");
+    }
+    if !uses_links() {
+        // The instance lock is held: another open file description cannot
+        // take it.
+        let f = File::open(INSTANCE_LOCK).unwrap();
+        // SAFETY: flock on an fd we own.
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_ne!(rc, 0, "instance lock held");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "lock file mode");
+        println!("LOCK held mode={mode:o}");
+    }
     for (p, t) in CGROUP_PROGRAMS {
         let ours = ebpf.program(p).unwrap().info().unwrap().id();
         let ids = attached_ids(&cgroup, t).unwrap();
@@ -233,6 +308,23 @@ fn scope_programs_load_attach_and_hold() {
         println!("MATRIX {p} attach=OK"); // required by attach_disarmed here
     }
 
+    // ── forced exit interleaving, first order: the exit tracepoint runs
+    // after the attach and before arm's insert. The kernel records it.
+    release(held_early);
+    let mut recorded = false;
+    for _ in 0..200 {
+        recorded = in_map(&ebpf, "PID_EXITED", early_pid);
+        if recorded {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        recorded,
+        "disarmed exit of a candidate recorded in PID_EXITED"
+    );
+    assert!(!in_map(&ebpf, "PID_EXITED", late_pid), "still held");
+
     // ── the startup window: sockets created (and established) before
     // arming stay uninitialised for life
     let lw = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -244,17 +336,64 @@ fn scope_programs_load_attach_and_hold() {
     let su_w = UdpSocket::bind("127.0.0.1:0").unwrap();
     su_w.connect(ru_w.local_addr().unwrap()).unwrap();
 
-    // ── arm: a live selected process and one that already exited
-    let mut sel = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let mut gone = std::process::Command::new("true").spawn().unwrap();
-    gone.wait().unwrap();
-    let (sel_pid, gone_pid) = (sel.id(), gone.id());
-    arm(&mut ebpf, Some(&[sel_pid, gone_pid])).unwrap();
+    // ── arm
+    let excluded = arm(&mut ebpf, Some(&candidates)).unwrap();
+    println!("ARM excluded={excluded:?}");
     assert!(pid_listed(&ebpf, sel_pid));
+    assert!(
+        pid_listed(&ebpf, late_pid),
+        "held short of the tracepoint: selected"
+    );
     assert!(!pid_listed(&ebpf, gone_pid), "a dead pid is not published");
+    assert!(
+        !pid_listed(&ebpf, early_pid),
+        "a recorded exit is not published"
+    );
+    assert!(
+        excluded.contains(&(early_pid, EXITED_RECORDED)),
+        "{excluded:?}"
+    );
+    assert!(
+        excluded.contains(&(gone_pid, EXITED_BEFORE_ATTACH)),
+        "{excluded:?}"
+    );
+    assert_eq!(excluded.len(), 2, "{excluded:?}");
+    for p in candidates {
+        assert!(!in_map(&ebpf, "PID_CANDIDATES", p), "candidates cleared");
+    }
+
+    // ── second order: the tracepoint runs after arm's insert (armed now):
+    // the entry is removed and nothing more is recorded
+    release(held_late);
+    assert!(
+        !pid_listed(&ebpf, late_pid),
+        "exit after arm removed the pid"
+    );
+    assert!(!in_map(&ebpf, "PID_EXITED", late_pid), "armed: no record");
+    println!("EXIT_RACE OK");
+
+    // A reused pid of the process that exited during startup is not
+    // selected.
+    let mut reuse_ok = false;
+    for _ in 0..50 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", early_pid - 1)).unwrap();
+        let mut c = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .unwrap();
+        let hit = c.id() == early_pid;
+        if hit {
+            assert!(!pid_listed(&ebpf, early_pid), "reused pid not selected");
+            reuse_ok = true;
+        }
+        c.kill().unwrap();
+        c.wait().unwrap();
+        if hit {
+            break;
+        }
+    }
+    println!("EXIT_RACE reuse={reuse_ok}");
+    assert!(reuse_ok, "could not reuse pid {early_pid}");
 
     let uninit0 = drops(&ebpf, DROP_UNINIT);
     let mut buf = [0u8; 64];
