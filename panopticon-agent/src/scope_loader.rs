@@ -1,6 +1,7 @@
 //! Loader for the cgroup_skb capture backend (DESIGN §7): load-check every
 //! program a mode needs before anything is attached, find the cgroup v2
-//! root, then attach the scope writers before the capture programs.
+//! root, attach everything while the scope writers are disarmed, publish
+//! `PID_FILTER`, and arm (`CONFIG_SCOPE_ARMED`) last.
 //!
 //! Self-contained (aya, anyhow, tracing, libc, panopticon-common only) so
 //! the lab attach test (`tests/scope_attach.rs`) runs this same code.
@@ -13,6 +14,7 @@ use aya::{
     Btf, Ebpf,
     programs::{CgroupAttachMode, CgroupSkbAttachType, ProgramError},
 };
+use panopticon_common::CONFIG_SCOPE_ARMED;
 use panopticon_common::scope::{SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, SCOPE_SEL_PID};
 use tracing::{info, warn};
 
@@ -113,6 +115,9 @@ pub struct LoadReport {
     pub accept: Option<&'static str>,
     /// Whether the scope writers loaded (required in restricted modes).
     pub writers: bool,
+    /// Whether the sched_process_exit tracepoint loaded (required with
+    /// pid_filter).
+    pub exit_tp: bool,
 }
 
 /// Load every program `setup` needs, attaching nothing. Fails with the
@@ -157,11 +162,18 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
             "fexit inet_csk_accept loads in neither variant: pid_filter uses socket creators only"
         );
     }
-    if setup.mode & SCOPE_SEL_PID != 0 {
-        load_program(ebpf, EXIT_TP, None).context(
-            "refusing pid_filter: the sched_process_exit tracepoint is required (PID reuse)",
-        )?;
-    }
+    let exit_tp = match load_program(ebpf, EXIT_TP, None) {
+        Ok(()) => true,
+        Err(e) if setup.mode & SCOPE_SEL_PID != 0 => {
+            return Err(e.context(
+                "refusing pid_filter: the sched_process_exit tracepoint is required (PID reuse)",
+            ));
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "sched_process_exit unavailable");
+            false
+        }
+    };
     if restricted && setup.tls {
         for p in TLS_PROGRAMS {
             load_program(ebpf, p, None).with_context(|| {
@@ -172,7 +184,11 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
             })?;
         }
     }
-    Ok(LoadReport { accept, writers })
+    Ok(LoadReport {
+        accept,
+        writers,
+        exit_tp,
+    })
 }
 
 // ── cgroup v2 root ─────────────────────────────────────────────────────────
@@ -258,10 +274,7 @@ type Links = Vec<Box<dyn std::any::Any + Send>>;
 /// always attaches as multi and which rejects any attach flag (EINVAL);
 /// before that (RHEL 8) through `BPF_PROG_ATTACH`, which needs the flag.
 pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Links) -> Result<()> {
-    use aya::util::KernelVersion;
-    // The same test aya makes when it picks the attach call.
-    let link = KernelVersion::current().is_ok_and(|v| v >= KernelVersion::new(5, 7, 0));
-    let mode = if link {
+    let mode = if uses_links() {
         CgroupAttachMode::Single
     } else {
         CgroupAttachMode::AllowMultiple
@@ -294,10 +307,20 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
     Ok(())
 }
 
-/// Load-check, find the root, then attach: writers first, capture last, so
-/// no packet is captured before the state it depends on is being written.
-/// Returns the root and whether the exit tracepoint was attached here.
-pub fn load_and_attach(
+/// Attach everything `setup` needs, with the scope writers disarmed
+/// (CONFIG_SCOPE_ARMED must be 0, as `sync_config_to_ebpf` leaves it), in
+/// dependency order:
+/// 1. load-check everything (nothing attached if any required program fails);
+/// 2. sched_process_exit, so no listed process can exit unseen once
+///    PID_FILTER is published;
+/// 3. the tcp_set_ulp marker, so no socket attaches kTLS unmarked;
+/// 4. both capture hooks and fexit accept;
+/// 5. sock_create and sockops.
+///
+/// Nothing is initialised before [`arm`], so no socket gets state while a
+/// dependency above is missing. Returns the root and whether the exit
+/// tracepoint was attached.
+pub fn attach_disarmed(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
     links: &mut Links,
@@ -313,36 +336,227 @@ pub fn load_and_attach(
     }
     let cgroup = File::open(root.path())
         .with_context(|| format!("cannot open cgroup root {}", root.path().display()))?;
+    if !uses_links() {
+        remove_stale_legacy(ebpf, &cgroup)?;
+    }
     let restricted = setup.mode != 0;
-    let mut writers: Vec<&str> = Vec::new();
+    let settings = mode_settings(setup.mode);
+    // (program, required)
+    let mut order: Vec<(&str, bool)> = Vec::new();
+    if report.exit_tp {
+        order.push((EXIT_TP, setup.mode & SCOPE_SEL_PID != 0));
+    }
     if report.writers {
-        writers.extend([SOCK_CREATE, SOCKOPS, SET_ULP]);
+        order.push((SET_ULP, restricted));
     }
-    writers.extend(report.accept);
-    let exit_tp = setup.mode & SCOPE_SEL_PID != 0;
-    if exit_tp {
-        writers.push(EXIT_TP);
+    order.extend([(SKB_INGRESS, true), (SKB_EGRESS, true)]);
+    order.extend(report.accept.map(|p| (p, false)));
+    if report.writers {
+        order.extend([(SOCK_CREATE, restricted), (SOCKOPS, restricted)]);
     }
-    for p in writers {
-        if let Err(e) = attach_program(ebpf, p, &cgroup, links) {
-            let required = restricted && !matches!(p, ACCEPT4 | ACCEPT2);
-            if required {
-                return Err(e.context(format!("refusing {}", mode_settings(setup.mode))));
-            }
-            warn!(prog = p, error = %format!("{e:#}"), "scope writer did not attach");
+    let mut exit_attached = false;
+    for (p, required) in order {
+        match attach_program(ebpf, p, &cgroup, links) {
+            Ok(()) => exit_attached |= p == EXIT_TP,
+            Err(e) if required => return Err(e.context(format!("refusing {settings}"))),
+            Err(e) => warn!(prog = p, error = %format!("{e:#}"), "did not attach"),
         }
-    }
-    for p in [SKB_INGRESS, SKB_EGRESS] {
-        attach_program(ebpf, p, &cgroup, links)?;
     }
     info!(
         root = %root.path().display(),
         private = matches!(root, CgroupRoot::Private(_)),
         accept = ?report.accept,
         mode = setup.mode,
-        "cgroup_skb capture attached"
+        "cgroup_skb capture attached (disarmed)"
     );
-    Ok((root, exit_tp))
+    Ok((root, exit_attached))
+}
+
+/// Publish `pid_filter`, drop every listed process that is not alive (it
+/// may have exited before the exit tracepoint was attached, and its PID
+/// could be reused), then arm: the last write of startup.
+pub fn arm(ebpf: &mut Ebpf, pids: Option<&[u32]>) -> Result<()> {
+    if let Some(pids) = pids {
+        let mut map: aya::maps::HashMap<_, u32, u8> = aya::maps::HashMap::try_from(
+            ebpf.map_mut("PID_FILTER")
+                .context("PID_FILTER map not found")?,
+        )?;
+        for &pid in pids {
+            map.insert(pid, 1, 0)
+                .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
+        }
+        for &pid in pids {
+            if !process_alive(pid) {
+                warn!(pid, "pid_filter process is not running; not selected");
+                match map.remove(&pid) {
+                    Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+                    Err(e) => return Err(e).context(format!("cannot remove PID {pid}")),
+                }
+            }
+        }
+    }
+    let mut cfg: aya::maps::Array<_, u64> =
+        aya::maps::Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
+    cfg.set(CONFIG_SCOPE_ARMED, 1, 0)?;
+    info!("capture scope armed");
+    Ok(())
+}
+
+/// Live and not a zombie: a zombie has already passed sched_process_exit.
+pub fn process_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // "pid (comm) S ...": the state follows the last ')'.
+    match stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+    {
+        Some('Z' | 'X' | 'x') | None => false,
+        Some(_) => true,
+    }
+}
+
+/// Attach (disarmed), then arm. The production startup path.
+pub fn load_and_attach(
+    ebpf: &mut Ebpf,
+    setup: &ScopeSetup,
+    pids: Option<&[u32]>,
+    links: &mut Links,
+) -> Result<(CgroupRoot, bool)> {
+    let r = attach_disarmed(ebpf, setup, links)?;
+    arm(ebpf, pids)?;
+    Ok(r)
+}
+
+// ── Stale legacy attachments (RHEL 8) ──────────────────────────────────────
+
+/// Whether aya attaches cgroup programs through bpf_link (5.7+), whose
+/// attachment dies with the agent. The same test aya makes.
+pub fn uses_links() -> bool {
+    use aya::util::KernelVersion;
+    KernelVersion::current().is_ok_and(|v| v >= KernelVersion::new(5, 7, 0))
+}
+
+const BPF_PROG_DETACH: libc::c_long = 9;
+const BPF_PROG_QUERY: libc::c_long = 16;
+
+/// Our cgroup programs and their attach types (BPF_CGROUP_*).
+pub const CGROUP_PROGRAMS: [(&str, u32); 4] = [
+    (SKB_INGRESS, 0),
+    (SKB_EGRESS, 1),
+    (SOCK_CREATE, 2),
+    (SOCKOPS, 3),
+];
+
+#[repr(C)]
+#[derive(Default)]
+struct QueryAttr {
+    target_fd: u32,
+    attach_type: u32,
+    query_flags: u32,
+    attach_flags: u32,
+    prog_ids: u64,
+    prog_cnt: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DetachAttr {
+    target_fd: u32,
+    attach_bpf_fd: u32,
+    attach_type: u32,
+    attach_flags: u32,
+    replace_bpf_fd: u32,
+}
+
+fn bpf<T>(cmd: libc::c_long, attr: &mut T) -> std::io::Result<()> {
+    // SAFETY: attr is a valid bpf_attr prefix of the given size.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            cmd,
+            attr as *mut T,
+            std::mem::size_of::<T>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Ids of the programs attached to `cgroup` for `attach_type`.
+pub fn attached_ids(cgroup: &File, attach_type: u32) -> Result<Vec<u32>> {
+    use std::os::fd::AsRawFd;
+    let mut ids = vec![0u32; 64];
+    let mut attr = QueryAttr {
+        target_fd: cgroup.as_raw_fd() as u32,
+        attach_type,
+        prog_ids: ids.as_mut_ptr() as u64,
+        prog_cnt: ids.len() as u32,
+        ..Default::default()
+    };
+    bpf(BPF_PROG_QUERY, &mut attr).context("BPF_PROG_QUERY on the cgroup root")?;
+    ids.truncate(attr.prog_cnt as usize);
+    Ok(ids)
+}
+
+/// On the legacy attach path an attachment outlives the agent (SIGKILL,
+/// crash). Before attaching, detach only programs that are provably ours:
+/// the same name and the same instruction tag (the kernel's hash of the
+/// program with map fds zeroed, so identical across loads of this object)
+/// as the program this agent just loaded. A program with our name but
+/// another tag (another build) is not ours to remove: refuse to start.
+/// Other tools' programs are never touched.
+pub fn remove_stale_legacy(ebpf: &Ebpf, cgroup: &File) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    for (name, attach_type) in CGROUP_PROGRAMS {
+        let Some(prog) = ebpf.program(name) else {
+            continue;
+        };
+        let Ok(ours) = prog.info() else {
+            continue; // not loaded: nothing of ours to compare against
+        };
+        let short = &name[..name.len().min(15)]; // BPF_OBJ_NAME_LEN - 1
+        for id in attached_ids(cgroup, attach_type)? {
+            if id == ours.id() {
+                continue;
+            }
+            let Some(info) = aya::programs::loaded_programs()
+                .filter_map(|p| p.ok())
+                .find(|p| p.id() == id)
+            else {
+                continue; // gone meanwhile
+            };
+            if info.name_as_str() != Some(short) {
+                continue; // another tool's program
+            }
+            if info.tag() != ours.tag() {
+                bail!(
+                    "refusing to start: program {name} (id {id}) from another panopticon build \
+                     is attached to the cgroup root and cannot be identified as stale; \
+                     detach it with `bpftool cgroup detach`"
+                );
+            }
+            let fd = info.fd().map_err(describe)?;
+            let mut attr = DetachAttr {
+                target_fd: cgroup.as_raw_fd() as u32,
+                attach_bpf_fd: fd.as_fd().as_raw_fd() as u32,
+                attach_type,
+                ..Default::default()
+            };
+            bpf(BPF_PROG_DETACH, &mut attr)
+                .with_context(|| format!("cannot detach stale {name} (id {id})"))?;
+            warn!(
+                prog = name,
+                id, "removed a stale attachment left by an earlier agent"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

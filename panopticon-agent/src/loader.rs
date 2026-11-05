@@ -16,8 +16,8 @@ use crate::scope_loader::{self, ScopeSetup};
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
     CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD,
-    CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF,
-    DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, scope,
+    CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS,
+    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, scope,
 };
 
 /// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
@@ -197,7 +197,12 @@ pub fn load_and_attach(
             tls: config.tls_scan_enabled,
             cgroup2_path: config.cgroup2_path.clone(),
         };
-        let (_root, exit_tp) = scope_loader::load_and_attach(&mut ebpf, &setup, &mut links)?;
+        let (_root, exit_tp) = scope_loader::load_and_attach(
+            &mut ebpf,
+            &setup,
+            config.pid_filter.as_deref(),
+            &mut links,
+        )?;
         exit_tp_attached = exit_tp;
     }
     let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };
@@ -361,7 +366,10 @@ pub fn sync_config_to_ebpf(
         for pid in stale {
             pids.remove(&pid)?;
         }
-        for &pid in config.pid_filter.iter().flatten() {
+        // The cgroup_skb backend publishes the list itself, only once the
+        // exit tracepoint is attached (scope_loader::arm).
+        let publish = config.capture_backend != CaptureBackend::CgroupSkb;
+        for &pid in config.pid_filter.iter().flatten().filter(|_| publish) {
             pids.insert(pid, 1, 0)
                 .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
         }
@@ -393,6 +401,11 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_HEAD_BYTES, head, 0)?;
     cfg_map.set(CONFIG_SCOPE_GEN, 1, 0)?;
     cfg_map.set(CONFIG_SCOPE_MODE, mode, 0)?;
+    // Disarmed until scope_loader::arm, the last step of startup. Written
+    // explicitly: a pinned CONFIG map keeps an earlier run's value. The mode
+    // above is set now, not at arming: capture hooks running with mode 0
+    // would capture unscoped during startup.
+    cfg_map.set(CONFIG_SCOPE_ARMED, 0, 0)?;
 
     Ok(())
 }
