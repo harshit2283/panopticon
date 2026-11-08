@@ -520,11 +520,12 @@ mod linux {
         /// What the kernel honours (panopticon-ebpf, read at this stage):
         /// `CONFIG_CAPTURE_ENABLED = 0` stops the cgroup_skb packet path
         /// (`sock_capture.rs` `try_skb`, kTLS and UDP included);
-        /// `CONFIG_SCOPE_ARMED = 0` stops the socket-state writers; TLS
-        /// plaintext checks neither, but drops every call once the scope
-        /// mode is a sampled/head mode (`tls_call_scope`,
-        /// `scope::tls_mode_allowed`), so the mode gains those bits. The
-        /// mode stays non-zero (never unscoped `full`).
+        /// `CONFIG_SCOPE_ARMED = 0` stops the socket-state writers; every
+        /// TLS probe checks both first and collects nothing
+        /// (`sock_capture.rs` `tls_capture_on`). The mode also gains the
+        /// sampled/head bits, which drop every TLS call on their own
+        /// (`tls_call_scope`, `scope::tls_mode_allowed`), and stays
+        /// non-zero (never unscoped `full`), so the armed flag applies.
         fn disarm(&mut self) -> Result<()> {
             use panopticon_common::scope::{SCOPE_HEAD, SCOPE_SAMPLE};
             use panopticon_common::{

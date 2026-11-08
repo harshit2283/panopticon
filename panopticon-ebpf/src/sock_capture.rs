@@ -131,6 +131,25 @@ pub(crate) fn armed() -> bool {
     cfg(CONFIG_SCOPE_ARMED) != 0
 }
 
+/// Whether the TLS probes may collect anything (DESIGN §3.5, §7): checked
+/// first by every TLS entry, return, address-recording and emission path.
+///
+/// * `CONFIG_CAPTURE_ENABLED`, on every backend and mode: the user's
+///   `capture_enabled = false`, and the fatal stop (`scope_select.rs`
+///   `AyaAllow::disarm`). The loader writes it from `capture_enabled`
+///   (default true) before any program is attached, as the TC and
+///   cgroup_skb packet paths already honour it.
+/// * `CONFIG_SCOPE_ARMED`, in restricted modes only: until arming, the TLS
+///   scope inputs (`PID_FILTER`) and the socket state the address check
+///   reads are incomplete, and the fatal stop clears it. Unscoped full
+///   mode (the TC backend included) is never armed, so it does not apply
+///   there. The fatal stop also leaves the mode restricted, so a stopped
+///   agent fails both conditions.
+#[inline(always)]
+pub(crate) fn tls_capture_on() -> bool {
+    cfg(CONFIG_CAPTURE_ENABLED) != 0 && (is_unscoped_full(scope_mode()) || armed())
+}
+
 #[inline(always)]
 fn current_tgid() -> u32 {
     (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32

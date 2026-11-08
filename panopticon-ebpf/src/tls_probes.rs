@@ -89,7 +89,7 @@ fn try_tls_sock_length(ctx: &TracePointContext) -> Result<(), ()> {
     const AF_INET: u16 = 2;
     const IPPROTO_TCP: u16 = 6;
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(conn) = take_active(pid_tgid) else {
+    let Some(conn) = take_active_if_on(pid_tgid) else {
         return Ok(());
     };
     let family: u16 = unsafe { ctx.read_at(16) }.map_err(|_| ())?;
@@ -139,7 +139,7 @@ fn try_tls_tcp_io_scoped(sk: *mut core::ffi::c_void) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     // Cheap per-CPU prefilter (not consumed: the call may do more I/O),
     // before a hash lookup on every TCP send/receive on the node.
-    if !peek_active(pid_tgid) {
+    if !peek_active(pid_tgid) || !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
     let Some(call) = TLS_CALL.get_ptr_mut(&pid_tgid) else {
@@ -190,7 +190,7 @@ pub fn tls_tcp_recvmsg(ctx: ProbeContext) {
 #[inline(always)]
 fn try_tls_tcp_io(sk: *const u8) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    match take_active(pid_tgid) {
+    match take_active_if_on(pid_tgid) {
         Some(conn) => record_unscoped(pid_tgid, conn, sk),
         None => Ok(()),
     }
@@ -204,6 +204,26 @@ fn record_unscoped(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
         return Ok(());
     }
     record_conn_addr(pid_tgid, conn, sk)
+}
+
+/// The marker (`take_active`), only while TLS capture is on: the cheap
+/// per-CPU check first, then the capture flags, before the marker is
+/// consumed or any socket field read.
+#[inline(always)]
+fn take_active_if_on(pid_tgid: u64) -> Option<u64> {
+    if !peek_active(pid_tgid) || !crate::sock_capture::tls_capture_on() {
+        return None;
+    }
+    take_active(pid_tgid)
+}
+
+/// TLS capture off: a return probe only clears what this thread's entry
+/// probe left, and collects nothing.
+#[inline(always)]
+fn forget_call(pid_tgid: u64) {
+    let _ = TLS_SCRATCH.remove(pid_tgid);
+    let _ = TLS_CALL.remove(&pid_tgid);
+    let _ = take_active(pid_tgid);
 }
 
 /// Whether this CPU's marker says this thread is inside a TLS call.
@@ -351,6 +371,9 @@ pub fn ssl_write_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
     let buf: *const u8 = ctx.arg(1).ok_or(())?;
     let num: i32 = ctx.arg(2).ok_or(())?;
@@ -389,6 +412,9 @@ pub fn ssl_write_ex_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
     let buf: *const u8 = ctx.arg(1).ok_or(())?;
     let num: u64 = ctx.arg(2).ok_or(())?;
@@ -431,6 +457,10 @@ pub fn ssl_write_ret(ctx: RetProbeContext) {
 #[inline(always)]
 fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
+    if !crate::sock_capture::tls_capture_on() {
+        forget_call(pid_tgid);
+        return Ok(());
+    }
     let Some(call) = end_call(ctx, pid_tgid) else {
         return Ok(()); // no call opened by this frame's entry probe
     };
@@ -470,6 +500,9 @@ pub fn ssl_read_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let args = TlsReadArgs {
         ssl: ctx.arg(0).ok_or(())?,
         buf: ctx.arg(1).ok_or(())?,
@@ -494,6 +527,9 @@ pub fn ssl_read_ex_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let args = TlsReadArgs {
         ssl: ctx.arg(0).ok_or(())?,
         buf: ctx.arg(1).ok_or(())?,
@@ -526,6 +562,10 @@ pub fn ssl_read_ret(ctx: RetProbeContext) {
 #[inline(always)]
 fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
+    if !crate::sock_capture::tls_capture_on() {
+        forget_call(pid_tgid);
+        return Ok(());
+    }
 
     // Look up the arguments saved by the entry probe
     let args = unsafe {
@@ -592,6 +632,9 @@ pub fn go_tls_write_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let (conn, buf, len) = read_go_write_args(ctx)?;
     if len == 0 {
         return Ok(());
@@ -620,6 +663,9 @@ pub fn go_tls_read_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let (conn, buf, _len) = read_go_write_args(ctx)?; // same argument layout
     let key = go_read_key(ctx)?;
     mark_active(conn);
@@ -641,6 +687,10 @@ pub fn go_tls_read_ret(ctx: ProbeContext) {
 #[inline(always)]
 fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
     let key = go_read_key(ctx)?;
+    if !crate::sock_capture::tls_capture_on() {
+        let _ = GO_READ_ARGS.remove(&key);
+        return Ok(());
+    }
     let args = match unsafe { GO_READ_ARGS.get(&key) } {
         Some(a) => *a,
         None => return Ok(()), // missed the entry
@@ -804,6 +854,9 @@ fn emit_tls_event<C: EbpfContext>(
     call_addr: Option<(SockTuple, u32)>,
 ) -> Result<(), ()> {
     // Decided here, before any reserve or copy, for every TLS writer.
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let mode = crate::sock_capture::scope_mode();
     // Stamped from the map in both branches: a constant 0 on one path and a

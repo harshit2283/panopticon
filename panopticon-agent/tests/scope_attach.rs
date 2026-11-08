@@ -106,6 +106,18 @@ pub extern "C" fn panop_test_ssl_write_entry_only(_ssl: u64, _buf: *const u8, nu
     std::hint::black_box(num)
 }
 
+/// Set by the hook when this thread's TLS_CALL slot exists mid-call.
+static SLOT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The kernel id of a map, to open a second handle to it.
+fn map_id(ebpf: &Ebpf, name: &str) -> u32 {
+    use aya::maps::Map;
+    match ebpf.map(name).unwrap() {
+        Map::Array(d) | Map::HashMap(d) | Map::LruHashMap(d) => d.info().unwrap().id(),
+        _ => unreachable!("{name}"),
+    }
+}
+
 /// TLS_ACTIVE on every CPU: [pid_tgid, conn].
 fn set_active(ebpf: &mut Ebpf, v: [u64; 2]) {
     let mut active: PerCpuArray<_, [u64; 2]> =
@@ -846,6 +858,92 @@ fn scope_programs_load_attach_and_hold() {
     );
     let e = find(b"tls-again").expect("next call emitted");
     assert_eq!(e.src_port as u64, c4_port, "next call has its own address");
+
+    // ── capture off (the user switch, the fatal stop) or not armed: the TLS
+    // probes collect nothing. No call slot during the call, no address, no
+    // event; the first call of each pair is the control that would see one.
+    let slots_id = map_id(&ebpf, "TLS_CALL");
+    *TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+        let slots: HashMap<MapData, u64, [u64; 9]> =
+            HashMap::try_from(aya::maps::Map::HashMap(MapData::from_id(slots_id).unwrap()))
+                .unwrap();
+        if slots.get(&pid_tgid, 0).is_ok() {
+            SLOT_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }));
+    let seen = || SLOT_SEEN.swap(false, std::sync::atomic::Ordering::SeqCst);
+    let slot_left = |ebpf: &Ebpf| {
+        let m: HashMap<_, u64, [u64; 9]> =
+            HashMap::try_from(ebpf.map("TLS_CALL").unwrap()).unwrap();
+        m.get(&pid_tgid, 0).is_ok()
+    };
+    let conn_addr = |ebpf: &Ebpf| {
+        let m: HashMap<_, [u64; 2], [u32; 3]> =
+            HashMap::try_from(ebpf.map("TLS_CONN_ADDR").unwrap()).unwrap();
+        m.get(&[ssl, me as u64], 0).is_ok()
+    };
+    let emitted = |ring: &mut RingBuf<MapData>, p: &[u8]| {
+        drain_tls(ring).iter().any(|e| e.payload_bytes() == p)
+    };
+    let _ = drain(&mut ring);
+    seen();
+    assert_eq!(write(ssl, b"tls-on".as_ptr(), 6), 6);
+    assert!(
+        seen() && emitted(&mut ring, b"tls-on"),
+        "control: slot, event"
+    );
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 0);
+    assert_eq!(write(ssl, b"tls-off".as_ptr(), 7), 7);
+    assert!(!seen(), "capture off: no call slot");
+    assert!(
+        !slot_left(&ebpf) && !emitted(&mut ring, b"tls-off"),
+        "capture off"
+    );
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 0);
+    assert_eq!(write(ssl, b"tls-unarmed".as_ptr(), 11), 11);
+    assert!(!seen(), "restricted, not armed: no call slot");
+    assert!(
+        !slot_left(&ebpf) && !emitted(&mut ring, b"tls-unarmed"),
+        "restricted, not armed"
+    );
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 1);
+    // Unscoped full (as on TC): the address cache path, and arming does not
+    // apply there.
+    let full_link = {
+        let p: &mut aya::programs::FEntry = ebpf
+            .program_mut("tls_tcp_sendmsg_fentry")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        p.attach().expect("tls_tcp_sendmsg_fentry attaches")
+    };
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 0);
+    assert_eq!(write(ssl, b"tls-full-off".as_ptr(), 12), 12);
+    assert!(!conn_addr(&ebpf), "capture off: no TLS_CONN_ADDR entry");
+    assert!(
+        !emitted(&mut ring, b"tls-full-off"),
+        "capture off: no event"
+    );
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 0);
+    assert_eq!(write(ssl, b"tls-full-on".as_ptr(), 11), 11);
+    assert!(
+        emitted(&mut ring, b"tls-full-on"),
+        "unscoped: not gated by arming"
+    );
+    assert!(conn_addr(&ebpf), "control: unscoped address recorded");
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 1);
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
+    let p: &mut aya::programs::FEntry = ebpf
+        .program_mut("tls_tcp_sendmsg_fentry")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    p.detach(full_link).unwrap();
+    *TEST_HOOK.lock().unwrap() = None;
+    println!("TLS_DISARM OK");
     for (prog, link) in uprobe_links {
         let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
         p.detach(link).unwrap();
