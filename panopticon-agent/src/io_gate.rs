@@ -89,6 +89,17 @@ struct FileState {
     rotations: u32,
 }
 
+/// What a write has to report. Logged only after the file mutex and the
+/// gate's read guard are released: a log line goes through a pipeline's
+/// gated writer, which takes a gate's read lock, and a second read lock
+/// queued behind a waiting `revoke` would never be granted.
+enum Diag {
+    Full,
+    Rotated(String),
+    GaveUp,
+    RotateFailed(anyhow::Error),
+}
+
 /// One output file, opened once and shared by every capture pipeline
 /// (Revision 1 item 4). Writes are whole records, serialised by the file
 /// mutex, each under the writer's gate: generations never interleave inside
@@ -105,26 +116,46 @@ pub struct RecordFile {
     /// Records the writers dropped because they fell behind (aggregate,
     /// over every pipeline).
     dropped: AtomicU64,
+    /// Tests: the next write stops after this many bytes (`u64::MAX`: off).
+    #[cfg(test)]
+    fail_after: AtomicU64,
+    /// Tests: diagnostics logged, and how many of them while the file
+    /// mutex or the writer's gate was held.
+    #[cfg(test)]
+    logged: [AtomicU64; 2],
 }
 
 impl RecordFile {
     /// Open `path` owner-only (`append`: keep what it holds; otherwise a
     /// fresh file, see [`crate::export::open_private`]) and write `header`.
+    /// A header that does not fit the cap is not written and the output
+    /// starts closed.
     pub fn create(path: &str, header: &[u8], max_bytes: u64, append: bool) -> Result<Arc<Self>> {
         let mut file = crate::export::open_private(path, append)?;
-        file.write_all(header)
-            .with_context(|| format!("cannot write the header of {path}"))?;
-        Ok(Arc::new(Self {
+        let fits = header.len() as u64 <= max_bytes;
+        if fits {
+            file.write_all(header)
+                .with_context(|| format!("cannot write the header of {path}"))?;
+        }
+        let f = Arc::new(Self {
             path: path.to_string(),
             header: header.to_vec(),
             max_bytes,
             state: Mutex::new(FileState {
-                file: Some(file),
-                written: header.len() as u64,
+                file: fits.then_some(file),
+                written: if fits { header.len() as u64 } else { 0 },
                 rotations: 0,
             }),
             dropped: AtomicU64::new(0),
-        }))
+            #[cfg(test)]
+            fail_after: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            logged: Default::default(),
+        });
+        if !fits {
+            f.log(Diag::Full, None);
+        }
+        Ok(f)
     }
 
     pub fn path(&self) -> &str {
@@ -133,44 +164,61 @@ impl RecordFile {
 
     /// Write `records` (complete records only) under `gate`.
     pub fn write(&self, gate: &IoGate, records: &[u8]) -> Result<(), Refused> {
+        let (result, diag) = self.write_locked(gate, records);
+        if let Some(d) = diag {
+            self.log(d, Some(gate));
+        }
+        result
+    }
+
+    /// The write itself, under the file mutex and the gate's read guard;
+    /// both are released when it returns.
+    fn write_locked(&self, gate: &IoGate, records: &[u8]) -> (Result<(), Refused>, Option<Diag>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(_open) = gate.open() else {
-            return Err(Refused::Revoked);
+            return (Err(Refused::Revoked), None);
         };
         if st.file.is_none() {
-            return Err(Refused::Closed);
+            return (Err(Refused::Closed), None);
         }
         if st.written.saturating_add(records.len() as u64) > self.max_bytes {
             st.file = None;
-            tracing::warn!(
-                path = %self.path,
-                max_bytes = self.max_bytes,
-                "Output size limit reached; output closed"
-            );
-            return Err(Refused::Full);
+            return (Err(Refused::Full), Some(Diag::Full));
         }
         let file = st.file.as_mut().expect("checked above");
-        let (done, result) = write_counted(file, records);
+        #[cfg(test)]
+        let cut = match self.fail_after.swap(u64::MAX, Ordering::Relaxed) {
+            u64::MAX => records.len(),
+            n => (n as usize).min(records.len()),
+        };
+        #[cfg(not(test))]
+        let cut = records.len();
+        let (done, mut result) = write_counted(file, &records[..cut]);
+        if result.is_ok() && cut < records.len() {
+            result = Err(io::ErrorKind::WriteZero.into());
+        }
         st.written += done as u64;
         match result {
-            Ok(()) => Ok(()),
-            Err(e) if done == 0 => Err(Refused::Io(e)),
+            Ok(()) => (Ok(()), None),
+            Err(e) if done == 0 => (Err(Refused::Io(e)), None),
             Err(e) => {
-                self.rotate(&mut st);
-                Err(Refused::Io(e))
+                let diag = self.rotate(&mut st);
+                (Err(Refused::Io(e)), Some(diag))
             }
         }
     }
 
-    /// After a torn write: continue in `<path>.<n>`.
-    fn rotate(&self, st: &mut FileState) {
+    /// After a torn write: continue in `<path>.<n>`, if its header fits.
+    fn rotate(&self, st: &mut FileState) -> Diag {
         st.file = None;
         st.rotations += 1;
-        let next = format!("{}.{}", self.path, st.rotations);
         if st.rotations > MAX_ROTATIONS {
-            tracing::error!(path = %self.path, "Output closed after repeated torn writes");
-            return;
+            return Diag::GaveUp;
         }
+        if st.written.saturating_add(self.header.len() as u64) > self.max_bytes {
+            return Diag::Full;
+        }
+        let next = format!("{}.{}", self.path, st.rotations);
         let opened = crate::export::open_private(&next, false).and_then(|mut f| {
             f.write_all(&self.header)?;
             Ok(f)
@@ -179,14 +227,36 @@ impl RecordFile {
             Ok(f) => {
                 st.written += self.header.len() as u64;
                 st.file = Some(f);
-                tracing::warn!(
-                    path = %self.path,
-                    continued_in = %next,
-                    "A write failed part way (torn record); output continues in a new file"
-                );
+                Diag::Rotated(next)
             }
-            Err(e) => {
-                tracing::error!(path = %self.path, error = %e, "Output closed: cannot rotate");
+            Err(e) => Diag::RotateFailed(e),
+        }
+    }
+
+    fn log(&self, d: Diag, _gate: Option<&IoGate>) {
+        #[cfg(test)]
+        {
+            let held =
+                self.state.try_lock().is_err() || _gate.is_some_and(|g| g.0.try_write().is_err());
+            self.logged[0].fetch_add(1, Ordering::Relaxed);
+            self.logged[1].fetch_add(held as u64, Ordering::Relaxed);
+        }
+        match d {
+            Diag::Full => tracing::warn!(
+                path = %self.path,
+                max_bytes = self.max_bytes,
+                "Output size limit reached; output closed"
+            ),
+            Diag::Rotated(next) => tracing::warn!(
+                path = %self.path,
+                continued_in = %next,
+                "A write failed part way (torn record); output continues in a new file"
+            ),
+            Diag::GaveUp => {
+                tracing::error!(path = %self.path, "Output closed after repeated torn writes")
+            }
+            Diag::RotateFailed(e) => {
+                tracing::error!(path = %self.path, error = %format!("{e:#}"), "Output closed: cannot rotate")
             }
         }
     }
@@ -202,6 +272,12 @@ impl RecordFile {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Tests: the next write stops after `n` bytes, as a full disk would.
+    #[cfg(test)]
+    pub fn fail_next_write_after(&self, n: u64) {
+        self.fail_after.store(n, Ordering::Relaxed);
     }
 }
 
@@ -607,6 +683,64 @@ mod tests {
         assert_eq!((done, r.is_err()), (3, true));
         let mut w = Short(0, Vec::new());
         assert_eq!(write_counted(&mut w, b"abc").0, 0);
+    }
+
+    #[test]
+    fn torn_write_rotates_and_a_failed_write_does_not() {
+        let path = tmp("torn");
+        let f = RecordFile::create(&path, b"H", u64::MAX, false).unwrap();
+        let g = IoGate::new();
+        f.write(&g, b"rec1\n").unwrap();
+        // Nothing written: the file is unchanged, writing goes on in it.
+        f.fail_next_write_after(0);
+        assert!(matches!(f.write(&g, b"lost\n"), Err(Refused::Io(_))));
+        f.write(&g, b"rec2\n").unwrap();
+        // Torn: the record is cut, output continues in `<path>.1`.
+        f.fail_next_write_after(2);
+        assert!(matches!(f.write(&g, b"torn\n"), Err(Refused::Io(_))));
+        f.write(&g, b"rec3\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Hrec1\nrec2\nto");
+        let next = format!("{path}.1");
+        assert_eq!(std::fs::read(&next).unwrap(), b"Hrec3\n");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&next).ok();
+    }
+
+    #[test]
+    fn headers_count_against_the_cap() {
+        let path = tmp("hdrcap");
+        // The header alone does not fit: nothing is written, output closed.
+        let f = RecordFile::create(&path, b"HH", 1, false).unwrap();
+        assert!(matches!(f.write(&IoGate::new(), b""), Err(Refused::Closed)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        // A rotation whose header would pass the cap closes the output.
+        let f = RecordFile::create(&path, b"HH", 6, false).unwrap();
+        let g = IoGate::new();
+        f.write(&g, b"ab").unwrap();
+        f.fail_next_write_after(1);
+        assert!(f.write(&g, b"cd").is_err());
+        assert!(matches!(f.write(&g, b""), Err(Refused::Closed)));
+        assert!(!std::path::Path::new(&format!("{path}.1")).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"HHabc");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A diagnostic logged under the file mutex or the gate's read guard
+    /// would go to a gated writer taking that read lock again, which blocks
+    /// for good behind a queued `revoke` (Linux's RwLock prefers writers).
+    #[test]
+    fn diagnostics_are_logged_outside_the_gate_and_file_locks() {
+        let path = tmp("diag");
+        let file = RecordFile::create(&path, b"H", 1 + 4 + 2, false).unwrap();
+        let gate = IoGate::new();
+        file.write(&gate, b"ab").unwrap();
+        file.fail_next_write_after(1);
+        assert!(file.write(&gate, b"cd").is_err()); // torn: rotation logged
+        assert!(matches!(file.write(&gate, b"efgh"), Err(Refused::Full)));
+        let n = |i: usize| file.logged[i].load(Ordering::Relaxed);
+        assert_eq!((n(0), n(1)), (2, 0), "(logged, logged under a lock)");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{path}.1")).ok();
     }
 
     #[test]
