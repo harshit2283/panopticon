@@ -20,9 +20,10 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, GoReadKey, SockTuple, TLS_ACTIVE,
-    TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH,
-    TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, GoReadKey, PROC_EPOCH, SockTuple,
+    TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR,
+    TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve,
+    shard_submit_flags,
 };
 use crate::sock_monitor::read_sock_tuple;
 
@@ -221,7 +222,7 @@ fn take_active_if_on(pid_tgid: u64) -> Option<u64> {
 /// probe left, and collects nothing.
 #[inline(always)]
 fn forget_call(pid_tgid: u64) {
-    let _ = TLS_SCRATCH.remove(pid_tgid);
+    let _ = TLS_SCRATCH.remove(&pid_tgid);
     let _ = TLS_CALL.remove(&pid_tgid);
     let _ = take_active(pid_tgid);
 }
@@ -545,7 +546,7 @@ fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 
 /// Intercepts `SSL_read(ssl, buf, num)` entry — stashes the arguments.
 /// The actual data isn't available until the function returns with the
-/// number of bytes read, so we save them in TLS_SCRATCH.
+/// number of bytes read, so `begin_read` saves them for the return probe.
 #[uprobe]
 pub fn ssl_read_entry(ctx: ProbeContext) {
     let _ = try_ssl_read_entry(&ctx);
@@ -556,18 +557,10 @@ fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
-    let args = TlsReadArgs {
-        ssl: ctx.arg(0).ok_or(())?,
-        buf: ctx.arg(1).ok_or(())?,
-        readbytes: 0,
-    };
-    mark_active(args.ssl);
-    if restricted() {
-        begin_call(ctx, args.ssl, 0, 0, 0);
-    }
-    TLS_SCRATCH
-        .insert(bpf_get_current_pid_tgid(), args, 0)
-        .map_err(|_| ())
+    let ssl: u64 = ctx.arg(0).ok_or(())?;
+    let buf: u64 = ctx.arg(1).ok_or(())?;
+    begin_read(ctx, ssl, buf, 0);
+    Ok(())
 }
 
 /// Intercepts `SSL_read_ex(ssl, buf, num, *readbytes)` entry. Shares the
@@ -583,25 +576,42 @@ fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
-    let args = TlsReadArgs {
-        ssl: ctx.arg(0).ok_or(())?,
-        buf: ctx.arg(1).ok_or(())?,
-        readbytes: ctx.arg(3).ok_or(())?,
-    };
-    let restricted = restricted();
-    if args.readbytes == 0 {
-        if restricted {
-            drop_call();
-        }
+    let ssl: u64 = ctx.arg(0).ok_or(())?;
+    let buf: u64 = ctx.arg(1).ok_or(())?;
+    let readbytes: u64 = ctx.arg(3).ok_or(())?;
+    if readbytes == 0 {
+        // Opens no call: drop whatever an earlier call left, so this
+        // call's return probe cannot consume it.
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+        let _ = TLS_CALL.remove(&pid_tgid);
         return Ok(());
     }
-    mark_active(args.ssl);
-    if restricted {
-        begin_call(ctx, args.ssl, 0, 0, 0);
+    begin_read(ctx, ssl, buf, readbytes);
+    Ok(())
+}
+
+/// Open an OpenSSL read: restricted modes keep the arguments in the call
+/// slot (`begin_call`), unscoped modes in TLS_SCRATCH, each stamped with
+/// the entry's stack pointer. Owner-only, and a failed insert leaves no
+/// entry at all (fails closed: the return probe emits nothing).
+#[inline(always)]
+fn begin_read(ctx: &ProbeContext, ssl: u64, buf: u64, readbytes: u64) {
+    mark_active(ssl);
+    if restricted() {
+        begin_call(ctx, ssl, buf, 0, readbytes);
+        return;
     }
-    TLS_SCRATCH
-        .insert(bpf_get_current_pid_tgid(), args, 0)
-        .map_err(|_| ())
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = TlsReadArgs {
+        buf,
+        ssl,
+        readbytes,
+        ident: user_sp(ctx.regs),
+    };
+    if TLS_SCRATCH.insert(&pid_tgid, &args, 0).is_err() {
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+    }
 }
 
 /// Return probe for `SSL_read` and `SSL_read_ex` — reads the decrypted data
@@ -620,39 +630,42 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         return Ok(());
     }
 
-    // Look up the arguments saved by the entry probe
-    let args = unsafe {
-        match TLS_SCRATCH.get(pid_tgid) {
-            Some(args) => *args,
-            None => return Ok(()), // Missed the entry probe
-        }
-    };
-
-    // Clean up scratch space (and the marker, if the read was served from
-    // already-buffered TLS records without touching the socket)
-    let _ = TLS_SCRATCH.remove(pid_tgid);
+    // The marker too, if the read was served from already-buffered TLS
+    // records without touching the socket.
     let _ = take_active(pid_tgid);
-    // Restricted modes: this call's own slot, consumed whatever the result.
-    // Without one opened by this frame's entry for this SSL*, the saved
-    // arguments are not proven to be this call's either: nothing is emitted.
-    let addr = if restricted() {
+    // This frame's own saved arguments, consumed whatever the result: the
+    // call slot in restricted modes, TLS_SCRATCH otherwise. Anything not
+    // opened by this frame's entry (a nested call, a missed return) is
+    // dropped and nothing is emitted from it.
+    let (ssl, buf, readbytes, addr) = if restricted() {
         let call = end_call(ctx, pid_tgid);
-        if call.found == 0 || call.conn != args.ssl {
+        if call.found == 0 {
             return Ok(());
         }
-        call.addr
+        (call.conn, call.buf, call.aux, call.addr)
     } else {
-        NO_ADDR
+        let Some(a) = TLS_SCRATCH.get_ptr(&pid_tgid) else {
+            return Ok(()); // missed the entry probe
+        };
+        // SAFETY: this thread's own entry (maps.rs TLS_SCRATCH), read field
+        // by field before the delete.
+        let (ssl, buf, readbytes, ident) =
+            unsafe { ((*a).ssl, (*a).buf, (*a).readbytes, (*a).ident) };
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+        if !same_frame(ident, user_sp(ctx.regs)) {
+            return Ok(());
+        }
+        (ssl, buf, readbytes, NO_ADDR)
     };
 
     let ret = ctx.ret::<i32>();
     if ret <= 0 {
         return Ok(()); // error / would-block / closed
     }
-    let len = if args.readbytes == 0 {
+    let len = if readbytes == 0 {
         ret as u64
     } else {
-        unsafe { bpf_probe_read_user(args.readbytes as *const u64) }.map_err(|_| ())?
+        unsafe { bpf_probe_read_user(readbytes as *const u64) }.map_err(|_| ())?
     };
     if len == 0 || len > u32::MAX as u64 {
         return Ok(());
@@ -660,8 +673,8 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 
     emit_tls_event(
         ctx,
-        args.ssl,
-        args.buf as *const u8,
+        ssl,
+        buf as *const u8,
         len as usize,
         Direction::Ingress,
         TlsLibrary::OpenSsl,
@@ -723,12 +736,39 @@ fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
     let (conn, buf, _len) = read_go_write_args(ctx)?; // same argument layout
     let key = go_read_key(ctx)?;
     mark_active(conn);
+    // Owner-only (the goroutine), bound to its process instance; a failed
+    // insert leaves no entry (fails closed).
+    let Some(epoch) = proc_epoch(key.tgid) else {
+        let _ = GO_READ_ARGS.remove(&key);
+        return Ok(());
+    };
     let args = TlsReadArgs {
         buf: buf as u64,
         ssl: conn,
         readbytes: 0,
+        ident: epoch,
     };
-    GO_READ_ARGS.insert(&key, &args, 0).map_err(|_| ())
+    if GO_READ_ARGS.insert(&key, &args, 0).is_err() {
+        let _ = GO_READ_ARGS.remove(&key);
+    }
+    Ok(())
+}
+
+/// This process instance's `PROC_EPOCH`, set at exec; a process that
+/// predates the agent gets one on first sight. None if the map is full.
+/// The value is only ever compared, never used as an address, so reading
+/// it while the leader's exit removes it can at worst fail the comparison.
+#[inline(always)]
+fn proc_epoch(tgid: u32) -> Option<u64> {
+    if let Some(e) = PROC_EPOCH.get_ptr(&tgid) {
+        return Some(unsafe { *e });
+    }
+    const BPF_NOEXIST: u64 = 1;
+    let now = unsafe { bpf_ktime_get_ns() };
+    if PROC_EPOCH.insert(&tgid, &now, BPF_NOEXIST).is_ok() {
+        return Some(now);
+    }
+    PROC_EPOCH.get_ptr(&tgid).map(|e| unsafe { *e })
 }
 
 /// A RET instruction of `(*Conn).Read` (attached at every one): the byte
@@ -745,19 +785,26 @@ fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
         let _ = GO_READ_ARGS.remove(&key);
         return Ok(());
     }
-    let args = match unsafe { GO_READ_ARGS.get(&key) } {
-        Some(a) => *a,
-        None => return Ok(()), // missed the entry
+    let Some(a) = GO_READ_ARGS.get_ptr(&key) else {
+        return Ok(()); // missed the entry
     };
+    // SAFETY: this goroutine's own entry (maps.rs GO_READ_ARGS), read field
+    // by field before the delete.
+    let (conn, buf, ident) = unsafe { ((*a).ssl, (*a).buf, (*a).ident) };
     let _ = GO_READ_ARGS.remove(&key);
+    // Left by an earlier process with this tgid: not this call's.
+    match PROC_EPOCH.get_ptr(&key.tgid) {
+        Some(e) if unsafe { *e } == ident => {}
+        _ => return Ok(()),
+    }
     let n = go_first_result(ctx) as i64;
     if n <= 0 || n > u32::MAX as i64 {
         return Ok(());
     }
     emit_tls_event(
         ctx,
-        args.ssl,
-        args.buf as *const u8,
+        conn,
+        buf as *const u8,
         n as usize,
         Direction::Ingress,
         TlsLibrary::GoTls,

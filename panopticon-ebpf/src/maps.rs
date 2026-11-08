@@ -257,8 +257,8 @@ pub fn pid_allowed(tgid: u32) -> bool {
     }
 }
 
-/// Arguments of an in-flight `SSL_read` / `SSL_read_ex`, saved by the entry
-/// probe for the return probe.
+/// Arguments of an in-flight `SSL_read` / `SSL_read_ex` (unscoped modes)
+/// or Go `(*Conn).Read`, saved by the entry probe for the return probe.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlsReadArgs {
@@ -267,18 +267,29 @@ pub struct TlsReadArgs {
     /// `SSL_read_ex`'s `size_t *readbytes`; 0 for `SSL_read`, whose return
     /// value is the byte count.
     pub readbytes: u64,
+    /// OpenSSL: user stack pointer at entry, the call's frame identity
+    /// (tls_probes.rs `same_frame`). Go: the process instance
+    /// (`PROC_EPOCH`), since a goroutine's stack can move mid-call.
+    pub ident: u64,
 }
 
 /// TLS probe state (read arguments between SSL_read entry and return
-/// probes). Key: pid_tgid.
+/// probes, unscoped modes; restricted modes keep them in TLS_CALL). Key:
+/// pid_tgid.
 ///
 /// Must NOT be per-CPU: SSL_read blocks, and the thread is frequently
 /// rescheduled onto another CPU before the uretprobe fires, which made the
-/// lookup miss and silently dropped inbound TLS plaintext. LRU so entries
-/// whose return probe never fires (thread killed mid-read) are reclaimed.
+/// lookup miss and silently dropped inbound TLS plaintext.
+///
+/// Not LRU: an LRU map evicts and recycles elements from any CPU, so a
+/// return probe reading its value could copy another call's buffer address
+/// and export unrelated memory. Same ownership rule as TLS_CALL: only the
+/// owning thread inserts, replaces, reads and deletes its key, and
+/// sched_process_exit removes the key of a thread that exits mid-call. A
+/// full map fails closed: the entry stores nothing and the call emits
+/// nothing. Not pinned (loader.rs `PINNED_MAP_NAMES`): per-call state.
 #[map]
-pub static TLS_SCRATCH: LruHashMap<u64, TlsReadArgs> =
-    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+pub static TLS_SCRATCH: HashMap<u64, TlsReadArgs> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// The TLS call in progress on this CPU: which thread, and its connection
 /// object (`SSL*`, `*tls.Conn`). Set by the TLS entry probes and consumed by
@@ -387,9 +398,25 @@ pub struct GoReadKey {
 }
 
 /// Arguments of in-flight Go TLS reads (buf, conn), for the RET probes.
+///
+/// Not LRU, for the reason given at TLS_SCRATCH. The owner is the
+/// goroutine: only its entry probe inserts or replaces its key and only its
+/// RET probe reads and deletes it. A goroutine that never returns (its
+/// process exits mid-Read) leaves its entry behind; `ident` binds the entry
+/// to its process instance (`PROC_EPOCH`), so a later process reusing the
+/// tgid (and goroutine address) never consumes it. A full map fails closed.
+// ponytail: leaked entries of processes that exit mid-Read are never
+// reclaimed; at capacity Go reads stop being captured. Upgrade: sweep by
+// tgid at process exit (bpf_for_each_map_elem, 5.13+).
 #[map]
-pub static GO_READ_ARGS: LruHashMap<GoReadKey, TlsReadArgs> =
-    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+pub static GO_READ_ARGS: HashMap<GoReadKey, TlsReadArgs> =
+    HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+
+/// Process instance per tgid: set at exec (and on first sight of a process
+/// that predates the agent), removed when the thread group leader exits.
+/// Values are boot-time nanoseconds, unique per instance.
+#[map]
+pub static PROC_EPOCH: HashMap<u32, u64> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.
