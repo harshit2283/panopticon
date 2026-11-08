@@ -1474,6 +1474,9 @@ fn handle_messages(
                 crate::test_hooks::pause(crate::test_hooks::BEFORE_DNS_INSERT, ctx.io_gate);
             }
             gb.observe_dns(&msg);
+            if msg.protocol == crate::protocol::Protocol::Dns {
+                crate::test_hooks::pause(crate::test_hooks::AFTER_DNS_INSERT, ctx.io_gate);
+            }
         }
 
         // JSON export (channel-based — no mutex, no per-event flush). Last, so

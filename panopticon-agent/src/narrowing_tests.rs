@@ -68,10 +68,19 @@ impl tonic::transport::server::Connected for Recorder {
     fn connect_info(&self) {}
 }
 
-/// The collector's answer: accept, or reject quoting the request (a
-/// collector may echo what it was sent in its error).
+/// How the collector answers.
+#[derive(Clone, Copy, PartialEq)]
+enum Reply {
+    Accept,
+    /// Reject, quoting the request (a collector may echo what it was sent
+    /// in its error).
+    EchoError,
+    /// Never answer.
+    Hang,
+}
+
 struct Accept {
-    echo_error: bool,
+    reply: Reply,
 }
 
 #[tonic::async_trait]
@@ -89,7 +98,10 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
         >,
         tonic::Status,
     > {
-        if self.echo_error {
+        if self.reply == Reply::Hang {
+            std::future::pending::<()>().await;
+        }
+        if self.reply == Reply::EchoError {
             let quoted: String = format!("{:?}", request.into_inner())
                 .chars()
                 .filter(char::is_ascii_graphic)
@@ -102,7 +114,7 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
 }
 
 /// Start the collector; returns its endpoint and the bytes it received.
-async fn collector(echo_error: bool) -> (String, Arc<Mutex<Vec<u8>>>) {
+async fn collector(reply: Reply) -> (String, Arc<Mutex<Vec<u8>>>) {
     use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -117,7 +129,7 @@ async fn collector(echo_error: bool) -> (String, Arc<Mutex<Vec<u8>>>) {
     });
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(Accept { echo_error }))
+            .add_service(TraceServiceServer::new(Accept { reply }))
             .serve_with_incoming(incoming),
     );
     (format!("http://{addr}"), seen)
@@ -192,15 +204,14 @@ fn config(dir: &Path, otlp: &str) -> AgentConfig {
 
 impl Env {
     async fn new(name: &str) -> Self {
-        Self::with(name, "info", false).await
+        Self::with(name, "info", Reply::Accept).await
     }
 
-    /// `log_filter`: the pipelines' log filter; `echo_error`: the
-    /// collector rejects every export, quoting it.
-    async fn with(name: &str, log_filter: &str, echo_error: bool) -> Self {
+    /// `log_filter`: the pipelines' log filter; `reply`: the collector's.
+    async fn with(name: &str, log_filter: &str, reply: Reply) -> Self {
         global_log();
         let dir = tmpdir(name);
-        let (endpoint, otlp) = collector(echo_error).await;
+        let (endpoint, otlp) = collector(reply).await;
         let cfg = config(&dir, &endpoint);
         let privacy = Arc::new(PrivacyGate::new(cfg.privacy_mode));
         let mut shared = Shared::open(cfg, privacy, None, log_filter.to_string()).unwrap();
@@ -335,10 +346,30 @@ fn packet(from: (u32, u16), to: (u32, u16), proto: u8, payload: &[u8], gen_: u32
 /// path is `/<marker>` and carries an email address (so the audit log gets
 /// a line naming `SERVER:port`).
 fn exchange(marker: &str, port: u16, gen_: u32) -> Vec<DataEvent> {
-    let (cli, srv) = ((CLIENT, 40_000 + port % 20_000), (SERVER, port));
+    exchange_to(SERVER, marker, port, gen_)
+}
+
+fn exchange_to(server: u32, marker: &str, port: u16, gen_: u32) -> Vec<DataEvent> {
     let req = format!("GET /{marker}?u=a.person@example.com HTTP/1.1\r\nHost: shop\r\n\r\n");
     let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    let mut a = packet(cli, srv, 6, req.as_bytes(), gen_);
+    tcp_exchange(
+        (CLIENT, 40_000 + port % 20_000),
+        (server, port),
+        req.as_bytes(),
+        resp,
+        gen_,
+    )
+}
+
+/// One request and its response on a fresh TCP connection.
+fn tcp_exchange(
+    cli: (u32, u16),
+    srv: (u32, u16),
+    req: &[u8],
+    resp: &[u8],
+    gen_: u32,
+) -> Vec<DataEvent> {
+    let mut a = packet(cli, srv, 6, req, gen_);
     (a.tcp_seq, a.tcp_ack, a.tcp_flags) = (100, 900, TCP_FLAG_ACK);
     let mut b = packet(srv, cli, 6, resp, gen_);
     (b.tcp_seq, b.tcp_ack, b.tcp_flags) = (900, 100 + req.len() as u32, TCP_FLAG_ACK);
@@ -532,7 +563,7 @@ fn in_flight_otlp_export_is_refused_after_applied() {
 #[test]
 fn otlp_errors_log_only_through_the_pipeline() {
     t2("otlp_errors_log_only_through_the_pipeline", 4, async {
-        let env = Env::with("otlp-errors", "trace", true).await;
+        let env = Env::with("otlp-errors", "trace", Reply::EchoError).await;
         env.feed(&exchange("echo-before", 18101, 1));
         env.wait_for("echo-before", &["json", "logs", "otlp"]).await;
 
@@ -584,46 +615,142 @@ fn otlp_errors_log_only_through_the_pipeline() {
     });
 }
 
-/// A DNS answer the old pipeline inserts after the change never names a
-/// flow the new pipeline exports.
+/// A DNS query and its answer, `name` -> `ip`, on the resolver's UDP flow.
+fn dns_exchange(name: &str, ip: u32, id: u16, gen_: u32) -> Vec<DataEvent> {
+    use crate::protocol::dns::test_helpers::{
+        build_dns_query, build_dns_response, encode_dns_name,
+    };
+    let resolver = (0x0A63_0035, 53);
+    let cli = (CLIENT, 5300 + id);
+    let q = packet(cli, resolver, 17, &build_dns_query(id, name, 1), gen_);
+    let rdata = ip.to_be_bytes();
+    let answer = build_dns_response(id, 0, name, 1, &[(&encode_dns_name(name), 1, 300, &rdata)]);
+    vec![q, packet(resolver, cli, 17, &answer, gen_)]
+}
+
+/// A hostname the old pipeline retains (its DNS cache) never names a flow
+/// the new pipeline exports, even when the old worker inserts it after the
+/// change is applied and before the new flow is looked up.
 #[test]
 fn dns_answer_inserted_after_applied_names_nothing_new() {
     t2(
         "dns_answer_inserted_after_applied_names_nothing_new",
         4,
         async {
-            use crate::protocol::dns::test_helpers::{
-                build_dns_query, build_dns_response, encode_dns_name,
-            };
             let env = Env::new("dns").await;
-            env.feed(&exchange("old-before", 18031, 1));
+            // Positive control: a name the pipeline learned names its flows.
+            let other = 0x0A63_0007;
+            env.feed(&dns_exchange("seen-dns.example", other, 6, 1));
+            env.feed(&exchange_to(other, "old-before", 18031, 1));
             env.wait_for("old-before", PATHS).await;
+            env.wait_for("seen-dns.example", &["json"]).await;
 
-            // old-dns.example -> 10.99.0.1 (SERVER), learned by the old pipeline.
-            let resolver = (0x0A63_0035, 53);
-            let cli = (CLIENT, 5353);
-            let name = "old-dns.example";
-            let q = packet(cli, resolver, 17, &build_dns_query(7, name, 1), 1);
-            let rdata = SERVER.to_be_bytes();
-            let answer =
-                build_dns_response(7, 0, name, 1, &[(&encode_dns_name(name), 1, 300, &rdata)]);
-            let r = packet(resolver, cli, 17, &answer, 1);
-
+            // old-dns.example -> SERVER, inserted by the old pipeline only once
+            // the change is applied.
             let old = env.scope.gate().await.unwrap();
-            let hook = test_hooks::arm(test_hooks::BEFORE_DNS_INSERT, &old);
-            env.feed(&[q, r]);
+            let before = test_hooks::arm(test_hooks::BEFORE_DNS_INSERT, &old);
+            let after = test_hooks::arm(test_hooks::AFTER_DNS_INSERT, &old);
+            env.feed(&dns_exchange("old-dns.example", SERVER, 7, 1));
             assert!(
-                hook.wait_reached(WAIT),
+                before.wait_reached(WAIT),
                 "worker never reached the DNS insert"
             );
             env.scope.narrow(2).await;
             let applied = env.marks();
-            drop(hook); // the old pipeline's cache gets the answer now
+            drop(before);
+            assert!(
+                after.wait_reached(WAIT),
+                "the old worker never inserted the answer"
+            );
+            drop(after);
 
             env.feed(&exchange("new-after", 18032, 2));
             env.wait_for(":18032", &["audit"]).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            env.wait_for("new-after", &["json"]).await;
             env.assert_absent_after(&applied, "old-dns");
+            env.assert_absent_after(&applied, "seen-dns");
+            env.assert_absent_after(&applied, "old-");
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// Kafka topic names a pipeline learned (Metadata) name nothing the next
+/// pipeline exports: its Fetch of the same topic ID shows the raw ID.
+#[test]
+fn kafka_topic_names_do_not_outlive_their_pipeline() {
+    use crate::protocol::kafka::tests::{fetch_v16_exchange, metadata_v12_exchange};
+    t2(
+        "kafka_topic_names_do_not_outlive_their_pipeline",
+        4,
+        async {
+            let env = Env::new("kafka").await;
+            let id = [0x5au8; 16];
+            let broker = (SERVER, 9092);
+            let kafka = |port: u16, [req, resp]: [Vec<u8>; 2], gen_: u32| {
+                tcp_exchange((CLIENT, port), broker, &req, &resp, gen_)
+            };
+            env.feed(&kafka(
+                41001,
+                metadata_v12_exchange(1, "old-topic.secret", id),
+                1,
+            ));
+            env.feed(&kafka(41002, fetch_v16_exchange(2, id, "k", "v"), 1));
+            env.wait_for("old-topic.secret", &["json"]).await; // the Fetch, named
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            env.feed(&kafka(41003, fetch_v16_exchange(3, id, "k", "v"), 2));
+            env.wait_for(&"5a".repeat(16), &["json"]).await;
+            env.assert_absent_after(&applied, "old-topic");
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// An audit write of the old pipeline that failed (nothing written) is
+/// never retried: the line is not written after applied.
+#[test]
+fn a_failed_old_audit_write_is_not_retried_after_applied() {
+    t2(
+        "a_failed_old_audit_write_is_not_retried_after_applied",
+        4,
+        async {
+            let env = Env::new("auditfail").await;
+            env.shared.audit.as_ref().unwrap().fail_next_write_after(0);
+            env.feed(&exchange("old-unaudited", 18121, 1));
+            env.wait_for("old-unaudited", &["json"]).await;
+            env.scope.narrow(2).await;
+            env.feed(&exchange("new-after", 18122, 2));
+            env.wait_for(":18122", &["audit"]).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!contains(&env.file("audit.jsonl"), ":18121"));
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// The collector never answers: an old export stays unanswered across the
+/// change, and nothing of the old generation reaches the collector after
+/// applied (the transport's retained bytes included) while the new
+/// pipeline exports.
+#[test]
+fn an_unanswered_old_export_sends_nothing_after_applied() {
+    t2(
+        "an_unanswered_old_export_sends_nothing_after_applied",
+        4,
+        async {
+            let env = Env::with("otlp-hang", "info", Reply::Hang).await;
+            env.feed(&exchange("old-unanswered", 18131, 1));
+            env.wait_for("old-unanswered", &["otlp"]).await; // sent, never answered
+            env.feed(&exchange("old-queued", 18132, 1));
+            env.wait_for("old-queued", &["json"]).await;
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            env.feed(&exchange("new-after", 18133, 2));
+            env.wait_for("new-after", &["otlp"]).await;
+            // The old export times out (1 s in tests); the old batch thread
+            // then exports what it kept queued, into the revoked gate.
+            tokio::time::sleep(Duration::from_secs(3)).await;
             env.assert_absent_after(&applied, "old-");
             env.scope.shutdown().await;
         },
@@ -704,7 +831,7 @@ fn live_close_records_are_counted_and_reach_no_output() {
         4,
         async {
             let dir = tmpdir("close");
-            let (endpoint, _otlp) = collector(false).await;
+            let (endpoint, _otlp) = collector(Reply::Accept).await;
             let mut cfg = config(&dir, &endpoint);
             cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
             let shared = Arc::new(

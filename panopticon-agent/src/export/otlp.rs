@@ -91,6 +91,14 @@ impl OtlpWorker {
     }
 }
 
+/// How long one export may wait for the collector (tests: shorter, so
+/// an unanswered export's successor runs within the test).
+const EXPORT_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+
 /// The pipeline's gRPC channel: lazily connected through `GatedConnector`,
 /// tonic's internal tasks spawned under `dispatch`. Only `http://`
 /// endpoints: TLS would have to sit above the gate, and this exporter has
@@ -109,7 +117,10 @@ fn gated_channel(
     let ep = tonic::transport::Endpoint::from_shared(endpoint.to_string())
         .with_context(|| format!("invalid OTLP endpoint {endpoint}"))?
         .executor(DispatchExecutor(dispatch))
-        .connect_timeout(Duration::from_secs(10));
+        .connect_timeout(Duration::from_secs(10))
+        // An export the collector never answers fails instead of holding
+        // the SDK's batch thread (and the spans it retains) for good.
+        .timeout(EXPORT_TIMEOUT);
     Ok(ep.connect_with_connector_lazy(
         GatedConnector::plain(gate).with_pause_point(crate::test_hooks::OTLP_IN_FLIGHT_EXPORT),
     ))

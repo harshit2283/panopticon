@@ -18,6 +18,8 @@
 pub const WORKER_BEFORE_SINK: &str = "worker_before_sink";
 /// A worker, before it inserts a DNS answer into the cache.
 pub const BEFORE_DNS_INSERT: &str = "before_dns_insert";
+/// A worker, right after it inserted a DNS answer into the cache.
+pub const AFTER_DNS_INSERT: &str = "after_dns_insert";
 /// A ring reader, after it admitted an event, before the hand-off.
 pub const READER_AFTER_ADMISSION: &str = "reader_after_admission";
 /// An OTLP export writing to its socket, before the gate check (async:
