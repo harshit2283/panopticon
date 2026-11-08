@@ -28,8 +28,7 @@ mod protocol;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
-// Driven by the Linux capture path only.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 mod scope_publisher;
 mod scope_select;
 #[cfg(test)]

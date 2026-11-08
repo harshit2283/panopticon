@@ -7,7 +7,6 @@
 //!
 //! One collector and one long-lived client connection per test.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -529,323 +528,331 @@ async fn live_close_records_are_counted_and_reach_no_output() {
 
 // ── The scope publisher ────────────────────────────────────────────────
 
-/// In-memory `CGROUP_ALLOW` / `CONFIG`, with injected failures.
-#[derive(Default)]
-struct FakeMaps {
-    ids: BTreeSet<u64>,
-    generation: u64,
-    disarmed: bool,
-    fail_publish: bool,
-    fail_disarm: bool,
-}
+/// The publisher resolves cgroups with openat2 (`scope_select::resolve`):
+/// Linux only.
+#[cfg(target_os = "linux")]
+mod publisher {
+    use super::*;
+    use std::collections::BTreeSet;
 
-#[derive(Clone, Default)]
-struct Maps(Arc<Mutex<FakeMaps>>);
+    /// In-memory `CGROUP_ALLOW` / `CONFIG`, with injected failures.
+    #[derive(Default)]
+    struct FakeMaps {
+        ids: BTreeSet<u64>,
+        generation: u64,
+        disarmed: bool,
+        fail_publish: bool,
+        fail_disarm: bool,
+    }
 
-impl crate::scope_select::AllowMap for FakeMaps {
-    fn insert(&mut self, id: u64) -> anyhow::Result<()> {
-        if self.fail_publish {
-            anyhow::bail!("injected insert failure");
+    #[derive(Clone, Default)]
+    struct Maps(Arc<Mutex<FakeMaps>>);
+
+    impl crate::scope_select::AllowMap for FakeMaps {
+        fn insert(&mut self, id: u64) -> anyhow::Result<()> {
+            if self.fail_publish {
+                anyhow::bail!("injected insert failure");
+            }
+            self.ids.insert(id);
+            Ok(())
         }
-        self.ids.insert(id);
-        Ok(())
-    }
-    fn remove(&mut self, id: u64) -> anyhow::Result<()> {
-        if self.fail_publish {
-            anyhow::bail!("injected remove failure");
+        fn remove(&mut self, id: u64) -> anyhow::Result<()> {
+            if self.fail_publish {
+                anyhow::bail!("injected remove failure");
+            }
+            self.ids.remove(&id);
+            Ok(())
         }
-        self.ids.remove(&id);
-        Ok(())
-    }
-    fn bump_gen(&mut self) -> anyhow::Result<()> {
-        self.generation += 1;
-        Ok(())
-    }
-    fn ids(&mut self) -> anyhow::Result<BTreeSet<u64>> {
-        Ok(self.ids.clone())
-    }
-    fn generation(&mut self) -> anyhow::Result<u64> {
-        Ok(self.generation)
-    }
-    fn disarm(&mut self) -> anyhow::Result<()> {
-        if self.fail_disarm {
-            anyhow::bail!("injected disarm failure");
+        fn bump_gen(&mut self) -> anyhow::Result<()> {
+            self.generation += 1;
+            Ok(())
         }
-        self.disarmed = true;
-        Ok(())
-    }
-}
-
-impl crate::scope_publisher::ScopeMaps for Maps {
-    fn with(
-        &mut self,
-        f: &mut dyn FnMut(&mut dyn crate::scope_select::AllowMap) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        f(&mut *self.0.lock().unwrap())
-    }
-}
-
-const UID_A: &str = "0f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
-const UID_B: &str = "1f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
-
-fn ino(p: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(p).unwrap().ino()
-}
-
-fn pod(name: &str, uid: &str, app: &str) -> crate::k8s::model::Pod {
-    serde_json::from_value(serde_json::json!({
-        "metadata": {"name": name, "namespace": "pay", "uid": uid, "labels": {"app": app}},
-        "spec": {"nodeName": "n1"},
-        "status": {"phase": "Running", "podIP": "10.0.0.9"}
-    }))
-    .unwrap()
-}
-
-struct PubEnv {
-    env: Env,
-    root: PathBuf,
-    maps: Maps,
-    meta: Arc<crate::k8s::K8sMetadata>,
-}
-
-impl PubEnv {
-    async fn new(name: &str) -> Self {
-        let env = Env::new(name).await;
-        let root = env.dir.join("cg");
-        for d in [
-            "system.slice",
-            "other.slice",
-            &format!("kubepods/pod{UID_A}"),
-            &format!("kubepods/pod{UID_B}"),
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
+        fn ids(&mut self) -> anyhow::Result<BTreeSet<u64>> {
+            Ok(self.ids.clone())
         }
-        let meta = crate::k8s::K8sMetadata::new("http://test");
-        Self {
-            env,
-            root,
-            maps: Maps::default(),
-            meta,
+        fn generation(&mut self) -> anyhow::Result<u64> {
+            Ok(self.generation)
+        }
+        fn disarm(&mut self) -> anyhow::Result<()> {
+            if self.fail_disarm {
+                anyhow::bail!("injected disarm failure");
+            }
+            self.disarmed = true;
+            Ok(())
         }
     }
 
-    fn publisher(
-        &self,
-        cgroup_filter: &[String],
-        pods: &[crate::config::PodFilter],
-    ) -> crate::scope_publisher::Publisher<Maps> {
-        crate::scope_publisher::Publisher::new(
-            self.maps.clone(),
-            Arc::clone(&self.env.scope),
-            self.root.clone(),
-            Some(Arc::clone(&self.meta)),
-            Some("n1".into()),
-            cgroup_filter,
-            pods,
-        )
+    impl crate::scope_publisher::ScopeMaps for Maps {
+        fn with(
+            &mut self,
+            f: &mut dyn FnMut(&mut dyn crate::scope_select::AllowMap) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            f(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    const UID_A: &str = "0f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
+    const UID_B: &str = "1f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
+
+    fn ino(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).unwrap().ino()
+    }
+
+    fn pod(name: &str, uid: &str, app: &str) -> crate::k8s::model::Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "namespace": "pay", "uid": uid, "labels": {"app": app}},
+            "spec": {"nodeName": "n1"},
+            "status": {"phase": "Running", "podIP": "10.0.0.9"}
+        }))
         .unwrap()
     }
 
-    fn set_pods(&self, pods: &[crate::k8s::model::Pod]) {
-        self.meta.replace_pods(pods);
-        self.meta.publish_if_dirty();
+    struct PubEnv {
+        env: Env,
+        root: PathBuf,
+        maps: Maps,
+        meta: Arc<crate::k8s::K8sMetadata>,
     }
 
-    fn ids(&self) -> BTreeSet<u64> {
-        self.maps.0.lock().unwrap().ids.clone()
-    }
-}
+    impl PubEnv {
+        async fn new(name: &str) -> Self {
+            let env = Env::new(name).await;
+            let root = env.dir.join("cg");
+            for d in [
+                "system.slice",
+                "other.slice",
+                &format!("kubepods/pod{UID_A}"),
+                &format!("kubepods/pod{UID_B}"),
+            ] {
+                std::fs::create_dir_all(root.join(d)).unwrap();
+            }
+            let meta = crate::k8s::K8sMetadata::new("http://test");
+            Self {
+                env,
+                root,
+                maps: Maps::default(),
+                meta,
+            }
+        }
 
-fn app_filter(app: &str) -> crate::config::PodFilter {
-    crate::config::load_config_from_str(&format!(
+        fn publisher(
+            &self,
+            cgroup_filter: &[String],
+            pods: &[crate::config::PodFilter],
+        ) -> crate::scope_publisher::Publisher<Maps> {
+            crate::scope_publisher::Publisher::new(
+                self.maps.clone(),
+                Arc::clone(&self.env.scope),
+                self.root.clone(),
+                Some(Arc::clone(&self.meta)),
+                Some("n1".into()),
+                cgroup_filter,
+                pods,
+            )
+            .unwrap()
+        }
+
+        fn set_pods(&self, pods: &[crate::k8s::model::Pod]) {
+            self.meta.replace_pods(pods);
+            self.meta.publish_if_dirty();
+        }
+
+        fn ids(&self) -> BTreeSet<u64> {
+            self.maps.0.lock().unwrap().ids.clone()
+        }
+    }
+
+    fn app_filter(app: &str) -> crate::config::PodFilter {
+        crate::config::load_config_from_str(&format!(
         "[capture]\nbackend = \"cgroup_skb\"\n[[pod_filter]]\nnamespace = \"pay\"\nlabels = {{ app = \"{app}\" }}\n"
     ))
     .unwrap()
     .pod_filter
     .unwrap()
     .remove(0)
-}
-
-/// Stage A6 review, HIGH 1: a pod whose labels stop matching leaves
-/// CGROUP_ALLOW, as a narrowing (the pipeline is revoked); a pod that
-/// starts matching is added (a widening, no revocation).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pod_label_change_narrows_and_revokes() {
-    let p = PubEnv::new("pods").await;
-    let a = ino(&p.root.join(format!("kubepods/pod{UID_A}")));
-    let b = ino(&p.root.join(format!("kubepods/pod{UID_B}")));
-    p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "web")]);
-    let mut publisher = p.publisher(&[], &[app_filter("co")]);
-    publisher.pods_changed().await.unwrap();
-    assert_eq!(p.ids(), BTreeSet::from([a]));
-    let first = p.env.scope.gate().await.unwrap();
-
-    // b starts matching: widening, same pipeline.
-    p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
-    publisher.pods_changed().await.unwrap();
-    assert_eq!(p.ids(), BTreeSet::from([a, b]));
-    assert!(!first.is_revoked());
-
-    // a's labels change: narrowing, floor raised, old pipeline revoked.
-    p.set_pods(&[pod("a", UID_A, "web"), pod("b", UID_B, "co")]);
-    publisher.pods_changed().await.unwrap();
-    assert_eq!(p.ids(), BTreeSet::from([b]));
-    assert!(first.is_revoked());
-    let generation = p.maps.0.lock().unwrap().generation as u32;
-    assert_eq!(p.env.floor.get(), generation);
-    let second = p.env.scope.gate().await.unwrap();
-    assert!(!second.is_revoked());
-
-    // b is deleted: narrowing to nothing.
-    p.set_pods(&[pod("a", UID_A, "web")]);
-    publisher.pods_changed().await.unwrap();
-    assert!(p.ids().is_empty());
-    assert!(second.is_revoked());
-    p.env.scope.shutdown().await;
-}
-
-/// Reloads are serialised: two narrowings in either order and a widening
-/// racing a narrowing all end in the last requested set, each reported
-/// only once applied.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reloads_are_serialised_and_reported_after_applied() {
-    use crate::scope_publisher::{ScopeMsg, run};
-    let p = PubEnv::new("reload").await;
-    let (sys, other) = (
-        ino(&p.root.join("system.slice")),
-        ino(&p.root.join("other.slice")),
-    );
-    let both = vec!["system.slice".to_string(), "other.slice".to_string()];
-    p.maps.0.lock().unwrap().ids = BTreeSet::from([sys, other]);
-    let publisher = p.publisher(&both, &[]);
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let task = tokio::spawn(run(publisher, rx));
-
-    let reload = |paths: &[&str]| {
-        let (reply, applied) = tokio::sync::oneshot::channel();
-        let msg = ScopeMsg::Reload {
-            cgroup_filter: Some(paths.iter().map(|s| s.to_string()).collect()),
-            pod_filter: None,
-            reply,
-        };
-        (msg, applied)
-    };
-    let first = p.env.scope.gate().await.unwrap();
-    // Narrow to `other`, then (sent before the first is applied) to
-    // `system`: processed in order, each its own revocation.
-    let (m1, a1) = reload(&["other.slice"]);
-    let (m2, a2) = reload(&["system.slice"]);
-    tx.send(m1).await.unwrap();
-    tx.send(m2).await.unwrap();
-    assert_eq!(a1.await.unwrap(), Ok(()));
-    assert!(
-        first.is_revoked(),
-        "reported applied only after the revocation"
-    );
-    assert_eq!(a2.await.unwrap(), Ok(()));
-    assert_eq!(p.ids(), BTreeSet::from([sys]));
-
-    // A widening racing a narrowing: the last one wins, the narrowing
-    // revokes the pipeline the widening left in place.
-    let second = p.env.scope.gate().await.unwrap();
-    let (m3, a3) = reload(&["system.slice", "other.slice"]);
-    let (m4, a4) = reload(&["other.slice"]);
-    tx.send(m3).await.unwrap();
-    tx.send(m4).await.unwrap();
-    assert_eq!(a3.await.unwrap(), Ok(()));
-    assert_eq!(a4.await.unwrap(), Ok(()));
-    assert_eq!(p.ids(), BTreeSet::from([other]));
-    assert!(second.is_revoked());
-    assert_eq!(
-        p.env.floor.get(),
-        p.maps.0.lock().unwrap().generation as u32
-    );
-
-    // A selector that does not resolve is rejected; nothing changes.
-    let (m5, a5) = reload(&["missing.slice"]);
-    tx.send(m5).await.unwrap();
-    assert!(a5.await.unwrap().is_err());
-    assert_eq!(p.ids(), BTreeSet::from([other]));
-
-    drop(tx);
-    task.await.unwrap().unwrap();
-    p.env.scope.shutdown().await;
-}
-
-/// The net_cls watch's narrowing is sticky: later pod changes cannot
-/// re-widen.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn net_cls_disable_is_a_sticky_narrowing() {
-    let p = PubEnv::new("netcls").await;
-    p.set_pods(&[pod("a", UID_A, "co")]);
-    let mut publisher = p.publisher(&["system.slice".into()], &[app_filter("co")]);
-    publisher.pods_changed().await.unwrap();
-    assert_eq!(p.ids().len(), 2);
-    let first = p.env.scope.gate().await.unwrap();
-    publisher
-        .handle(crate::scope_publisher::ScopeMsg::Disable("test".into()))
-        .await
-        .unwrap();
-    assert!(p.ids().is_empty());
-    assert!(first.is_revoked());
-    p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
-    publisher.pods_changed().await.unwrap();
-    assert!(p.ids().is_empty());
-    p.env.scope.shutdown().await;
-}
-
-/// Stage A6 review, HIGH 2: a failed runtime publication disarms the
-/// kernel and revokes the pipeline before the stop is logged; nothing is
-/// published afterwards. A failed disarm makes the task fail (the agent
-/// exits).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn publication_failure_is_a_fatal_capture_stop() {
-    let p = PubEnv::new("fatal").await;
-    p.set_pods(&[pod("a", UID_A, "co")]);
-    let mut publisher = p.publisher(&[], &[app_filter("co")]);
-    publisher.pods_changed().await.unwrap();
-    let gate = p.env.scope.gate().await.unwrap();
-
-    p.maps.0.lock().unwrap().fail_publish = true;
-    p.set_pods(&[]);
-    publisher.pods_changed().await.unwrap();
-    assert!(publisher.is_stopped());
-    assert!(p.maps.0.lock().unwrap().disarmed);
-    assert!(gate.is_revoked());
-    assert!(p.env.scope.gate().await.is_none());
-    p.env.feed(&exchange("after-stop", 18071, 99));
-    assert!(p.env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
-    // Nothing more is published, and a reload is refused.
-    p.maps.0.lock().unwrap().fail_publish = false;
-    p.set_pods(&[pod("b", UID_B, "co")]);
-    publisher.pods_changed().await.unwrap();
-    assert_eq!(p.ids().len(), 1, "unchanged since the failure");
-    let (reply, rejected) = tokio::sync::oneshot::channel();
-    publisher
-        .handle(crate::scope_publisher::ScopeMsg::Reload {
-            cgroup_filter: None,
-            pod_filter: Some(vec![app_filter("co")]),
-            reply,
-        })
-        .await
-        .unwrap();
-    assert!(rejected.await.unwrap().is_err());
-
-    // Disarming fails too: the publisher reports it, for the agent to exit.
-    let q = PubEnv::new("fatal2").await;
-    q.set_pods(&[pod("a", UID_A, "co")]);
-    let mut publisher = q.publisher(&[], &[app_filter("co")]);
-    publisher.pods_changed().await.unwrap();
-    {
-        let mut m = q.maps.0.lock().unwrap();
-        m.fail_publish = true;
-        m.fail_disarm = true;
     }
-    q.set_pods(&[]);
-    assert!(publisher.pods_changed().await.is_err());
-    assert!(
-        q.env.scope.gate().await.is_none(),
-        "pipeline revoked anyway"
-    );
+
+    /// Stage A6 review, HIGH 1: a pod whose labels stop matching leaves
+    /// CGROUP_ALLOW, as a narrowing (the pipeline is revoked); a pod that
+    /// starts matching is added (a widening, no revocation).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pod_label_change_narrows_and_revokes() {
+        let p = PubEnv::new("pods").await;
+        let a = ino(&p.root.join(format!("kubepods/pod{UID_A}")));
+        let b = ino(&p.root.join(format!("kubepods/pod{UID_B}")));
+        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "web")]);
+        let mut publisher = p.publisher(&[], &[app_filter("co")]);
+        publisher.pods_changed().await.unwrap();
+        assert_eq!(p.ids(), BTreeSet::from([a]));
+        let first = p.env.scope.gate().await.unwrap();
+
+        // b starts matching: widening, same pipeline.
+        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
+        publisher.pods_changed().await.unwrap();
+        assert_eq!(p.ids(), BTreeSet::from([a, b]));
+        assert!(!first.is_revoked());
+
+        // a's labels change: narrowing, floor raised, old pipeline revoked.
+        p.set_pods(&[pod("a", UID_A, "web"), pod("b", UID_B, "co")]);
+        publisher.pods_changed().await.unwrap();
+        assert_eq!(p.ids(), BTreeSet::from([b]));
+        assert!(first.is_revoked());
+        let generation = p.maps.0.lock().unwrap().generation as u32;
+        assert_eq!(p.env.floor.get(), generation);
+        let second = p.env.scope.gate().await.unwrap();
+        assert!(!second.is_revoked());
+
+        // b is deleted: narrowing to nothing.
+        p.set_pods(&[pod("a", UID_A, "web")]);
+        publisher.pods_changed().await.unwrap();
+        assert!(p.ids().is_empty());
+        assert!(second.is_revoked());
+        p.env.scope.shutdown().await;
+    }
+
+    /// Reloads are serialised: two narrowings in either order and a widening
+    /// racing a narrowing all end in the last requested set, each reported
+    /// only once applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reloads_are_serialised_and_reported_after_applied() {
+        use crate::scope_publisher::{ScopeMsg, run};
+        let p = PubEnv::new("reload").await;
+        let (sys, other) = (
+            ino(&p.root.join("system.slice")),
+            ino(&p.root.join("other.slice")),
+        );
+        let both = vec!["system.slice".to_string(), "other.slice".to_string()];
+        p.maps.0.lock().unwrap().ids = BTreeSet::from([sys, other]);
+        let publisher = p.publisher(&both, &[]);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(run(publisher, rx));
+
+        let reload = |paths: &[&str]| {
+            let (reply, applied) = tokio::sync::oneshot::channel();
+            let msg = ScopeMsg::Reload {
+                cgroup_filter: Some(paths.iter().map(|s| s.to_string()).collect()),
+                pod_filter: None,
+                reply,
+            };
+            (msg, applied)
+        };
+        let first = p.env.scope.gate().await.unwrap();
+        // Narrow to `other`, then (sent before the first is applied) to
+        // `system`: processed in order, each its own revocation.
+        let (m1, a1) = reload(&["other.slice"]);
+        let (m2, a2) = reload(&["system.slice"]);
+        tx.send(m1).await.unwrap();
+        tx.send(m2).await.unwrap();
+        assert_eq!(a1.await.unwrap(), Ok(()));
+        assert!(
+            first.is_revoked(),
+            "reported applied only after the revocation"
+        );
+        assert_eq!(a2.await.unwrap(), Ok(()));
+        assert_eq!(p.ids(), BTreeSet::from([sys]));
+
+        // A widening racing a narrowing: the last one wins, the narrowing
+        // revokes the pipeline the widening left in place.
+        let second = p.env.scope.gate().await.unwrap();
+        let (m3, a3) = reload(&["system.slice", "other.slice"]);
+        let (m4, a4) = reload(&["other.slice"]);
+        tx.send(m3).await.unwrap();
+        tx.send(m4).await.unwrap();
+        assert_eq!(a3.await.unwrap(), Ok(()));
+        assert_eq!(a4.await.unwrap(), Ok(()));
+        assert_eq!(p.ids(), BTreeSet::from([other]));
+        assert!(second.is_revoked());
+        assert_eq!(
+            p.env.floor.get(),
+            p.maps.0.lock().unwrap().generation as u32
+        );
+
+        // A selector that does not resolve is rejected; nothing changes.
+        let (m5, a5) = reload(&["missing.slice"]);
+        tx.send(m5).await.unwrap();
+        assert!(a5.await.unwrap().is_err());
+        assert_eq!(p.ids(), BTreeSet::from([other]));
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+        p.env.scope.shutdown().await;
+    }
+
+    /// The net_cls watch's narrowing is sticky: later pod changes cannot
+    /// re-widen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn net_cls_disable_is_a_sticky_narrowing() {
+        let p = PubEnv::new("netcls").await;
+        p.set_pods(&[pod("a", UID_A, "co")]);
+        let mut publisher = p.publisher(&["system.slice".into()], &[app_filter("co")]);
+        publisher.pods_changed().await.unwrap();
+        assert_eq!(p.ids().len(), 2);
+        let first = p.env.scope.gate().await.unwrap();
+        publisher
+            .handle(crate::scope_publisher::ScopeMsg::Disable("test".into()))
+            .await
+            .unwrap();
+        assert!(p.ids().is_empty());
+        assert!(first.is_revoked());
+        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
+        publisher.pods_changed().await.unwrap();
+        assert!(p.ids().is_empty());
+        p.env.scope.shutdown().await;
+    }
+
+    /// Stage A6 review, HIGH 2: a failed runtime publication disarms the
+    /// kernel and revokes the pipeline before the stop is logged; nothing is
+    /// published afterwards. A failed disarm makes the task fail (the agent
+    /// exits).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publication_failure_is_a_fatal_capture_stop() {
+        let p = PubEnv::new("fatal").await;
+        p.set_pods(&[pod("a", UID_A, "co")]);
+        let mut publisher = p.publisher(&[], &[app_filter("co")]);
+        publisher.pods_changed().await.unwrap();
+        let gate = p.env.scope.gate().await.unwrap();
+
+        p.maps.0.lock().unwrap().fail_publish = true;
+        p.set_pods(&[]);
+        publisher.pods_changed().await.unwrap();
+        assert!(publisher.is_stopped());
+        assert!(p.maps.0.lock().unwrap().disarmed);
+        assert!(gate.is_revoked());
+        assert!(p.env.scope.gate().await.is_none());
+        p.env.feed(&exchange("after-stop", 18071, 99));
+        assert!(p.env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
+        // Nothing more is published, and a reload is refused.
+        p.maps.0.lock().unwrap().fail_publish = false;
+        p.set_pods(&[pod("b", UID_B, "co")]);
+        publisher.pods_changed().await.unwrap();
+        assert_eq!(p.ids().len(), 1, "unchanged since the failure");
+        let (reply, rejected) = tokio::sync::oneshot::channel();
+        publisher
+            .handle(crate::scope_publisher::ScopeMsg::Reload {
+                cgroup_filter: None,
+                pod_filter: Some(vec![app_filter("co")]),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(rejected.await.unwrap().is_err());
+
+        // Disarming fails too: the publisher reports it, for the agent to exit.
+        let q = PubEnv::new("fatal2").await;
+        q.set_pods(&[pod("a", UID_A, "co")]);
+        let mut publisher = q.publisher(&[], &[app_filter("co")]);
+        publisher.pods_changed().await.unwrap();
+        {
+            let mut m = q.maps.0.lock().unwrap();
+            m.fail_publish = true;
+            m.fail_disarm = true;
+        }
+        q.set_pods(&[]);
+        assert!(publisher.pods_changed().await.is_err());
+        assert!(
+            q.env.scope.gate().await.is_none(),
+            "pipeline revoked anyway"
+        );
+    }
 }
