@@ -100,6 +100,7 @@ impl<M: ScopeMaps> Publisher<M> {
         })
     }
 
+    #[cfg(test)]
     pub fn is_stopped(&self) -> bool {
         self.stopped
     }

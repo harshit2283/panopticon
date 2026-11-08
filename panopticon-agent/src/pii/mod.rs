@@ -949,11 +949,13 @@ mod tests {
 
     #[test]
     fn pipeline_copies_share_regexes_but_not_captured_state() {
-        let mut config = PiiConfig::default();
-        config.mode = PiiMode::External {
-            url: "http://pii.local/detect".to_string(),
-            sample_rate: 1.0,
-            timeout_ms: 100,
+        let config = PiiConfig {
+            mode: PiiMode::External {
+                url: "http://pii.local/detect".to_string(),
+                sample_rate: 1.0,
+                timeout_ms: 100,
+            },
+            ..PiiConfig::default()
         };
         let engine = PiiEngine::new(&config, &[]);
         let gate = crate::io_gate::IoGate::new();

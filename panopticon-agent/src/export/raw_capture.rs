@@ -74,11 +74,6 @@ impl RawCaptureHandle {
         }
     }
 
-    /// Events dropped because a writer could not keep up (every pipeline).
-    pub fn dropped(&self) -> u64 {
-        self.file.dropped()
-    }
-
     /// Ask the writer to drain what is queued and exit.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -451,8 +446,8 @@ mod tests {
         thread.join().unwrap();
         let mut out = Vec::new();
         let written = decode_to_jsonl(std::fs::File::open(&path).unwrap(), &mut out).unwrap();
-        assert_eq!(written + handle.dropped(), 10_000);
-        assert!(handle.dropped() > 0);
+        assert_eq!(written + handle.file.dropped(), 10_000);
+        assert!(handle.file.dropped() > 0);
         std::fs::remove_file(&path).ok();
     }
 }

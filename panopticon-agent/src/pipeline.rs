@@ -59,6 +59,9 @@ pub struct Shared {
     /// `EnvFilter` directives of the pipelines' log subscribers.
     pub log_filter: String,
     pub log_sink: LogSink,
+    /// Tests: how many upcoming pipeline builds fail.
+    #[cfg(test)]
+    pub fail_builds: std::sync::atomic::AtomicU32,
 }
 
 impl Shared {
@@ -129,6 +132,8 @@ impl Shared {
             raw,
             log_filter,
             log_sink: crate::io_gate::stdout_sink(),
+            #[cfg(test)]
+            fail_builds: Default::default(),
         })
     }
 
@@ -160,6 +165,8 @@ impl Shared {
             raw: None,
             log_filter: "info".to_string(),
             log_sink: crate::io_gate::stdout_sink(),
+            #[cfg(test)]
+            fail_builds: Default::default(),
         })
     }
 }
@@ -208,6 +215,18 @@ fn log_dispatch(shared: &Shared, gate: &Arc<IoGate>) -> tracing::Dispatch {
 impl Pipeline {
     /// Build a pipeline and start its tasks. Must run inside the runtime.
     pub fn build(shared: &Shared) -> Result<Self> {
+        #[cfg(test)]
+        if shared
+            .fail_builds
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("test: pipeline build failure");
+        }
         let cfg = &shared.config;
         let gate = IoGate::new();
         let dispatch = log_dispatch(shared, &gate);
@@ -313,16 +332,18 @@ impl Pipeline {
         Arc::clone(&self.handle)
     }
 
-    pub fn gate(&self) -> &Arc<IoGate> {
-        &self.gate
-    }
-
     /// Narrowing step 4: revoke the gate. Waits for every gated write in
     /// flight; nothing the pipeline holds can leave the process afterwards.
     pub async fn revoke(&self) {
         let gate = Arc::clone(&self.gate);
-        // The write lock can wait on a blocked write: off the runtime.
-        let _ = tokio::task::spawn_blocking(move || gate.revoke()).await;
+        // The write lock can wait on a blocked write: off the runtime. If
+        // the blocking pool refuses (runtime shutting down), revoke here.
+        if tokio::task::spawn_blocking(move || gate.revoke())
+            .await
+            .is_err()
+        {
+            self.gate.revoke();
+        }
     }
 
     /// After [`revoke`](Self::revoke): stop everything and drop its state,
@@ -445,10 +466,6 @@ impl Scope {
         Arc::clone(&self.slot)
     }
 
-    pub fn shared(&self) -> &Arc<Shared> {
-        &self.shared
-    }
-
     /// Build a pipeline and install it; on failure install the closed
     /// handle. Returns the new pipeline, if any.
     fn install(&self) -> Option<Pipeline> {
@@ -524,6 +541,6 @@ impl Scope {
             .lock()
             .await
             .as_ref()
-            .map(|p| Arc::clone(p.gate()))
+            .map(|p| Arc::clone(&p.gate))
     }
 }

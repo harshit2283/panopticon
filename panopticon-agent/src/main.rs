@@ -10,18 +10,26 @@ mod config;
 mod event_loop;
 mod export;
 mod graph;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod io_gate;
 mod k8s;
 #[cfg(target_os = "linux")]
 mod loader;
 mod pii;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod pipeline;
 
+#[cfg(test)]
+mod narrowing_tests;
 mod platform;
 mod protocol;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod scope_publisher;
 mod scope_select;
 #[cfg(test)]

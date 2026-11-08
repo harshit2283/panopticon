@@ -205,8 +205,11 @@ running config is kept.
 An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
 `head_only_bytes` without `head_only` stop the agent with an error.
 
-`SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3) —
-restart the agent for anything else. Unknown keys are ignored silently
+`SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3)
+and, with the `cgroup_skb` backend, changes to `cgroup_filter` / `pod_filter`
+that are already set (adding or removing one needs a restart; a reload that
+narrows them is reported applied only once nothing captured under the old
+scope can still leave the agent) — restart the agent for anything else. Unknown keys are ignored silently
 (except inside `[privacy]`, where they are an error), so check spelling.
 
 ### 4.3 Privacy modes

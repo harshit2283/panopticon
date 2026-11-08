@@ -1572,6 +1572,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "flate2",
+ "futures-util",
  "fxhash",
  "hpack-patched",
  "http",
