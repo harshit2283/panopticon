@@ -163,6 +163,14 @@ pub struct AgentConfig {
     /// If set, only capture traffic of these processes (PIDs, i.e. kernel
     /// tgids): at most `MAX_PID_FILTER`, none 0. Restart-only.
     pub pid_filter: Option<Vec<u32>>,
+    /// `cgroup_filter`: cgroup v2 paths, relative to the cgroup2 root (a
+    /// leading `/` is allowed and means the same, as in `/proc/<pid>/cgroup`).
+    /// Their sockets and those of every descendant cgroup are captured
+    /// (DESIGN §3.2). cgroup_skb backend only. Restart-only for now.
+    pub cgroup_filter: Option<Vec<String>>,
+    /// `[[pod_filter]]`: pods on this node whose pod-level cgroup is
+    /// captured (DESIGN §3.2). cgroup_skb backend only. Restart-only for now.
+    pub pod_filter: Option<Vec<PodFilter>>,
     /// `[capture] backend`. Restart-only.
     pub capture_backend: CaptureBackend,
     /// `[capture] cgroup2_path`: the cgroup v2 root the cgroup_skb backend
@@ -273,6 +281,8 @@ impl Default for AgentConfig {
             // Empty = auto-detect default-route interface(s) at startup.
             interfaces: Vec::new(),
             pid_filter: None,
+            cgroup_filter: None,
+            pod_filter: None,
             capture_backend: CaptureBackend::Tc,
             cgroup2_path: "auto".into(),
 
@@ -461,6 +471,8 @@ pub struct AgentConfigFile {
     pub capture_enabled: Option<bool>,
     pub interfaces: Option<Vec<String>>,
     pub pid_filter: Option<Vec<u32>>,
+    pub cgroup_filter: Option<Vec<String>>,
+    pub pod_filter: Option<Vec<PodFilterFile>>,
     pub capture: Option<CaptureConfigFile>,
     pub max_events_per_sec: Option<u64>,
     pub max_worker_count: Option<usize>,
@@ -516,6 +528,75 @@ pub struct GraphConfigFile {
     pub aggregation_window_secs: Option<u64>,
     pub stale_edge_timeout_secs: Option<u64>,
     pub identity_cache_ttl_secs: Option<u64>,
+}
+
+/// One `[[pod_filter]]` entry: `namespace` plus exactly one of `labels`
+/// (every label must match) or `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodFilter {
+    pub namespace: String,
+    pub select: PodSelect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodSelect {
+    Labels(std::collections::BTreeMap<String, String>),
+    Name(String),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PodFilterFile {
+    pub namespace: Option<String>,
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    pub name: Option<String>,
+}
+
+impl PodFilterFile {
+    fn validate(self) -> anyhow::Result<PodFilter> {
+        let namespace = self.namespace.unwrap_or_default();
+        if namespace.is_empty() {
+            anyhow::bail!("[[pod_filter]] needs a non-empty namespace");
+        }
+        let select = match (self.labels, self.name) {
+            (Some(l), None) if l.is_empty() => anyhow::bail!(
+                "[[pod_filter]] namespace = \"{namespace}\": labels = {{}} would match every pod; \
+                 list at least one label, or use name"
+            ),
+            (Some(l), None) => PodSelect::Labels(l),
+            (None, Some(n)) if !n.is_empty() => PodSelect::Name(n),
+            (None, Some(_)) => {
+                anyhow::bail!("[[pod_filter]] namespace = \"{namespace}\": name is empty")
+            }
+            _ => anyhow::bail!(
+                "[[pod_filter]] namespace = \"{namespace}\" needs exactly one of labels or name"
+            ),
+        };
+        Ok(PodFilter { namespace, select })
+    }
+}
+
+/// Check one `cgroup_filter` entry and return it relative to the cgroup2
+/// root (without the optional leading `/`). Refused: the root itself (empty
+/// or `/`), and any `.`/`..` or empty component, so a path can never leave
+/// the root or name it.
+pub fn cgroup_filter_rel(path: &str) -> anyhow::Result<&str> {
+    let rel = path.strip_prefix('/').unwrap_or(path);
+    if rel.is_empty() {
+        anyhow::bail!(
+            "cgroup_filter = \"{path}\" names the cgroup2 root, which would capture every process"
+        );
+    }
+    if rel
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == ".." || c.contains('\0'))
+    {
+        anyhow::bail!(
+            "cgroup_filter = \"{path}\": use a plain path relative to the cgroup2 root \
+             (no `.`, `..` or empty components)"
+        );
+    }
+    Ok(rel)
 }
 
 /// `[capture]` table.
@@ -589,6 +670,16 @@ impl AgentConfigFile {
         }
         if let Some(v) = self.pid_filter {
             base.pid_filter = Some(v);
+        }
+        if let Some(v) = self.cgroup_filter {
+            base.cgroup_filter = Some(v);
+        }
+        if let Some(v) = self.pod_filter {
+            base.pod_filter = Some(
+                v.into_iter()
+                    .map(PodFilterFile::validate)
+                    .collect::<anyhow::Result<_>>()?,
+            );
         }
         if let Some(capture) = self.capture {
             match capture.backend.as_deref() {
@@ -823,6 +914,39 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
             anyhow::bail!("pid_filter cannot contain 0 (not a process)");
         }
     }
+    if let Some(paths) = &config.cgroup_filter {
+        if paths.is_empty() {
+            anyhow::bail!(
+                "cgroup_filter = [] would capture nothing; list cgroup paths, or remove it"
+            );
+        }
+        let max = panopticon_common::MAX_CGROUP_ALLOW as usize;
+        if paths.len() > max {
+            anyhow::bail!(
+                "cgroup_filter lists {} paths; at most {max} are allowed",
+                paths.len()
+            );
+        }
+        for p in paths {
+            cgroup_filter_rel(p)?;
+        }
+    }
+    if config.pod_filter.as_ref().is_some_and(|p| p.is_empty()) {
+        anyhow::bail!(
+            "pod_filter = [] would capture nothing; add [[pod_filter]] entries, or remove it"
+        );
+    }
+    if config.cgroup_filter.is_some() || config.pod_filter.is_some() {
+        if config.capture_backend != CaptureBackend::CgroupSkb {
+            anyhow::bail!(
+                "cgroup_filter and pod_filter need [capture] backend = \"cgroup_skb\"; \
+                 the tc backend cannot select by cgroup"
+            );
+        }
+        if config.pod_filter.is_some() && config.kubernetes.mode == KubernetesMode::Disabled {
+            anyhow::bail!("pod_filter needs Kubernetes metadata, but [kubernetes] enabled = false");
+        }
+    }
     if config.kubernetes.relist_interval < Duration::from_secs(5) {
         return Err(anyhow::anyhow!(
             "kubernetes.relist_interval_secs must be >= 5"
@@ -844,6 +968,13 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     };
     if pids(running) != pids(new) {
         return Err("changing pid_filter needs a restart".into());
+    }
+    // DESIGN §3 lets cgroup_filter/pod_filter change at runtime (widening,
+    // or narrowing through pipeline revocation), but that needs the runtime
+    // scope publisher, a later stage. Until it lands they are restart-only,
+    // so nothing narrows without the revocation.
+    if running.cgroup_filter != new.cgroup_filter || running.pod_filter != new.pod_filter {
+        return Err("changing cgroup_filter or pod_filter needs a restart".into());
     }
     if running.capture_backend != new.capture_backend || running.cgroup2_path != new.cgroup2_path {
         return Err("changing [capture] backend or cgroup2_path needs a restart".into());
@@ -1287,6 +1418,105 @@ mod tests {
         assert!(load_config_from_str("[capture]\nbogus = 1\n").is_err());
         let err = check_restart_only(&tc, &cg).unwrap_err();
         assert!(err.contains("[capture] backend"), "{err}");
+    }
+
+    #[test]
+    fn test_cgroup_and_pod_filter_config() {
+        const CG: &str = "[capture]\nbackend = \"cgroup_skb\"\n";
+        let ok = |toml: &str| load_config_from_str(&format!("{toml}{CG}")).unwrap();
+        let err = |toml: &str| {
+            load_config_from_str(&format!("{toml}{CG}"))
+                .unwrap_err()
+                .to_string()
+        };
+        let c = ok("cgroup_filter = [\"/kubepods.slice/a.slice\", \"system.slice\"]\n");
+        assert_eq!(
+            c.cgroup_filter.as_deref().unwrap(),
+            ["/kubepods.slice/a.slice", "system.slice"]
+        );
+        assert_eq!(cgroup_filter_rel("/a/b").unwrap(), "a/b");
+        assert_eq!(cgroup_filter_rel("a/b").unwrap(), "a/b");
+        for bad in [
+            "\"\"",
+            "\"/\"",
+            "\"a/../b\"",
+            "\"..\"",
+            "\"a//b\"",
+            "\"./a\"",
+            "\"a/\"",
+        ] {
+            let e = err(&format!("cgroup_filter = [{bad}]\n"));
+            assert!(e.contains("cgroup_filter"), "{bad}: {e}");
+        }
+        assert!(err("cgroup_filter = []\n").contains("would capture nothing"));
+
+        let c = ok(
+            "[[pod_filter]]\nnamespace = \"pay\"\nlabels = { app = \"co\", tier = \"web\" }\n\
+             [[pod_filter]]\nnamespace = \"pay\"\nname = \"co-1\"\n",
+        );
+        let pods = c.pod_filter.unwrap();
+        assert_eq!(pods[0].namespace, "pay");
+        assert!(matches!(&pods[0].select, PodSelect::Labels(l) if l.len() == 2));
+        assert_eq!(pods[1].select, PodSelect::Name("co-1".into()));
+        for (toml, what) in [
+            (
+                "[[pod_filter]]\nlabels = { a = \"b\" }\n",
+                "non-empty namespace",
+            ),
+            (
+                "[[pod_filter]]\nnamespace = \"\"\nname = \"x\"\n",
+                "non-empty namespace",
+            ),
+            ("[[pod_filter]]\nnamespace = \"n\"\n", "exactly one"),
+            (
+                "[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\nlabels = { a = \"b\" }\n",
+                "exactly one",
+            ),
+            (
+                "[[pod_filter]]\nnamespace = \"n\"\nlabels = {}\n",
+                "every pod",
+            ),
+            (
+                "[[pod_filter]]\nnamespace = \"n\"\nname = \"\"\n",
+                "name is empty",
+            ),
+            (
+                "[[pod_filter]]\nnamespace = \"n\"\nuid = \"x\"\n",
+                "Invalid TOML",
+            ),
+            (
+                "[kubernetes]\nenabled = false\n[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n",
+                "enabled = false",
+            ),
+        ] {
+            let e = load_config_from_str(&format!("{CG}{toml}"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(what), "{toml}: {e}");
+        }
+
+        // Refused with the tc backend.
+        for toml in [
+            "cgroup_filter = [\"a\"]\n",
+            "[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n",
+        ] {
+            let e = load_config_from_str(toml).unwrap_err().to_string();
+            assert!(e.contains("cgroup_skb"), "{e}");
+        }
+
+        // Restart-only until the runtime scope publisher lands.
+        let running = ok("cgroup_filter = [\"a\"]\n");
+        assert_eq!(
+            check_restart_only(&running, &ok("cgroup_filter = [\"a\"]\n")),
+            Ok(())
+        );
+        let e = check_restart_only(&running, &ok("cgroup_filter = [\"b\"]\n")).unwrap_err();
+        assert!(e.contains("cgroup_filter or pod_filter"), "{e}");
+        let pods = load_config_from_str(&format!(
+            "{CG}[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n"
+        ))
+        .unwrap();
+        assert!(check_restart_only(&running, &pods).is_err());
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {

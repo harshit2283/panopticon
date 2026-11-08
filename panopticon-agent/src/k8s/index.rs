@@ -247,6 +247,8 @@ mod tests {
         PodRecord {
             namespace: Arc::from(ns),
             name: Arc::from(name),
+            uid: Arc::from(""),
+            labels: Default::default(),
             workload_kind: "Deployment",
             workload_name: Arc::from(workload),
             node: Some(Arc::from("node-1")),

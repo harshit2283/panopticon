@@ -314,8 +314,14 @@ fn scope_programs_load_attach_and_hold() {
 
     // ── production attach, disarmed
     let mut links = Vec::new();
-    let (_, exit_attached) =
-        attach_disarmed(&mut ebpf, &setup, Some(&candidates), &mut links).expect("attach");
+    let (_, exit_attached) = attach_disarmed(
+        &mut ebpf,
+        &setup,
+        Some(&candidates),
+        |_, _| Ok(()),
+        &mut links,
+    )
+    .expect("attach");
     assert!(exit_attached);
     for p in pids {
         assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
