@@ -68,7 +68,11 @@ impl tonic::transport::server::Connected for Recorder {
     fn connect_info(&self) {}
 }
 
-struct Accept;
+/// The collector's answer: accept, or reject quoting the request (a
+/// collector may echo what it was sent in its error).
+struct Accept {
+    echo_error: bool,
+}
 
 #[tonic::async_trait]
 impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService
@@ -76,7 +80,7 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
 {
     async fn export(
         &self,
-        _request: tonic::Request<
+        request: tonic::Request<
             opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
         >,
     ) -> Result<
@@ -85,12 +89,20 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
         >,
         tonic::Status,
     > {
+        if self.echo_error {
+            let quoted: String = format!("{:?}", request.into_inner())
+                .chars()
+                .filter(char::is_ascii_graphic)
+                .take(4096)
+                .collect();
+            return Err(tonic::Status::internal(format!("rejected: {quoted}")));
+        }
         Ok(tonic::Response::new(Default::default()))
     }
 }
 
 /// Start the collector; returns its endpoint and the bytes it received.
-async fn collector() -> (String, Arc<Mutex<Vec<u8>>>) {
+async fn collector(echo_error: bool) -> (String, Arc<Mutex<Vec<u8>>>) {
     use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -105,13 +117,46 @@ async fn collector() -> (String, Arc<Mutex<Vec<u8>>>) {
     });
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(Accept))
+            .add_service(TraceServiceServer::new(Accept { echo_error }))
             .serve_with_incoming(incoming),
     );
     (format!("http://{addr}"), seen)
 }
 
 // ── The environment: every sink on ─────────────────────────────────────
+
+/// The process-wide log subscriber of the test binary, at every level,
+/// writing into a buffer: what the agent would print outside any pipeline
+/// (its global subscriber writes to stdout). Installed once; the agent's
+/// own code never installs one in tests.
+fn global_log() -> &'static Mutex<Vec<u8>> {
+    static GLOBAL_LOG: std::sync::OnceLock<Mutex<Vec<u8>>> = std::sync::OnceLock::new();
+    let mut fresh = false;
+    let buf = GLOBAL_LOG.get_or_init(|| {
+        fresh = true;
+        Mutex::new(Vec::new())
+    });
+    if fresh {
+        struct W;
+        impl std::io::Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                global_log().lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_thread_names(true)
+            .with_ansi(false)
+            .with_writer(|| W)
+            .finish();
+        tracing::subscriber::set_global_default(sub).expect("no other global subscriber");
+    }
+    buf
+}
 
 struct Env {
     dir: PathBuf,
@@ -147,11 +192,18 @@ fn config(dir: &Path, otlp: &str) -> AgentConfig {
 
 impl Env {
     async fn new(name: &str) -> Self {
+        Self::with(name, "info", false).await
+    }
+
+    /// `log_filter`: the pipelines' log filter; `echo_error`: the
+    /// collector rejects every export, quoting it.
+    async fn with(name: &str, log_filter: &str, echo_error: bool) -> Self {
+        global_log();
         let dir = tmpdir(name);
-        let (endpoint, otlp) = collector().await;
+        let (endpoint, otlp) = collector(echo_error).await;
         let cfg = config(&dir, &endpoint);
         let privacy = Arc::new(PrivacyGate::new(cfg.privacy_mode));
-        let mut shared = Shared::open(cfg, privacy, None, "info".to_string()).unwrap();
+        let mut shared = Shared::open(cfg, privacy, None, log_filter.to_string()).unwrap();
         let logs = Arc::new(Mutex::new(Vec::new()));
         let l = Arc::clone(&logs);
         shared.log_sink = Arc::new(move |b: &[u8]| l.lock().unwrap().extend_from_slice(b));
@@ -183,7 +235,9 @@ impl Env {
         std::fs::read(self.dir.join(name)).unwrap_or_default()
     }
 
-    /// Every output, by name.
+    /// Every output, by name. `global` is everything logged through the
+    /// process-wide subscriber (the agent's stdout outside pipelines), by
+    /// every test: markers are unique per test.
     fn outputs(&self) -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("json", self.file("events.jsonl")),
@@ -191,6 +245,7 @@ impl Env {
             ("raw", self.file("raw.pncap")),
             ("logs", self.logs.lock().unwrap().clone()),
             ("otlp", self.otlp.lock().unwrap().clone()),
+            ("global", global_log().lock().unwrap().clone()),
         ]
     }
 
@@ -229,9 +284,11 @@ impl Env {
     }
 
     /// Nothing written after `marks` holds `needle`.
+    /// A marker straddling the mark counts as written after it.
     fn assert_absent_after(&self, marks: &[usize], needle: &str) {
         for ((name, bytes), &at) in self.outputs().iter().zip(marks) {
-            let after = &bytes[at.min(bytes.len())..];
+            let from = at.saturating_sub(needle.len().saturating_sub(1));
+            let after = &bytes[from.min(bytes.len())..];
             assert!(
                 !contains(after, needle),
                 "{needle} reached {name} after applied"
@@ -467,6 +524,66 @@ fn in_flight_otlp_export_is_refused_after_applied() {
     });
 }
 
+/// The collector rejects every export, quoting it, and the pipelines log
+/// at every level. What the exporter logs while the SDK's batch thread
+/// polls it goes through the pipeline's gated log only (never the
+/// process-wide log), and after "applied" nothing of the old generation
+/// reaches any output, an export paused on its socket included.
+#[test]
+fn otlp_errors_log_only_through_the_pipeline() {
+    t2("otlp_errors_log_only_through_the_pipeline", 4, async {
+        let env = Env::with("otlp-errors", "trace", true).await;
+        env.feed(&exchange("echo-before", 18101, 1));
+        env.wait_for("echo-before", &["json", "logs", "otlp"]).await;
+
+        let old = env.scope.gate().await.unwrap();
+        let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
+        env.feed(&exchange("echo-inflight", 18102, 1));
+        assert!(
+            hook.wait_reached(WAIT),
+            "no OTLP write reached the pause point"
+        );
+        env.scope.narrow(2).await;
+        let applied = env.marks();
+        drop(hook);
+
+        env.feed(&exchange("echo-after", 18103, 2));
+        env.wait_for("echo-after", &["otlp"]).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        env.assert_absent_after(&applied, "echo-before");
+        env.assert_absent_after(&applied, "echo-inflight");
+        assert!(!contains(&env.otlp.lock().unwrap(), "echo-inflight"));
+        let global = global_log().lock().unwrap().clone();
+        let leaked: Vec<String> = String::from_utf8_lossy(&global)
+            .lines()
+            .filter(|l| l.contains("echo-"))
+            .take(3)
+            .map(|l| l.chars().take(400).collect())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a marker reached the process-wide log: {leaked:#?}"
+        );
+        let bsp = String::from_utf8_lossy(&global)
+            .lines()
+            .filter(|l| l.contains("OpenTelemetry.Traces.BatchProcessor"))
+            .take(3)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            bsp.is_empty(),
+            "the SDK batch thread logged globally: {bsp:?}"
+        );
+        // The exporter's own lines did reach the pipeline's (gated) log.
+        let logs = env.logs.lock().unwrap().clone();
+        assert!(
+            contains(&logs, "h2::") || contains(&logs, "tonic::"),
+            "no exporter lines"
+        );
+        env.scope.shutdown().await;
+    });
+}
+
 /// A DNS answer the old pipeline inserts after the change never names a
 /// flow the new pipeline exports.
 #[test]
@@ -587,7 +704,7 @@ fn live_close_records_are_counted_and_reach_no_output() {
         4,
         async {
             let dir = tmpdir("close");
-            let (endpoint, _otlp) = collector().await;
+            let (endpoint, _otlp) = collector(false).await;
             let mut cfg = config(&dir, &endpoint);
             cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
             let shared = Arc::new(

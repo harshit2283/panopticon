@@ -16,6 +16,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     ("main.rs", "GLOBAL", "the global allocator"),
     (
+        "narrowing_tests.rs",
+        "GLOBAL_LOG",
+        "tests only: the test binary's process-wide log, the oracle itself",
+    ),
+    (
         "event_loop.rs",
         "TLS_KEY",
         "a random hash key drawn at start, never derived from traffic",

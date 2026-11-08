@@ -5,6 +5,14 @@
 //! 5): the channel is built only from [`GatedConnector`] via
 //! `with_channel`, never from the exporter's own transport, and refuses to
 //! start otherwise.
+//!
+//! The SDK's batch processor calls the exporter and polls its futures on a
+//! thread of its own, where tonic decodes the collector's response and logs
+//! (a `Status` can quote what the collector sent back). The exporter is
+//! wrapped ([`DispatchExporter`]) so that every call and every poll runs
+//! under the pipeline's log subscriber, whose writer is gated. The SDK's
+//! own internal logs are compiled out (`opentelemetry_sdk` and
+//! `opentelemetry-otlp` without their `internal-logs` feature).
 
 #![allow(dead_code)]
 
@@ -107,6 +115,42 @@ fn gated_channel(
     ))
 }
 
+/// A span exporter whose calls and futures run under the pipeline's
+/// tracing `Dispatch` (see the module docs).
+#[derive(Debug)]
+struct DispatchExporter<E> {
+    inner: E,
+    dispatch: tracing::Dispatch,
+}
+
+impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+    for DispatchExporter<E>
+{
+    fn export(
+        &mut self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send>,
+    > {
+        let dispatch = self.dispatch.clone();
+        let inner = &mut self.inner;
+        let export = tracing::dispatcher::with_default(&dispatch, || inner.export(batch));
+        Box::pin(export.with_subscriber(dispatch))
+    }
+
+    fn shutdown(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+        tracing::dispatcher::with_default(&self.dispatch, || self.inner.shutdown())
+    }
+
+    fn force_flush(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+        tracing::dispatcher::with_default(&self.dispatch, || self.inner.force_flush())
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
 impl OtlpExportHandle {
     /// Spawn one pipeline's OTLP exporter, writing under `gate` and logging
     /// through `dispatch`. An event produced under a wider privacy mode
@@ -120,11 +164,14 @@ impl OtlpExportHandle {
         dispatch: tracing::Dispatch,
     ) -> Result<(Self, OtlpWorker)> {
         let channel = gated_channel(&config.endpoint, gate, dispatch.clone())?;
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_channel(channel)
-            .build()
-            .context("failed to build OTLP gRPC span exporter")?;
+        let span_exporter = DispatchExporter {
+            inner: opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_channel(channel)
+                .build()
+                .context("failed to build OTLP gRPC span exporter")?,
+            dispatch: dispatch.clone(),
+        };
 
         let resource = Resource::builder_empty()
             .with_service_name(config.service_name.clone())
