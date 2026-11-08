@@ -218,8 +218,8 @@ macro_rules! wr {
     }};
 }
 
-/// TLS address learning in a restricted mode (§3.5, §2.1): `sk`'s cookie
-/// and tuple, only if `sk` itself is in scope under the current generation
+/// TLS address learning in a restricted mode (§3.5, §2.1): `sk`'s cookie,
+/// the generation it was checked under, and its tuple, only if `sk` itself is in scope under the current generation
 /// for the whole time its tuple is read. Uses the capture path's own state:
 /// the socket's `SOCK_STATE` entry, initialised with its own cookie, not
 /// REUSED, and an IN verdict cached for `CONFIG_SCOPE_GEN`, checked before
@@ -230,7 +230,7 @@ macro_rules! wr {
 /// not available to tracing programs): a stale or missing cache gives no
 /// address. `sk` must be a BTF `struct sock *` (fentry arg).
 #[inline(always)]
-pub(crate) fn sock_addr_checked(sk: *mut c_void) -> Option<(u64, (u32, u32, u16, u16))> {
+pub(crate) fn sock_addr_checked(sk: *mut c_void) -> Option<(u64, u32, (u32, u32, u16, u16))> {
     let st = state_of(sk, false);
     if st.is_null() {
         return None;
@@ -260,7 +260,7 @@ pub(crate) fn sock_addr_checked(sk: *mut c_void) -> Option<(u64, (u32, u32, u16,
     if !after {
         return None;
     }
-    Some((cookie, tuple))
+    Some((cookie, g1, tuple))
 }
 
 // ── Socket creation ────────────────────────────────────────────────────────

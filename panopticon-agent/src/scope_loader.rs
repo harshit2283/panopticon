@@ -171,6 +171,13 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
                 "refusing pid_filter: the sched_process_exit tracepoint is required (PID reuse)",
             ));
         }
+        Err(e) if restricted && setup.tls => {
+            return Err(e.context(format!(
+                "refusing TLS capture with {settings}: the sched_process_exit tracepoint is \
+                 required (it removes TLS_CALL slots of threads that exit mid-call); set \
+                 tls_scan_enabled = false or use unscoped full"
+            )));
+        }
         Err(e) => {
             warn!(error = %format!("{e:#}"), "sched_process_exit unavailable");
             false
@@ -362,7 +369,12 @@ pub fn attach_disarmed(
     // (program, required)
     let mut order: Vec<(&str, bool)> = Vec::new();
     if report.exit_tp {
-        order.push((EXIT_TP, setup.mode & SCOPE_SEL_PID != 0));
+        // Required by pid_filter (PID reuse) and by restricted TLS (TLS_CALL
+        // slots of threads that exit mid-call).
+        order.push((
+            EXIT_TP,
+            setup.mode & SCOPE_SEL_PID != 0 || restricted && setup.tls,
+        ));
     }
     if report.writers {
         order.push((SET_ULP, restricted));
