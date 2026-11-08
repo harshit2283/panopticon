@@ -314,19 +314,22 @@ impl<T> GatedIo<T> {
     /// Gate one poll: `f` runs under the read guard, or is refused.
     fn gated<R>(
         self: Pin<&mut Self>,
-        f: impl FnOnce(Pin<&mut T>) -> Poll<io::Result<R>>,
+        cx: &mut Context<'_>,
+        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>>
     where
         T: Unpin,
     {
         let this = self.get_mut();
-        if let Some(point) = this.pause_point {
-            crate::test_hooks::pause(point, &this.gate);
+        if let Some(point) = this.pause_point
+            && crate::test_hooks::poll_pause(point, &this.gate, cx).is_pending()
+        {
+            return Poll::Pending;
         }
         let Some(_open) = this.gate.open() else {
             return Poll::Ready(Err(refused()));
         };
-        f(Pin::new(&mut this.inner))
+        f(Pin::new(&mut this.inner), cx)
     }
 }
 
@@ -346,7 +349,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.gated(|io| io.poll_write(cx, buf))
+        self.gated(cx, |io, cx| io.poll_write(cx, buf))
     }
 
     fn poll_write_vectored(
@@ -354,7 +357,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.gated(|io| io.poll_write_vectored(cx, bufs))
+        self.gated(cx, |io, cx| io.poll_write_vectored(cx, bufs))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -362,11 +365,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.gated(|io| io.poll_flush(cx))
+        self.gated(cx, |io, cx| io.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.gated(|io| io.poll_shutdown(cx))
+        self.gated(cx, |io, cx| io.poll_shutdown(cx))
     }
 }
 
