@@ -316,6 +316,10 @@ pub struct SockTuple {
     pub remote_addr: u32,
     pub local_port: u16,
     pub remote_port: u16,
+    /// `CONFIG_SCOPE_GEN` the socket was verified in scope under
+    /// (tls_probes.rs `record_conn_addr`); restricted modes serve the tuple
+    /// only to a TLS call in scope under the same generation.
+    pub scope_gen: u32,
 }
 
 /// Addresses of each TLS connection, learned on its first socket I/O.

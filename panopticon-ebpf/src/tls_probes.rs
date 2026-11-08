@@ -51,7 +51,15 @@ fn mark_active(conn: u64) {
 ///
 /// Hooked through the `sock:sock_send_length` / `sock:sock_recv_length`
 /// tracepoints where available (stable ABI, kernel 6.3+), else fentry (BTF
-/// trampolines), else kprobes.
+/// trampolines), else kprobes. These record only in unscoped `full`.
+///
+/// Restricted modes (cgroup_skb, DESIGN §3.5) use the `*_scoped` fentry
+/// programs only: a thread inside a TLS call can still do I/O on a socket
+/// that is out of scope (a memory BIO, a socket received from another
+/// process), so the socket itself must be in scope under the current
+/// generation before its tuple is recorded. That check needs the socket's
+/// `SOCK_STATE`, and `bpf_sk_storage_get` is offered to tracing (fentry)
+/// programs only, not to tracepoint or kprobe programs.
 #[tracepoint]
 pub fn tls_sock_send_length(ctx: TracePointContext) {
     let _ = try_tls_sock_length(&ctx);
@@ -82,7 +90,7 @@ fn try_tls_sock_length(ctx: &TracePointContext) -> Result<(), ()> {
         return Ok(());
     }
     let sk: u64 = unsafe { ctx.read_at(8) }.map_err(|_| ())?;
-    record_conn_addr(pid_tgid, conn, sk as *const u8)
+    record_unscoped(pid_tgid, conn, sk as *const u8)
 }
 
 #[fentry(function = "tcp_sendmsg")]
@@ -95,6 +103,35 @@ pub fn tls_tcp_sendmsg_fentry(ctx: FEntryContext) -> u32 {
 pub fn tls_tcp_recvmsg_fentry(ctx: FEntryContext) -> u32 {
     let _ = try_tls_tcp_io(ctx.arg(0));
     0
+}
+
+/// Restricted modes: record only if `sk` is itself in scope (see above).
+#[fentry(function = "tcp_sendmsg")]
+pub fn tls_tcp_sendmsg_scoped(ctx: FEntryContext) -> u32 {
+    let _ = try_tls_tcp_io_scoped(ctx.arg(0));
+    0
+}
+
+#[fentry(function = "tcp_recvmsg")]
+pub fn tls_tcp_recvmsg_scoped(ctx: FEntryContext) -> u32 {
+    let _ = try_tls_tcp_io_scoped(ctx.arg(0));
+    0
+}
+
+#[inline(always)]
+fn try_tls_tcp_io_scoped(sk: *mut core::ffi::c_void) -> Result<(), ()> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(conn) = take_active(pid_tgid) else {
+        return Ok(());
+    };
+    // Sampled and head-only modes export no TLS plaintext (§3.5).
+    if !panopticon_common::scope::tls_mode_allowed(crate::sock_capture::scope_mode()) {
+        return Ok(());
+    }
+    match crate::sock_capture::sock_scope_cached(sk) {
+        Some(g) => record_conn_addr(pid_tgid, conn, sk as *const u8, g),
+        None => Ok(()),
+    }
 }
 
 #[kprobe]
@@ -115,9 +152,19 @@ pub fn tls_tcp_recvmsg(ctx: ProbeContext) {
 fn try_tls_tcp_io(sk: *const u8) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     match take_active(pid_tgid) {
-        Some(conn) => record_conn_addr(pid_tgid, conn, sk),
+        Some(conn) => record_unscoped(pid_tgid, conn, sk),
         None => Ok(()),
     }
+}
+
+/// The unscoped programs (tracepoint, fentry, kprobe) record nothing in a
+/// restricted mode, whatever attached them.
+#[inline(always)]
+fn record_unscoped(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
+    if !panopticon_common::scope::is_unscoped_full(crate::sock_capture::scope_mode()) {
+        return Ok(());
+    }
+    record_conn_addr(pid_tgid, conn, sk, crate::sock_capture::scope_gen())
 }
 
 /// The TLS connection this thread is inside a call for, if any; consumed.
@@ -135,7 +182,7 @@ fn take_active(pid_tgid: u64) -> Option<u64> {
 }
 
 #[inline(always)]
-fn record_conn_addr(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
+fn record_conn_addr(pid_tgid: u64, conn: u64, sk: *const u8, scope_gen: u32) -> Result<(), ()> {
     let (local_addr, remote_addr, local_port, remote_port) = read_sock_tuple(sk)?;
     let key = TlsConnKey {
         conn,
@@ -147,6 +194,7 @@ fn record_conn_addr(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
         remote_addr,
         local_port,
         remote_port,
+        scope_gen,
     };
     TLS_CONN_ADDR.insert(&key, &tuple, 0).map_err(|_| ())
 }
@@ -460,7 +508,13 @@ struct TlsHeader {
 }
 
 #[inline(always)]
-fn tls_header(conn: u64, direction: Direction, tls_lib: TlsLibrary) -> TlsHeader {
+fn tls_header(
+    conn: u64,
+    direction: Direction,
+    tls_lib: TlsLibrary,
+    restricted: bool,
+    scope_gen: u32,
+) -> TlsHeader {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let mut h = TlsHeader {
@@ -474,12 +528,16 @@ fn tls_header(conn: u64, direction: Direction, tls_lib: TlsLibrary) -> TlsHeader
         ip_proto: 0,
         direction,
         tls_lib,
-        scope_gen: 0,
+        scope_gen,
     };
     // Addresses are known once this connection has done socket I/O inside a
-    // hooked call (see try_tls_tcp_io); zero until then.
+    // hooked call (see try_tls_tcp_io); zero until then. In a restricted
+    // mode a tuple is served only under the generation its socket was
+    // verified in scope under: after a selector change it is not trusted.
     let key = TlsConnKey { conn, pid, _pad: 0 };
-    if let Some(t) = unsafe { TLS_CONN_ADDR.get(&key) } {
+    if let Some(t) = unsafe { TLS_CONN_ADDR.get(&key) }
+        && (!restricted || t.scope_gen == scope_gen)
+    {
         let (src, dst) = match direction {
             Direction::Egress => ((t.local_addr, t.local_port), (t.remote_addr, t.remote_port)),
             _ => ((t.remote_addr, t.remote_port), (t.local_addr, t.local_port)),
@@ -509,7 +567,8 @@ fn emit_tls_event<C: EbpfContext>(
     // map value on the other doubles the states the verifier walks through
     // the chunk loop below (ssl_read_ret hit the 1M limit on RHEL 8).
     let mut scope_gen = crate::sock_capture::scope_gen();
-    if panopticon_common::scope::is_unscoped_full(mode) {
+    let restricted = !panopticon_common::scope::is_unscoped_full(mode);
+    if !restricted {
         // TC backend (and unscoped full): pid_filter as before, other
         // processes' plaintext never leaves the kernel.
         if !pid_allowed(tgid) {
@@ -526,8 +585,7 @@ fn emit_tls_event<C: EbpfContext>(
             }
         }
     }
-    let mut h = tls_header(conn, direction, tls_lib);
-    h.scope_gen = scope_gen;
+    let h = tls_header(conn, direction, tls_lib, restricted, scope_gen);
     let use_ringbuf = match CONFIG.get(panopticon_common::CONFIG_USE_RINGBUF) {
         Some(&v) => v != 0,
         None => true,

@@ -25,12 +25,14 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 5] = [
+const TARGETS: [(&str, &str); 7] = [
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     (SET_ULP, "tcp_set_ulp"),
     ("tls_tcp_sendmsg_fentry", "tcp_sendmsg"),
     ("tls_tcp_recvmsg_fentry", "tcp_recvmsg"),
+    ("tls_tcp_sendmsg_scoped", "tcp_sendmsg"),
+    ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
 ];
 
 #[derive(Clone, Copy)]
@@ -645,6 +647,52 @@ fn scope_programs_load_attach_and_hold() {
         !ev.iter().any(|e| e.0 == cookie(&c3)),
         "old verdict stays OUT"
     );
+
+    // ── TLS address learning (restricted): with this thread marked inside
+    // a TLS call, only a socket that is itself IN under the current
+    // generation has its tuple recorded
+    let tls_link = {
+        let p: &mut aya::programs::FEntry = ebpf
+            .program_mut("tls_tcp_sendmsg_scoped")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        p.attach().expect("tls_tcp_sendmsg_scoped attaches")
+    };
+    let recorded = |ebpf: &mut Ebpf, conn: u64, sock: &mut TcpStream| -> Option<[u32; 4]> {
+        // SAFETY: gettid has no preconditions.
+        let tid = unsafe { libc::gettid() } as u64;
+        let mut active: PerCpuArray<_, [u64; 2]> =
+            PerCpuArray::try_from(ebpf.map_mut("TLS_ACTIVE").unwrap()).unwrap();
+        let n = aya::util::nr_cpus().unwrap();
+        let v = aya::maps::PerCpuValues::try_from(vec![[((me as u64) << 32) | tid, conn]; n]);
+        active.set(0, v.unwrap(), 0).unwrap();
+        sock.write_all(b"t").unwrap();
+        let addrs: HashMap<_, [u64; 2], [u32; 4]> =
+            HashMap::try_from(ebpf.map("TLS_CONN_ADDR").unwrap()).unwrap();
+        addrs.get(&[conn, me as u64], 0).ok()
+    };
+    assert_eq!(recorded(&mut ebpf, 0x7001, &mut c3), None, "OUT socket");
+    assert_eq!(
+        recorded(&mut ebpf, 0x7002, &mut pre_client),
+        None,
+        "no state"
+    );
+    let t = recorded(&mut ebpf, 0x7003, &mut c4).expect("IN socket recorded");
+    let port = c4.local_addr().unwrap().port();
+    assert_eq!((t[2] & 0xffff, t[3]), (port as u32, 1), "tuple, generation");
+    set(&mut ebpf, CONFIG_SCOPE_GEN, 2);
+    assert_eq!(recorded(&mut ebpf, 0x7004, &mut c4), None, "stale verdict");
+    let t = recorded(&mut ebpf, 0x7005, &mut c4).expect("recomputed: recorded");
+    assert_eq!(t[3], 2, "current generation");
+    let p: &mut aya::programs::FEntry = ebpf
+        .program_mut("tls_tcp_sendmsg_scoped")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    p.detach(tls_link).unwrap();
+    let _ = drain(&mut ring);
+    println!("TLS_ADDR scoped=OK");
 
     // ── a selected process exits; its pid is reused by another process
     sel.kill().unwrap();

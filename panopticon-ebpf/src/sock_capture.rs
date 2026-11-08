@@ -217,6 +217,32 @@ macro_rules! wr {
     }};
 }
 
+/// TLS address learning in a restricted mode (§3.5, §2.1): the generation
+/// under which `sk` itself is in scope, or None. Uses the capture path's
+/// own state: the socket's `SOCK_STATE` entry, initialised with its own
+/// cookie (so never REUSED or a listener's clone), and an IN verdict cached
+/// for the current `CONFIG_SCOPE_GEN`, read under g1/g2. The verdict is not
+/// computed here: `bpf_sk_ancestor_cgroup_id` is not offered to tracing
+/// programs, so a stale or missing cache records nothing (the socket's next
+/// packet recomputes it). `sk` must be a BTF `struct sock *` (fentry arg).
+#[inline(always)]
+pub(crate) fn sock_scope_cached(sk: *mut c_void) -> Option<u32> {
+    let st = state_of(sk, false);
+    if st.is_null() {
+        return None;
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(sk) };
+    if !is_initialised(rd!(st, init_cookie), cookie) {
+        return None;
+    }
+    let g1 = scope_gen();
+    let v = cached_verdict(rd!(st, verdict_word), g1);
+    if v != Some(VERDICT_IN) || scope_gen() != g1 {
+        return None;
+    }
+    Some(g1)
+}
+
 // ── Socket creation ────────────────────────────────────────────────────────
 
 const SOCK_STREAM: u32 = 1;
