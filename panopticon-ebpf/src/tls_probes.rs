@@ -89,7 +89,7 @@ fn try_tls_sock_length(ctx: &TracePointContext) -> Result<(), ()> {
     const AF_INET: u16 = 2;
     const IPPROTO_TCP: u16 = 6;
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(conn) = take_active(pid_tgid) else {
+    let Some(conn) = take_active_if_on(pid_tgid) else {
         return Ok(());
     };
     let family: u16 = unsafe { ctx.read_at(16) }.map_err(|_| ())?;
@@ -139,7 +139,7 @@ fn try_tls_tcp_io_scoped(sk: *mut core::ffi::c_void) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     // Cheap per-CPU prefilter (not consumed: the call may do more I/O),
     // before a hash lookup on every TCP send/receive on the node.
-    if !peek_active(pid_tgid) {
+    if !peek_active(pid_tgid) || !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
     let Some(call) = TLS_CALL.get_ptr_mut(&pid_tgid) else {
@@ -190,7 +190,7 @@ pub fn tls_tcp_recvmsg(ctx: ProbeContext) {
 #[inline(always)]
 fn try_tls_tcp_io(sk: *const u8) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    match take_active(pid_tgid) {
+    match take_active_if_on(pid_tgid) {
         Some(conn) => record_unscoped(pid_tgid, conn, sk),
         None => Ok(()),
     }
@@ -204,6 +204,26 @@ fn record_unscoped(pid_tgid: u64, conn: u64, sk: *const u8) -> Result<(), ()> {
         return Ok(());
     }
     record_conn_addr(pid_tgid, conn, sk)
+}
+
+/// The marker (`take_active`), only while TLS capture is on: the cheap
+/// per-CPU check first, then the capture flags, before the marker is
+/// consumed or any socket field read.
+#[inline(always)]
+fn take_active_if_on(pid_tgid: u64) -> Option<u64> {
+    if !peek_active(pid_tgid) || !crate::sock_capture::tls_capture_on() {
+        return None;
+    }
+    take_active(pid_tgid)
+}
+
+/// TLS capture off: a return probe only clears what this thread's entry
+/// probe left, and collects nothing.
+#[inline(always)]
+fn forget_call(pid_tgid: u64) {
+    let _ = TLS_SCRATCH.remove(pid_tgid);
+    let _ = TLS_CALL.remove(&pid_tgid);
+    let _ = take_active(pid_tgid);
 }
 
 /// Whether this CPU's marker says this thread is inside a TLS call.
@@ -244,8 +264,43 @@ const RET_SP_ADJ: u64 = 0;
 
 /// Whether a slot was opened by the entry of the call returning now.
 #[inline(always)]
-fn same_frame(call: &TlsCall, ret_sp: u64) -> bool {
-    call.entry_sp != 0 && call.entry_sp.wrapping_add(RET_SP_ADJ) == ret_sp
+fn same_frame(entry_sp: u64, ret_sp: u64) -> bool {
+    entry_sp != 0 && entry_sp.wrapping_add(RET_SP_ADJ) == ret_sp
+}
+
+/// The address a consumed call carries (`ok` != 0), with the generation its
+/// socket was checked in scope under. Plain integers with no padding and
+/// always fully written: the RHEL 8 verifier rejects reading stack bytes
+/// that one path left unwritten (an `Option` of a struct does that).
+#[derive(Clone, Copy)]
+struct CallAddr {
+    ok: u32,
+    scope_gen: u32,
+    local_addr: u32,
+    remote_addr: u32,
+    local_port: u16,
+    remote_port: u16,
+}
+
+const NO_ADDR: CallAddr = CallAddr {
+    ok: 0,
+    scope_gen: 0,
+    local_addr: 0,
+    remote_addr: 0,
+    local_port: 0,
+    remote_port: 0,
+};
+
+/// What a return probe takes from its call slot (`found` != 0 only for a
+/// slot opened by this frame's entry). Same layout rules as `CallAddr`.
+#[derive(Clone, Copy)]
+struct Ended {
+    conn: u64,
+    buf: u64,
+    len: u64,
+    aux: u64,
+    found: u32,
+    addr: CallAddr,
 }
 
 /// Restricted modes: open this thread's call slot, replacing whatever a
@@ -287,26 +342,43 @@ fn drop_call() {
 /// returning now. A slot from another frame (a nested call, or an inner
 /// call whose return probe never ran) carries another call's buffer and
 /// address: nothing is emitted from it.
+/// Fields are read one by one before the delete (no copy of the whole
+/// value: a large struct copy costs the verifier a byte loop).
 #[inline(always)]
-fn end_call(ctx: &RetProbeContext, pid_tgid: u64) -> Option<TlsCall> {
-    let call = unsafe { TLS_CALL.get(&pid_tgid) }.copied()?;
+fn end_call(ctx: &RetProbeContext, pid_tgid: u64) -> Ended {
+    let mut e = Ended {
+        conn: 0,
+        buf: 0,
+        len: 0,
+        aux: 0,
+        found: 0,
+        addr: NO_ADDR,
+    };
+    let Some(call) = TLS_CALL.get_ptr(&pid_tgid) else {
+        return e;
+    };
+    // SAFETY: this thread's own slot (maps.rs TLS_CALL), read before delete.
+    unsafe {
+        if same_frame((*call).entry_sp, user_sp(ctx.regs)) {
+            e.found = 1;
+            e.conn = (*call).conn;
+            e.buf = (*call).buf;
+            e.len = (*call).len;
+            e.aux = (*call).aux;
+            if (*call).state == TLS_CALL_FILLED {
+                e.addr = CallAddr {
+                    ok: 1,
+                    scope_gen: (*call).scope_gen,
+                    local_addr: (*call).tuple.local_addr,
+                    remote_addr: (*call).tuple.remote_addr,
+                    local_port: (*call).tuple.local_port,
+                    remote_port: (*call).tuple.remote_port,
+                };
+            }
+        }
+    }
     let _ = TLS_CALL.remove(&pid_tgid);
-    if same_frame(&call, user_sp(ctx.regs)) {
-        Some(call)
-    } else {
-        None
-    }
-}
-
-/// The address a consumed call carries, with the generation its socket was
-/// checked in scope under: only one in-scope socket's.
-#[inline(always)]
-fn call_addr(call: &TlsCall) -> Option<(SockTuple, u32)> {
-    if call.state == TLS_CALL_FILLED {
-        Some((call.tuple, call.scope_gen))
-    } else {
-        None
-    }
+    e
 }
 
 /// The TLS connection this thread is inside a call for, if any; consumed.
@@ -351,6 +423,9 @@ pub fn ssl_write_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
     let buf: *const u8 = ctx.arg(1).ok_or(())?;
     let num: i32 = ctx.arg(2).ok_or(())?;
@@ -375,7 +450,7 @@ fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
         num as usize,
         Direction::Egress,
         TlsLibrary::OpenSsl,
-        None,
+        NO_ADDR,
     )
 }
 
@@ -389,6 +464,9 @@ pub fn ssl_write_ex_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
     let buf: *const u8 = ctx.arg(1).ok_or(())?;
     let num: u64 = ctx.arg(2).ok_or(())?;
@@ -413,7 +491,7 @@ fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
         num as usize,
         Direction::Egress,
         TlsLibrary::OpenSsl,
-        None,
+        NO_ADDR,
     )
 }
 
@@ -431,9 +509,14 @@ pub fn ssl_write_ret(ctx: RetProbeContext) {
 #[inline(always)]
 fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(call) = end_call(ctx, pid_tgid) else {
+    if !crate::sock_capture::tls_capture_on() {
+        forget_call(pid_tgid);
+        return Ok(());
+    }
+    let call = end_call(ctx, pid_tgid);
+    if call.found == 0 {
         return Ok(()); // no call opened by this frame's entry probe
-    };
+    }
     let _ = take_active(pid_tgid);
     let ret = ctx.ret::<i32>();
     if ret <= 0 {
@@ -454,7 +537,7 @@ fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         len as usize,
         Direction::Egress,
         TlsLibrary::OpenSsl,
-        call_addr(&call),
+        call.addr,
     )
 }
 
@@ -470,6 +553,9 @@ pub fn ssl_read_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let args = TlsReadArgs {
         ssl: ctx.arg(0).ok_or(())?,
         buf: ctx.arg(1).ok_or(())?,
@@ -494,6 +580,9 @@ pub fn ssl_read_ex_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let args = TlsReadArgs {
         ssl: ctx.arg(0).ok_or(())?,
         buf: ctx.arg(1).ok_or(())?,
@@ -526,6 +615,10 @@ pub fn ssl_read_ret(ctx: RetProbeContext) {
 #[inline(always)]
 fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
+    if !crate::sock_capture::tls_capture_on() {
+        forget_call(pid_tgid);
+        return Ok(());
+    }
 
     // Look up the arguments saved by the entry probe
     let args = unsafe {
@@ -543,12 +636,13 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     // Without one opened by this frame's entry for this SSL*, the saved
     // arguments are not proven to be this call's either: nothing is emitted.
     let addr = if restricted() {
-        match end_call(ctx, pid_tgid) {
-            Some(call) if call.conn == args.ssl => call_addr(&call),
-            _ => return Ok(()),
+        let call = end_call(ctx, pid_tgid);
+        if call.found == 0 || call.conn != args.ssl {
+            return Ok(());
         }
+        call.addr
     } else {
-        None
+        NO_ADDR
     };
 
     let ret = ctx.ret::<i32>();
@@ -592,6 +686,9 @@ pub fn go_tls_write_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let (conn, buf, len) = read_go_write_args(ctx)?;
     if len == 0 {
         return Ok(());
@@ -605,7 +702,7 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
         len,
         Direction::Egress,
         TlsLibrary::GoTls,
-        None,
+        NO_ADDR,
     )
 }
 
@@ -620,6 +717,9 @@ pub fn go_tls_read_entry(ctx: ProbeContext) {
 
 #[inline(always)]
 fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let (conn, buf, _len) = read_go_write_args(ctx)?; // same argument layout
     let key = go_read_key(ctx)?;
     mark_active(conn);
@@ -641,6 +741,10 @@ pub fn go_tls_read_ret(ctx: ProbeContext) {
 #[inline(always)]
 fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
     let key = go_read_key(ctx)?;
+    if !crate::sock_capture::tls_capture_on() {
+        let _ = GO_READ_ARGS.remove(&key);
+        return Ok(());
+    }
     let args = match unsafe { GO_READ_ARGS.get(&key) } {
         Some(a) => *a,
         None => return Ok(()), // missed the entry
@@ -657,7 +761,7 @@ fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
         n as usize,
         Direction::Ingress,
         TlsLibrary::GoTls,
-        None,
+        NO_ADDR,
     )
 }
 
@@ -724,17 +828,23 @@ fn read_go_write_args(ctx: &ProbeContext) -> Result<(u64, *const u8, usize), ()>
 
 // ── Shared helper ──────────────────────────────────────────────────────────
 
+/// An event's addresses: `ports` is src | dst << 16. No padding.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HdrAddr {
+    src_addr: u32,
+    dst_addr: u32,
+    ports: u32,
+    ip_proto: u32,
+}
+
 /// Fields shared by every event of one TLS read/write, computed once.
 #[derive(Clone, Copy)]
 struct TlsHeader {
     conn: u64,
     pid: u32,
     tgid: u32,
-    src_addr: u32,
-    dst_addr: u32,
-    src_port: u16,
-    dst_port: u16,
-    ip_proto: u8,
+    addr: HdrAddr,
     direction: Direction,
     tls_lib: TlsLibrary,
     scope_gen: u32,
@@ -747,7 +857,7 @@ fn tls_header(
     tls_lib: TlsLibrary,
     restricted: bool,
     scope_gen: u32,
-    call_addr: Option<(SockTuple, u32)>,
+    call_addr: CallAddr,
 ) -> TlsHeader {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
@@ -755,11 +865,12 @@ fn tls_header(
         conn,
         pid,
         tgid: pid_tgid as u32,
-        src_addr: 0,
-        dst_addr: 0,
-        src_port: 0,
-        dst_port: 0,
-        ip_proto: 0,
+        addr: HdrAddr {
+            src_addr: 0,
+            dst_addr: 0,
+            ports: 0,
+            ip_proto: 0,
+        },
         direction,
         tls_lib,
         scope_gen,
@@ -770,25 +881,65 @@ fn tls_header(
     // (try_tls_tcp_io_scoped), never one cached from another call, and only
     // if the socket was checked under the generation this call is in scope
     // under now: after a narrowing it is not trusted.
-    let addr = if restricted {
-        match call_addr {
-            Some((t, g)) if g == scope_gen => Some(t),
-            _ => None,
+    let mut t = (0u32, 0u32, 0u16, 0u16, false);
+    if restricted {
+        if call_addr.ok != 0 && call_addr.scope_gen == scope_gen {
+            t = (
+                call_addr.local_addr,
+                call_addr.remote_addr,
+                call_addr.local_port,
+                call_addr.remote_port,
+                true,
+            );
         }
     } else {
         let key = TlsConnKey { conn, pid, _pad: 0 };
-        unsafe { TLS_CONN_ADDR.get(&key) }.copied()
+        if let Some(c) = unsafe { TLS_CONN_ADDR.get(&key) } {
+            t = (
+                c.local_addr,
+                c.remote_addr,
+                c.local_port,
+                c.remote_port,
+                true,
+            );
+        }
+    }
+    let (local_addr, remote_addr, local_port, remote_port, known) = t;
+    let a = if !known {
+        HdrAddr {
+            src_addr: 0,
+            dst_addr: 0,
+            ports: 0,
+            ip_proto: 0,
+        }
+    } else if direction == Direction::Egress {
+        HdrAddr {
+            src_addr: local_addr,
+            dst_addr: remote_addr,
+            ports: local_port as u32 | (remote_port as u32) << 16,
+            ip_proto: 6,
+        }
+    } else {
+        HdrAddr {
+            src_addr: remote_addr,
+            dst_addr: local_addr,
+            ports: remote_port as u32 | (local_port as u32) << 16,
+            ip_proto: 6,
+        }
     };
-    if let Some(t) = addr {
-        let (src, dst) = match direction {
-            Direction::Egress => ((t.local_addr, t.local_port), (t.remote_addr, t.remote_port)),
-            _ => ((t.remote_addr, t.remote_port), (t.local_addr, t.local_port)),
-        };
-        h.src_addr = src.0;
-        h.src_port = src.1;
-        h.dst_addr = dst.0;
-        h.dst_port = dst.1;
-        h.ip_proto = 6;
+    // Launder through a helper copy: the verifier sees helper-written bytes
+    // as unknown on every path, so "no address" (constants) and an address
+    // (map values) reach the chunk loop as one state, not several (each
+    // walks the whole loop; ssl_read_ret ran out of budget on 5.15 and
+    // RHEL 8). The copy is from this program's own stack and cannot fault;
+    // its result is not checked, so no branch is added.
+    // SAFETY: both pointers are to HdrAddr-sized stack objects.
+    unsafe {
+        aya_ebpf::helpers::generated::bpf_probe_read_kernel(
+            &raw mut h.addr as *mut core::ffi::c_void,
+            core::mem::size_of::<HdrAddr>() as u32,
+            &raw const a as *const core::ffi::c_void,
+        );
     }
     h
 }
@@ -801,9 +952,12 @@ fn emit_tls_event<C: EbpfContext>(
     len: usize,
     direction: Direction,
     tls_lib: TlsLibrary,
-    call_addr: Option<(SockTuple, u32)>,
+    call_addr: CallAddr,
 ) -> Result<(), ()> {
     // Decided here, before any reserve or copy, for every TLS writer.
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let mode = crate::sock_capture::scope_mode();
     // Stamped from the map in both branches: a constant 0 on one path and a
@@ -840,7 +994,9 @@ fn emit_tls_event<C: EbpfContext>(
             return Ok(());
         };
         unsafe {
-            core::ptr::write_bytes(event as *mut u8, 0, core::mem::size_of::<DataEvent>());
+            // Typed, so the zeroing is 8-byte stores, not a byte loop the
+            // verifier walks 4 KiB times.
+            core::ptr::write_bytes(event, 0, 1);
         }
         populate_tls_event(event, &h, buf, len);
         DATA_EVENTS_PERF.output(ctx, unsafe { &*event }, 0);
@@ -894,11 +1050,11 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).direction = h.direction;
         (*event).pid = h.pid;
         (*event).tgid = h.tgid;
-        (*event).src_addr = h.src_addr;
-        (*event).dst_addr = h.dst_addr;
-        (*event).src_port = h.src_port;
-        (*event).dst_port = h.dst_port;
-        (*event).ip_proto = h.ip_proto;
+        (*event).src_addr = h.addr.src_addr;
+        (*event).dst_addr = h.addr.dst_addr;
+        (*event).src_port = h.addr.ports as u16;
+        (*event).dst_port = (h.addr.ports >> 16) as u16;
+        (*event).ip_proto = h.addr.ip_proto as u8;
         (*event).tls_library = h.tls_lib;
         (*event).tcp_flags = 0;
         (*event).tcp_seq = 0;
