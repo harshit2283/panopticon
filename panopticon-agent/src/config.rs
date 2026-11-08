@@ -975,7 +975,10 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     // kernel scope mode, set at startup.
     let selector = |c: &AgentConfig| c.cgroup_filter.is_some() || c.pod_filter.is_some();
     if selector(running) != selector(new) {
-        return Err("adding or removing cgroup_filter/pod_filter needs a restart".into());
+        return Err(
+            "turning cgroup selection (cgroup_filter or pod_filter) on or off needs a restart"
+                .into(),
+        );
     }
     if running.capture_backend != new.capture_backend || running.cgroup2_path != new.cgroup2_path {
         return Err("changing [capture] backend or cgroup2_path needs a restart".into());
@@ -1506,7 +1509,9 @@ mod tests {
         }
 
         // The selectors change at runtime (the scope publisher applies
-        // them); adding or removing the selector needs a restart.
+        // them), including switching from one form to the other or
+        // combining them; turning cgroup selection on or off needs a
+        // restart.
         let running = ok("cgroup_filter = [\"a\"]\n");
         assert_eq!(
             check_restart_only(&running, &ok("cgroup_filter = [\"b\"]\n")),
@@ -1517,12 +1522,19 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(check_restart_only(&running, &pods), Ok(()));
+        let both = load_config_from_str(&format!(
+            "cgroup_filter = [\"a\"]\n{CG}[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n"
+        ))
+        .unwrap();
+        assert_eq!(check_restart_only(&pods, &both), Ok(()));
         let none = load_config_from_str(CG).unwrap();
-        let e = check_restart_only(&running, &none).unwrap_err();
-        assert!(
-            e.contains("adding or removing cgroup_filter/pod_filter"),
-            "{e}"
-        );
+        for (from, to) in [(&running, &none), (&none, &pods)] {
+            let e = check_restart_only(from, to).unwrap_err();
+            assert!(
+                e.contains("cgroup selection") && e.contains("on or off"),
+                "{e}"
+            );
+        }
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {
