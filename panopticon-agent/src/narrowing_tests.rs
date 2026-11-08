@@ -367,6 +367,38 @@ fn paused_worker_and_stale_events_reach_no_output_after_applied() {
     );
 }
 
+/// The connections a discarded pipeline tracked leave the
+/// `active_connections` gauge; the new pipeline's are counted.
+#[test]
+fn narrowing_releases_the_old_pipelines_connections() {
+    t2(
+        "narrowing_releases_the_old_pipelines_connections",
+        4,
+        async {
+            let env = Env::new("gauge").await;
+            let active = || env.shared.stats.active_connections.load(Ordering::Relaxed);
+            for port in [18091, 18092, 18093] {
+                env.feed(&exchange("old-open", port, 1));
+            }
+            env.wait_for(":18093", &["audit"]).await;
+            assert_eq!(active(), 3, "three open connections");
+            env.scope.narrow(2).await;
+            for _ in 0..200 {
+                if active() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(active(), 0, "the old pipeline's connections are gone");
+            env.feed(&exchange("new-open", 18094, 2));
+            env.wait_for(":18094", &["audit"]).await;
+            assert_eq!(active(), 1);
+            env.scope.shutdown().await;
+            assert_eq!(active(), 0, "a drained pipeline leaves nothing either");
+        },
+    );
+}
+
 /// A ring reader paused after admitting an event, its batch pending across
 /// the swap: the batch keeps its (revoked) destination.
 #[test]
