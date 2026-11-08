@@ -251,9 +251,9 @@ the agent was started without regex PII detection (`[pii] enabled` or
 In `full` mode the agent prints a warning at startup, on stderr and in the
 log (so `RUST_LOG=error` cannot hide it), that decrypted payloads are being
 written unredacted. The JSON export, the PII audit log and the raw dump are created
-readable by their owner only (`0600`). In `redacted` and `metrics_only`,
-panic messages (which can quote the data being processed) are reduced to
-where the panic happened.
+readable by their owner only (`0600`). In every mode, panic messages
+(which can quote the data being processed) are reduced to where the panic
+happened.
 
 Each mode is checked against ground truth: `tests/oracle/run_modes.sh`
 plants unique PII values and credentials in HTTP, HTTPS, Redis and Kafka

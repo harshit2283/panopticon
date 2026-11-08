@@ -417,14 +417,7 @@ impl EventLoop {
     }
 
     /// Main entry point: spawn workers, consume RingBufs, route events.
-    ///
-    /// `tls_rescan_tx` — if provided, ProcessExec events send the PID to this channel
-    /// so the TLS scanner task can rescan the new process for TLS libraries.
-    pub async fn run(
-        self,
-        event_source: EventSource,
-        tls_rescan_tx: Option<mpsc::Sender<u32>>,
-    ) -> Result<()> {
+    pub async fn run(self, event_source: EventSource) -> Result<()> {
         let num_workers = self.config.max_worker_count;
         if num_workers == 0 {
             bail!("max_worker_count must be >= 1");
@@ -599,7 +592,6 @@ impl EventLoop {
             &rate_limiter,
             &self.stats,
             &self.admission_floor,
-            tls_rescan_tx,
         )
         .await;
 
@@ -624,22 +616,13 @@ async fn consume_data_events(
     rate_limiter: &Arc<RateLimiter>,
     stats: &Arc<EventStats>,
     floor: &AdmissionFloor,
-    tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     match event_source {
         EventSource::RingBuf(rings) => {
-            consume_ringbufs(rings, senders, rate_limiter, stats, floor, tls_rescan_tx).await
+            consume_ringbufs(rings, senders, rate_limiter, stats, floor).await
         }
         EventSource::PerfEventArray(perf_array) => {
-            consume_perf_array(
-                perf_array,
-                senders,
-                rate_limiter,
-                stats,
-                floor,
-                tls_rescan_tx,
-            )
-            .await
+            consume_perf_array(perf_array, senders, rate_limiter, stats, floor).await
         }
     }
 }
@@ -657,7 +640,6 @@ async fn consume_ringbufs(
     rate_limiter: &Arc<RateLimiter>,
     stats: &Arc<EventStats>,
     floor: &AdmissionFloor,
-    tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     /// Stops the drain threads when this future ends or is dropped (shutdown
     /// drops it): they exit within one poll timeout, releasing their worker
@@ -681,7 +663,6 @@ async fn consume_ringbufs(
         let rate_limiter = Arc::clone(rate_limiter);
         let stats = Arc::clone(stats);
         let floor = floor.clone();
-        let tls_rescan_tx = tls_rescan_tx.clone();
         let stop = Arc::clone(&stop.0);
         let exit_tx = exit_tx.clone();
         std::thread::Builder::new()
@@ -694,7 +675,6 @@ async fn consume_ringbufs(
                     &rate_limiter,
                     &stats,
                     &floor,
-                    tls_rescan_tx.as_ref(),
                     &stop,
                 );
                 let _ = exit_tx.send(result);
@@ -726,7 +706,6 @@ fn drain_thread(
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     floor: &AdmissionFloor,
-    tls_rescan_tx: Option<&mpsc::Sender<u32>>,
     stop: &AtomicBool,
 ) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -771,7 +750,6 @@ fn drain_thread(
             rate_limiter,
             stats,
             floor.get(),
-            tls_rescan_tx,
         );
         // Woken by the kernel: traffic is flowing, keep the tight bound.
         interval = if woken > 0 {
@@ -816,7 +794,6 @@ fn drain_ringbuf(
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     floor: u32,
-    tls_rescan_tx: Option<&mpsc::Sender<u32>>,
 ) -> usize {
     let mut drained = 0;
     let mut received = 0;
@@ -832,35 +809,6 @@ fn drain_ringbuf(
         if below_floor(event, floor) {
             stale += 1;
             continue;
-        }
-
-        // Handle ProcessEvent-typed events differently (they come through
-        // PROCESS_EVENTS in the kernel, but we handle routing here)
-        match event.event_type {
-            EventType::ProcessExec => {
-                debug!(
-                    event_type = ?event.event_type,
-                    pid = event.pid,
-                    "Process exec event — triggering TLS rescan"
-                );
-                // 7.1: Send PID to TLS scanner for on-demand rescan
-                if let Some(tx) = tls_rescan_tx.as_ref() {
-                    let _ = tx.try_send(event.pid);
-                }
-                continue;
-            }
-            EventType::ProcessExit => {
-                debug!(
-                    event_type = ?event.event_type,
-                    pid = event.pid,
-                    "Process exit event"
-                );
-                // TODO: PID→connection cleanup requires PID tracking in ConnectionEntry.
-                // Currently the FSM manager is keyed by socket_cookie, not PID.
-                // A PID→cookie index in ConnectionFsmManager would enable cleanup here.
-                continue;
-            }
-            _ => {}
         }
 
         // Rate limit check
@@ -1045,7 +993,6 @@ async fn consume_perf_array(
     rate_limiter: &RateLimiter,
     stats: &EventStats,
     floor: &AdmissionFloor,
-    tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     let cpus = aya::util::online_cpus().map_err(|(path, error)| {
         anyhow::anyhow!("Failed to get online CPUs from {path}: {error}")
@@ -1079,18 +1026,6 @@ async fn consume_perf_array(
             stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             stats.drops_stale_scope_gen.fetch_add(1, Ordering::Relaxed);
             continue;
-        }
-
-        // Same routing logic as RingBuf
-        match event.event_type {
-            EventType::ProcessExec => {
-                if let Some(tx) = tls_rescan_tx.as_ref() {
-                    let _ = tx.try_send(event.pid);
-                }
-                continue;
-            }
-            EventType::ProcessExit => continue,
-            _ => {}
         }
 
         if !rate_limiter.try_acquire() {

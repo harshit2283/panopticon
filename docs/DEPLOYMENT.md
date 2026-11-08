@@ -225,7 +225,7 @@ journalctl -u panopticon -f
   This profile has not yet been validated on all distributions — test it on
   one node pool first.
 - Core dumps are disabled by the agent (`PR_SET_DUMPABLE=0`) so captured data
-  cannot leak through them.
+  cannot leak through them; the agent refuses to start if that call fails.
 
 ## 7. Upgrade notes
 

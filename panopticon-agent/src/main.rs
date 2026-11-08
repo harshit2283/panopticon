@@ -178,6 +178,7 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_target(true)
         .init();
+    install_panic_hook();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -200,8 +201,10 @@ async fn main() -> Result<()> {
         use anyhow::Context;
         use arc_swap::ArcSwap;
 
-        // Disable core dumps to prevent PII leakage
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        // Disable core dumps to prevent PII leakage. Capture never starts
+        // without it (DESIGN §3): a core dump would carry everything the
+        // process holds, past any gate.
+        disable_core_dumps()?;
         info!("Core dumps disabled (PR_SET_DUMPABLE=0)");
 
         // Load config: file first (if provided), then CLI overrides
@@ -381,27 +384,14 @@ async fn main() -> Result<()> {
             scope_select::spawn_net_cls_watch(Arc::clone(&shared_ebpf));
         }
 
-        // 4. Create TLS rescan channel and spawn background TLS scanner task
-        //    ProcessExec events in the event loop send PIDs to tls_rescan_tx,
-        //    which the scanner task receives for on-demand library scanning.
-        let (tls_rescan_tx, tls_rescan_rx) = tokio::sync::mpsc::channel::<u32>(256);
-        let scanner_handle = if agent_config.tls_scan_enabled {
-            let ebpf_clone = Arc::clone(&shared_ebpf);
-            let interval = agent_config.tls_scan_interval;
-            Some(tokio::spawn(platform::proc_scanner::tls_scanner_task(
-                ebpf_clone,
-                interval,
-                tls_rescan_rx,
-            )))
-        } else {
-            None
-        };
-        let tls_rescan_tx = if agent_config.tls_scan_enabled {
-            Some(tls_rescan_tx)
-        } else {
-            // Drop sender if scanner not enabled, so channel closes cleanly
-            None
-        };
+        // 4. Background TLS scanner (periodic; it takes no input from the
+        //    capture path).
+        let scanner_handle = agent_config.tls_scan_enabled.then(|| {
+            tokio::spawn(platform::proc_scanner::tls_scanner_task(
+                Arc::clone(&shared_ebpf),
+                agent_config.tls_scan_interval,
+            ))
+        });
 
         // 5. Construct PII engine + JSON exporter
         let pii_engine = if agent_config.pii.enabled {
@@ -489,26 +479,6 @@ async fn main() -> Result<()> {
             pii_audit_log,
             graph_builder,
         );
-
-        // A panic message can quote the data being processed (e.g. a string
-        // slice out of a payload): print only where it happened unless the
-        // mode allows raw payloads anyway.
-        let default_hook = std::panic::take_hook();
-        let panic_privacy = Arc::clone(&privacy);
-        std::panic::set_hook(Box::new(move |info| {
-            let mode = panic_privacy.get();
-            if mode == config::PrivacyMode::Full {
-                default_hook(info);
-            } else {
-                let at = info
-                    .location()
-                    .map_or_else(|| "unknown location".to_string(), |l| l.to_string());
-                eprintln!(
-                    "thread panicked at {at} (message withheld in privacy mode {mode}: \
-                     it may quote captured data)"
-                );
-            }
-        }));
 
         // 7b. Raw capture (unredacted): opt-in only, loudly.
         let (event_loop, raw_capture) = match &agent_config.capture_raw_path {
@@ -669,7 +639,7 @@ async fn main() -> Result<()> {
         // This is the main blocking task that drives the system.
         let mut exit_result: Result<()> = Ok(());
         tokio::select! {
-            result = event_loop.run(event_source, tls_rescan_tx) => {
+            result = event_loop.run(event_source) => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Event loop exited with error");
                     exit_result = Err(e.context("event loop failed"));
@@ -716,6 +686,40 @@ async fn main() -> Result<()> {
     }
 }
 
+/// A panic message can quote the data being processed (a string slice out
+/// of a payload): print only where it happened, in every privacy mode
+/// (DESIGN §3). stderr is outside every pipeline gate.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{}", panic_line(info.location()));
+    }));
+}
+
+fn panic_line(at: Option<&std::panic::Location<'_>>) -> String {
+    let at = at.map_or_else(|| "unknown location".to_string(), |l| l.to_string());
+    format!("thread panicked at {at} (message withheld: it may quote captured data)")
+}
+
+/// `prctl(PR_SET_DUMPABLE, 0)`, checked: the agent refuses to start capture
+/// when it fails.
+#[cfg(target_os = "linux")]
+fn disable_core_dumps() -> Result<()> {
+    // SAFETY: a plain syscall with integer arguments.
+    check_prctl(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn check_prctl(ret: i32) -> Result<()> {
+    if ret != 0 {
+        anyhow::bail!(
+            "refusing to start: prctl(PR_SET_DUMPABLE, 0) failed ({}); a core dump \
+             could expose captured data",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
 /// `--smoke-test`: succeed as soon as the attached programs deliver at least
 /// one event, fail after a timeout. Never resolves when smoke testing is off.
 #[cfg(target_os = "linux")]
@@ -751,7 +755,22 @@ async fn smoke_test_wait(enabled: bool, stats: &event_loop::EventStats) -> Resul
 mod tests {
     use clap::Parser;
 
-    use super::{Args, config, offline_privacy_mode};
+    use super::{Args, check_prctl, config, offline_privacy_mode, panic_line};
+
+    #[test]
+    fn prctl_failure_refuses_to_start() {
+        assert!(check_prctl(0).is_ok());
+        let err = check_prctl(-1).unwrap_err().to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    #[test]
+    fn panic_line_names_the_location_only() {
+        let line = panic_line(Some(std::panic::Location::caller()));
+        assert!(line.contains("main.rs"), "{line}");
+        assert!(line.contains("withheld"), "{line}");
+        assert!(panic_line(None).contains("unknown location"));
+    }
 
     #[test]
     fn test_cli_default_args() {
