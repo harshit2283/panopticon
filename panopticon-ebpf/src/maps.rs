@@ -334,21 +334,32 @@ pub struct TlsCall {
     pub aux: u64,
     /// Cookie of the socket whose tuple is held (TLS_CALL_FILLED).
     pub cookie: u64,
+    /// User stack pointer at the entry probe: the call's frame identity,
+    /// checked by the return probe (tls_probes.rs `same_frame`).
+    pub entry_sp: u64,
     pub tuple: SockTuple,
     /// TLS_CALL_EMPTY, TLS_CALL_FILLED or TLS_CALL_POISONED.
     pub state: u32,
+    /// `CONFIG_SCOPE_GEN` the tuple's socket was checked in scope under;
+    /// emitted only by a call in scope under the same generation.
+    pub scope_gen: u32,
+    pub _pad: u32,
 }
 
 pub const TLS_CALL_EMPTY: u32 = 0;
 pub const TLS_CALL_FILLED: u32 = 1;
-/// The call touched a second socket, or one not in scope: no address.
+/// The call was seen touching a second socket, or one not in scope: no
+/// address. Only I/O seen on the CPU holding the call's TLS_ACTIVE marker
+/// counts, so this is not guaranteed for every socket the call touches.
 pub const TLS_CALL_POISONED: u32 = 2;
 
-/// Key: pid_tgid. A plain preallocated hash, not LRU: only the owning
-/// thread inserts, reads and deletes its key, and a preallocated element is
-/// recycled only after its key is deleted, so a value pointer held by that
-/// thread stays its own; an LRU map can evict and reuse it from another CPU.
-/// Entries of a thread that exits mid-call are removed by sched_process_exit.
+/// Key: pid_tgid. Safe to read through a value pointer because of
+/// ownership, not preallocation: only the owning thread inserts (which
+/// replaces and recycles the old element), reads and deletes its key, and
+/// never while it holds a pointer to it, so no other CPU recycles that
+/// element under it. Not LRU: an LRU map can evict and reuse an element
+/// from another CPU at any time. Entries of a thread that exits mid-call
+/// are removed by sched_process_exit, which restricted TLS requires.
 #[map]
 pub static TLS_CALL: HashMap<u64, TlsCall> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 

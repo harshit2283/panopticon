@@ -87,7 +87,23 @@ static TEST_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i32 {
     let fd = TEST_FD.load(std::sync::atomic::Ordering::SeqCst);
     // SAFETY: buf holds num bytes (the callers in the test).
-    unsafe { libc::write(fd, buf.cast(), num as usize) as i32 }
+    let n = unsafe { libc::write(fd, buf.cast(), num as usize) as i32 };
+    if let Some(hook) = TEST_HOOK.lock().unwrap().as_mut() {
+        hook();
+    }
+    n
+}
+
+/// Run inside the stand-in SSL_write, after its socket write.
+type Hook = Box<dyn FnMut() + Send>;
+static TEST_HOOK: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+/// A second stand-in with only the write entry probe attached: an inner
+/// call whose return probe never runs.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn panop_test_ssl_write_entry_only(_ssl: u64, _buf: *const u8, num: i32) -> i32 {
+    std::hint::black_box(num)
 }
 
 /// TLS_ACTIVE on every CPU: [pid_tgid, conn].
@@ -697,11 +713,13 @@ fn scope_programs_load_attach_and_hold() {
     };
     // A call slot as an entry probe opens it, socket I/O inside the call,
     // then the slot as the return probe would consume it.
-    let call = |ebpf: &mut Ebpf, conn: u64, socks: &mut [&mut TcpStream]| -> [u64; 7] {
+    let call = |ebpf: &mut Ebpf, conn: u64, socks: &mut [&mut TcpStream]| -> [u64; 9] {
         set_active(ebpf, [pid_tgid, conn]);
-        let mut slots: HashMap<_, u64, [u64; 7]> =
+        let mut slots: HashMap<_, u64, [u64; 9]> =
             HashMap::try_from(ebpf.map_mut("TLS_CALL").unwrap()).unwrap();
-        slots.insert(pid_tgid, [conn, 0, 0, 0, 0, 0, 0], 0).unwrap();
+        slots
+            .insert(pid_tgid, [conn, 0, 0, 0, 0, 0, 0, 0, 0], 0)
+            .unwrap();
         for s in socks.iter_mut() {
             s.write_all(b"t").unwrap();
         }
@@ -709,11 +727,15 @@ fn scope_programs_load_attach_and_hold() {
         slots.remove(&pid_tgid).unwrap();
         got
     };
-    // TlsCall: conn, buf, len, aux, cookie, tuple (12 bytes), state
-    let state = |c: &[u64; 7]| c[6] >> 32;
+    // TlsCall: conn, buf, len, aux, cookie, entry_sp, tuple (12 bytes),
+    // state, scope_gen
+    let state = |c: &[u64; 9]| c[7] >> 32;
     let c4_port = c4.local_addr().unwrap().port() as u64;
     let c = call(&mut ebpf, 0x7001, &mut [&mut c4]);
-    assert_eq!((state(&c), c[4], c[6] & 0xffff), (1, cookie(&c4), c4_port));
+    assert_eq!(
+        (state(&c), c[4], c[7] & 0xffff, c[8] as u32),
+        (1, cookie(&c4), c4_port, 1)
+    );
     let c = call(&mut ebpf, 0x7001, &mut [&mut c3]);
     assert_eq!(state(&c), 2, "same SSL*, next call on an OUT socket: none");
     let c = call(&mut ebpf, 0x7002, &mut [&mut c4, &mut c3]);
@@ -724,7 +746,7 @@ fn scope_programs_load_attach_and_hold() {
     let c = call(&mut ebpf, 0x7004, &mut [&mut c4]);
     assert_eq!(state(&c), 2, "verdict cached under an older generation");
     let c = call(&mut ebpf, 0x7005, &mut [&mut c4]); // its packet recomputed it
-    assert_eq!((state(&c), c[6] & 0xffff), (1, c4_port));
+    assert_eq!((state(&c), c[7] & 0xffff, c[8] as u32), (1, c4_port, 2));
 
     // End to end through the real write probes, on a stand-in SSL_write in
     // this binary: emitted at return, with only that call's address.
@@ -735,6 +757,21 @@ fn scope_programs_load_attach_and_hold() {
             .attach("panop_test_ssl_write", "/proc/self/exe", Some(me))
             .unwrap_or_else(|e| panic!("{prog} attaches: {e}"));
         uprobe_links.push((prog, link));
+    }
+    {
+        let p: &mut aya::programs::UProbe = ebpf
+            .program_mut("ssl_write_entry")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let link = p
+            .attach(
+                "panop_test_ssl_write_entry_only",
+                "/proc/self/exe",
+                Some(me),
+            )
+            .unwrap();
+        uprobe_links.push(("ssl_write_entry", link));
     }
     let _ = drain(&mut ring);
     let write =
@@ -763,6 +800,52 @@ fn scope_programs_load_attach_and_hold() {
         (0, 0, 0, 0, 0),
         "same SSL*, OUT socket: no address, none carried over"
     );
+
+    // A narrowing between the socket check and the emission: the call is
+    // still in scope (pid_filter), under the new generation, so the tuple
+    // checked under the old one is not emitted.
+    let config_id = match ebpf.map("CONFIG").unwrap() {
+        aya::maps::Map::Array(d) => d.info().unwrap().id(),
+        _ => unreachable!(),
+    };
+    let mut cfg2: Array<MapData, u64> =
+        Array::try_from(aya::maps::Map::Array(MapData::from_id(config_id).unwrap())).unwrap();
+    *TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+        let g = cfg2.get(&CONFIG_SCOPE_GEN, 0).unwrap();
+        cfg2.set(CONFIG_SCOPE_GEN, g + 1, 0).unwrap();
+    }));
+    TEST_FD.store(c4.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(write(ssl, b"tls-narrowed".as_ptr(), 12), 12);
+    // An inner call whose return probe never runs replaces the slot: the
+    // outer return finds another frame's slot and emits nothing from it.
+    *TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+        let inner = std::hint::black_box(
+            panop_test_ssl_write_entry_only as extern "C" fn(u64, *const u8, i32) -> i32,
+        );
+        inner(ssl, b"inner!".as_ptr(), 6);
+    }));
+    assert_eq!(write(ssl, b"tls-outer".as_ptr(), 9), 9);
+    *TEST_HOOK.lock().unwrap() = None;
+    // And the next ordinary call is whole again.
+    assert_eq!(write(ssl, b"tls-again".as_ptr(), 9), 9);
+    let tls = drain_tls(&mut ring);
+    let find = |p: &[u8]| tls.iter().find(|e| e.payload_bytes() == p).copied();
+    let e = find(b"tls-narrowed").expect("narrowed call still emitted");
+    assert_eq!(
+        (e.src_addr, e.src_port, e.scope_gen),
+        (0, 0, 3),
+        "checked under 2, emitted under 3: no address"
+    );
+    assert!(
+        find(b"tls-outer").is_none(),
+        "mismatched frame: nothing emitted"
+    );
+    assert!(
+        find(b"inner!").is_none(),
+        "the inner slot's buffer is not emitted"
+    );
+    let e = find(b"tls-again").expect("next call emitted");
+    assert_eq!(e.src_port as u64, c4_port, "next call has its own address");
     for (prog, link) in uprobe_links {
         let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
         p.detach(link).unwrap();
