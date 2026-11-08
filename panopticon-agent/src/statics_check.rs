@@ -73,29 +73,39 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// `static NAME:` declarations in `text` (comments and `'static` skipped).
+/// `static NAME:` declarations in `text`, read from its tokens: comments
+/// and string contents are not code, `r#NAME` is `NAME`, a declaration may
+/// span lines or carry a comment anywhere, `'static` is a lifetime, and
+/// macro bodies (`thread_local!`, `lazy_static!`) are searched too.
 fn statics_in(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let code = line.split("//").next().unwrap_or_default();
-        let mut words = code
-            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''))
-            .filter(|w| !w.is_empty());
-        while let Some(w) = words.next() {
-            if w != "static" {
-                continue;
-            }
-            let mut name = words.next();
-            if matches!(name, Some("ref" | "mut")) {
-                name = words.next();
-            }
-            if let Some(name) = name
-                && code.contains(&format!("{name}:"))
-            {
-                out.push(name.to_string());
+    use proc_macro2::{TokenStream, TokenTree};
+    fn scan(ts: TokenStream, out: &mut Vec<String>) {
+        let tts: Vec<TokenTree> = ts.into_iter().collect();
+        let punct = |t: Option<&TokenTree>, c: char| matches!(t, Some(TokenTree::Punct(p)) if p.as_char() == c);
+        for (i, tt) in tts.iter().enumerate() {
+            match tt {
+                TokenTree::Group(g) => scan(g.stream(), out),
+                TokenTree::Ident(id) if id == "static" => {
+                    if i > 0 && punct(tts.get(i - 1), '\'') {
+                        continue; // 'static
+                    }
+                    let mut j = i + 1;
+                    if matches!(tts.get(j), Some(TokenTree::Ident(w)) if w == "ref" || w == "mut") {
+                        j += 1;
+                    }
+                    if let Some(TokenTree::Ident(name)) = tts.get(j)
+                        && punct(tts.get(j + 1), ':')
+                    {
+                        let name = name.to_string();
+                        out.push(name.strip_prefix("r#").unwrap_or(&name).to_string());
+                    }
+                }
+                _ => {}
             }
         }
     }
+    let mut out = Vec::new();
+    scan(text.parse().expect("source file does not lex"), &mut out);
     out
 }
 
@@ -150,4 +160,24 @@ fn scanner_finds_each_form() {
     let src = "static A: u8 = 0;\npub static mut B: u8 = 0;\nthread_local! {\n    static C: Cell<u8> = Cell::new(0);\n}\nlazy_static! { static ref D: X = x(); }\n\
                fn f(s: &'static str) {} // static E: u8\nconst F: &'static str = \"\";\n";
     assert_eq!(statics_in(src), ["A", "B", "C", "D"]);
+}
+
+/// Forms a line-based scan missed (statics_check review).
+#[test]
+fn scanner_reads_tokens_not_lines() {
+    let src = r##"
+        static r#TYPE: u8 = 0;
+        static G /* why */ : u8 = 0;
+        pub(crate) static
+            H
+            : std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+        mod m { fn f() { static I: u8 = 0; } }
+        /// static J: u8 (a doc comment)
+        const K: &str = "static L: u8";
+        const M: &str = r#"static N: u8"#;
+        /* static O: u8 */
+        fn g<'a>(_: &'a str) -> &'static str { "" }
+        static P: &'static str = "";
+    "##;
+    assert_eq!(statics_in(src), ["TYPE", "G", "H", "I", "P"]);
 }

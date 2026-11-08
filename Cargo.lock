@@ -1591,6 +1591,7 @@ dependencies = [
  "ort",
  "panopticon-common",
  "petgraph",
+ "proc-macro2",
  "prometheus-client",
  "regex",
  "reqwest",

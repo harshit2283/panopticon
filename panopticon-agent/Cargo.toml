@@ -97,6 +97,7 @@ cargo_metadata = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 futures-util = { version = "0.3", default-features = false }
+proc-macro2 = { version = "1", default-features = false }
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic", "trace"] }
 criterion = { workspace = true }
 
