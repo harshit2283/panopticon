@@ -1,7 +1,8 @@
 //! Loader for the cgroup_skb capture backend (DESIGN §7): load-check every
 //! program a mode needs before anything is attached, find the cgroup v2
-//! root, attach everything while the scope writers are disarmed, publish
-//! `PID_FILTER`, and arm (`CONFIG_SCOPE_ARMED`) last.
+//! root, publish the cgroup selectors (`CGROUP_ALLOW`, through the caller's
+//! `select` hook), attach everything while the scope writers are disarmed,
+//! publish `PID_FILTER`, and arm (`CONFIG_SCOPE_ARMED`) last.
 //!
 //! Self-contained (aya, anyhow, tracing, libc, panopticon-common only) so
 //! the lab attach test (`tests/scope_attach.rs`) runs this same code.
@@ -310,12 +311,14 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
 /// Attach everything `setup` needs, with the scope writers disarmed, in
 /// dependency order:
 /// 1. load-check everything (nothing attached if any required program fails);
-/// 2. write the `pid_filter` candidates (PID_CANDIDATES), then attach
+/// 2. `select` (cgroup_filter/pod_filter: publish CGROUP_ALLOW) once the
+///    root is known and the private-root refusal has passed;
+/// 3. write the `pid_filter` candidates (PID_CANDIDATES), then attach
 ///    sched_process_exit, so every candidate exit from here on is recorded
 ///    in PID_EXITED for [`arm`];
-/// 3. the tcp_set_ulp marker, so no socket attaches kTLS unmarked;
-/// 4. both capture hooks and fexit accept;
-/// 5. sock_create and sockops.
+/// 4. the tcp_set_ulp marker, so no socket attaches kTLS unmarked;
+/// 5. both capture hooks and fexit accept;
+/// 6. sock_create and sockops.
 ///
 /// Nothing is initialised before [`arm`], so no socket gets state while a
 /// dependency above is missing. Returns the root and whether the exit
@@ -324,6 +327,7 @@ pub fn attach_disarmed(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
     pids: Option<&[Candidate]>,
+    select: impl FnOnce(&mut Ebpf, &CgroupRoot) -> Result<()>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
     // Disarmed whatever CONFIG held before (a pinned CONFIG survives
@@ -338,6 +342,7 @@ pub fn attach_disarmed(
             root.path().display()
         );
     }
+    select(&mut *ebpf, &root)?;
     let cgroup = File::open(root.path())
         .with_context(|| format!("cannot open cgroup root {}", root.path().display()))?;
     if !uses_links() {
@@ -632,14 +637,16 @@ fn remove_pid(
     }
 }
 
-/// Attach (disarmed), then arm. The production startup path.
+/// Attach (disarmed), then arm. The production startup path. `select`
+/// publishes the cgroup selectors (see [`attach_disarmed`]).
 pub fn load_and_attach(
     ebpf: &mut Ebpf,
     setup: &ScopeSetup,
     pids: Option<Vec<Candidate>>,
+    select: impl FnOnce(&mut Ebpf, &CgroupRoot) -> Result<()>,
     links: &mut Links,
 ) -> Result<(CgroupRoot, bool)> {
-    let r = attach_disarmed(ebpf, setup, pids.as_deref(), links)?;
+    let r = attach_disarmed(ebpf, setup, pids.as_deref(), select, links)?;
     arm(ebpf, pids)?;
     Ok(r)
 }

@@ -157,6 +157,12 @@ impl K8sMetadata {
         self.synced.load(Ordering::Acquire)
     }
 
+    /// The pods last seen (all nodes).
+    pub fn pods(&self) -> Vec<model::PodRecord> {
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.pods.values().cloned().collect()
+    }
+
     /// API requests that failed so far.
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)

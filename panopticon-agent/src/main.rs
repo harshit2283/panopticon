@@ -20,6 +20,7 @@ mod protocol;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
+mod scope_select;
 mod util;
 
 /// Panopticon Agent — eBPF-powered network observability
@@ -259,6 +260,8 @@ async fn main() -> Result<()> {
         info!(mode = %privacy_mode, "Privacy mode");
         info!(
             pid_filter = ?agent_config.pid_filter,
+            cgroup_filter = ?agent_config.cgroup_filter,
+            pod_filter = ?agent_config.pod_filter,
             sampling_mode = ?agent_config.sampling_mode,
             sample_rate = agent_config.sample_rate,
             "Capture scope"
@@ -311,11 +314,27 @@ async fn main() -> Result<()> {
             );
         }
 
+        // Kubernetes metadata (pod/service names for graph nodes and exports).
+        // Starts a background sync and returns at once; never fails startup
+        // unless pod_filter needs it.
+        let k8s_metadata = k8s::K8sMetadata::start(&agent_config.kubernetes);
+        // pod_filter: this node's matching pods, after the first sync
+        // (bounded wait), resolved to cgroups before arming.
+        let selected_pods = match (&agent_config.pod_filter, &k8s_metadata) {
+            (None, _) => Vec::new(),
+            (Some(filters), Some(meta)) => scope_select::startup_pods(meta, filters).await,
+            (Some(_), None) => anyhow::bail!(
+                "refusing pod_filter: Kubernetes metadata is not available (not in a pod, \
+                 or the API client could not be set up)"
+            ),
+        };
+
         let mut programs = loader::load_and_attach(
             &agent_config.interfaces,
             &caps,
             &agent_config,
             pid_candidates,
+            &selected_pods,
         )?;
 
         // 1. Extract EventSource (RingBuf or PerfEventArray) BEFORE wrapping Ebpf in Arc<Mutex>.
@@ -350,6 +369,11 @@ async fn main() -> Result<()> {
             links: programs._links,
             attached_libs,
         }));
+        // §3.2: the cgroup selector stops admitting if a v1 net_cls/net_prio
+        // hierarchy appears at runtime (refused at startup already).
+        if loader::scope_config(&agent_config).0 & panopticon_common::scope::SCOPE_SEL_CGROUP != 0 {
+            scope_select::spawn_net_cls_watch(Arc::clone(&shared_ebpf));
+        }
 
         // 4. Create TLS rescan channel and spawn background TLS scanner task
         //    ProcessExec events in the event loop send PIDs to tls_rescan_tx,
@@ -388,10 +412,6 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-
-        // Kubernetes metadata (pod/service names for graph nodes and exports).
-        // Starts a background sync and returns at once; never fails startup.
-        let k8s_metadata = k8s::K8sMetadata::start(&agent_config.kubernetes);
 
         // The privacy mode in effect, shared by the workers and every writer:
         // a reload can only tighten it, and the writers check each record.

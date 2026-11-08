@@ -34,6 +34,8 @@ pub struct ObjectMeta {
     pub name: String,
     #[serde(default)]
     pub namespace: String,
+    #[serde(default)]
+    pub uid: String,
     #[serde(rename = "resourceVersion", default)]
     pub resource_version: Option<String>,
     #[serde(rename = "creationTimestamp", default)]
@@ -124,6 +126,12 @@ pub struct WatchEvent {
 pub struct PodRecord {
     pub namespace: Arc<str>,
     pub name: Arc<str>,
+    /// `metadata.uid`: names the pod's cgroup directory (`pod_filter`).
+    pub uid: Arc<str>,
+    // ponytail: kept for every pod in the cluster, though only `pod_filter`
+    // reads them (for this node's pods); drop non-local pods' labels if
+    // memory on large clusters matters.
+    pub labels: HashMap<String, String>,
     pub workload_kind: &'static str,
     pub workload_name: Arc<str>,
     pub node: Option<Arc<str>>,
@@ -184,6 +192,8 @@ impl Pod {
         Some(PodRecord {
             namespace: Arc::from(self.metadata.namespace.as_str()),
             name: Arc::from(self.metadata.name.as_str()),
+            uid: Arc::from(self.metadata.uid.as_str()),
+            labels: self.metadata.labels.clone(),
             workload_kind,
             workload_name: Arc::from(workload_name.as_str()),
             node: self.spec.node_name.as_deref().map(Arc::from),

@@ -31,6 +31,9 @@ pub fn scope_config(config: &AgentConfig) -> (u64, u64, u64) {
     if config.pid_filter.is_some() {
         mode |= scope::SCOPE_SEL_PID;
     }
+    if config.cgroup_filter.is_some() || config.pod_filter.is_some() {
+        mode |= scope::SCOPE_SEL_CGROUP;
+    }
     let mut threshold = 0;
     let mut head = 0;
     match config.sampling_mode {
@@ -164,6 +167,7 @@ pub fn load_and_attach(
     caps: &KernelCapabilities,
     config: &AgentConfig,
     pid_candidates: Option<Vec<scope_loader::Candidate>>,
+    pods: &[crate::scope_select::SelectedPod],
 ) -> Result<LoadedPrograms> {
     if !caps.has_tc_ebpf {
         anyhow::bail!(
@@ -200,8 +204,19 @@ pub fn load_and_attach(
             tls: config.tls_scan_enabled,
             cgroup2_path: config.cgroup2_path.clone(),
         };
+        let cgroup_sel = setup.mode & scope::SCOPE_SEL_CGROUP != 0;
+        let paths = config.cgroup_filter.as_deref().unwrap_or_default();
+        // CGROUP_ALLOW is published before anything is attached (and so
+        // before arm); the selector's refusals come first.
+        let select = |ebpf: &mut Ebpf, root: &scope_loader::CgroupRoot| {
+            if cgroup_sel {
+                crate::scope_select::startup_publish(ebpf, root.path(), paths, pods)
+            } else {
+                Ok(())
+            }
+        };
         let (_root, exit_tp) =
-            scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, &mut links)?;
+            scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, select, &mut links)?;
         exit_tp_attached = exit_tp;
     }
     let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };
