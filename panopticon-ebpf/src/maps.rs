@@ -316,13 +316,44 @@ pub struct SockTuple {
     pub remote_addr: u32,
     pub local_port: u16,
     pub remote_port: u16,
-    /// `CONFIG_SCOPE_GEN` the socket was verified in scope under
-    /// (tls_probes.rs `record_conn_addr`); restricted modes serve the tuple
-    /// only to a TLS call in scope under the same generation.
-    pub scope_gen: u32,
 }
 
+/// One OpenSSL call in progress on a thread, restricted modes only
+/// (tls_probes.rs `begin_call`): opened by the entry probe, given its
+/// socket's address by the scoped fentry inside the call, consumed and
+/// deleted by the call's return probe. Nothing survives the call.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsCall {
+    /// `SSL*` of the call.
+    pub conn: u64,
+    /// SSL_write*: plaintext buffer and requested length (unchanged at return).
+    pub buf: u64,
+    pub len: u64,
+    /// `SSL_write_ex`'s `size_t *written`; 0 otherwise.
+    pub aux: u64,
+    /// Cookie of the socket whose tuple is held (TLS_CALL_FILLED).
+    pub cookie: u64,
+    pub tuple: SockTuple,
+    /// TLS_CALL_EMPTY, TLS_CALL_FILLED or TLS_CALL_POISONED.
+    pub state: u32,
+}
+
+pub const TLS_CALL_EMPTY: u32 = 0;
+pub const TLS_CALL_FILLED: u32 = 1;
+/// The call touched a second socket, or one not in scope: no address.
+pub const TLS_CALL_POISONED: u32 = 2;
+
+/// Key: pid_tgid. A plain preallocated hash, not LRU: only the owning
+/// thread inserts, reads and deletes its key, and a preallocated element is
+/// recycled only after its key is deleted, so a value pointer held by that
+/// thread stays its own; an LRU map can evict and reuse it from another CPU.
+/// Entries of a thread that exits mid-call are removed by sched_process_exit.
+#[map]
+pub static TLS_CALL: HashMap<u64, TlsCall> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+
 /// Addresses of each TLS connection, learned on its first socket I/O.
+/// Unscoped modes only; restricted modes use per-call TLS_CALL slots.
 #[map]
 pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
     LruHashMap::with_max_entries(TLS_SCRATCH_SIZE * 2, 0);

@@ -18,6 +18,7 @@ use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
 
 use crate::maps::{
     PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROCESS_EVENTS,
+    TLS_CALL,
 };
 
 // ── Process Exec ───────────────────────────────────────────────────────────
@@ -91,6 +92,8 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let tgid = pid_tgid as u32;
+    // A thread that exits inside a TLS call never reaches its return probe.
+    let _ = TLS_CALL.remove(&pid_tgid);
 
     // sched_process_exit fires for every exiting *thread*. Only the thread
     // group leader exiting means the process is gone; otherwise a worker

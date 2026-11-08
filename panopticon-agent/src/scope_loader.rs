@@ -39,9 +39,10 @@ pub const ACCEPT2: &str = "scope_accept2";
 pub const SET_ULP: &str = "scope_set_ulp";
 pub const EXIT_TP: &str = "sched_process_exit";
 /// TLS uprobe programs; the scope gate lives in their shared emit path.
-pub const TLS_PROGRAMS: [&str; 8] = [
+pub const TLS_PROGRAMS: [&str; 9] = [
     "ssl_write_entry",
     "ssl_write_ex_entry",
+    "ssl_write_ret",
     "ssl_read_entry",
     "ssl_read_ex_entry",
     "ssl_read_ret",
