@@ -4,9 +4,8 @@
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
@@ -183,6 +182,12 @@ pub struct EventStats {
     pub sampled_out_events: AtomicU64,
     /// `head_only`: events cut or dropped past the per-direction limit.
     pub head_only_cut_events: AtomicU64,
+    /// cgroup_skb: events dropped at the ring read because their scope
+    /// generation is below the admission floor (a narrowing came after it).
+    pub drops_stale_scope_gen: AtomicU64,
+    /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
+    /// (refreshed from the map; indexed by `scope::DROP_*`).
+    pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
 }
 
 impl EventStats {
@@ -209,8 +214,37 @@ impl EventStats {
             sampled_out_connections: AtomicU64::new(0),
             sampled_out_events: AtomicU64::new(0),
             head_only_cut_events: AtomicU64::new(0),
+            drops_stale_scope_gen: AtomicU64::new(0),
+            scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
+}
+
+// ── Admission floor (cgroup_skb, DESIGN §3 narrowing) ─────────────────────
+
+/// The lowest scope generation the ring readers admit, shared by all of
+/// them. Only ever raised. Stays 0 on TC, whose events carry generation 0.
+#[derive(Clone, Default)]
+pub struct AdmissionFloor(Arc<AtomicU32>);
+
+impl AdmissionFloor {
+    /// Admit nothing computed under a generation below `generation` from
+    /// now on.
+    pub fn raise(&self, generation: u32) {
+        self.0.fetch_max(generation, Ordering::SeqCst);
+    }
+
+    /// Loaded once per drained batch.
+    fn get(&self) -> u32 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Whether `event` is dropped at the ring read under admission `floor`. A
+/// close record carries no generation and reaches no sink (it only frees
+/// state), so it is never stale.
+fn below_floor(event: &DataEvent, floor: u32) -> bool {
+    event.event_type != EventType::SockClose && event.scope_gen < floor
 }
 
 // ── Rate Limiter (global token bucket) ───────────────────────────────────
@@ -293,6 +327,7 @@ pub struct EventLoop {
     graph_builder: Option<Arc<GraphBuilder>>,
     raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
     privacy: Arc<PrivacyGate>,
+    admission_floor: AdmissionFloor,
 }
 
 #[cfg(target_os = "linux")]
@@ -318,7 +353,13 @@ impl EventLoop {
             audit_log,
             graph_builder: graph_builder.map(Arc::new),
             raw_capture: None,
+            admission_floor: AdmissionFloor::default(),
         }
+    }
+
+    /// The ring readers' admission floor, for the scope publisher to raise.
+    pub fn admission_floor(&self) -> AdmissionFloor {
+        self.admission_floor.clone()
     }
 
     /// Record every processed event, unredacted, to a raw capture file.
@@ -557,6 +598,7 @@ impl EventLoop {
             &senders,
             &rate_limiter,
             &self.stats,
+            &self.admission_floor,
             tls_rescan_tx,
         )
         .await;
@@ -581,14 +623,23 @@ async fn consume_data_events(
     senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &Arc<RateLimiter>,
     stats: &Arc<EventStats>,
+    floor: &AdmissionFloor,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     match event_source {
         EventSource::RingBuf(rings) => {
-            consume_ringbufs(rings, senders, rate_limiter, stats, tls_rescan_tx).await
+            consume_ringbufs(rings, senders, rate_limiter, stats, floor, tls_rescan_tx).await
         }
         EventSource::PerfEventArray(perf_array) => {
-            consume_perf_array(perf_array, senders, rate_limiter, stats, tls_rescan_tx).await
+            consume_perf_array(
+                perf_array,
+                senders,
+                rate_limiter,
+                stats,
+                floor,
+                tls_rescan_tx,
+            )
+            .await
         }
     }
 }
@@ -605,6 +656,7 @@ async fn consume_ringbufs(
     senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &Arc<RateLimiter>,
     stats: &Arc<EventStats>,
+    floor: &AdmissionFloor,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     /// Stops the drain threads when this future ends or is dropped (shutdown
@@ -628,6 +680,7 @@ async fn consume_ringbufs(
         let senders = senders.to_vec();
         let rate_limiter = Arc::clone(rate_limiter);
         let stats = Arc::clone(stats);
+        let floor = floor.clone();
         let tls_rescan_tx = tls_rescan_tx.clone();
         let stop = Arc::clone(&stop.0);
         let exit_tx = exit_tx.clone();
@@ -640,6 +693,7 @@ async fn consume_ringbufs(
                     &senders,
                     &rate_limiter,
                     &stats,
+                    &floor,
                     tls_rescan_tx.as_ref(),
                     &stop,
                 );
@@ -671,6 +725,7 @@ fn drain_thread(
     senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
+    floor: &AdmissionFloor,
     tls_rescan_tx: Option<&mpsc::Sender<u32>>,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -715,6 +770,7 @@ fn drain_thread(
             WorkerBatcher::new(senders, stats, shard, shards),
             rate_limiter,
             stats,
+            floor.get(),
             tls_rescan_tx,
         );
         // Woken by the kernel: traffic is flowing, keep the tight bound.
@@ -751,7 +807,7 @@ fn next_drain_interval(current: Duration, drained: usize) -> Duration {
 /// Drain every pending event from the ring buffer and route it to workers.
 /// Copies each event's header and payload bytes once into the routing
 /// scratch, and from there into the worker's batch: never a whole 4KB
-/// DataEvent.
+/// DataEvent. `floor` is the admission floor, loaded once for the batch.
 #[cfg(target_os = "linux")]
 fn drain_ringbuf(
     ring: &mut RingBuf<aya::maps::MapData>,
@@ -759,10 +815,12 @@ fn drain_ringbuf(
     mut batcher: WorkerBatcher<'_>,
     rate_limiter: &RateLimiter,
     stats: &EventStats,
+    floor: u32,
     tls_rescan_tx: Option<&mpsc::Sender<u32>>,
 ) -> usize {
     let mut drained = 0;
     let mut received = 0;
+    let mut stale = 0;
     while let Some(item) = ring.next() {
         drained += 1;
         if !read_data_event_into(item.as_ref(), scratch) {
@@ -770,6 +828,11 @@ fn drain_ringbuf(
         }
         let event: &DataEvent = scratch;
         received += 1;
+        // Before dispatch: computed under a scope a narrowing has revoked.
+        if below_floor(event, floor) {
+            stale += 1;
+            continue;
+        }
 
         // Handle ProcessEvent-typed events differently (they come through
         // PROCESS_EVENTS in the kernel, but we handle routing here)
@@ -814,6 +877,12 @@ fn drain_ringbuf(
     // One shared-counter update per drain, not per event: every drain
     // thread bumps it.
     stats.events_received.fetch_add(received, Ordering::Relaxed);
+    if stale > 0 {
+        stats.events_dropped.fetch_add(stale, Ordering::Relaxed);
+        stats
+            .drops_stale_scope_gen
+            .fetch_add(stale, Ordering::Relaxed);
+    }
     drained
 }
 
@@ -975,6 +1044,7 @@ async fn consume_perf_array(
     senders: &[mpsc::Sender<EventBatch>],
     rate_limiter: &RateLimiter,
     stats: &EventStats,
+    floor: &AdmissionFloor,
     tls_rescan_tx: Option<mpsc::Sender<u32>>,
 ) -> Result<()> {
     let cpus = aya::util::online_cpus().map_err(|(path, error)| {
@@ -1004,6 +1074,12 @@ async fn consume_perf_array(
     // Flow parsing is per-connection so out-of-order across *different* connections is fine.
     while let Some(event) = event_rx.recv().await {
         stats.events_received.fetch_add(1, Ordering::Relaxed);
+        // One event per receive: the floor is loaded for each.
+        if below_floor(&event, floor.get()) {
+            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            stats.drops_stale_scope_gen.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
 
         // Same routing logic as RingBuf
         match event.event_type {
@@ -1118,6 +1194,13 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                 continue;
             }
             let cookie = connection_key(&scratch);
+            // A close record (cgroup_skb sockops STATE_CB) is sent for every
+            // socket the kernel tracks, in scope or not, with its tuple and
+            // owner: it frees the connection's state and reaches no sink.
+            if scratch.event_type == EventType::SockClose {
+                end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
+                continue;
+            }
             // Owners first: they decide whether the connection's TC packets
             // pass pid_filter. Only a listed process may name one.
             if gate.pid_allowed(scratch.pid) {
@@ -1297,10 +1380,9 @@ fn process_event(
         }
     }
 
-    // Handle connection close events: socket close, TCP RST, or FIN
+    // Handle connection close: TCP RST, or FIN
     // from both sides (after this packet's payload was parsed).
     let closed = match event.event_type {
-        EventType::SockClose => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
             manager.note_fin(cookie, sender_endpoint(event), event.direction)
@@ -1308,11 +1390,23 @@ fn process_event(
         _ => false,
     };
     if closed {
-        owners.remove(cookie);
-        gate.forget(cookie);
-        if manager.close_connection(cookie) {
-            ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-        }
+        end_connection(ctx, manager, owners, gate, cookie);
+    }
+}
+
+/// Free everything a worker holds for connection `cookie`.
+#[cfg(target_os = "linux")]
+fn end_connection(
+    ctx: &WorkerTaskContext,
+    manager: &ConnectionFsmManager,
+    owners: &mut OwnerTable,
+    gate: &mut crate::capture_gate::CaptureGate,
+    cookie: u64,
+) {
+    owners.remove(cookie);
+    gate.forget(cookie);
+    if manager.close_connection(cookie) {
+        ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2367,6 +2461,49 @@ mod tests {
         assert_eq!(b[0].path.as_deref(), Some("/b"));
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].path.as_deref(), Some("/orders/7"));
+    }
+
+    #[test]
+    fn admission_floor_drops_stale_generations_only() {
+        // SAFETY: all-zero is a valid DataEvent.
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        e.event_type = EventType::TcPacket;
+        // TC: generation 0 under the floor that never moves off 0.
+        let floor = AdmissionFloor::default();
+        assert_eq!(floor.get(), 0);
+        assert!(!below_floor(&e, floor.get()));
+
+        // cgroup_skb starts at generation 1; a narrowing to 3 drops 1 and 2.
+        floor.raise(3);
+        floor.raise(2); // never lowered
+        assert_eq!(floor.get(), 3);
+        assert!(floor.clone().get() == 3, "one floor for every reader");
+        for (kind, gen_, stale) in [
+            (EventType::TcPacket, 1, true),
+            (EventType::TcPacket, 2, true),
+            (EventType::TcPacket, 3, false),
+            (EventType::TcPacket, 4, false),
+            (EventType::TlsData, 2, true),
+            (EventType::TlsData, 3, false),
+            // A close record (generation 0) only frees state: never stale.
+            (EventType::SockClose, 0, false),
+        ] {
+            e.event_type = kind;
+            e.scope_gen = gen_;
+            assert_eq!(below_floor(&e, floor.get()), stale, "{kind:?} gen {gen_}");
+        }
+    }
+
+    #[test]
+    fn cgroup_skb_packets_and_close_records_key_by_socket_cookie() {
+        // SAFETY: all-zero is a valid DataEvent.
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        e.socket_cookie = 0x1234_5678;
+        e.pid = 7;
+        for kind in [EventType::TcPacket, EventType::SockClose] {
+            e.event_type = kind;
+            assert_eq!(connection_key(&e), 0x1234_5678, "{kind:?}");
+        }
     }
 
     #[cfg(target_os = "linux")]

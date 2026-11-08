@@ -322,7 +322,13 @@ async fn main() -> Result<()> {
         //    This breaks the borrow chain — event loop no longer needs &mut Ebpf.
         let event_source = loader::take_event_source(&mut programs.ebpf, &caps)
             .context("Failed to initialize event source from eBPF maps")?;
-        let kernel_drops = loader::take_kernel_drops(&mut programs.ebpf);
+        let kernel_drops = loader::take_per_cpu_counters(&mut programs.ebpf, "KERNEL_DROPS");
+        let cgroup_backend = agent_config.capture_backend == config::CaptureBackend::CgroupSkb;
+        let scope_drops = if cgroup_backend {
+            loader::take_per_cpu_counters(&mut programs.ebpf, "SCOPE_DROPS")
+        } else {
+            None
+        };
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
@@ -513,21 +519,31 @@ async fn main() -> Result<()> {
         //    is cleared again as soon as shutdown begins.
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let event_stats = event_loop.stats().clone();
-        if let Some(map) = kernel_drops {
+        if kernel_drops.is_some() || scope_drops.is_some() {
             let stats = event_stats.clone();
             tokio::spawn(async move {
+                use std::sync::atomic::Ordering::Relaxed;
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     tick.tick().await;
-                    stats.kernel_drops.store(
-                        loader::sum_per_cpu(&map),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    if let Some(map) = &kernel_drops {
+                        stats
+                            .kernel_drops
+                            .store(loader::sum_per_cpu(map, 0), Relaxed);
+                    }
+                    if let Some(map) = &scope_drops {
+                        for (i, c) in stats.scope_drops.iter().enumerate() {
+                            c.store(loader::sum_per_cpu(map, i as u32), Relaxed);
+                        }
+                    }
                 }
             });
         }
         let http_handle = if let Some(ref bind) = agent_config.metrics_bind {
-            let (metrics, registry) = export::metrics::AgentMetrics::new();
+            let (mut metrics, mut registry) = export::metrics::AgentMetrics::new();
+            if cgroup_backend {
+                metrics.register_scope_drops(&mut registry);
+            }
             let state = export::http_server::AppState {
                 registry: Arc::new(registry),
                 stats: event_loop.stats().clone(),

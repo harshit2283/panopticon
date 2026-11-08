@@ -235,22 +235,27 @@ pub fn load_and_attach(
 
     // ── Connection owners (client/server PIDs) ────────────────────────
     // kprobes where the kernel has them (both sides), else the
-    // inet_sock_set_state tracepoint (connecting side only).
-    let connect_kprobe = attach_kprobe(&mut ebpf, "tcp_connect", "tcp_connect", &mut links);
-    attach_kretprobe(
-        &mut ebpf,
-        "inet_csk_accept_ret",
-        "inet_csk_accept",
-        &mut links,
-    );
-    if !connect_kprobe {
-        attach_tracepoint(
+    // inet_sock_set_state tracepoint (connecting side only). Not on
+    // cgroup_skb (DESIGN §8): they report the tuple and PID of every
+    // connection on the node, outside any kernel scope decision; the
+    // kernel stamps owner_tgid / acceptor_tgid into captured events instead.
+    if !cgroup_backend {
+        let connect_kprobe = attach_kprobe(&mut ebpf, "tcp_connect", "tcp_connect", &mut links);
+        attach_kretprobe(
             &mut ebpf,
-            "sock_state_connect",
-            "sock",
-            "inet_sock_set_state",
+            "inet_csk_accept_ret",
+            "inet_csk_accept",
             &mut links,
         );
+        if !connect_kprobe {
+            attach_tracepoint(
+                &mut ebpf,
+                "sock_state_connect",
+                "sock",
+                "inet_sock_set_state",
+                &mut links,
+            );
+        }
     }
     if config.tls_scan_enabled {
         // Give TLS connections their socket addresses (see tls_probes.rs):
@@ -721,20 +726,22 @@ pub fn take_event_source(ebpf: &mut Ebpf, caps: &KernelCapabilities) -> Result<E
     }
 }
 
-/// Take the per-CPU counter of events the kernel dropped because the ring
-/// buffer was full. `None` on objects built without it.
-pub fn take_kernel_drops(
+/// Take a per-CPU counter map: `KERNEL_DROPS` (events the kernel dropped
+/// because the ring buffer was full) or `SCOPE_DROPS` (cgroup_skb scope
+/// drops by reason). `None` on objects built without it.
+pub fn take_per_cpu_counters(
     ebpf: &mut Ebpf,
+    name: &str,
 ) -> Option<aya::maps::PerCpuArray<aya::maps::MapData, u64>> {
-    let map = ebpf.take_map("KERNEL_DROPS")?;
+    let map = ebpf.take_map(name)?;
     aya::maps::PerCpuArray::try_from(map)
-        .inspect_err(|e| warn!(error = %e, "KERNEL_DROPS map has an unexpected type"))
+        .inspect_err(|e| warn!(map = name, error = %e, "map has an unexpected type"))
         .ok()
 }
 
-/// Sum a per-CPU counter across CPUs.
-pub fn sum_per_cpu(map: &aya::maps::PerCpuArray<aya::maps::MapData, u64>) -> u64 {
-    map.get(&0, 0).map_or(0, |v| v.iter().sum())
+/// Sum entry `index` of a per-CPU counter across CPUs.
+pub fn sum_per_cpu(map: &aya::maps::PerCpuArray<aya::maps::MapData, u64>, index: u32) -> u64 {
+    map.get(&index, 0).map_or(0, |v| v.iter().sum())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────

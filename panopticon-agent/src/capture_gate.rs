@@ -1,5 +1,7 @@
 //! What may reach the parsers and every sink: `pid_filter`,
-//! `sampling_mode = "connection_sample"` and `"head_only"`.
+//! `sampling_mode = "connection_sample"` and `"head_only"`, on the TC
+//! backend. On cgroup_skb the kernel decides all of them and this gate is a
+//! pass-through ([`GateConfig::from_config`]).
 //!
 //! Each worker runs every event through its gate first, before the raw dump,
 //! logging, parsing, PII scanning, the service graph and the exports, so an
@@ -40,7 +42,7 @@ use panopticon_common::{
     DataEvent, EventType, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN,
 };
 
-use crate::config::{AgentConfig, SamplingMode};
+use crate::config::{AgentConfig, CaptureBackend, SamplingMode};
 use crate::event_loop::{EventStats, sender_endpoint};
 use crate::protocol::fsm::Endpoint;
 
@@ -74,7 +76,13 @@ pub struct GateConfig {
 }
 
 impl GateConfig {
+    /// On the cgroup_skb backend the kernel has made every scope decision
+    /// (DESIGN §8): the gate is a pass-through (no pid check, holds,
+    /// sampling or head cut) and TC SYN events stay off.
     pub fn from_config(config: &AgentConfig) -> Self {
+        if config.capture_backend == CaptureBackend::CgroupSkb {
+            return Self::default();
+        }
         Self {
             pids: config
                 .pid_filter
@@ -593,6 +601,46 @@ mod tests {
             );
         }
         assert_eq!(g.admit(&mut pkt, 5000, [None; 2], &stats), Verdict::Drop);
+    }
+
+    #[test]
+    fn cgroup_skb_gate_is_a_pass_through() {
+        // Every user-space rule set, on both backends.
+        for rules in [
+            "pid_filter = [100]\n",
+            "sampling_mode = \"connection_sample\"\nsample_rate = 0.0\n",
+            "sampling_mode = \"head_only\"\nhead_only_bytes = 1\n",
+        ] {
+            let stats = EventStats::new();
+            let cg = config(&format!("{rules}[capture]\nbackend = \"cgroup_skb\"\n"));
+            assert!(!cg.wants_syn(), "{rules}");
+            let mut g = CaptureGate::new(cg, 1024);
+            let mut tls = event(EventType::TlsData, b"GET / HTTP/1.1");
+            tls.pid = 101;
+            let mut close = event(EventType::SockClose, b"");
+            close.socket_cookie = 9;
+            // No SYN seen, no owner known, unlisted pid: all pass unchanged.
+            for (key, mut e) in [(1, tcp((1, 1000), 5, 0, b"abcdef")), (2, tls), (9, close)] {
+                let before = e;
+                assert_eq!(g.admit(&mut e, key, [None; 2], &stats), Verdict::Process);
+                assert_eq!(e.payload_bytes(), before.payload_bytes(), "{rules}");
+                assert_eq!(e.orig_len, before.orig_len);
+            }
+            assert!(!g.has_held());
+            for c in [
+                &stats.pid_filter_dropped_events,
+                &stats.sampled_out_events,
+                &stats.head_only_cut_events,
+            ] {
+                assert_eq!(c.load(Ordering::Relaxed), 0, "{rules}");
+            }
+
+            // The same rules on TC still filter.
+            let mut tc = gate(rules);
+            let mut p = tcp((1, 1000), 5, 0, b"abcdef");
+            assert_ne!(tc.admit(&mut p, 1, [None; 2], &stats), Verdict::Process);
+        }
+        assert!(config("sampling_mode = \"head_only\"\nhead_only_bytes = 1\n").wants_syn());
     }
 
     fn head(g: &mut CaptureGate, e: &mut DataEvent, key: u64) -> (Verdict, Vec<u8>) {

@@ -8,12 +8,14 @@
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 
 use crate::event_loop::EventStats;
+use panopticon_common::scope::SCOPE_DROP_NAMES;
 
 /// Agent metrics backed by prometheus-client.
 ///
@@ -40,6 +42,10 @@ pub struct AgentMetrics {
     pub sampled_out_connections: Counter<u64>,
     pub sampled_out_events: Counter<u64>,
     pub head_only_cut_events: Counter<u64>,
+    /// cgroup_skb only ([`Self::register_scope_drops`]): kernel scope drops,
+    /// one per `SCOPE_DROP_NAMES` entry in that order; empty on TC.
+    pub scope_drops: Vec<Counter<u64>>,
+    pub drops_stale_scope_gen: Option<Counter<u64>>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -219,11 +225,37 @@ impl AgentMetrics {
             sampled_out_connections,
             sampled_out_events,
             head_only_cut_events,
+            scope_drops: Vec::new(),
+            drops_stale_scope_gen: None,
             parse_latency,
             ringbuf_approx_pending,
         };
 
         (metrics, registry)
+    }
+
+    /// Register the cgroup_skb backend's scope counters:
+    /// `panopticon_scope_dropped_events_total{reason}` (the kernel's
+    /// `SCOPE_DROPS`, labels only from the fixed `SCOPE_DROP_NAMES`) and
+    /// `panopticon_drops_stale_scope_gen_total` (the ring readers' floor).
+    pub fn register_scope_drops(&mut self, registry: &mut Registry) {
+        let family = Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_scope_dropped_events",
+            "Events the kernel did not capture because of the capture scope, by reason",
+            family.clone(),
+        );
+        self.scope_drops = SCOPE_DROP_NAMES
+            .iter()
+            .map(|&reason| family.get_or_create(&[("reason", reason)]).clone())
+            .collect();
+        let stale = Counter::<u64>::default();
+        registry.register(
+            "panopticon_drops_stale_scope_gen",
+            "Events dropped at the ring read: computed under a scope a narrowing revoked",
+            stale.clone(),
+        );
+        self.drops_stale_scope_gen = Some(stale);
     }
 
     /// Snapshot current values from `EventStats` atomics into prometheus metrics.
@@ -311,6 +343,17 @@ impl AgentMetrics {
             counter
                 .inner()
                 .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (counter, value) in self.scope_drops.iter().zip(&stats.scope_drops) {
+            counter
+                .inner()
+                .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        if let Some(stale) = &self.drops_stale_scope_gen {
+            stale.inner().store(
+                stats.drops_stale_scope_gen.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
 
         // Approximate queued-but-unprocessed events (dropped ones are gone,
@@ -436,6 +479,46 @@ mod tests {
         assert_eq!(metrics.events_received.get(), 31);
         assert_eq!(metrics.events_processed.get(), 22);
         assert_eq!(metrics.ringbuf_approx_pending.get(), 9);
+    }
+
+    #[test]
+    fn scope_drops_only_on_cgroup_skb_with_the_fixed_labels() {
+        let stats = EventStats::new();
+        for (i, c) in stats.scope_drops.iter().enumerate() {
+            c.store(10 + i as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        stats
+            .drops_stale_scope_gen
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+
+        // TC: not registered.
+        let (tc, registry) = AgentMetrics::new();
+        tc.sync_from_stats(&stats);
+        let out = encode_metrics(&registry);
+        assert!(!out.contains("scope"), "{out}");
+
+        let (mut cg, mut registry) = AgentMetrics::new();
+        cg.register_scope_drops(&mut registry);
+        cg.sync_from_stats(&stats);
+        let out = encode_metrics(&registry);
+        let mut labels: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("panopticon_scope_dropped_events_total{reason=\""))
+            .map(|l| {
+                let (reason, value) = l.split_once("\"} ").unwrap();
+                let i = SCOPE_DROP_NAMES.iter().position(|&n| n == reason).unwrap();
+                assert_eq!(value, (10 + i).to_string(), "{reason}");
+                reason.to_string()
+            })
+            .collect();
+        labels.sort();
+        let mut want: Vec<String> = SCOPE_DROP_NAMES.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(labels, want);
+        assert!(
+            out.contains("panopticon_drops_stale_scope_gen_total 4"),
+            "{out}"
+        );
     }
 
     #[test]
