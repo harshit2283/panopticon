@@ -8,14 +8,15 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::{BTreeSet, HashMap};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::bail;
 use tracing::warn;
 
-use crate::config::{PodFilter, PodSelect, cgroup_filter_rel};
+use crate::config::{PodFilter, PodSelect};
 use crate::k8s::model::PodRecord;
 
 /// Directory levels below the cgroup2 root searched for pod directories.
@@ -148,59 +149,57 @@ pub struct Resolved {
     pub unresolved: Vec<String>,
 }
 
-fn real_subdirs(root: &Path) -> impl Fn(&Path) -> Vec<String> + '_ {
-    move |rel| {
-        let Ok(rd) = std::fs::read_dir(root.join(rel)) else {
-            return Vec::new();
-        };
-        rd.flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect()
-    }
-}
-
 /// Resolve `cgroup_filter` paths and the selected pods under `root` (the
-/// attach root). Refuses a missing path, a path on another filesystem, and
-/// the root cgroup (id 1) or the attach root itself (§3.2).
+/// attach root). Every path is opened beneath an fd of the root with
+/// `openat2(2)`, refusing any symlink and any mount crossing (bind mounts
+/// included), and the cgroup id is the opened directory's inode. Refuses: a
+/// kernel without openat2 (never falls back to path lookup), a root that is
+/// not the one discovered, an unresolvable `cgroup_filter` path, and the
+/// root cgroup (id 1) or the attach root itself (§3.2). An unresolvable pod
+/// is not selected.
+#[cfg(target_os = "linux")]
 pub fn resolve(root: &Path, paths: &[String], pods: &[SelectedPod]) -> Result<Resolved> {
-    let root_meta = std::fs::metadata(root)
-        .with_context(|| format!("cannot stat the cgroup root {}", root.display()))?;
-    let id_of = |rel: &Path, what: &str| -> Result<Option<u64>> {
-        let Ok(m) = std::fs::metadata(root.join(rel)) else {
-            return Ok(None);
+    use crate::config::cgroup_filter_rel;
+    let r = beneath::Root::open(root)?;
+    let id_of = |rel: &Path, what: &str| -> Result<std::io::Result<u64>> {
+        let (dev, ino) = match r.dir_id(rel) {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
         };
-        if !m.is_dir() || m.dev() != root_meta.dev() {
-            return Ok(None);
+        if dev != r.dev {
+            return Ok(Err(std::io::Error::from_raw_os_error(libc::EXDEV)));
         }
-        if m.ino() == 1 || m.ino() == root_meta.ino() {
+        if ino == 1 || ino == r.ino {
             bail!(
-                "refusing {what}: it resolves to the cgroup root (id {}), which would capture \
-                 every process",
-                m.ino()
+                "refusing {what}: it resolves to the cgroup root (id {ino}), which would capture \
+                 every process"
             );
         }
-        Ok(Some(m.ino()))
+        Ok(Ok(ino))
     };
     let mut out = Resolved::default();
     for p in paths {
         let what = format!("cgroup_filter = \"{p}\"");
         let rel = cgroup_filter_rel(p)?;
         match id_of(Path::new(rel), &what)? {
-            Some(id) => out.ids.insert(id),
-            None => bail!("refusing {what}: no such cgroup under {}", root.display()),
+            Ok(id) => out.ids.insert(id),
+            Err(e) => bail!(
+                "refusing {what}: no cgroup directory there under {} reachable without a \
+                 symlink or mount crossing ({e})",
+                root.display()
+            ),
         };
     }
     if !pods.is_empty() {
-        let dirs = pod_dirs(&real_subdirs(root));
+        let dirs = pod_dirs(&|rel: &Path| r.subdirs(rel));
         for pod in pods {
             let what = format!("pod_filter pod {}", pod.key);
             match pod_dir(&dirs, &pod.uid) {
                 Some(rel) => match id_of(rel, &what)? {
-                    Some(id) => {
+                    Ok(id) => {
                         out.ids.insert(id);
                     }
-                    None => out.unresolved.push(pod.key.clone()),
+                    Err(_) => out.unresolved.push(pod.key.clone()),
                 },
                 None => out.unresolved.push(pod.key.clone()),
             }
@@ -214,6 +213,146 @@ pub fn resolve(root: &Path, paths: &[String], pods: &[SelectedPod]) -> Result<Re
         );
     }
     Ok(out)
+}
+
+/// Lookups beneath an opened cgroup2 root with `openat2(2)` (Linux 5.6+).
+#[cfg(target_os = "linux")]
+mod beneath {
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    use anyhow::{Context, Result, bail};
+
+    /// No `..` out of the root, no symlink, no mount point (bind mounts too).
+    const BENEATH: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_XDEV;
+
+    /// `openat2(dir, path, flags | O_DIRECTORY | O_CLOEXEC, resolve)`; an
+    /// empty `path` is `.`.
+    fn openat2(
+        dir: libc::c_int,
+        path: &Path,
+        flags: libc::c_int,
+        resolve: u64,
+    ) -> io::Result<OwnedFd> {
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: open_how is plain integers, so zero is valid.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (flags | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+        how.resolve = resolve;
+        // SAFETY: valid C string; `how` lives across the call, size matches.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir,
+                c.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the kernel returned a new fd, owned from here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+    }
+
+    fn dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
+        // SAFETY: fstat writes into the zeroed struct; fd is open.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// The opened cgroup2 root.
+    pub struct Root {
+        fd: OwnedFd,
+        pub dev: u64,
+        pub ino: u64,
+    }
+
+    impl Root {
+        /// Open `path`, refusing a kernel without openat2 and a directory
+        /// that is not the root that was discovered (a swap since).
+        pub fn open(path: &Path) -> Result<Self> {
+            let fd = match openat2(libc::AT_FDCWD, path, libc::O_PATH, 0) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => bail!(
+                    "refusing cgroup_filter/pod_filter: this kernel has no openat2(2) (Linux \
+                     5.6+), needed to resolve cgroups without following symlinks or mounts"
+                ),
+                r => {
+                    r.with_context(|| format!("cannot open the cgroup root {}", path.display()))?
+                }
+            };
+            let (dev, ino) = dev_ino(&fd)?;
+            let m = std::fs::metadata(path)
+                .with_context(|| format!("cannot stat the cgroup root {}", path.display()))?;
+            if (m.dev(), m.ino()) != (dev, ino) {
+                bail!(
+                    "refusing cgroup_filter/pod_filter: the opened cgroup root is not {}",
+                    path.display()
+                );
+            }
+            Ok(Self { fd, dev, ino })
+        }
+
+        /// `(st_dev, st_ino)` of the directory `rel` beneath the root.
+        pub fn dir_id(&self, rel: &Path) -> io::Result<(u64, u64)> {
+            dev_ino(&openat2(self.fd.as_raw_fd(), rel, libc::O_PATH, BENEATH)?)
+        }
+
+        /// Subdirectory names of `rel` beneath the root (symlinks are not
+        /// directories here); empty when `rel` cannot be opened or read in
+        /// full.
+        pub fn subdirs(&self, rel: &Path) -> Vec<String> {
+            let Ok(fd) = openat2(self.fd.as_raw_fd(), rel, libc::O_RDONLY, BENEATH) else {
+                return Vec::new();
+            };
+            let raw = fd.into_raw_fd();
+            // SAFETY: fdopendir owns `raw` on success, closed here on
+            // failure; entries are copied out before closedir.
+            unsafe {
+                let d = libc::fdopendir(raw);
+                if d.is_null() {
+                    libc::close(raw);
+                    return Vec::new();
+                }
+                let mut out = Vec::new();
+                loop {
+                    *libc::__errno_location() = 0;
+                    let e = libc::readdir(d);
+                    if e.is_null() {
+                        if *libc::__errno_location() != 0 {
+                            out.clear();
+                        }
+                        break;
+                    }
+                    if (*e).d_type != libc::DT_DIR {
+                        continue;
+                    }
+                    let Ok(name) = CStr::from_ptr((*e).d_name.as_ptr()).to_str() else {
+                        continue;
+                    };
+                    if name != "." && name != ".." {
+                        out.push(name.to_owned());
+                    }
+                }
+                libc::closedir(d);
+                out
+            }
+        }
+    }
 }
 
 // ── Publication ────────────────────────────────────────────────────────────
@@ -306,6 +445,7 @@ pub use linux::*;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use anyhow::Context;
     use aya::Ebpf;
     use aya::maps::{Array, HashMap as BpfHashMap, MapData, MapError};
     use panopticon_common::CONFIG_SCOPE_GEN;
@@ -437,6 +577,7 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     use std::sync::Arc;
 
     const UID: &str = "0f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
@@ -560,19 +701,34 @@ mod tests {
         assert_eq!(select_pods(&pods, &f, None).len(), 2);
     }
 
+    #[cfg(target_os = "linux")]
     struct TempDir(PathBuf);
+    #[cfg(target_os = "linux")]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[cfg(target_os = "linux")]
     fn temp(tag: &str) -> TempDir {
         let p = std::env::temp_dir().join(format!("panopticon-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
     }
+    #[cfg(target_os = "linux")]
+    fn ino(root: &Path, rel: &str) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(root.join(rel)).unwrap())
+    }
+    fn sel(key: &str, uid: &str) -> SelectedPod {
+        SelectedPod {
+            key: key.into(),
+            uid: uid.into(),
+        }
+    }
+    const UID2: &str = "11111111-2222-3333-4444-555555555555";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_paths_and_pods_to_inodes() {
         let t = temp("resolve");
@@ -580,20 +736,13 @@ mod tests {
         let pod = format!("kubepods/burstable/pod{UID}");
         std::fs::create_dir_all(root.join(&pod).join("ctr")).unwrap();
         std::fs::create_dir_all(root.join("system.slice")).unwrap();
-        let ino = |rel: &str| std::fs::metadata(root.join(rel)).unwrap().ino();
 
-        let pods = [
-            SelectedPod {
-                key: "pay/co-1".into(),
-                uid: UID.into(),
-            },
-            SelectedPod {
-                key: "pay/gone".into(),
-                uid: "11111111-2222-3333-4444-555555555555".into(),
-            },
-        ];
+        let pods = [sel("pay/co-1", UID), sel("pay/gone", UID2)];
         let r = resolve(root, &["/system.slice".into()], &pods).unwrap();
-        assert_eq!(r.ids, BTreeSet::from([ino("system.slice"), ino(&pod)]));
+        assert_eq!(
+            r.ids,
+            BTreeSet::from([ino(root, "system.slice"), ino(root, &pod)])
+        );
         assert_eq!(r.unresolved, ["pay/gone"]);
 
         // A missing path refuses to start and names it.
@@ -601,15 +750,95 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("nope.slice") && e.contains("no such cgroup"),
-            "{e}"
+            e.contains("nope.slice") && e.contains("os error 2)"),
+            "ENOENT: {e}"
         );
-        // The attach root itself is refused, however it is reached.
-        std::os::unix::fs::symlink(".", root.join("self")).unwrap();
-        let e = resolve(root, &["self".into()], &[])
+    }
+
+    /// Symlinks are never followed: as a `cgroup_filter` path or component
+    /// (refused, even to the root itself), or as a pod directory (unresolved).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_refuses_symlinks() {
+        let t = temp("symlink");
+        let root = &t.0;
+        std::fs::create_dir_all(root.join("system.slice/sshd.service")).unwrap();
+        std::fs::create_dir_all(root.join(format!("real/pod{UID}"))).unwrap();
+        std::fs::create_dir_all(root.join("kubepods")).unwrap();
+        use std::os::unix::fs::symlink as link;
+        link(".", root.join("self")).unwrap();
+        link("system.slice", root.join("sys")).unwrap();
+        link(
+            root.join(format!("real/pod{UID}")),
+            root.join(format!("kubepods/pod{UID2}")),
+        )
+        .unwrap();
+        link("../real", root.join("kubepods/via")).unwrap();
+
+        for p in ["self", "sys", "sys/sshd.service"] {
+            let e = resolve(root, &[p.into()], &[]).unwrap_err().to_string();
+            assert!(e.contains(p) && e.contains("os error 40"), "ELOOP: {e}");
+        }
+        // pod UID is only reachable through the `via` link, pod UID2 is a
+        // link to a pod directory; the real one is found once, by its name.
+        let r = resolve(root, &[], &[sel("pay/linked", UID2)]).unwrap();
+        assert!(r.ids.is_empty());
+        assert_eq!(r.unresolved, ["pay/linked"]);
+        let r = resolve(root, &[], &[sel("pay/real", UID)]).unwrap();
+        assert_eq!(
+            r.ids,
+            BTreeSet::from([ino(root, &format!("real/pod{UID}"))])
+        );
+    }
+
+    /// A bind mount puts pod B's cgroup over pod A's directory: A is not
+    /// resolved (to B's inode or at all), B still is. Needs root:
+    /// `sudo <test binary> --ignored resolve_refuses_a_bind_mount`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root to bind mount"]
+    fn resolve_refuses_a_bind_mount() {
+        struct Umount(std::ffi::CString);
+        impl Drop for Umount {
+            fn drop(&mut self) {
+                // SAFETY: valid C string.
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+        let t = temp("bind");
+        let root = &t.0;
+        let a = format!("kubepods/pod{UID}");
+        let b = format!("kubepods/pod{UID2}");
+        std::fs::create_dir_all(root.join(&a)).unwrap();
+        std::fs::create_dir_all(root.join(&b)).unwrap();
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        let cs = |rel: &str| {
+            std::ffi::CString::new(root.join(rel).into_os_string().into_encoded_bytes()).unwrap()
+        };
+        let (src, dst) = (cs(&b), cs(&a));
+        // SAFETY: valid C strings; no data argument.
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "bind mount: {}", std::io::Error::last_os_error());
+        let _umount = Umount(dst);
+        let b_ino = ino(root, &b);
+        assert_eq!(ino(root, &a), b_ino, "the bind mount is in place");
+
+        let r = resolve(root, &[], &[sel("pay/a", UID), sel("pay/b", UID2)]).unwrap();
+        assert_eq!(r.ids, BTreeSet::from([b_ino]));
+        assert_eq!(r.unresolved, ["pay/a"]);
+        let e = resolve(root, std::slice::from_ref(&a), &[])
             .unwrap_err()
             .to_string();
-        assert!(e.contains("cgroup root"), "{e}");
+        assert!(e.contains(&a) && e.contains("os error 18"), "EXDEV: {e}");
+        assert!(resolve(root, &["plain".into()], &[]).is_ok());
     }
 
     #[derive(Default)]
