@@ -205,8 +205,11 @@ running config is kept.
 An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
 `head_only_bytes` without `head_only` stop the agent with an error.
 
-`SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3) —
-restart the agent for anything else. Unknown keys are ignored silently
+`SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3)
+and, with the `cgroup_skb` backend, changes to `cgroup_filter` / `pod_filter`
+that are already set (adding or removing one needs a restart; a reload that
+narrows them is reported applied only once nothing captured under the old
+scope can still leave the agent) — restart the agent for anything else. Unknown keys are ignored silently
 (except inside `[privacy]`, where they are an error), so check spelling.
 
 ### 4.3 Privacy modes
@@ -251,9 +254,9 @@ the agent was started without regex PII detection (`[pii] enabled` or
 In `full` mode the agent prints a warning at startup, on stderr and in the
 log (so `RUST_LOG=error` cannot hide it), that decrypted payloads are being
 written unredacted. The JSON export, the PII audit log and the raw dump are created
-readable by their owner only (`0600`). In `redacted` and `metrics_only`,
-panic messages (which can quote the data being processed) are reduced to
-where the panic happened.
+readable by their owner only (`0600`). In every mode, panic messages
+(which can quote the data being processed) are reduced to where the panic
+happened.
 
 Each mode is checked against ground truth: `tests/oracle/run_modes.sh`
 plants unique PII values and credentials in HTTP, HTTPS, Redis and Kafka

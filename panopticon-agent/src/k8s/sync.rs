@@ -283,7 +283,8 @@ impl K8sMetadata {
         };
         let (pods, services, nodes) = (index.pods, index.services, index.nodes);
         self.index.store(Arc::new(index));
-        self.generation.fetch_add(1, Ordering::Release);
+        let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
+        self.changed.send_replace(generation);
         // "Synced" once both pods and services have been listed.
         let all_listed = self.listed.iter().all(|l| l.load(Ordering::Acquire));
         if all_listed && !self.synced.swap(true, Ordering::AcqRel) {

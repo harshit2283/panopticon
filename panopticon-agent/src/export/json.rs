@@ -3,9 +3,6 @@
 
 #![allow(dead_code)]
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
 use anyhow::{Context, Result};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -13,6 +10,7 @@ use tokio::sync::mpsc;
 use std::sync::Arc;
 
 use crate::config::{PrivacyGate, PrivacyMode};
+use crate::io_gate::{IoGate, RecordFile, Refused};
 use crate::k8s::K8sMetadata;
 use crate::pii::PiiReport;
 use crate::protocol::{Direction, L7Message, Protocol};
@@ -179,22 +177,22 @@ impl From<TlsLibrary> for TlsLibraryStr {
     }
 }
 
-/// JSONL file writer. One JSON object per line.
+/// Serialises exported events as JSON lines. One JSON object per line.
+#[derive(Default)]
 pub struct JsonExporter {
-    writer: BufWriter<File>,
     k8s: Option<Arc<K8sMetadata>>,
 }
 
 impl JsonExporter {
-    /// Create a new exporter writing to the given path.
-    /// Replaces the file with a fresh owner-only (0600) one on Unix: in
-    /// `full` privacy mode it holds unredacted payloads.
-    pub fn new(path: &str) -> Result<Self> {
-        let file = super::open_private(path, false).context("JSON export file")?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-            k8s: None,
-        })
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create the export file: a fresh owner-only (0600) file replacing any
+    /// existing one on Unix (in `full` privacy mode it holds unredacted
+    /// payloads). Opened once and shared by every capture pipeline.
+    pub fn open(path: &str) -> Result<Arc<RecordFile>> {
+        RecordFile::create(path, b"", u64::MAX, false).context("JSON export file")
     }
 
     /// Add `src_workload` / `dst_workload` from Kubernetes metadata. The
@@ -204,9 +202,11 @@ impl JsonExporter {
         self
     }
 
-    /// Write an L7Message with optional PII report as a single JSON line.
+    /// Append an L7Message with optional PII report to `out` as a single
+    /// JSON line.
     pub fn emit(
-        &mut self,
+        &self,
+        out: &mut Vec<u8>,
         msg: &L7Message,
         pii: Option<&PiiReport>,
         context: Option<&TransportContext>,
@@ -246,20 +246,19 @@ impl JsonExporter {
             pii,
         };
 
-        serde_json::to_writer(&mut self.writer, &event)
-            .context("Failed to serialize JSON event")?;
-        self.writer.write_all(b"\n")?;
-        // No flush here: the writer task flushes once per drained batch.
-        // Flushing every event cost one write(2) per exchange.
-        Ok(())
-    }
-
-    /// Flush the underlying buffer without writing an event.
-    pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        let start = out.len();
+        if let Err(e) = serde_json::to_writer(&mut *out, &event) {
+            out.truncate(start); // never leave half a line
+            return Err(e).context("Failed to serialize JSON event");
+        }
+        out.push(b'\n');
         Ok(())
     }
 }
+
+/// Write the batched lines once they reach this size, so the batch buffer
+/// stays bounded under load.
+const EXPORT_WRITE_BYTES: usize = 64 * 1024;
 
 /// Owned message for the channel-based export pipeline.
 /// Contains cloned data since L7Message isn't Send-safe across tasks.
@@ -287,80 +286,117 @@ pub struct JsonExportHandle {
 }
 
 impl JsonExportHandle {
-    /// Spawn a dedicated writer and return the handle.
-    /// The writer drains the channel and batches writes, flushing only when
-    /// the channel is empty (no more pending events). It runs on the
-    /// blocking pool: file writes on a runtime thread stalled the parser
-    /// workers sharing it. It polls every EXPORT_POLL_INTERVAL instead of
-    /// blocking on the channel, so workers' sends never have to wake it.
-    ///
-    /// Each record is checked against the privacy mode now in effect
-    /// (`privacy`): one produced under a wider mode before a reload
-    /// tightened it is dropped, not written. Once the mode is
-    /// `metrics_only` the writer stops and closes the file.
+    /// Spawn a writer on a new file at `path` with its own open gate
+    /// (replay, tests). See [`spawn_on`](Self::spawn_on).
     pub fn spawn(
         path: &str,
         buffer_size: usize,
         privacy: Arc<PrivacyGate>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
-        Self::spawn_with_k8s(path, buffer_size, None, privacy)
+        Ok(Self::spawn_on(
+            JsonExporter::open(path)?,
+            IoGate::new(),
+            buffer_size,
+            None,
+            privacy,
+            tracing::Dispatch::default(),
+        ))
     }
 
-    /// Like [`spawn`](Self::spawn), adding Kubernetes workload names.
-    pub fn spawn_with_k8s(
-        path: &str,
+    /// Spawn one capture pipeline's writer and return the handle.
+    ///
+    /// The writer drains the channel and appends whole lines to a batch
+    /// buffer it owns, then writes the batch to the shared `file` under the
+    /// pipeline's `gate` once the channel is empty: a revoked pipeline's
+    /// batch is refused whole, and dropping the pipeline drops its buffer
+    /// unwritten. It runs on the blocking pool: file writes on a runtime
+    /// thread stalled the parser workers sharing it. It polls every
+    /// EXPORT_POLL_INTERVAL instead of blocking on the channel, so workers'
+    /// sends never have to wake it. It logs through `dispatch`.
+    ///
+    /// Each record is checked against the privacy mode now in effect
+    /// (`privacy`): one produced under a wider mode before a reload
+    /// tightened it is dropped, not written. Once the mode is
+    /// `metrics_only` the writer stops and closes the file.
+    pub fn spawn_on(
+        file: Arc<RecordFile>,
+        gate: Arc<IoGate>,
         buffer_size: usize,
         k8s: Option<Arc<K8sMetadata>>,
         privacy: Arc<PrivacyGate>,
-    ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
-        let mut exporter = JsonExporter::new(path)?.with_k8s(k8s);
+        dispatch: tracing::Dispatch,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let exporter = JsonExporter::new().with_k8s(k8s);
         let (tx, mut rx) = mpsc::channel::<ExportEvent>(buffer_size);
 
         let handle = tokio::task::spawn_blocking(move || {
-            use tokio::sync::mpsc::error::TryRecvError;
-            let mut poll = EXPORT_POLL_INTERVAL;
-            loop {
-                let mut wrote = false;
-                let closed = loop {
-                    if privacy.get() == PrivacyMode::MetricsOnly {
-                        break true; // no per-request export any more
-                    }
-                    match rx.try_recv() {
-                        Ok(event) if !privacy.allows(event.mode) => {}
-                        Ok(event) => {
-                            if let Err(e) =
-                                exporter.emit(&event.msg, event.pii.as_ref(), Some(&event.context))
-                            {
-                                tracing::warn!(error = %e, "JSON export write failed");
-                            }
-                            wrote = true;
+            tracing::dispatcher::with_default(&dispatch, || {
+                use tokio::sync::mpsc::error::TryRecvError;
+                let mut poll = EXPORT_POLL_INTERVAL;
+                let mut batch = Vec::with_capacity(EXPORT_WRITE_BYTES);
+                // False once the file or the pipeline refuses for good.
+                let write = |batch: &mut Vec<u8>| -> bool {
+                    let r = file.write(&gate, batch);
+                    batch.clear();
+                    match r {
+                        Ok(()) => true,
+                        Err(Refused::Io(e)) => {
+                            tracing::warn!(error = %e, "JSON export write failed");
+                            true
                         }
-                        Err(TryRecvError::Empty) => break false,
-                        Err(TryRecvError::Disconnected) => break true,
+                        Err(_) => false,
                     }
                 };
-                // Flush once per drained batch
-                if wrote && let Err(e) = exporter.flush() {
-                    tracing::warn!(error = %e, "JSON export flush failed");
-                }
-                if closed {
-                    if privacy.get() == PrivacyMode::MetricsOnly {
-                        tracing::warn!("Privacy mode is metrics_only: JSON export closed");
+                loop {
+                    let mut wrote = false;
+                    let mut closed = loop {
+                        if privacy.get() == PrivacyMode::MetricsOnly {
+                            break true; // no per-request export any more
+                        }
+                        match rx.try_recv() {
+                            Ok(event) if !privacy.allows(event.mode) => {}
+                            Ok(event) => {
+                                if let Err(e) = exporter.emit(
+                                    &mut batch,
+                                    &event.msg,
+                                    event.pii.as_ref(),
+                                    Some(&event.context),
+                                ) {
+                                    tracing::warn!(error = %e, "JSON export write failed");
+                                }
+                                wrote = true;
+                                if batch.len() >= EXPORT_WRITE_BYTES && !write(&mut batch) {
+                                    break true;
+                                }
+                            }
+                            Err(TryRecvError::Empty) => break false,
+                            Err(TryRecvError::Disconnected) => break true,
+                        }
+                    };
+                    // Write once per drained batch.
+                    if !batch.is_empty() && privacy.get() != PrivacyMode::MetricsOnly {
+                        closed |= !write(&mut batch);
                     }
-                    break;
+                    if closed {
+                        if privacy.get() == PrivacyMode::MetricsOnly {
+                            file.close();
+                            tracing::warn!("Privacy mode is metrics_only: JSON export closed");
+                        }
+                        break;
+                    }
+                    // Back off while idle (a fixed 5ms poll cost ~1% of a core
+                    // with no traffic); tighten again as soon as events flow.
+                    poll = if wrote {
+                        EXPORT_POLL_INTERVAL
+                    } else {
+                        (poll * 2).min(EXPORT_IDLE_POLL_INTERVAL)
+                    };
+                    std::thread::sleep(poll);
                 }
-                // Back off while idle (a fixed 5ms poll cost ~1% of a core
-                // with no traffic); tighten again as soon as events flow.
-                poll = if wrote {
-                    EXPORT_POLL_INTERVAL
-                } else {
-                    (poll * 2).min(EXPORT_IDLE_POLL_INTERVAL)
-                };
-                std::thread::sleep(poll);
-            }
+            })
         });
 
-        Ok((Self { tx }, handle))
+        (Self { tx }, handle)
     }
 
     /// Send an event, produced under privacy mode `mode`, to the writer
@@ -453,7 +489,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("panopticon_json_{}", std::process::id()));
         std::fs::write(&path, b"old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        JsonExporter::new(path.to_str().unwrap()).unwrap();
+        JsonExporter::open(path.to_str().unwrap()).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         std::fs::remove_file(&path).ok();
         assert_eq!(mode, 0o600);
@@ -542,11 +578,17 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         {
-            let mut exporter = JsonExporter::new(path_str).unwrap();
-            let msg = make_test_msg();
-            exporter
-                .emit(&msg, None, Some(&make_transport_context()))
+            let file = JsonExporter::open(path_str).unwrap();
+            let mut out = Vec::new();
+            JsonExporter::new()
+                .emit(
+                    &mut out,
+                    &make_test_msg(),
+                    None,
+                    Some(&make_transport_context()),
+                )
                 .unwrap();
+            file.write(&IoGate::new(), &out).unwrap();
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -565,14 +607,17 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         {
-            let mut exporter = JsonExporter::new(path_str).unwrap();
+            let file = JsonExporter::open(path_str).unwrap();
+            let exporter = JsonExporter::new();
             let msg1 = make_test_msg();
             let mut msg2 = L7Message::new(Protocol::Mysql, Direction::Ingress, 2000);
             msg2.method = Some("QUERY".to_string());
+            let mut out = Vec::new();
             exporter
-                .emit(&msg1, None, Some(&make_transport_context()))
+                .emit(&mut out, &msg1, None, Some(&make_transport_context()))
                 .unwrap();
-            exporter.emit(&msg2, None, None).unwrap();
+            exporter.emit(&mut out, &msg2, None, None).unwrap();
+            file.write(&IoGate::new(), &out).unwrap();
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -722,23 +767,19 @@ mod tests {
         meta.replace_pods(&pods);
         meta.publish_if_dirty();
 
-        let path = std::env::temp_dir().join(format!(
-            "panopticon_test_export_k8s_{}.jsonl",
-            std::process::id()
-        ));
-        let path_str = path.to_str().unwrap();
-        {
-            let mut exporter = JsonExporter::new(path_str).unwrap().with_k8s(Some(meta));
-            exporter
-                .emit(&make_test_msg(), None, Some(&make_transport_context()))
-                .unwrap();
-            exporter.flush().unwrap();
-        }
-        let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let mut out = Vec::new();
+        JsonExporter::new()
+            .with_k8s(Some(meta))
+            .emit(
+                &mut out,
+                &make_test_msg(),
+                None,
+                Some(&make_transport_context()),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["src_workload"], "shop/web");
         // 10.0.0.2 is unknown to Kubernetes: no field.
         assert!(v.get("dst_workload").is_none());
-        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! Append-only audit log for PII events.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::io_gate::{IoGate, RecordFile};
 use crate::pii::{PiiCategory, PiiSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,30 +31,41 @@ pub struct AuditEntry {
     pub service_addr: String,
 }
 
+/// One capture pipeline's writer of the audit log: whole lines, straight
+/// to the shared file under the pipeline's gate. Nothing is kept for a
+/// later flush: a refused or failed write drops its lines.
+#[derive(Clone)]
 pub struct PiiAuditLog {
-    writer: BufWriter<File>,
+    file: Arc<RecordFile>,
+    gate: Arc<IoGate>,
 }
 
 impl PiiAuditLog {
-    pub fn new(path: &str) -> Result<Self> {
-        // Owner-only (0600), like the JSON export: findings name services
-        // and PII categories.
-        let file = super::open_private(path, true).context("PII audit log file")?;
-
-        Ok(Self {
-            writer: BufWriter::new(file),
-        })
+    /// Open the audit log file, appending, owner-only (0600) like the JSON
+    /// export: findings name services and PII categories.
+    pub fn open(path: &str) -> Result<Arc<RecordFile>> {
+        RecordFile::create(path, b"", u64::MAX, true).context("PII audit log file")
     }
 
-    pub fn emit(&mut self, entries: &[AuditEntry]) -> Result<()> {
+    /// A writer on its own open gate (tests).
+    pub fn new(path: &str) -> Result<Self> {
+        Ok(Self::on(Self::open(path)?, IoGate::new()))
+    }
+
+    pub fn on(file: Arc<RecordFile>, gate: Arc<IoGate>) -> Self {
+        Self { file, gate }
+    }
+
+    pub fn emit(&self, entries: &[AuditEntry]) -> Result<()> {
+        let mut buf = Vec::with_capacity(entries.len() * 160);
         for entry in entries {
             // TODO: HMAC signing for tamper detection
-            serde_json::to_writer(&mut self.writer, entry)
-                .context("Failed to serialize audit entry")?;
-            self.writer.write_all(b"\n")?;
+            serde_json::to_writer(&mut buf, entry).context("Failed to serialize audit entry")?;
+            buf.push(b'\n');
         }
-        self.writer.flush()?;
-        Ok(())
+        self.file
+            .write(&self.gate, &buf)
+            .map_err(|e| anyhow::anyhow!("audit log write refused: {e:?}"))
     }
 }
 
@@ -82,7 +93,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         {
-            let mut log1 = PiiAuditLog::new(path_str).unwrap();
+            let log1 = PiiAuditLog::new(path_str).unwrap();
             log1.emit(&[AuditEntry {
                 timestamp_ns: 1000,
                 category: PiiCategory::Email,
@@ -96,7 +107,7 @@ mod tests {
         }
 
         {
-            let mut log2 = PiiAuditLog::new(path_str).unwrap();
+            let log2 = PiiAuditLog::new(path_str).unwrap();
             log2.emit(&[AuditEntry {
                 timestamp_ns: 2000,
                 category: PiiCategory::Ssn,

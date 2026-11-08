@@ -646,9 +646,8 @@ pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
 /// Long-lived background task that periodically rescans `/proc` for new TLS
 /// libraries and attaches uprobes to them.
 ///
-/// Also listens on `rescan_rx` for on-demand PID scans triggered by ProcessExec
-/// events — when a new process starts, we immediately check it for TLS libraries
-/// rather than waiting for the next periodic scan.
+/// It takes no input from the capture path: a long-lived task outside the
+/// disposable pipeline must not hold captured values (DESIGN §3).
 ///
 /// Key design choices following review feedback:
 /// - **Inode-based dedup**: `(dev, ino)` instead of paths — handles symlinks/namespaces
@@ -659,72 +658,36 @@ pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
 pub async fn tls_scanner_task(
     shared_ebpf: std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>,
     scan_interval: std::time::Duration,
-    mut rescan_rx: tokio::sync::mpsc::Receiver<u32>,
 ) {
     let mut interval = tokio::time::interval(scan_interval);
     interval.tick().await; // skip immediate first tick — initial scan already done
 
     loop {
-        // Select between periodic full scan and on-demand PID scan
-        enum ScanType {
-            Full,
-            Pid(u32),
-        }
-
-        let scan_type = tokio::select! {
-            _ = interval.tick() => ScanType::Full,
-            pid = rescan_rx.recv() => {
-                match pid {
-                    Some(pid) => ScanType::Pid(pid),
-                    None => break, // Channel closed, shut down
-                }
-            }
+        interval.tick().await;
+        // Jitter: sleep 0–10% of the interval to avoid thundering herd
+        let jitter_max_ms = (scan_interval.as_millis() as u64 / 10).max(1);
+        let jitter_ms = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            nanos % jitter_max_ms
         };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
-        match scan_type {
-            ScanType::Full => {
-                // Jitter: sleep 0–10% of the interval to avoid thundering herd
-                let jitter_max_ms = (scan_interval.as_millis() as u64 / 10).max(1);
-                let jitter_ms = {
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos() as u64;
-                    nanos % jitter_max_ms
-                };
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-
-                // ── IO + ELF parsing OUTSIDE the lock, and off the async
-                //    runtime: a full scan blocks for long enough to stall the
-                //    packet workers sharing the runtime threads.
-                let Ok(targets) = tokio::task::spawn_blocking(scan_all_processes).await else {
-                    continue;
-                };
-                prune_attached_libs(&shared_ebpf, &targets);
-                let newly_attached = attach_new_targets(&shared_ebpf, targets);
-                if newly_attached > 0 {
-                    info!(
-                        new_libraries = newly_attached,
-                        "Background TLS scan: attached uprobes to new libraries"
-                    );
-                }
-            }
-            ScanType::Pid(pid) => {
-                debug!(pid, "On-demand TLS rescan for new process");
-                // Small delay to let the process finish loading its libraries
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let Ok(targets) = tokio::task::spawn_blocking(move || scan_pid(pid)).await else {
-                    continue;
-                };
-                let newly_attached = attach_new_targets(&shared_ebpf, targets);
-                if newly_attached > 0 {
-                    info!(
-                        pid,
-                        new_libraries = newly_attached,
-                        "On-demand TLS scan: attached uprobes for new process"
-                    );
-                }
-            }
+        // ── IO + ELF parsing OUTSIDE the lock, and off the async
+        //    runtime: a full scan blocks for long enough to stall the
+        //    packet workers sharing the runtime threads.
+        let Ok(targets) = tokio::task::spawn_blocking(scan_all_processes).await else {
+            continue;
+        };
+        prune_attached_libs(&shared_ebpf, &targets);
+        let newly_attached = attach_new_targets(&shared_ebpf, targets);
+        if newly_attached > 0 {
+            info!(
+                new_libraries = newly_attached,
+                "Background TLS scan: attached uprobes to new libraries"
+            );
         }
     }
 }

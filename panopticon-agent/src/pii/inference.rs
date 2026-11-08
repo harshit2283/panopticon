@@ -9,10 +9,14 @@ use super::classifier::{NerLabel, NerSpan, decode_bio};
 use super::tokenizer::{PiiTokenizer, TokenizedInput};
 use super::{PiiCategory, PiiEntity, PiiSource};
 
-/// ONNX inference engine for NER-based PII detection.
+/// ONNX inference engine for NER-based PII detection. The model session
+/// is immutable and shared by every capture pipeline; the tokenizer may
+/// cache inputs (BPE), so each pipeline loads its own
+/// ([`for_pipeline`](Self::for_pipeline), Revision 1 item 6).
 pub struct OnnxInference {
-    session: Session,
+    session: std::sync::Arc<Session>,
     tokenizer: PiiTokenizer,
+    tokenizer_path: String,
     /// Label mapping from model output indices to NER labels.
     labels: Vec<NerLabel>,
 }
@@ -45,9 +49,20 @@ impl OnnxInference {
         info!(model = model_path, "ONNX NER model loaded");
 
         Ok(Self {
-            session,
+            session: std::sync::Arc::new(session),
             tokenizer,
+            tokenizer_path: tokenizer_path.to_string(),
             labels,
+        })
+    }
+
+    /// The shared model with a freshly loaded tokenizer.
+    pub fn for_pipeline(&self) -> Result<Self> {
+        Ok(Self {
+            session: std::sync::Arc::clone(&self.session),
+            tokenizer: PiiTokenizer::from_file(&self.tokenizer_path)?,
+            tokenizer_path: self.tokenizer_path.clone(),
+            labels: self.labels.clone(),
         })
     }
 

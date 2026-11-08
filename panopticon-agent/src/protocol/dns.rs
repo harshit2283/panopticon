@@ -475,7 +475,7 @@ fn qtype_to_string(qtype: u16) -> &'static str {
 // ── Helper: Build DNS Packets for Tests ──────────────────────────────────
 
 #[cfg(test)]
-mod test_helpers {
+pub(crate) mod test_helpers {
     /// Encode a DNS name as a sequence of length-prefixed labels.
     pub fn encode_dns_name(name: &str) -> Vec<u8> {
         let mut buf = Vec::new();

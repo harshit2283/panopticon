@@ -30,9 +30,9 @@ pub struct AppState {
     pub worker_count: usize,
     /// True once eBPF programs are attached; cleared when shutdown begins.
     pub ready: Arc<AtomicBool>,
-    /// Raw capture writer, when enabled (for its drop counter).
-    #[cfg(unix)]
-    pub raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
+    /// The raw capture file, when enabled (for its drop counter, which
+    /// spans every capture pipeline).
+    pub raw_capture: Option<Arc<crate::io_gate::RecordFile>>,
 }
 
 /// Start the HTTP server on the given bind address.
@@ -83,7 +83,6 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Sync latest stats into prometheus counters before encoding
     state.metrics.sync_from_stats(&state.stats);
-    #[cfg(unix)]
     if let Some(raw) = state.raw_capture.as_ref() {
         state
             .metrics

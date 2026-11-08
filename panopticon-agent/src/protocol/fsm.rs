@@ -130,9 +130,9 @@ pub struct ProtocolFsmAdapter {
 }
 
 impl ProtocolFsmAdapter {
-    pub fn new(protocol: Protocol) -> Self {
+    pub fn new(protocol: Protocol, topics: &super::kafka::KafkaTopics) -> Self {
         Self {
-            parser: create_parser(protocol),
+            parser: create_parser(protocol, topics),
         }
     }
 }
@@ -336,13 +336,22 @@ impl ConnectionEntry {
 pub struct ConnectionFsmManager {
     connections: DashMap<u64, ConnectionEntry>,
     max_connections: usize,
+    /// The pipeline's Kafka topic ID map, given to every Kafka parser.
+    topics: super::kafka::KafkaTopics,
 }
 
 impl ConnectionFsmManager {
+    /// A manager with its own Kafka topic map (tests, standalone use).
     pub fn new(max_connections: usize) -> Self {
+        Self::with_topics(max_connections, Default::default())
+    }
+
+    /// A manager whose Kafka parsers share `topics`, their pipeline's map.
+    pub fn with_topics(max_connections: usize, topics: super::kafka::KafkaTopics) -> Self {
         Self {
             connections: DashMap::new(),
             max_connections,
+            topics,
         }
     }
 
@@ -387,7 +396,7 @@ impl ConnectionFsmManager {
             evicted = self.evict_oldest_batch();
         }
 
-        let fsm: Box<dyn ProtocolFsm> = Box::new(ProtocolFsmAdapter::new(protocol));
+        let fsm: Box<dyn ProtocolFsm> = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
         self.connections.insert(
             conn_id,
             ConnectionEntry {
@@ -465,7 +474,7 @@ impl ConnectionFsmManager {
             && data.starts_with(super::detect::HTTP2_PREFACE)
         {
             let protocol = entry.fsm.protocol();
-            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol));
+            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
             entry.fin = [false; 2];
         }
         Some(entry.fsm.process_packet(direction, data, timestamp_ns))
@@ -506,7 +515,7 @@ impl ConnectionFsmManager {
             Some(result) => Some(result),
             None => {
                 let protocol = entry.fsm.protocol();
-                entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol));
+                entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
                 None
             }
         }

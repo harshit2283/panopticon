@@ -10,17 +10,32 @@ mod config;
 mod event_loop;
 mod export;
 mod graph;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod io_gate;
 mod k8s;
 #[cfg(target_os = "linux")]
 mod loader;
 mod pii;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod pipeline;
 
+#[cfg(test)]
+mod narrowing_tests;
 mod platform;
 mod protocol;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod scope_publisher;
 mod scope_select;
+#[cfg(test)]
+mod statics_check;
+#[allow(dead_code)]
+mod test_hooks;
 mod util;
 
 /// Panopticon Agent — eBPF-powered network observability
@@ -167,17 +182,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize tracing subscriber with env filter
-    let filter = if args.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-    };
-
+    // Initialize tracing subscriber with env filter. Each capture pipeline
+    // gets its own subscriber with the same filter (pipeline.rs).
+    let log_filter = log_directives(args.verbose, std::env::var("RUST_LOG").ok());
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(EnvFilter::new(&log_filter))
         .with_target(true)
         .init();
+    install_panic_hook();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -200,8 +212,10 @@ async fn main() -> Result<()> {
         use anyhow::Context;
         use arc_swap::ArcSwap;
 
-        // Disable core dumps to prevent PII leakage
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+        // Disable core dumps to prevent PII leakage. Capture never starts
+        // without it (DESIGN §3): a core dump would carry everything the
+        // process holds, past any gate.
+        disable_core_dumps()?;
         info!("Core dumps disabled (PR_SET_DUMPABLE=0)");
 
         // Load config: file first (if provided), then CLI overrides
@@ -370,175 +384,92 @@ async fn main() -> Result<()> {
         }
 
         // 3. Wrap Ebpf + links in shared state for background scanner
+        let programs_cgroup_root = programs.cgroup_root.take();
         let shared_ebpf = Arc::new(Mutex::new(loader::EbpfState {
             ebpf: programs.ebpf,
             links: programs._links,
             attached_libs,
         }));
-        // §3.2: the cgroup selector stops admitting if a v1 net_cls/net_prio
-        // hierarchy appears at runtime (refused at startup already).
-        if loader::scope_config(&agent_config).0 & panopticon_common::scope::SCOPE_SEL_CGROUP != 0 {
-            scope_select::spawn_net_cls_watch(Arc::clone(&shared_ebpf));
-        }
+        let cgroup_root = programs_cgroup_root;
 
-        // 4. Create TLS rescan channel and spawn background TLS scanner task
-        //    ProcessExec events in the event loop send PIDs to tls_rescan_tx,
-        //    which the scanner task receives for on-demand library scanning.
-        let (tls_rescan_tx, tls_rescan_rx) = tokio::sync::mpsc::channel::<u32>(256);
-        let scanner_handle = if agent_config.tls_scan_enabled {
-            let ebpf_clone = Arc::clone(&shared_ebpf);
-            let interval = agent_config.tls_scan_interval;
-            Some(tokio::spawn(platform::proc_scanner::tls_scanner_task(
-                ebpf_clone,
-                interval,
-                tls_rescan_rx,
-            )))
-        } else {
-            None
-        };
-        let tls_rescan_tx = if agent_config.tls_scan_enabled {
-            Some(tls_rescan_tx)
-        } else {
-            // Drop sender if scanner not enabled, so channel closes cleanly
-            None
-        };
-
-        // 5. Construct PII engine + JSON exporter
-        let pii_engine = if agent_config.pii.enabled {
-            let ml = matches!(agent_config.pii.mode, config::PiiMode::InAgent { .. });
-            info!(
-                regex = agent_config.pii.regex_enabled,
-                ml = ml,
-                "PII detection enabled"
-            );
-            Some(pii::PiiEngine::new(
-                &agent_config.pii,
-                &agent_config.pii_external_url_allowlist,
+        // 4. Background TLS scanner (periodic; it takes no input from the
+        //    capture path).
+        let scanner_handle = agent_config.tls_scan_enabled.then(|| {
+            tokio::spawn(platform::proc_scanner::tls_scanner_task(
+                Arc::clone(&shared_ebpf),
+                agent_config.tls_scan_interval,
             ))
-        } else {
-            None
-        };
+        });
 
-        // The privacy mode in effect, shared by the workers and every writer:
-        // a reload can only tighten it, and the writers check each record.
+        // 5. The privacy mode in effect, shared by the workers and every
+        //    writer: a reload can only tighten it, and the writers check
+        //    each record.
         let privacy = Arc::new(config::PrivacyGate::new(agent_config.privacy_mode));
 
-        let (json_export_handle, json_writer_handle) = match &agent_config.json_export_path {
-            Some(path) => {
-                info!(path = %path, "JSON export enabled");
-                let (handle, writer) = export::json::JsonExportHandle::spawn_with_k8s(
-                    path,
-                    4096,
-                    k8s_metadata.clone(),
-                    Arc::clone(&privacy),
-                )?;
-                (Some(handle), Some(writer))
-            }
-            None => (None, None),
-        };
-        let (otlp_export_handle, otlp_writer_handle) = if agent_config.otlp.enabled {
+        // 6. Outputs and everything else that outlives capture pipelines,
+        //    then the first pipeline (DESIGN §3: everything after the ring
+        //    read is one disposable pipeline).
+        let shared = Arc::new(pipeline::Shared::open(
+            agent_config.clone(),
+            Arc::clone(&privacy),
+            k8s_metadata.clone(),
+            log_filter,
+        )?);
+        if agent_config.otlp.enabled {
             info!(
                 endpoint = %agent_config.otlp.endpoint,
                 service_name = %agent_config.otlp.service_name,
                 "OTLP gRPC export enabled"
             );
-            match export::otlp::OtlpExportHandle::spawn(
-                &agent_config.otlp,
-                4096,
-                Arc::clone(&privacy),
-            ) {
-                Ok((handle, worker)) => (Some(handle), Some(worker)),
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to initialize OTLP exporter");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        let pii_audit_log = match &agent_config.pii_audit_log_path {
-            Some(path) => {
-                info!(path = %path, "PII audit log enabled");
-                match export::audit::PiiAuditLog::new(path) {
-                    Ok(log) => Some(Arc::new(Mutex::new(log))),
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create PII audit log");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-
-        // 6. Construct graph builder
-        let graph_builder = if agent_config.graph.enabled {
+        }
+        if agent_config.graph.enabled {
             info!("Service graph enabled");
-            Some(graph::GraphBuilder::new(&agent_config.graph).with_k8s(k8s_metadata.clone()))
-        } else {
-            None
-        };
+        }
+        let admission_floor = event_loop::AdmissionFloor::default();
+        let scope = pipeline::Scope::start(Arc::clone(&shared), admission_floor.clone())
+            .context("cannot start the capture pipeline")?;
 
-        // 7. Construct event loop (needed before HTTP server for shared stats access)
+        // 7. The ring readers.
         let event_loop = event_loop::EventLoop::new(
             agent_config.clone(),
-            Arc::clone(&privacy),
-            pii_engine,
-            json_export_handle,
-            otlp_export_handle,
-            pii_audit_log,
-            graph_builder,
+            Arc::clone(&shared.stats),
+            scope.slot(),
+            admission_floor,
         );
 
-        // A panic message can quote the data being processed (e.g. a string
-        // slice out of a payload): print only where it happened unless the
-        // mode allows raw payloads anyway.
-        let default_hook = std::panic::take_hook();
-        let panic_privacy = Arc::clone(&privacy);
-        std::panic::set_hook(Box::new(move |info| {
-            let mode = panic_privacy.get();
-            if mode == config::PrivacyMode::Full {
-                default_hook(info);
-            } else {
-                let at = info
-                    .location()
-                    .map_or_else(|| "unknown location".to_string(), |l| l.to_string());
-                eprintln!(
-                    "thread panicked at {at} (message withheld in privacy mode {mode}: \
-                     it may quote captured data)"
-                );
-            }
-        }));
-
-        // 7b. Raw capture (unredacted): opt-in only, loudly.
-        let (event_loop, raw_capture) = match &agent_config.capture_raw_path {
-            Some(path) => {
-                let (handle, thread) = export::raw_capture::spawn(
-                    path,
-                    agent_config.capture_raw_max_bytes,
-                    16_384,
-                    util::monotonic_now_ns(),
-                    Arc::clone(&privacy),
-                )?;
-                tracing::warn!(
-                    path = %path,
-                    max_bytes = agent_config.capture_raw_max_bytes,
-                    "RAW CAPTURE ENABLED: every captured payload is written UNREDACTED \
-                     (credentials, tokens, personal data). Protect and delete this file."
-                );
+        // 7b. The scope publisher (cgroup selector only): reloads,
+        //     Kubernetes pod changes and the net_cls watch.
+        let cgroup_selector =
+            loader::scope_config(&agent_config).0 & panopticon_common::scope::SCOPE_SEL_CGROUP != 0;
+        let (scope_tx, publisher_handle) = match (&cgroup_root, cgroup_selector) {
+            (Some(root), true) => {
+                let publisher = scope_publisher::Publisher::new(
+                    scope_publisher::AyaMaps(Arc::clone(&shared_ebpf)),
+                    Arc::clone(&scope),
+                    root.clone(),
+                    k8s_metadata.clone(),
+                    std::env::var("NODE_NAME").ok().filter(|n| !n.is_empty()),
+                    agent_config.cgroup_filter.as_deref().unwrap_or_default(),
+                    agent_config.pod_filter.as_deref().unwrap_or_default(),
+                )
+                .context("cannot start the scope publisher")?;
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                // §3.2: the cgroup selector stops admitting if a v1
+                // net_cls/net_prio hierarchy appears at runtime (refused at
+                // startup already).
+                scope_select::spawn_net_cls_watch(tx.clone());
                 (
-                    event_loop.with_raw_capture(handle.clone()),
-                    Some((handle, thread)),
+                    Some(tx),
+                    Some(tokio::spawn(scope_publisher::run(publisher, rx))),
                 )
             }
-            None => (event_loop, None),
+            _ => (None, None),
         };
-
         // 8. HTTP server (health, metrics, debug endpoints).
         //    Probes are attached at this point, so the agent is ready; the flag
         //    is cleared again as soon as shutdown begins.
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let event_stats = event_loop.stats().clone();
+        let event_stats = Arc::clone(&shared.stats);
         if kernel_drops.is_some() || scope_drops.is_some() {
             let stats = event_stats.clone();
             tokio::spawn(async move {
@@ -566,11 +497,11 @@ async fn main() -> Result<()> {
             }
             let state = export::http_server::AppState {
                 registry: Arc::new(registry),
-                stats: event_loop.stats().clone(),
+                stats: Arc::clone(&shared.stats),
                 metrics,
                 worker_count: agent_config.max_worker_count,
                 ready: Arc::clone(&ready),
-                raw_capture: raw_capture.as_ref().map(|(h, _)| h.clone()),
+                raw_capture: shared.raw.clone(),
             };
             let bind = bind.clone();
             Some(tokio::spawn(async move {
@@ -589,6 +520,8 @@ async fn main() -> Result<()> {
         let shared_config = Arc::new(ArcSwap::from_pointee(agent_config));
         let config_path_for_reload = args.config.clone();
         let config_swap = Arc::clone(&shared_config);
+        let reload_scope_tx = scope_tx.clone();
+        let reload_k8s = k8s_metadata.is_some();
         let sighup_handle = tokio::spawn(async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
                 .expect("failed to register SIGHUP handler");
@@ -626,7 +559,40 @@ async fn main() -> Result<()> {
                             })
                             .and_then(|()| {
                                 config::check_restart_only(&config_swap.load(), &new_config)
+                            })
+                            .and_then(|()| {
+                                if new_config.pod_filter.is_some() && !reload_k8s {
+                                    Err("pod_filter needs Kubernetes metadata, which is not \
+                                         available"
+                                        .into())
+                                } else {
+                                    Ok(())
+                                }
                             });
+                            // cgroup_filter / pod_filter: the scope publisher
+                            // applies the change (a narrowing revokes the
+                            // capture pipeline) and replies once applied; it
+                            // rejects selectors that do not resolve.
+                            let running = config_swap.load_full();
+                            let rescope = running.cgroup_filter != new_config.cgroup_filter
+                                || running.pod_filter != new_config.pod_filter;
+                            let check = match (check, rescope, &reload_scope_tx) {
+                                (Ok(()), true, Some(tx)) => {
+                                    let (reply, applied) = tokio::sync::oneshot::channel();
+                                    let sent = tx
+                                        .send(scope_publisher::ScopeMsg::Reload {
+                                            cgroup_filter: new_config.cgroup_filter.clone(),
+                                            pod_filter: new_config.pod_filter.clone(),
+                                            reply,
+                                        })
+                                        .await;
+                                    match (sent, applied.await) {
+                                        (Ok(()), Ok(r)) => r,
+                                        _ => Err("the scope publisher has stopped".into()),
+                                    }
+                                }
+                                (check, _, _) => check,
+                            };
                             if let Err(why) = check.and_then(|()| {
                                 privacy
                                     .tighten(requested)
@@ -669,7 +635,7 @@ async fn main() -> Result<()> {
         // This is the main blocking task that drives the system.
         let mut exit_result: Result<()> = Ok(());
         tokio::select! {
-            result = event_loop.run(event_source, tls_rescan_tx) => {
+            result = event_loop.run(event_source) => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Event loop exited with error");
                     exit_result = Err(e.context("event loop failed"));
@@ -684,10 +650,15 @@ async fn main() -> Result<()> {
             outcome = smoke_test_wait(smoke_test, &event_stats) => {
                 exit_result = outcome;
             }
+            e = publisher_failed(publisher_handle) => {
+                tracing::error!(error = %format!("{e:#}"), "Scope publisher failed; exiting");
+                exit_result = Err(e);
+            }
         }
         ready.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // 10. Cleanup — abort background tasks, wait for JSON writer drain
+        // 10. Cleanup — abort background tasks, then drain the current
+        //     pipeline and flush its outputs (a revoked one never flushes).
         sighup_handle.abort();
         if let Some(h) = http_handle {
             h.abort();
@@ -695,25 +666,68 @@ async fn main() -> Result<()> {
         if let Some(h) = scanner_handle {
             h.abort();
         }
-        if let Some(h) = json_writer_handle {
-            // Give the writer 5s to flush remaining events
-            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
-        }
-        if let Some(h) = otlp_writer_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
-        }
-        if let Some((handle, thread)) = raw_capture {
-            // Drain the queue and flush the file before the process exits.
-            handle.shutdown();
-            let _ = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || thread.join()),
-            )
-            .await;
-        }
+        drop(scope_tx);
+        scope.shutdown().await;
 
         exit_result
     }
+}
+
+/// A panic message can quote the data being processed (a string slice out
+/// of a payload): print only where it happened, in every privacy mode
+/// (DESIGN §3). stderr is outside every pipeline gate.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{}", panic_line(info.location()));
+    }));
+}
+
+fn panic_line(at: Option<&std::panic::Location<'_>>) -> String {
+    let at = at.map_or_else(|| "unknown location".to_string(), |l| l.to_string());
+    format!("thread panicked at {at} (message withheld: it may quote captured data)")
+}
+
+/// `prctl(PR_SET_DUMPABLE, 0)`, checked: the agent refuses to start capture
+/// when it fails.
+#[cfg(target_os = "linux")]
+fn disable_core_dumps() -> Result<()> {
+    // SAFETY: a plain syscall with integer arguments.
+    check_prctl(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn check_prctl(ret: i32) -> Result<()> {
+    if ret != 0 {
+        anyhow::bail!(
+            "refusing to start: prctl(PR_SET_DUMPABLE, 0) failed ({}); a core dump \
+             could expose captured data",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// The publisher's error, if it ends with one (the agent must exit then);
+/// never resolves otherwise.
+#[cfg(target_os = "linux")]
+async fn publisher_failed(handle: Option<tokio::task::JoinHandle<Result<()>>>) -> anyhow::Error {
+    if let Some(h) = handle
+        && let Ok(Err(e)) = h.await
+    {
+        return e;
+    }
+    std::future::pending().await
+}
+
+/// The log filter directives: `debug` with `--verbose`, else `RUST_LOG`
+/// when it parses, else `info`.
+fn log_directives(verbose: bool, rust_log: Option<String>) -> String {
+    if verbose {
+        return "debug".to_string();
+    }
+    rust_log
+        .filter(|f| EnvFilter::try_new(f).is_ok())
+        .unwrap_or_else(|| "info".to_string())
 }
 
 /// `--smoke-test`: succeed as soon as the attached programs deliver at least
@@ -751,7 +765,31 @@ async fn smoke_test_wait(enabled: bool, stats: &event_loop::EventStats) -> Resul
 mod tests {
     use clap::Parser;
 
-    use super::{Args, config, offline_privacy_mode};
+    use super::{Args, check_prctl, config, offline_privacy_mode, panic_line};
+
+    #[test]
+    fn log_directives_follow_verbose_then_rust_log() {
+        use super::log_directives;
+        assert_eq!(log_directives(true, Some("warn".into())), "debug");
+        assert_eq!(log_directives(false, Some("warn".into())), "warn");
+        assert_eq!(log_directives(false, Some("=[".into())), "info");
+        assert_eq!(log_directives(false, None), "info");
+    }
+
+    #[test]
+    fn prctl_failure_refuses_to_start() {
+        assert!(check_prctl(0).is_ok());
+        let err = check_prctl(-1).unwrap_err().to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    #[test]
+    fn panic_line_names_the_location_only() {
+        let line = panic_line(Some(std::panic::Location::caller()));
+        assert!(line.contains("main.rs"), "{line}");
+        assert!(line.contains("withheld"), "{line}");
+        assert!(panic_line(None).contains("unknown location"));
+    }
 
     #[test]
     fn test_cli_default_args() {
@@ -903,35 +941,16 @@ async fn replay_bench(config: &config::AgentConfig, path: &str) -> Result<()> {
         }
     }
 
-    let pii = config
-        .pii
-        .enabled
-        .then(|| pii::PiiEngine::new(&config.pii, &config.pii_external_url_allowlist));
     let privacy = std::sync::Arc::new(config::PrivacyGate::new(config.privacy_mode));
-    let (json, writer) = match &config.json_export_path {
-        Some(p) => {
-            let (h, w) =
-                export::json::JsonExportHandle::spawn(p, 4096, std::sync::Arc::clone(&privacy))?;
-            (Some(h), Some(w))
-        }
-        None => (None, None),
-    };
-    let graph = config
-        .graph
-        .enabled
-        .then(|| graph::GraphBuilder::new(&config.graph));
-    let event_loop =
-        event_loop::EventLoop::new(config.clone(), privacy, pii, json, None, None, graph);
+    let shared = pipeline::Shared::for_replay(config.clone(), privacy)?;
+    let stats = std::sync::Arc::clone(&shared.stats);
+    let pipeline = pipeline::Pipeline::build(&shared)?;
 
     let n = events.len();
     let start = std::time::Instant::now();
-    event_loop.replay_through_worker(events).await?;
+    pipeline.replay(&events).await;
+    pipeline.shutdown().await;
     let elapsed = start.elapsed().as_secs_f64();
-    let stats = event_loop.stats().clone();
-    drop(event_loop);
-    if let Some(w) = writer {
-        w.await?;
-    }
     println!(
         "events={n} elapsed={elapsed:.3}s rate={:.0}/s per_event={:.2}us pii_detections={} parser_errors={}",
         n as f64 / elapsed,

@@ -1,21 +1,29 @@
 //! OTLP exporter over gRPC.
+//!
+//! One exporter per capture pipeline, on its own gRPC channel whose socket
+//! writes go through the pipeline's gate (DESIGN §3, Revision 1 items 1, 2,
+//! 5): the channel is built only from [`GatedConnector`] via
+//! `with_channel`, never from the exporter's own transport, and refuses to
+//! start otherwise.
 
 #![allow(dead_code)]
 
 use std::{
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Span, Tracer, TracerProvider};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::sync::mpsc;
+use tracing::instrument::WithSubscriber;
 
 use crate::config::{OtlpConfig, PrivacyGate, PrivacyMode};
+use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate};
 use crate::protocol::L7Message;
 
 /// An event to be exported via OTLP.
@@ -38,26 +46,88 @@ pub struct OtlpExportHandle {
     tx: mpsc::Sender<(PrivacyMode, OtlpEvent)>,
 }
 
+/// One pipeline's exporter task and its SDK provider.
+pub struct OtlpWorker {
+    task: tokio::task::JoinHandle<()>,
+    provider: SdkTracerProvider,
+}
+
+impl OtlpWorker {
+    /// Graceful stop (agent shutdown; the pipeline was not revoked): once
+    /// every handle is gone the task drains, then queued spans are flushed.
+    pub async fn finish(self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, self.task).await;
+        let provider = self.provider;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = provider.force_flush() {
+                tracing::warn!(error = ?e, "OTLP force_flush failed");
+            }
+            if let Err(e) = provider.shutdown() {
+                tracing::warn!(error = ?e, "OTLP provider shutdown failed");
+            }
+        })
+        .await;
+    }
+
+    /// Discard a revoked pipeline's exporter. The gate must already be
+    /// revoked (Revision 1 item 5): the SDK's shutdown still exports what
+    /// it queued, and that export fails at the socket gate and is
+    /// discarded. Nothing is flushed on purpose.
+    pub fn discard(self) {
+        self.task.abort();
+        let provider = self.provider;
+        // Shutdown blocks on the batch processor thread.
+        tokio::task::spawn_blocking(move || {
+            let _ = provider.shutdown();
+        });
+    }
+}
+
+/// The pipeline's gRPC channel: lazily connected through `GatedConnector`,
+/// tonic's internal tasks spawned under `dispatch`. Only `http://`
+/// endpoints: TLS would have to sit above the gate, and this exporter has
+/// no TLS setup, so `https://` refuses to start.
+fn gated_channel(
+    endpoint: &str,
+    gate: Arc<IoGate>,
+    dispatch: tracing::Dispatch,
+) -> Result<tonic::transport::Channel> {
+    let uri: http::Uri = endpoint
+        .parse()
+        .with_context(|| format!("invalid OTLP endpoint {endpoint}"))?;
+    if uri.scheme_str() != Some("http") {
+        bail!("OTLP endpoint {endpoint}: only http:// endpoints are supported");
+    }
+    let ep = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+        .with_context(|| format!("invalid OTLP endpoint {endpoint}"))?
+        .executor(DispatchExecutor(dispatch))
+        .connect_timeout(Duration::from_secs(10));
+    Ok(ep.connect_with_connector_lazy(
+        GatedConnector::plain(gate).with_pause_point(crate::test_hooks::OTLP_IN_FLIGHT_EXPORT),
+    ))
+}
+
 impl OtlpExportHandle {
-    /// Spawn OTLP exporter task. An event produced under a wider privacy
-    /// mode than the one now in effect (`privacy`, tightened by a reload
-    /// while it was queued) is dropped, not exported.
+    /// Spawn one pipeline's OTLP exporter, writing under `gate` and logging
+    /// through `dispatch`. An event produced under a wider privacy mode
+    /// than the one now in effect (`privacy`, tightened by a reload while
+    /// it was queued) is dropped, not exported.
     pub fn spawn(
         config: &OtlpConfig,
         buffer_size: usize,
         privacy: std::sync::Arc<PrivacyGate>,
-    ) -> Result<(Self, tokio::task::JoinHandle<()>)> {
-        let endpoint = config.endpoint.clone();
-        let service_name = config.service_name.clone();
-
+        gate: Arc<IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> Result<(Self, OtlpWorker)> {
+        let channel = gated_channel(&config.endpoint, gate, dispatch.clone())?;
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
-            .with_endpoint(endpoint)
+            .with_channel(channel)
             .build()
             .context("failed to build OTLP gRPC span exporter")?;
 
         let resource = Resource::builder_empty()
-            .with_service_name(service_name)
+            .with_service_name(config.service_name.clone())
             .build();
         let provider = SdkTracerProvider::builder()
             .with_resource(resource)
@@ -66,28 +136,24 @@ impl OtlpExportHandle {
         let tracer = provider.tracer("panopticon-agent.otlp");
 
         let (tx, mut rx) = mpsc::channel::<(PrivacyMode, OtlpEvent)>(buffer_size);
-        let handle = tokio::spawn(async move {
-            let emit = |(mode, event)| {
-                if privacy.allows(mode) {
-                    emit_event(&tracer, event);
-                }
-            };
-            while let Some(event) = rx.recv().await {
-                emit(event);
-                while let Ok(event) = rx.try_recv() {
+        let task = tokio::spawn(
+            async move {
+                let emit = |(mode, event)| {
+                    if privacy.allows(mode) {
+                        emit_event(&tracer, event);
+                    }
+                };
+                while let Some(event) = rx.recv().await {
                     emit(event);
+                    while let Ok(event) = rx.try_recv() {
+                        emit(event);
+                    }
                 }
             }
+            .with_subscriber(dispatch),
+        );
 
-            if let Err(e) = provider.force_flush() {
-                tracing::warn!(error = ?e, "OTLP force_flush failed");
-            }
-            if let Err(e) = provider.shutdown() {
-                tracing::warn!(error = ?e, "OTLP provider shutdown failed");
-            }
-        });
-
-        Ok((Self { tx }, handle))
+        Ok((Self { tx }, OtlpWorker { task, provider }))
     }
 
     /// Try to enqueue a span produced under privacy mode `mode`. Returns
@@ -259,16 +325,42 @@ mod tests {
         let config = OtlpConfig::default();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (exporter, handle) = OtlpExportHandle::spawn(
+            let gate = IoGate::new();
+            let (exporter, worker) = OtlpExportHandle::spawn(
                 &config,
                 100,
                 std::sync::Arc::new(PrivacyGate::new(PrivacyMode::Redacted)),
+                Arc::clone(&gate),
+                tracing::Dispatch::default(),
             )
             .unwrap();
             let msg = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
             assert!(exporter.try_send_span(msg, PrivacyMode::Redacted));
             drop(exporter);
-            handle.abort();
+            gate.revoke();
+            worker.discard();
+        });
+    }
+
+    #[test]
+    fn https_and_invalid_endpoints_refuse_to_start() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for endpoint in ["https://collector:4317", "collector:4317", "not a uri"] {
+                let config = OtlpConfig {
+                    enabled: true,
+                    endpoint: endpoint.to_string(),
+                    ..OtlpConfig::default()
+                };
+                let r = OtlpExportHandle::spawn(
+                    &config,
+                    1,
+                    std::sync::Arc::new(PrivacyGate::new(PrivacyMode::Redacted)),
+                    IoGate::new(),
+                    tracing::Dispatch::default(),
+                );
+                assert!(r.is_err(), "{endpoint}");
+            }
         });
     }
 

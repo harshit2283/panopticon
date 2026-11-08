@@ -127,6 +127,9 @@ pub struct LoadedPrograms {
     pub ebpf: Ebpf,
     /// Heterogeneous link types kept alive via type erasure.
     pub _links: Vec<Box<dyn std::any::Any + Send>>,
+    /// cgroup_skb: the cgroup v2 root the programs attach to, against
+    /// which the scope publisher resolves selectors.
+    pub cgroup_root: Option<std::path::PathBuf>,
 }
 
 /// Shared eBPF state for concurrent access between event loop and scanner.
@@ -198,6 +201,7 @@ pub fn load_and_attach(
     // ── cgroup_skb backend: scope writers, then capture (DESIGN §7) ───
     let cgroup_backend = config.capture_backend == CaptureBackend::CgroupSkb;
     let mut exit_tp_attached = false;
+    let mut cgroup_root = None;
     if cgroup_backend {
         let setup = ScopeSetup {
             mode: scope_config(config).0,
@@ -215,9 +219,10 @@ pub fn load_and_attach(
                 Ok(())
             }
         };
-        let (_root, exit_tp) =
+        let (root, exit_tp) =
             scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, select, &mut links)?;
         exit_tp_attached = exit_tp;
+        cgroup_root = Some(root.path().to_path_buf());
     }
     let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };
 
@@ -373,6 +378,7 @@ pub fn load_and_attach(
     Ok(LoadedPrograms {
         ebpf,
         _links: links,
+        cgroup_root,
     })
 }
 

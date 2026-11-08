@@ -236,7 +236,8 @@ pub trait ProtocolParser: Send {
 /// # Panics
 /// Panics if called with `Protocol::Unknown` — detect_protocol() should
 /// never return Unknown; it returns `None` instead.
-pub fn create_parser(proto: Protocol) -> Box<dyn ProtocolParser> {
+/// `topics` is the pipeline's Kafka topic ID map.
+pub fn create_parser(proto: Protocol, topics: &kafka::KafkaTopics) -> Box<dyn ProtocolParser> {
     match proto {
         Protocol::Http1 => Box::new(http1::Http1Parser::new()),
         Protocol::Http2 => Box::new(http2::Http2Parser::new(false)),
@@ -245,7 +246,7 @@ pub fn create_parser(proto: Protocol) -> Box<dyn ProtocolParser> {
         Protocol::Postgres => Box::new(postgres::PostgresParser::new()),
         Protocol::Redis => Box::new(redis::RedisParser::new()),
         Protocol::Dns => Box::new(dns::DnsParser::new()),
-        Protocol::Kafka => Box::new(kafka::KafkaParser::new()),
+        Protocol::Kafka => Box::new(kafka::KafkaParser::with_topics(topics.clone())),
         Protocol::Amqp => Box::new(amqp::AmqpParser::new()),
         Protocol::Unknown => unreachable!("create_parser called with Unknown protocol"),
     }
@@ -275,19 +276,19 @@ mod tests {
 
     #[test]
     fn test_create_parser_http1() {
-        let parser = create_parser(Protocol::Http1);
+        let parser = create_parser(Protocol::Http1, &Default::default());
         assert_eq!(parser.protocol(), Protocol::Http1);
     }
 
     #[test]
     fn test_create_parser_redis() {
-        let parser = create_parser(Protocol::Redis);
+        let parser = create_parser(Protocol::Redis, &Default::default());
         assert_eq!(parser.protocol(), Protocol::Redis);
     }
 
     #[test]
     #[should_panic(expected = "Unknown protocol")]
     fn test_create_parser_unknown_panics() {
-        create_parser(Protocol::Unknown);
+        create_parser(Protocol::Unknown, &Default::default());
     }
 }

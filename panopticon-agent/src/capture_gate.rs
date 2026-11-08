@@ -76,13 +76,20 @@ pub struct GateConfig {
 }
 
 impl GateConfig {
-    /// On the cgroup_skb backend the kernel has made every scope decision
-    /// (DESIGN §8): the gate is a pass-through (no pid check, holds,
-    /// sampling or head cut) and TC SYN events stay off.
+    /// For live capture. On the cgroup_skb backend the kernel has made
+    /// every scope decision (DESIGN §8): the gate is a pass-through (no pid
+    /// check, holds, sampling or head cut) and TC SYN events stay off.
     pub fn from_config(config: &AgentConfig) -> Self {
         if config.capture_backend == CaptureBackend::CgroupSkb {
             return Self::default();
         }
+        Self::user_space(config)
+    }
+
+    /// The user-space rules (TC semantics) whatever the backend: for events
+    /// no kernel scope decided, such as a replayed recording. They err
+    /// toward drop.
+    pub fn user_space(config: &AgentConfig) -> Self {
         Self {
             pids: config
                 .pid_filter
