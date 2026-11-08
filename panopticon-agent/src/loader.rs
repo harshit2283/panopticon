@@ -488,6 +488,17 @@ pub fn attach_tls_uprobes(
     attached
 }
 
+/// Whether the loaded object runs a restricted capture scope
+/// (`CONFIG_SCOPE_MODE` != 0, cgroup_skb only). Unreadable counts as
+/// restricted: the extra return probe is a no-op in unscoped modes.
+fn restricted_kernel_scope(ebpf: &Ebpf) -> bool {
+    let read = || -> Option<u64> {
+        let cfg: Array<_, u64> = Array::try_from(ebpf.map("CONFIG")?).ok()?;
+        cfg.get(&CONFIG_SCOPE_MODE, 0).ok()
+    };
+    read().is_none_or(|mode| !scope::is_unscoped_full(mode))
+}
+
 /// Attach the target's probes at `target.library_path` (an fd path).
 fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
@@ -495,6 +506,22 @@ fn attach_tls_uprobes_to(
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
 ) -> usize {
     let mut attached = 0;
+    // Restricted modes emit SSL_write* at return, with that call's own
+    // socket address (tls_probes.rs `ssl_write_ret`). The return probe goes
+    // first: an entry without it would open calls nothing emits.
+    let write_at_return = restricted_kernel_scope(ebpf);
+    let write_ret =
+        |ebpf: &mut Ebpf, offset: u64, links: &mut Vec<Box<dyn std::any::Any + Send>>| {
+            !write_at_return
+                || attach_uretprobe(
+                    ebpf,
+                    "ssl_write_ret",
+                    &target.library_path,
+                    offset,
+                    None,
+                    links,
+                )
+        };
 
     match &target.tls_type {
         TlsType::OpenSsl {
@@ -504,14 +531,16 @@ fn attach_tls_uprobes_to(
             ssl_read_ex_offset,
         } => {
             // SSL_write — uprobe (pid=None for system-wide shared lib coverage)
-            if attach_uprobe(
-                ebpf,
-                "ssl_write_entry",
-                &target.library_path,
-                *ssl_write_offset,
-                None,
-                links,
-            ) {
+            if write_ret(ebpf, *ssl_write_offset, links)
+                && attach_uprobe(
+                    ebpf,
+                    "ssl_write_entry",
+                    &target.library_path,
+                    *ssl_write_offset,
+                    None,
+                    links,
+                )
+            {
                 attached += 1;
             }
 
@@ -541,6 +570,7 @@ fn attach_tls_uprobes_to(
 
             // SSL_write_ex / SSL_read_ex. SSL_read_ex shares the return probe.
             if let Some(offset) = *ssl_write_ex_offset
+                && write_ret(ebpf, offset, links)
                 && attach_uprobe(
                     ebpf,
                     "ssl_write_ex_entry",

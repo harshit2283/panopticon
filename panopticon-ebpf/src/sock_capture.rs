@@ -38,7 +38,8 @@ use panopticon_common::{
         FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY, OWNER_LISTED, SCOPE_HEAD,
         SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict,
         drop_reason, head_take, in_sample, is_initialised, is_unscoped_full, pid_inputs,
-        reserved_take, role_of, stream_offset, udp_should_reserve, verdict, verdict_word,
+        reserved_take, role_of, stream_offset, tls_addr_in_scope, udp_should_reserve, verdict,
+        verdict_word,
     },
 };
 
@@ -217,30 +218,49 @@ macro_rules! wr {
     }};
 }
 
-/// TLS address learning in a restricted mode (§3.5, §2.1): the generation
-/// under which `sk` itself is in scope, or None. Uses the capture path's
-/// own state: the socket's `SOCK_STATE` entry, initialised with its own
-/// cookie (so never REUSED or a listener's clone), and an IN verdict cached
-/// for the current `CONFIG_SCOPE_GEN`, read under g1/g2. The verdict is not
-/// computed here: `bpf_sk_ancestor_cgroup_id` is not offered to tracing
-/// programs, so a stale or missing cache records nothing (the socket's next
-/// packet recomputes it). `sk` must be a BTF `struct sock *` (fentry arg).
+/// TLS address learning in a restricted mode (§3.5, §2.1): `sk`'s cookie
+/// and tuple, only if `sk` itself is in scope under the current generation
+/// for the whole time its tuple is read. Uses the capture path's own state:
+/// the socket's `SOCK_STATE` entry, initialised with its own cookie, not
+/// REUSED, and an IN verdict cached for `CONFIG_SCOPE_GEN`, checked before
+/// the tuple read and again after it (`tls_addr_in_scope`). fentry runs
+/// before the socket lock, so another thread may disconnect and reconnect
+/// the socket meanwhile; that sets REUSED for good and fails the second
+/// check. The verdict is not computed here (the socket cgroup helper is
+/// not available to tracing programs): a stale or missing cache gives no
+/// address. `sk` must be a BTF `struct sock *` (fentry arg).
 #[inline(always)]
-pub(crate) fn sock_scope_cached(sk: *mut c_void) -> Option<u32> {
+pub(crate) fn sock_addr_checked(sk: *mut c_void) -> Option<(u64, (u32, u32, u16, u16))> {
     let st = state_of(sk, false);
     if st.is_null() {
         return None;
     }
     let cookie = unsafe { bpf_get_socket_cookie(sk) };
-    if !is_initialised(rd!(st, init_cookie), cookie) {
-        return None;
-    }
     let g1 = scope_gen();
-    let v = cached_verdict(rd!(st, verdict_word), g1);
-    if v != Some(VERDICT_IN) || scope_gen() != g1 {
+    let before = tls_addr_in_scope(
+        cookie,
+        g1,
+        rd!(st, init_cookie),
+        rd!(st, flags),
+        rd!(st, verdict_word),
+        g1,
+    );
+    if !before {
         return None;
     }
-    Some(g1)
+    let tuple = crate::sock_monitor::read_sock_tuple(sk as *const u8).ok()?;
+    let after = tls_addr_in_scope(
+        cookie,
+        g1,
+        rd!(st, init_cookie),
+        rd!(st, flags),
+        rd!(st, verdict_word),
+        scope_gen(),
+    );
+    if !after {
+        return None;
+    }
+    Some((cookie, tuple))
 }
 
 // ── Socket creation ────────────────────────────────────────────────────────

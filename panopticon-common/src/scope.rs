@@ -207,6 +207,28 @@ pub fn is_initialised(init_cookie: u64, cookie: u64) -> bool {
     init_cookie != 0 && init_cookie == cookie
 }
 
+/// TLS address learning (DESIGN §3.5): whether one read of a socket's
+/// state (`init_cookie`, `flags`, `verdict_word`, and `CONFIG_SCOPE_GEN` as
+/// `gen_now`) shows the socket in scope under generation `g1`. The kernel
+/// evaluates it before reading the socket's tuple and again after: the tuple
+/// is the in-scope socket's only if both hold. A disconnect in between sets
+/// `REUSED` and clears `init_cookie` for good; a selector change moves the
+/// generation; an accept clears the verdict.
+#[inline(always)]
+pub fn tls_addr_in_scope(
+    cookie: u64,
+    g1: u32,
+    init_cookie: u64,
+    flags: u8,
+    word: u64,
+    gen_now: u32,
+) -> bool {
+    is_initialised(init_cookie, cookie)
+        && flags & FLAG_REUSED == 0
+        && cached_verdict(word, g1) == Some(VERDICT_IN)
+        && gen_now == g1
+}
+
 /// Stream offset of the first byte of a segment, from an unlocked read of
 /// a socket's kernel counters, or `None` if the read was torn.
 ///
@@ -330,6 +352,48 @@ mod tests {
             cached_verdict(verdict_word(u32::MAX, VERDICT_OUT_SAMPLE), u32::MAX),
             Some(VERDICT_OUT_SAMPLE)
         );
+    }
+
+    #[test]
+    fn tls_addr_needs_the_same_in_scope_socket_throughout() {
+        let w = verdict_word(3, VERDICT_IN);
+        assert!(tls_addr_in_scope(42, 3, 42, 0, w, 3));
+        // before the read: not initialised, a listener's clone, no verdict
+        assert!(!tls_addr_in_scope(42, 3, 0, 0, w, 3));
+        assert!(!tls_addr_in_scope(42, 3, 41, 0, w, 3));
+        assert!(!tls_addr_in_scope(42, 3, 42, 0, 0, 3));
+        assert!(!tls_addr_in_scope(
+            42,
+            3,
+            42,
+            0,
+            verdict_word(3, VERDICT_OUT_PID),
+            3
+        ));
+        // stale verdict (older generation)
+        assert!(!tls_addr_in_scope(
+            42,
+            3,
+            42,
+            0,
+            verdict_word(2, VERDICT_IN),
+            3
+        ));
+        // after the read: disconnected (REUSED, init cleared), or REUSED
+        // alone, or the generation moved, or the verdict was cleared
+        assert!(!tls_addr_in_scope(42, 3, 0, FLAG_REUSED, w, 3));
+        assert!(!tls_addr_in_scope(42, 3, 42, FLAG_REUSED, w, 3));
+        assert!(!tls_addr_in_scope(42, 3, 42, 0, w, 4));
+        assert!(!tls_addr_in_scope(42, 3, 42, 0, 0, 3));
+        // other sticky flags do not matter for an address
+        assert!(tls_addr_in_scope(
+            42,
+            3,
+            42,
+            FLAG_KTLS | FLAG_BASELINE,
+            w,
+            3
+        ));
     }
 
     #[test]

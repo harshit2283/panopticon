@@ -77,6 +77,41 @@ fn drops(ebpf: &Ebpf, reason: u32) -> u64 {
     m.get(&reason, 0).map_or(0, |v| v.iter().sum())
 }
 
+/// The fd the stand-in SSL_write below writes to.
+static TEST_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Stand-in for OpenSSL's `SSL_write(ssl, buf, num)`: the TLS write probes
+/// attach to it by symbol. Writes the plaintext to `TEST_FD` (no TLS).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i32 {
+    let fd = TEST_FD.load(std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: buf holds num bytes (the callers in the test).
+    unsafe { libc::write(fd, buf.cast(), num as usize) as i32 }
+}
+
+/// TLS_ACTIVE on every CPU: [pid_tgid, conn].
+fn set_active(ebpf: &mut Ebpf, v: [u64; 2]) {
+    let mut active: PerCpuArray<_, [u64; 2]> =
+        PerCpuArray::try_from(ebpf.map_mut("TLS_ACTIVE").unwrap()).unwrap();
+    let n = aya::util::nr_cpus().unwrap();
+    let values = aya::maps::PerCpuValues::try_from(vec![v; n]).unwrap();
+    active.set(0, values, 0).unwrap();
+}
+
+/// Drain ring 0: every TlsData event.
+fn drain_tls(ring: &mut RingBuf<MapData>) -> Vec<DataEvent> {
+    let mut out = Vec::new();
+    while let Some(item) = ring.next() {
+        // SAFETY: all-zero is a valid DataEvent.
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        if read_data_event_into(&item, &mut e) && e.event_type == EventType::TlsData {
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// Drain ring 0: (cookie, direction, stream_off, payload) of every event.
 fn drain(ring: &mut RingBuf<MapData>) -> Vec<(u64, Direction, u64, Vec<u8>)> {
     let mut out = Vec::new();
@@ -648,10 +683,11 @@ fn scope_programs_load_attach_and_hold() {
         "old verdict stays OUT"
     );
 
-    // ── TLS address learning (restricted): with this thread marked inside
-    // a TLS call, only a socket that is itself IN under the current
-    // generation has its tuple recorded
-    let tls_link = {
+    // ── TLS addresses (restricted): an address belongs to one OpenSSL call
+    // and only to an in-scope socket of that call (tls_probes.rs TLS_CALL)
+    // SAFETY: gettid has no preconditions.
+    let pid_tgid = ((me as u64) << 32) | unsafe { libc::gettid() } as u64;
+    let fentry_link = {
         let p: &mut aya::programs::FEntry = ebpf
             .program_mut("tls_tcp_sendmsg_scoped")
             .unwrap()
@@ -659,38 +695,85 @@ fn scope_programs_load_attach_and_hold() {
             .unwrap();
         p.attach().expect("tls_tcp_sendmsg_scoped attaches")
     };
-    let recorded = |ebpf: &mut Ebpf, conn: u64, sock: &mut TcpStream| -> Option<[u32; 4]> {
-        // SAFETY: gettid has no preconditions.
-        let tid = unsafe { libc::gettid() } as u64;
-        let mut active: PerCpuArray<_, [u64; 2]> =
-            PerCpuArray::try_from(ebpf.map_mut("TLS_ACTIVE").unwrap()).unwrap();
-        let n = aya::util::nr_cpus().unwrap();
-        let v = aya::maps::PerCpuValues::try_from(vec![[((me as u64) << 32) | tid, conn]; n]);
-        active.set(0, v.unwrap(), 0).unwrap();
-        sock.write_all(b"t").unwrap();
-        let addrs: HashMap<_, [u64; 2], [u32; 4]> =
-            HashMap::try_from(ebpf.map("TLS_CONN_ADDR").unwrap()).unwrap();
-        addrs.get(&[conn, me as u64], 0).ok()
+    // A call slot as an entry probe opens it, socket I/O inside the call,
+    // then the slot as the return probe would consume it.
+    let call = |ebpf: &mut Ebpf, conn: u64, socks: &mut [&mut TcpStream]| -> [u64; 7] {
+        set_active(ebpf, [pid_tgid, conn]);
+        let mut slots: HashMap<_, u64, [u64; 7]> =
+            HashMap::try_from(ebpf.map_mut("TLS_CALL").unwrap()).unwrap();
+        slots.insert(pid_tgid, [conn, 0, 0, 0, 0, 0, 0], 0).unwrap();
+        for s in socks.iter_mut() {
+            s.write_all(b"t").unwrap();
+        }
+        let got = slots.get(&pid_tgid, 0).unwrap();
+        slots.remove(&pid_tgid).unwrap();
+        got
     };
-    assert_eq!(recorded(&mut ebpf, 0x7001, &mut c3), None, "OUT socket");
-    assert_eq!(
-        recorded(&mut ebpf, 0x7002, &mut pre_client),
-        None,
-        "no state"
-    );
-    let t = recorded(&mut ebpf, 0x7003, &mut c4).expect("IN socket recorded");
-    let port = c4.local_addr().unwrap().port();
-    assert_eq!((t[2] & 0xffff, t[3]), (port as u32, 1), "tuple, generation");
+    // TlsCall: conn, buf, len, aux, cookie, tuple (12 bytes), state
+    let state = |c: &[u64; 7]| c[6] >> 32;
+    let c4_port = c4.local_addr().unwrap().port() as u64;
+    let c = call(&mut ebpf, 0x7001, &mut [&mut c4]);
+    assert_eq!((state(&c), c[4], c[6] & 0xffff), (1, cookie(&c4), c4_port));
+    let c = call(&mut ebpf, 0x7001, &mut [&mut c3]);
+    assert_eq!(state(&c), 2, "same SSL*, next call on an OUT socket: none");
+    let c = call(&mut ebpf, 0x7002, &mut [&mut c4, &mut c3]);
+    assert_eq!(state(&c), 2, "a second socket in one call poisons it");
+    let c = call(&mut ebpf, 0x7003, &mut [&mut pre_client]);
+    assert_eq!(state(&c), 2, "socket without state");
     set(&mut ebpf, CONFIG_SCOPE_GEN, 2);
-    assert_eq!(recorded(&mut ebpf, 0x7004, &mut c4), None, "stale verdict");
-    let t = recorded(&mut ebpf, 0x7005, &mut c4).expect("recomputed: recorded");
-    assert_eq!(t[3], 2, "current generation");
+    let c = call(&mut ebpf, 0x7004, &mut [&mut c4]);
+    assert_eq!(state(&c), 2, "verdict cached under an older generation");
+    let c = call(&mut ebpf, 0x7005, &mut [&mut c4]); // its packet recomputed it
+    assert_eq!((state(&c), c[6] & 0xffff), (1, c4_port));
+
+    // End to end through the real write probes, on a stand-in SSL_write in
+    // this binary: emitted at return, with only that call's address.
+    let mut uprobe_links = Vec::new();
+    for prog in ["ssl_write_ret", "ssl_write_entry"] {
+        let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+        let link = p
+            .attach("panop_test_ssl_write", "/proc/self/exe", Some(me))
+            .unwrap_or_else(|e| panic!("{prog} attaches: {e}"));
+        uprobe_links.push((prog, link));
+    }
+    let _ = drain(&mut ring);
+    let write =
+        std::hint::black_box(panop_test_ssl_write as extern "C" fn(u64, *const u8, i32) -> i32);
+    let ssl = 0x5000u64;
+    TEST_FD.store(c4.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(write(ssl, b"tls-in".as_ptr(), 6), 6);
+    TEST_FD.store(c3.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(write(ssl, b"tls-out".as_ptr(), 7), 7);
+    let tls = drain_tls(&mut ring);
+    let find = |p: &[u8]| {
+        *tls.iter()
+            .find(|e| e.payload_bytes() == p)
+            .unwrap_or_else(|| panic!("TLS event {p:?} emitted"))
+    };
+    let e = find(b"tls-in");
+    assert_eq!(e.socket_cookie, ssl);
+    assert_eq!(
+        (e.src_addr, e.src_port as u64, e.dst_port),
+        (0x7f00_0001, c4_port, listener.local_addr().unwrap().port()),
+        "the call's own in-scope socket"
+    );
+    let e = find(b"tls-out");
+    assert_eq!(
+        (e.src_addr, e.dst_addr, e.src_port, e.dst_port, e.ip_proto),
+        (0, 0, 0, 0, 0),
+        "same SSL*, OUT socket: no address, none carried over"
+    );
+    for (prog, link) in uprobe_links {
+        let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+        p.detach(link).unwrap();
+    }
     let p: &mut aya::programs::FEntry = ebpf
         .program_mut("tls_tcp_sendmsg_scoped")
         .unwrap()
         .try_into()
         .unwrap();
-    p.detach(tls_link).unwrap();
+    p.detach(fentry_link).unwrap();
+    set_active(&mut ebpf, [0, 0]);
     let _ = drain(&mut ring);
     println!("TLS_ADDR scoped=OK");
 
