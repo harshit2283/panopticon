@@ -719,12 +719,17 @@ fn check_prctl(ret: i32) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn publisher_failed(
     handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    ebpf: &Arc<std::sync::Mutex<loader::EbpfState>>,
+    ebpf: &std::sync::Arc<std::sync::Mutex<loader::EbpfState>>,
     scope: &pipeline::Scope,
 ) -> anyhow::Error {
     match handle {
         Some(h) => {
-            scope_publisher::supervise(h, scope_publisher::AyaMaps(Arc::clone(ebpf)), scope).await
+            scope_publisher::supervise(
+                h,
+                scope_publisher::AyaMaps(std::sync::Arc::clone(ebpf)),
+                scope,
+            )
+            .await
         }
         None => std::future::pending().await,
     }
