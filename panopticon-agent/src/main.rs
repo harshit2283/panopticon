@@ -10,6 +10,7 @@ mod config;
 mod event_loop;
 mod export;
 mod graph;
+mod io_gate;
 mod k8s;
 #[cfg(target_os = "linux")]
 mod loader;
@@ -23,6 +24,8 @@ mod scope_loader;
 mod scope_select;
 #[cfg(test)]
 mod statics_check;
+#[allow(dead_code)]
+mod test_hooks;
 mod util;
 
 /// Panopticon Agent — eBPF-powered network observability

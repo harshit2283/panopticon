@@ -33,6 +33,31 @@ const MAGIC: &[u8; 6] = b"PNCAP\x01";
 /// 4192 bytes).
 const FORMAT_VERSION: u32 = 4;
 
+/// Bytes per record: u32 length prefix + fixed-size DataEvent.
+pub const CAPTURE_RECORD_BYTES: usize = 4 + mem::size_of::<DataEvent>();
+
+/// The file header: magic, version, `start_timestamp_ns` and a zero event
+/// count (readers count records instead).
+pub fn capture_header(start_timestamp_ns: u64) -> Vec<u8> {
+    let mut h = Vec::with_capacity(MAGIC.len() + 20);
+    h.extend_from_slice(MAGIC);
+    h.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    h.extend_from_slice(&start_timestamp_ns.to_le_bytes());
+    h.extend_from_slice(&0u64.to_le_bytes());
+    h
+}
+
+/// Append one `[u32 length][DataEvent bytes]` record to `out`.
+pub fn encode_capture_record(event: &DataEvent, out: &mut Vec<u8>) {
+    let event_size = mem::size_of::<DataEvent>();
+    out.extend_from_slice(&(event_size as u32).to_le_bytes());
+    // SAFETY: DataEvent is #[repr(C)], Copy, and contains no pointers.
+    // This is the same guarantee that makes it safe for eBPF ring buffer transfer.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(event as *const DataEvent as *const u8, event_size) };
+    out.extend_from_slice(bytes);
+}
+
 /// File header metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureHeader {
@@ -57,15 +82,7 @@ impl<W: Write> CaptureWriter<W> {
     /// Create a new capture writer. Writes the magic bytes and a placeholder header.
     pub fn new(inner: W, start_timestamp_ns: u64) -> io::Result<Self> {
         let mut writer = BufWriter::new(inner);
-
-        // Write magic
-        writer.write_all(MAGIC)?;
-
-        // Write placeholder header (will be updated on finish if seekable)
-        writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
-        writer.write_all(&start_timestamp_ns.to_le_bytes())?;
-        writer.write_all(&0u64.to_le_bytes())?; // event_count placeholder
-
+        writer.write_all(&capture_header(start_timestamp_ns))?;
         Ok(Self {
             writer,
             start_timestamp_ns,
@@ -77,16 +94,9 @@ impl<W: Write> CaptureWriter<W> {
     ///
     /// The event is written as `[u32 length][raw bytes]`.
     pub fn write_event(&mut self, event: &DataEvent) -> io::Result<()> {
-        let event_size = mem::size_of::<DataEvent>() as u32;
-        self.writer.write_all(&event_size.to_le_bytes())?;
-
-        // SAFETY: DataEvent is #[repr(C)], Copy, and contains no pointers.
-        // This is the same guarantee that makes it safe for eBPF ring buffer transfer.
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(event as *const DataEvent as *const u8, event_size as usize)
-        };
-        self.writer.write_all(bytes)?;
-
+        let mut record = Vec::with_capacity(CAPTURE_RECORD_BYTES);
+        encode_capture_record(event, &mut record);
+        self.writer.write_all(&record)?;
         self.event_count += 1;
         Ok(())
     }

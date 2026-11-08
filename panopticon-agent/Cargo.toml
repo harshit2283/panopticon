@@ -6,6 +6,9 @@ license.workspace = true
 
 [features]
 default = ["compression"]
+# Named pause points for the narrowing tests (DESIGN §10 T-2); always on
+# in unit tests.
+scope-test-hooks = []
 ml = ["dep:ort", "dep:tokenizers"]
 compression = ["dep:flate2", "dep:snap", "dep:zstd"]
 
@@ -59,6 +62,17 @@ prometheus-client = { workspace = true }
 opentelemetry = { version = "0.28", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.28", default-features = false, features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = ["trace", "grpc-tonic"] }
+# Gated transports (io_gate.rs): OTLP's gRPC channel and the external PII
+# client are built on a connector whose socket writes go through the
+# pipeline's IoGate, beneath TLS and HTTP buffering.
+tonic = { version = "0.12", default-features = false, features = ["transport"] }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "client-legacy", "http1"] }
+http = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 
 # Compression support (optional)
 flate2 = { version = "1", optional = true }
@@ -82,6 +96,7 @@ cargo_metadata = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic", "trace"] }
 criterion = { workspace = true }
 
 [[bench]]

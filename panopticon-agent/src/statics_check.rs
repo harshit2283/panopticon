@@ -9,6 +9,11 @@
 
 /// (file under `src/`, static name, why it holds nothing captured-derived).
 const ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "test_hooks.rs",
+        "HOOKS",
+        "armed test pause points (unit tests and scope-test-hooks builds only)",
+    ),
     ("main.rs", "GLOBAL", "the global allocator"),
     (
         "event_loop.rs",
