@@ -7,6 +7,7 @@
 //!
 //! One collector and one long-lived client connection per test.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -293,166 +294,217 @@ const WAIT: Duration = Duration::from_secs(10);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+/// A hung test aborts the test process (with its name) instead of
+/// blocking CI.
+const HANG: Duration = Duration::from_secs(120);
+
+/// Run `body` on a fresh multi-threaded runtime of `workers` threads,
+/// under a watchdog that also covers the runtime's shutdown.
+fn t2(name: &'static str, workers: usize, body: impl std::future::Future<Output = ()>) {
+    let (alive, done) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done.recv_timeout(HANG) {
+            eprintln!("{name}: still running after {HANG:?}; aborting");
+            std::process::abort();
+        }
+    });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(body);
+    drop(rt);
+    drop(alive);
+}
+
 /// A worker paused after admission, before its sink hand-off, and an
 /// old-generation event at the ring read after the change: neither leaves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn paused_worker_and_stale_events_reach_no_output_after_applied() {
-    let env = Env::new("worker").await;
-    env.feed(&exchange("old-before", 18001, 1));
-    env.wait_for("old-before", PATHS).await;
-    env.wait_for(":18001", &["audit"]).await;
+#[test]
+fn paused_worker_and_stale_events_reach_no_output_after_applied() {
+    t2(
+        "paused_worker_and_stale_events_reach_no_output_after_applied",
+        4,
+        async {
+            let env = Env::new("worker").await;
+            env.feed(&exchange("old-before", 18001, 1));
+            env.wait_for("old-before", PATHS).await;
+            env.wait_for(":18001", &["audit"]).await;
 
-    let old = env.scope.gate().await.unwrap();
-    let hook = test_hooks::arm(test_hooks::WORKER_BEFORE_SINK, &old);
-    env.feed(&exchange("old-held", 18002, 1));
-    assert!(
-        hook.wait_reached(WAIT),
-        "worker never reached the pause point"
+            let old = env.scope.gate().await.unwrap();
+            let hook = test_hooks::arm(test_hooks::WORKER_BEFORE_SINK, &old);
+            env.feed(&exchange("old-held", 18002, 1));
+            assert!(
+                hook.wait_reached(WAIT),
+                "worker never reached the pause point"
+            );
+
+            assert!(env.scope.narrow(2).await, "a new pipeline is installed");
+            let applied = env.marks();
+            assert!(old.is_revoked());
+            drop(hook); // the worker resumes with the old event
+
+            env.feed(&exchange("old-stale", 18003, 1));
+            env.feed(&exchange("new-after", 18004, 2));
+            env.wait_for("new-after", PATHS).await;
+            env.wait_for(":18004", &["audit"]).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            for marker in ["old-held", "old-stale", ":18002", ":18003"] {
+                env.assert_absent(marker);
+            }
+            env.assert_absent_after(&applied, "old-");
+            env.assert_absent_after(&applied, ":18001");
+            assert!(
+                env.shared
+                    .stats
+                    .drops_stale_scope_gen
+                    .load(Ordering::Relaxed)
+                    >= 2
+            );
+            env.scope.shutdown().await;
+        },
     );
-
-    assert!(env.scope.narrow(2).await, "a new pipeline is installed");
-    let applied = env.marks();
-    assert!(old.is_revoked());
-    drop(hook); // the worker resumes with the old event
-
-    env.feed(&exchange("old-stale", 18003, 1));
-    env.feed(&exchange("new-after", 18004, 2));
-    env.wait_for("new-after", PATHS).await;
-    env.wait_for(":18004", &["audit"]).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    for marker in ["old-held", "old-stale", ":18002", ":18003"] {
-        env.assert_absent(marker);
-    }
-    env.assert_absent_after(&applied, "old-");
-    env.assert_absent_after(&applied, ":18001");
-    assert!(
-        env.shared
-            .stats
-            .drops_stale_scope_gen
-            .load(Ordering::Relaxed)
-            >= 2
-    );
-    env.scope.shutdown().await;
 }
 
 /// A ring reader paused after admitting an event, its batch pending across
 /// the swap: the batch keeps its (revoked) destination.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reader_paused_after_admission_keeps_its_old_destination() {
-    let env = Arc::new(Env::new("reader").await);
-    env.feed(&exchange("old-before", 18011, 1));
-    env.wait_for("old-before", PATHS).await;
+#[test]
+fn reader_paused_after_admission_keeps_its_old_destination() {
+    t2(
+        "reader_paused_after_admission_keeps_its_old_destination",
+        4,
+        async {
+            let env = Arc::new(Env::new("reader").await);
+            env.feed(&exchange("old-before", 18011, 1));
+            env.wait_for("old-before", PATHS).await;
 
-    let old = env.scope.gate().await.unwrap();
-    let hook = test_hooks::arm(test_hooks::READER_AFTER_ADMISSION, &old);
-    let e = Arc::clone(&env);
-    let reader = std::thread::spawn(move || e.feed(&exchange("old-pending", 18012, 1)));
-    assert!(
-        hook.wait_reached(WAIT),
-        "reader never reached the pause point"
+            let old = env.scope.gate().await.unwrap();
+            let hook = test_hooks::arm(test_hooks::READER_AFTER_ADMISSION, &old);
+            let e = Arc::clone(&env);
+            let reader = std::thread::spawn(move || e.feed(&exchange("old-pending", 18012, 1)));
+            assert!(
+                hook.wait_reached(WAIT),
+                "reader never reached the pause point"
+            );
+
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            drop(hook);
+            reader.join().unwrap();
+
+            env.feed(&exchange("new-after", 18013, 2));
+            env.wait_for("new-after", PATHS).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            env.assert_absent("old-pending");
+            env.assert_absent(":18012");
+            env.assert_absent_after(&applied, "old-");
+            env.scope.shutdown().await;
+        },
     );
-
-    env.scope.narrow(2).await;
-    let applied = env.marks();
-    drop(hook);
-    reader.join().unwrap();
-
-    env.feed(&exchange("new-after", 18013, 2));
-    env.wait_for("new-after", PATHS).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    env.assert_absent("old-pending");
-    env.assert_absent(":18012");
-    env.assert_absent_after(&applied, "old-");
-    env.scope.shutdown().await;
 }
 
 /// An OTLP export writing to its socket when the change lands (paused
 /// before the socket gate), and the old SDK's shutdown export: refused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_flight_otlp_export_is_refused_after_applied() {
-    let env = Env::new("otlp").await;
-    env.feed(&exchange("old-before", 18021, 1));
-    env.wait_for("old-before", PATHS).await;
+#[test]
+fn in_flight_otlp_export_is_refused_after_applied() {
+    t2("in_flight_otlp_export_is_refused_after_applied", 4, async {
+        let env = Env::new("otlp").await;
+        env.feed(&exchange("old-before", 18021, 1));
+        env.wait_for("old-before", PATHS).await;
 
-    let old = env.scope.gate().await.unwrap();
-    let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
-    env.feed(&exchange("old-inflight", 18022, 1));
-    env.wait_for("old-inflight", &["json", "logs"]).await;
-    assert!(
-        hook.wait_reached(WAIT),
-        "no OTLP write reached the pause point"
-    );
+        let old = env.scope.gate().await.unwrap();
+        let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
+        env.feed(&exchange("old-inflight", 18022, 1));
+        env.wait_for("old-inflight", &["json", "logs"]).await;
+        assert!(
+            hook.wait_reached(WAIT),
+            "no OTLP write reached the pause point"
+        );
 
-    env.scope.narrow(2).await;
-    let applied = env.marks();
-    drop(hook);
+        env.scope.narrow(2).await;
+        let applied = env.marks();
+        drop(hook);
 
-    env.feed(&exchange("new-after", 18023, 2));
-    env.wait_for("new-after", &["otlp"]).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    env.assert_absent_after(&applied, "old-");
-    assert!(!contains(&env.otlp.lock().unwrap(), "old-inflight"));
-    env.scope.shutdown().await;
+        env.feed(&exchange("new-after", 18023, 2));
+        env.wait_for("new-after", &["otlp"]).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        env.assert_absent_after(&applied, "old-");
+        assert!(!contains(&env.otlp.lock().unwrap(), "old-inflight"));
+        env.scope.shutdown().await;
+    });
 }
 
 /// A DNS answer the old pipeline inserts after the change never names a
 /// flow the new pipeline exports.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dns_answer_inserted_after_applied_names_nothing_new() {
-    use crate::protocol::dns::test_helpers::{
-        build_dns_query, build_dns_response, encode_dns_name,
-    };
-    let env = Env::new("dns").await;
-    env.feed(&exchange("old-before", 18031, 1));
-    env.wait_for("old-before", PATHS).await;
+#[test]
+fn dns_answer_inserted_after_applied_names_nothing_new() {
+    t2(
+        "dns_answer_inserted_after_applied_names_nothing_new",
+        4,
+        async {
+            use crate::protocol::dns::test_helpers::{
+                build_dns_query, build_dns_response, encode_dns_name,
+            };
+            let env = Env::new("dns").await;
+            env.feed(&exchange("old-before", 18031, 1));
+            env.wait_for("old-before", PATHS).await;
 
-    // old-dns.example -> 10.99.0.1 (SERVER), learned by the old pipeline.
-    let resolver = (0x0A63_0035, 53);
-    let cli = (CLIENT, 5353);
-    let name = "old-dns.example";
-    let q = packet(cli, resolver, 17, &build_dns_query(7, name, 1), 1);
-    let rdata = SERVER.to_be_bytes();
-    let answer = build_dns_response(7, 0, name, 1, &[(&encode_dns_name(name), 1, 300, &rdata)]);
-    let r = packet(resolver, cli, 17, &answer, 1);
+            // old-dns.example -> 10.99.0.1 (SERVER), learned by the old pipeline.
+            let resolver = (0x0A63_0035, 53);
+            let cli = (CLIENT, 5353);
+            let name = "old-dns.example";
+            let q = packet(cli, resolver, 17, &build_dns_query(7, name, 1), 1);
+            let rdata = SERVER.to_be_bytes();
+            let answer =
+                build_dns_response(7, 0, name, 1, &[(&encode_dns_name(name), 1, 300, &rdata)]);
+            let r = packet(resolver, cli, 17, &answer, 1);
 
-    let old = env.scope.gate().await.unwrap();
-    let hook = test_hooks::arm(test_hooks::BEFORE_DNS_INSERT, &old);
-    env.feed(&[q, r]);
-    assert!(
-        hook.wait_reached(WAIT),
-        "worker never reached the DNS insert"
+            let old = env.scope.gate().await.unwrap();
+            let hook = test_hooks::arm(test_hooks::BEFORE_DNS_INSERT, &old);
+            env.feed(&[q, r]);
+            assert!(
+                hook.wait_reached(WAIT),
+                "worker never reached the DNS insert"
+            );
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            drop(hook); // the old pipeline's cache gets the answer now
+
+            env.feed(&exchange("new-after", 18032, 2));
+            env.wait_for(":18032", &["audit"]).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            env.assert_absent_after(&applied, "old-dns");
+            env.assert_absent_after(&applied, "old-");
+            env.scope.shutdown().await;
+        },
     );
-    env.scope.narrow(2).await;
-    let applied = env.marks();
-    drop(hook); // the old pipeline's cache gets the answer now
-
-    env.feed(&exchange("new-after", 18032, 2));
-    env.wait_for(":18032", &["audit"]).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    env.assert_absent_after(&applied, "old-dns");
-    env.assert_absent_after(&applied, "old-");
-    env.scope.shutdown().await;
 }
 
 /// A failed build keeps the floor raised and the old pipeline revoked;
 /// readers drop until a later change builds one (Revision 1 item 7).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_build_drops_everything_until_a_later_change_builds() {
-    let env = Env::new("build").await;
-    let old = env.scope.gate().await.unwrap();
-    env.shared.fail_builds.store(1, Ordering::SeqCst);
-    assert!(!env.scope.narrow(2).await);
-    assert!(old.is_revoked());
-    assert_eq!(env.floor.get(), 2);
-    env.feed(&exchange("lost", 18041, 2));
-    assert!(env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
-    // The next change (here: none, a widening, or a narrowing) builds.
-    assert!(env.scope.ensure_installed().await);
-    env.feed(&exchange("new-after", 18042, 2));
-    env.wait_for("new-after", PATHS).await;
-    env.assert_absent("lost");
-    env.scope.shutdown().await;
+#[test]
+fn failed_build_drops_everything_until_a_later_change_builds() {
+    t2(
+        "failed_build_drops_everything_until_a_later_change_builds",
+        4,
+        async {
+            let env = Env::new("build").await;
+            let old = env.scope.gate().await.unwrap();
+            env.shared.fail_builds.store(1, Ordering::SeqCst);
+            assert!(!env.scope.narrow(2).await);
+            assert!(old.is_revoked());
+            assert_eq!(env.floor.get(), 2);
+            env.feed(&exchange("lost", 18041, 2));
+            assert!(env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
+            // The next change (here: none, a widening, or a narrowing) builds.
+            assert!(env.scope.ensure_installed().await);
+            env.feed(&exchange("new-after", 18042, 2));
+            env.wait_for("new-after", PATHS).await;
+            env.assert_absent("lost");
+            env.scope.shutdown().await;
+        },
+    );
 }
 
 // ── Replay and close records (Stage A1 review) ─────────────────────────
@@ -475,121 +527,170 @@ async fn replay_once(dir: &Path, toml: &str) -> String {
 
 /// Replaying a recording applies the user-space scope rules even with the
 /// cgroup_skb backend (no kernel decided them): rate 0 exports nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_with_cgroup_skb_applies_user_space_scope() {
-    let dir = tmpdir("replay");
-    let cg = "[capture]\nbackend = \"cgroup_skb\"\n";
-    let sampled = format!("sampling_mode = \"connection_sample\"\nsample_rate = 0.0\n{cg}");
-    let out = replay_once(&dir, &sampled).await;
-    assert!(!out.contains("replayed"), "{out}");
-    // Positive control: the same recording unscoped is exported.
-    let out = replay_once(&dir, cg).await;
-    assert!(out.contains("replayed"), "{out}");
-    std::fs::remove_dir_all(&dir).ok();
+#[test]
+fn replay_with_cgroup_skb_applies_user_space_scope() {
+    t2(
+        "replay_with_cgroup_skb_applies_user_space_scope",
+        2,
+        async {
+            let dir = tmpdir("replay");
+            let cg = "[capture]\nbackend = \"cgroup_skb\"\n";
+            let sampled = format!("sampling_mode = \"connection_sample\"\nsample_rate = 0.0\n{cg}");
+            let out = replay_once(&dir, &sampled).await;
+            assert!(!out.contains("replayed"), "{out}");
+            // Positive control: the same recording unscoped is exported.
+            let out = replay_once(&dir, cg).await;
+            assert!(out.contains("replayed"), "{out}");
+            std::fs::remove_dir_all(&dir).ok();
+        },
+    );
 }
 
 /// Live cgroup_skb close records free state, count as processed and reach
 /// no output.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_close_records_are_counted_and_reach_no_output() {
-    let dir = tmpdir("close");
-    let (endpoint, _otlp) = collector().await;
-    let mut cfg = config(&dir, &endpoint);
-    cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
-    let shared = Arc::new(
-        Shared::open(
-            cfg,
-            Arc::new(PrivacyGate::new(PrivacyMode::Full)),
-            None,
-            "info".into(),
-        )
-        .unwrap(),
+#[test]
+fn live_close_records_are_counted_and_reach_no_output() {
+    t2(
+        "live_close_records_are_counted_and_reach_no_output",
+        4,
+        async {
+            let dir = tmpdir("close");
+            let (endpoint, _otlp) = collector().await;
+            let mut cfg = config(&dir, &endpoint);
+            cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
+            let shared = Arc::new(
+                Shared::open(
+                    cfg,
+                    Arc::new(PrivacyGate::new(PrivacyMode::Full)),
+                    None,
+                    "info".into(),
+                )
+                .unwrap(),
+            );
+            let floor = AdmissionFloor::default();
+            let scope = Scope::start(Arc::clone(&shared), floor.clone()).unwrap();
+            let mut close = packet((CLIENT, 40_001), (SERVER, 18061), 6, b"close-marker", 0);
+            close.event_type = EventType::SockClose;
+            let slot = scope.slot();
+            let mut a = crate::event_loop::Admission::new(&slot, &floor, &shared.stats, 0, 1);
+            a.offer(&close, &RateLimiter::new(0));
+            a.finish();
+            for _ in 0..100 {
+                if shared.stats.events_processed.load(Ordering::Relaxed) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(shared.stats.events_processed.load(Ordering::Relaxed), 1);
+            scope.shutdown().await;
+            let raw = std::fs::read(dir.join("raw.pncap")).unwrap();
+            assert!(!contains(&raw, "close-marker"));
+            std::fs::remove_dir_all(&dir).ok();
+        },
     );
-    let floor = AdmissionFloor::default();
-    let scope = Scope::start(Arc::clone(&shared), floor.clone()).unwrap();
-    let mut close = packet((CLIENT, 40_001), (SERVER, 18061), 6, b"close-marker", 0);
-    close.event_type = EventType::SockClose;
-    let slot = scope.slot();
-    let mut a = crate::event_loop::Admission::new(&slot, &floor, &shared.stats, 0, 1);
-    a.offer(&close, &RateLimiter::new(0));
-    a.finish();
-    for _ in 0..100 {
-        if shared.stats.events_processed.load(Ordering::Relaxed) == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(shared.stats.events_processed.load(Ordering::Relaxed), 1);
-    scope.shutdown().await;
-    let raw = std::fs::read(dir.join("raw.pncap")).unwrap();
-    assert!(!contains(&raw, "close-marker"));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ── The scope publisher ────────────────────────────────────────────────
+
+/// In-memory `CGROUP_ALLOW` / `CONFIG`, with injected failures.
+#[derive(Default)]
+struct FakeMaps {
+    ids: BTreeSet<u64>,
+    generation: u64,
+    disarmed: bool,
+    fail_publish: bool,
+    fail_disarm: bool,
+}
+
+#[derive(Clone, Default)]
+struct Maps(Arc<Mutex<FakeMaps>>);
+
+impl crate::scope_select::AllowMap for FakeMaps {
+    fn insert(&mut self, id: u64) -> anyhow::Result<()> {
+        if self.fail_publish {
+            anyhow::bail!("injected insert failure");
+        }
+        self.ids.insert(id);
+        Ok(())
+    }
+    fn remove(&mut self, id: u64) -> anyhow::Result<()> {
+        if self.fail_publish {
+            anyhow::bail!("injected remove failure");
+        }
+        self.ids.remove(&id);
+        Ok(())
+    }
+    fn bump_gen(&mut self) -> anyhow::Result<()> {
+        self.generation += 1;
+        Ok(())
+    }
+    fn ids(&mut self) -> anyhow::Result<BTreeSet<u64>> {
+        Ok(self.ids.clone())
+    }
+    fn generation(&mut self) -> anyhow::Result<u64> {
+        Ok(self.generation)
+    }
+    fn disarm(&mut self) -> anyhow::Result<()> {
+        if self.fail_disarm {
+            anyhow::bail!("injected disarm failure");
+        }
+        self.disarmed = true;
+        Ok(())
+    }
+}
+
+impl crate::scope_publisher::ScopeMaps for Maps {
+    fn with(
+        &mut self,
+        f: &mut dyn FnMut(&mut dyn crate::scope_select::AllowMap) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        f(&mut *self.0.lock().unwrap())
+    }
+}
+
+/// The publisher task ending in any way while the agent runs (a panic, an
+/// error, a return) is a fatal stop: kernel disarmed, pipeline revoked; a
+/// failed disarm is reported with the exit error.
+#[test]
+fn publisher_ending_any_way_is_a_fatal_stop() {
+    t2("publisher_ending_any_way_is_a_fatal_stop", 4, async {
+        for (case, disarm_fails) in [("panic", false), ("return", false), ("error", true)] {
+            let env = Env::new(&format!("supervise-{case}")).await;
+            let maps = Maps::default();
+            maps.0.lock().unwrap().fail_disarm = disarm_fails;
+            let gate = env.scope.gate().await.unwrap();
+            let task = tokio::spawn(async move {
+                match case {
+                    "panic" => panic!("a publisher bug"),
+                    "return" => Ok(()),
+                    _ => Err(anyhow::anyhow!("publication failed")),
+                }
+            });
+            let e = crate::scope_publisher::supervise(task, maps.clone(), &env.scope).await;
+            let e = format!("{e:#}");
+            assert!(gate.is_revoked(), "{case}");
+            assert!(
+                env.scope.gate().await.is_none(),
+                "{case}: no pipeline after"
+            );
+            assert_eq!(maps.0.lock().unwrap().disarmed, !disarm_fails, "{case}");
+            assert_eq!(
+                e.contains("disarming the kernel failed"),
+                disarm_fails,
+                "{e}"
+            );
+            env.feed(&exchange("after-stop", 18081, 0));
+            assert!(env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
+            env.scope.shutdown().await;
+        }
+    });
+}
 
 /// The publisher resolves cgroups with openat2 (`scope_select::resolve`):
 /// Linux only.
 #[cfg(target_os = "linux")]
 mod publisher {
     use super::*;
-    use std::collections::BTreeSet;
-
-    /// In-memory `CGROUP_ALLOW` / `CONFIG`, with injected failures.
-    #[derive(Default)]
-    struct FakeMaps {
-        ids: BTreeSet<u64>,
-        generation: u64,
-        disarmed: bool,
-        fail_publish: bool,
-        fail_disarm: bool,
-    }
-
-    #[derive(Clone, Default)]
-    struct Maps(Arc<Mutex<FakeMaps>>);
-
-    impl crate::scope_select::AllowMap for FakeMaps {
-        fn insert(&mut self, id: u64) -> anyhow::Result<()> {
-            if self.fail_publish {
-                anyhow::bail!("injected insert failure");
-            }
-            self.ids.insert(id);
-            Ok(())
-        }
-        fn remove(&mut self, id: u64) -> anyhow::Result<()> {
-            if self.fail_publish {
-                anyhow::bail!("injected remove failure");
-            }
-            self.ids.remove(&id);
-            Ok(())
-        }
-        fn bump_gen(&mut self) -> anyhow::Result<()> {
-            self.generation += 1;
-            Ok(())
-        }
-        fn ids(&mut self) -> anyhow::Result<BTreeSet<u64>> {
-            Ok(self.ids.clone())
-        }
-        fn generation(&mut self) -> anyhow::Result<u64> {
-            Ok(self.generation)
-        }
-        fn disarm(&mut self) -> anyhow::Result<()> {
-            if self.fail_disarm {
-                anyhow::bail!("injected disarm failure");
-            }
-            self.disarmed = true;
-            Ok(())
-        }
-    }
-
-    impl crate::scope_publisher::ScopeMaps for Maps {
-        fn with(
-            &mut self,
-            f: &mut dyn FnMut(&mut dyn crate::scope_select::AllowMap) -> anyhow::Result<()>,
-        ) -> anyhow::Result<()> {
-            f(&mut *self.0.lock().unwrap())
-        }
-    }
 
     const UID_A: &str = "0f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
     const UID_B: &str = "1f3c1a2b-4d5e-6f70-8192-a3b4c5d6e7f8";
@@ -676,183 +777,224 @@ mod publisher {
     /// Stage A6 review, HIGH 1: a pod whose labels stop matching leaves
     /// CGROUP_ALLOW, as a narrowing (the pipeline is revoked); a pod that
     /// starts matching is added (a widening, no revocation).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pod_label_change_narrows_and_revokes() {
-        let p = PubEnv::new("pods").await;
-        let a = ino(&p.root.join(format!("kubepods/pod{UID_A}")));
-        let b = ino(&p.root.join(format!("kubepods/pod{UID_B}")));
-        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "web")]);
-        let mut publisher = p.publisher(&[], &[app_filter("co")]);
-        publisher.pods_changed().await.unwrap();
-        assert_eq!(p.ids(), BTreeSet::from([a]));
-        let first = p.env.scope.gate().await.unwrap();
+    #[test]
+    fn pod_label_change_narrows_and_revokes() {
+        t2("pod_label_change_narrows_and_revokes", 4, async {
+            let p = PubEnv::new("pods").await;
+            let a = ino(&p.root.join(format!("kubepods/pod{UID_A}")));
+            let b = ino(&p.root.join(format!("kubepods/pod{UID_B}")));
+            p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "web")]);
+            let mut publisher = p.publisher(&[], &[app_filter("co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids(), BTreeSet::from([a]));
+            let first = p.env.scope.gate().await.unwrap();
 
-        // b starts matching: widening, same pipeline.
-        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
-        publisher.pods_changed().await.unwrap();
-        assert_eq!(p.ids(), BTreeSet::from([a, b]));
-        assert!(!first.is_revoked());
+            // b starts matching: widening, same pipeline.
+            p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids(), BTreeSet::from([a, b]));
+            assert!(!first.is_revoked());
 
-        // a's labels change: narrowing, floor raised, old pipeline revoked.
-        p.set_pods(&[pod("a", UID_A, "web"), pod("b", UID_B, "co")]);
-        publisher.pods_changed().await.unwrap();
-        assert_eq!(p.ids(), BTreeSet::from([b]));
-        assert!(first.is_revoked());
-        let generation = p.maps.0.lock().unwrap().generation as u32;
-        assert_eq!(p.env.floor.get(), generation);
-        let second = p.env.scope.gate().await.unwrap();
-        assert!(!second.is_revoked());
+            // a's labels change: narrowing, floor raised, old pipeline revoked.
+            p.set_pods(&[pod("a", UID_A, "web"), pod("b", UID_B, "co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids(), BTreeSet::from([b]));
+            assert!(first.is_revoked());
+            let generation = p.maps.0.lock().unwrap().generation as u32;
+            assert_eq!(p.env.floor.get(), generation);
+            let second = p.env.scope.gate().await.unwrap();
+            assert!(!second.is_revoked());
 
-        // b is deleted: narrowing to nothing.
-        p.set_pods(&[pod("a", UID_A, "web")]);
-        publisher.pods_changed().await.unwrap();
-        assert!(p.ids().is_empty());
-        assert!(second.is_revoked());
-        p.env.scope.shutdown().await;
+            // b is deleted: narrowing to nothing.
+            p.set_pods(&[pod("a", UID_A, "web")]);
+            publisher.pods_changed().await.unwrap();
+            assert!(p.ids().is_empty());
+            assert!(second.is_revoked());
+            p.env.scope.shutdown().await;
+        });
     }
 
     /// Reloads are serialised: two narrowings in either order and a widening
     /// racing a narrowing all end in the last requested set, each reported
     /// only once applied.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reloads_are_serialised_and_reported_after_applied() {
-        use crate::scope_publisher::{ScopeMsg, run};
-        let p = PubEnv::new("reload").await;
-        let (sys, other) = (
-            ino(&p.root.join("system.slice")),
-            ino(&p.root.join("other.slice")),
+    #[test]
+    fn reloads_are_serialised_and_reported_after_applied() {
+        t2(
+            "reloads_are_serialised_and_reported_after_applied",
+            4,
+            async {
+                use crate::scope_publisher::{ScopeMsg, run};
+                let p = PubEnv::new("reload").await;
+                let (sys, other) = (
+                    ino(&p.root.join("system.slice")),
+                    ino(&p.root.join("other.slice")),
+                );
+                let both = vec!["system.slice".to_string(), "other.slice".to_string()];
+                p.maps.0.lock().unwrap().ids = BTreeSet::from([sys, other]);
+                let publisher = p.publisher(&both, &[]);
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                let task = tokio::spawn(run(publisher, rx));
+
+                let reload = |paths: &[&str]| {
+                    let (reply, applied) = tokio::sync::oneshot::channel();
+                    let msg = ScopeMsg::Reload {
+                        cgroup_filter: Some(paths.iter().map(|s| s.to_string()).collect()),
+                        pod_filter: None,
+                        reply,
+                    };
+                    (msg, applied)
+                };
+                let first = p.env.scope.gate().await.unwrap();
+                // Narrow to `other`, then (sent before the first is applied) to
+                // `system`: processed in order, each its own revocation.
+                let (m1, a1) = reload(&["other.slice"]);
+                let (m2, a2) = reload(&["system.slice"]);
+                tx.send(m1).await.unwrap();
+                tx.send(m2).await.unwrap();
+                assert_eq!(a1.await.unwrap(), Ok(()));
+                assert!(
+                    first.is_revoked(),
+                    "reported applied only after the revocation"
+                );
+                assert_eq!(a2.await.unwrap(), Ok(()));
+                assert_eq!(p.ids(), BTreeSet::from([sys]));
+
+                // A widening racing a narrowing: the last one wins, the narrowing
+                // revokes the pipeline the widening left in place.
+                let second = p.env.scope.gate().await.unwrap();
+                let (m3, a3) = reload(&["system.slice", "other.slice"]);
+                let (m4, a4) = reload(&["other.slice"]);
+                tx.send(m3).await.unwrap();
+                tx.send(m4).await.unwrap();
+                assert_eq!(a3.await.unwrap(), Ok(()));
+                assert_eq!(a4.await.unwrap(), Ok(()));
+                assert_eq!(p.ids(), BTreeSet::from([other]));
+                assert!(second.is_revoked());
+                assert_eq!(
+                    p.env.floor.get(),
+                    p.maps.0.lock().unwrap().generation as u32
+                );
+
+                // A selector that does not resolve is rejected; nothing changes.
+                let (m5, a5) = reload(&["missing.slice"]);
+                tx.send(m5).await.unwrap();
+                assert!(a5.await.unwrap().is_err());
+                assert_eq!(p.ids(), BTreeSet::from([other]));
+
+                drop(tx);
+                task.await.unwrap().unwrap();
+                p.env.scope.shutdown().await;
+            },
         );
-        let both = vec!["system.slice".to_string(), "other.slice".to_string()];
-        p.maps.0.lock().unwrap().ids = BTreeSet::from([sys, other]);
-        let publisher = p.publisher(&both, &[]);
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let task = tokio::spawn(run(publisher, rx));
-
-        let reload = |paths: &[&str]| {
-            let (reply, applied) = tokio::sync::oneshot::channel();
-            let msg = ScopeMsg::Reload {
-                cgroup_filter: Some(paths.iter().map(|s| s.to_string()).collect()),
-                pod_filter: None,
-                reply,
-            };
-            (msg, applied)
-        };
-        let first = p.env.scope.gate().await.unwrap();
-        // Narrow to `other`, then (sent before the first is applied) to
-        // `system`: processed in order, each its own revocation.
-        let (m1, a1) = reload(&["other.slice"]);
-        let (m2, a2) = reload(&["system.slice"]);
-        tx.send(m1).await.unwrap();
-        tx.send(m2).await.unwrap();
-        assert_eq!(a1.await.unwrap(), Ok(()));
-        assert!(
-            first.is_revoked(),
-            "reported applied only after the revocation"
-        );
-        assert_eq!(a2.await.unwrap(), Ok(()));
-        assert_eq!(p.ids(), BTreeSet::from([sys]));
-
-        // A widening racing a narrowing: the last one wins, the narrowing
-        // revokes the pipeline the widening left in place.
-        let second = p.env.scope.gate().await.unwrap();
-        let (m3, a3) = reload(&["system.slice", "other.slice"]);
-        let (m4, a4) = reload(&["other.slice"]);
-        tx.send(m3).await.unwrap();
-        tx.send(m4).await.unwrap();
-        assert_eq!(a3.await.unwrap(), Ok(()));
-        assert_eq!(a4.await.unwrap(), Ok(()));
-        assert_eq!(p.ids(), BTreeSet::from([other]));
-        assert!(second.is_revoked());
-        assert_eq!(
-            p.env.floor.get(),
-            p.maps.0.lock().unwrap().generation as u32
-        );
-
-        // A selector that does not resolve is rejected; nothing changes.
-        let (m5, a5) = reload(&["missing.slice"]);
-        tx.send(m5).await.unwrap();
-        assert!(a5.await.unwrap().is_err());
-        assert_eq!(p.ids(), BTreeSet::from([other]));
-
-        drop(tx);
-        task.await.unwrap().unwrap();
-        p.env.scope.shutdown().await;
     }
 
     /// The net_cls watch's narrowing is sticky: later pod changes cannot
     /// re-widen.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn net_cls_disable_is_a_sticky_narrowing() {
-        let p = PubEnv::new("netcls").await;
-        p.set_pods(&[pod("a", UID_A, "co")]);
-        let mut publisher = p.publisher(&["system.slice".into()], &[app_filter("co")]);
-        publisher.pods_changed().await.unwrap();
-        assert_eq!(p.ids().len(), 2);
-        let first = p.env.scope.gate().await.unwrap();
-        publisher
-            .handle(crate::scope_publisher::ScopeMsg::Disable("test".into()))
-            .await
-            .unwrap();
-        assert!(p.ids().is_empty());
-        assert!(first.is_revoked());
-        p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
-        publisher.pods_changed().await.unwrap();
-        assert!(p.ids().is_empty());
-        p.env.scope.shutdown().await;
+    #[test]
+    fn net_cls_disable_is_a_sticky_narrowing() {
+        t2("net_cls_disable_is_a_sticky_narrowing", 4, async {
+            let p = PubEnv::new("netcls").await;
+            p.set_pods(&[pod("a", UID_A, "co")]);
+            let mut publisher = p.publisher(&["system.slice".into()], &[app_filter("co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids().len(), 2);
+            let first = p.env.scope.gate().await.unwrap();
+            publisher
+                .handle(crate::scope_publisher::ScopeMsg::Disable("test".into()))
+                .await
+                .unwrap();
+            assert!(p.ids().is_empty());
+            assert!(first.is_revoked());
+            p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
+            publisher.pods_changed().await.unwrap();
+            assert!(p.ids().is_empty());
+            p.env.scope.shutdown().await;
+        });
     }
 
     /// Stage A6 review, HIGH 2: a failed runtime publication disarms the
     /// kernel and revokes the pipeline before the stop is logged; nothing is
     /// published afterwards. A failed disarm makes the task fail (the agent
     /// exits).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn publication_failure_is_a_fatal_capture_stop() {
-        let p = PubEnv::new("fatal").await;
-        p.set_pods(&[pod("a", UID_A, "co")]);
-        let mut publisher = p.publisher(&[], &[app_filter("co")]);
-        publisher.pods_changed().await.unwrap();
-        let gate = p.env.scope.gate().await.unwrap();
+    #[test]
+    fn publication_failure_is_a_fatal_capture_stop() {
+        t2("publication_failure_is_a_fatal_capture_stop", 4, async {
+            let p = PubEnv::new("fatal").await;
+            p.set_pods(&[pod("a", UID_A, "co")]);
+            let mut publisher = p.publisher(&[], &[app_filter("co")]);
+            publisher.pods_changed().await.unwrap();
+            let gate = p.env.scope.gate().await.unwrap();
 
-        p.maps.0.lock().unwrap().fail_publish = true;
-        p.set_pods(&[]);
-        publisher.pods_changed().await.unwrap();
-        assert!(publisher.is_stopped());
-        assert!(p.maps.0.lock().unwrap().disarmed);
-        assert!(gate.is_revoked());
-        assert!(p.env.scope.gate().await.is_none());
-        p.env.feed(&exchange("after-stop", 18071, 99));
-        assert!(p.env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
-        // Nothing more is published, and a reload is refused.
-        p.maps.0.lock().unwrap().fail_publish = false;
-        p.set_pods(&[pod("b", UID_B, "co")]);
-        publisher.pods_changed().await.unwrap();
-        assert_eq!(p.ids().len(), 1, "unchanged since the failure");
-        let (reply, rejected) = tokio::sync::oneshot::channel();
-        publisher
-            .handle(crate::scope_publisher::ScopeMsg::Reload {
-                cgroup_filter: None,
-                pod_filter: Some(vec![app_filter("co")]),
-                reply,
-            })
-            .await
-            .unwrap();
-        assert!(rejected.await.unwrap().is_err());
+            p.maps.0.lock().unwrap().fail_publish = true;
+            p.set_pods(&[]);
+            publisher.pods_changed().await.unwrap();
+            assert!(publisher.is_stopped());
+            assert!(p.maps.0.lock().unwrap().disarmed);
+            assert!(gate.is_revoked());
+            assert!(p.env.scope.gate().await.is_none());
+            p.env.feed(&exchange("after-stop", 18071, 99));
+            assert!(p.env.shared.stats.drops_no_pipeline.load(Ordering::Relaxed) >= 2);
+            // Nothing more is published, and a reload is refused.
+            p.maps.0.lock().unwrap().fail_publish = false;
+            p.set_pods(&[pod("b", UID_B, "co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids().len(), 1, "unchanged since the failure");
+            let (reply, rejected) = tokio::sync::oneshot::channel();
+            publisher
+                .handle(crate::scope_publisher::ScopeMsg::Reload {
+                    cgroup_filter: None,
+                    pod_filter: Some(vec![app_filter("co")]),
+                    reply,
+                })
+                .await
+                .unwrap();
+            assert!(rejected.await.unwrap().is_err());
 
-        // Disarming fails too: the publisher reports it, for the agent to exit.
-        let q = PubEnv::new("fatal2").await;
-        q.set_pods(&[pod("a", UID_A, "co")]);
-        let mut publisher = q.publisher(&[], &[app_filter("co")]);
-        publisher.pods_changed().await.unwrap();
-        {
-            let mut m = q.maps.0.lock().unwrap();
-            m.fail_publish = true;
-            m.fail_disarm = true;
-        }
-        q.set_pods(&[]);
-        assert!(publisher.pods_changed().await.is_err());
-        assert!(
-            q.env.scope.gate().await.is_none(),
-            "pipeline revoked anyway"
-        );
+            // Disarming fails too: the publisher reports it, for the agent to exit.
+            let q = PubEnv::new("fatal2").await;
+            q.set_pods(&[pod("a", UID_A, "co")]);
+            let mut publisher = q.publisher(&[], &[app_filter("co")]);
+            publisher.pods_changed().await.unwrap();
+            {
+                let mut m = q.maps.0.lock().unwrap();
+                m.fail_publish = true;
+                m.fail_disarm = true;
+            }
+            q.set_pods(&[]);
+            assert!(publisher.pods_changed().await.is_err());
+            assert!(
+                q.env.scope.gate().await.is_none(),
+                "pipeline revoked anyway"
+            );
+        });
+    }
+
+    /// The publisher subscribes to Kubernetes changes when it is created:
+    /// a change after the first reconciliation (run by the agent before it
+    /// starts the readers) and before the task runs is applied.
+    #[test]
+    fn a_change_before_the_task_starts_is_not_missed() {
+        t2("a_change_before_the_task_starts_is_not_missed", 4, async {
+            let p = PubEnv::new("startup").await;
+            let a = ino(&p.root.join(format!("kubepods/pod{UID_A}")));
+            let b = ino(&p.root.join(format!("kubepods/pod{UID_B}")));
+            p.set_pods(&[pod("a", UID_A, "co")]);
+            let mut publisher = p.publisher(&[], &[app_filter("co")]);
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(p.ids(), BTreeSet::from([a]));
+            p.set_pods(&[pod("a", UID_A, "co"), pod("b", UID_B, "co")]);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(crate::scope_publisher::run(publisher, rx));
+            for _ in 0..100 {
+                if p.ids().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(p.ids(), BTreeSet::from([a, b]));
+            drop(tx);
+            task.await.unwrap().unwrap();
+            p.env.scope.shutdown().await;
+        });
     }
 }

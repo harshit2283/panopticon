@@ -28,7 +28,8 @@ mod protocol;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
-#[cfg(target_os = "linux")]
+// Driven by the Linux capture path only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod scope_publisher;
 mod scope_select;
 #[cfg(test)]
@@ -442,7 +443,7 @@ async fn main() -> Result<()> {
             loader::scope_config(&agent_config).0 & panopticon_common::scope::SCOPE_SEL_CGROUP != 0;
         let (scope_tx, publisher_handle) = match (&cgroup_root, cgroup_selector) {
             (Some(root), true) => {
-                let publisher = scope_publisher::Publisher::new(
+                let mut publisher = scope_publisher::Publisher::new(
                     scope_publisher::AyaMaps(Arc::clone(&shared_ebpf)),
                     Arc::clone(&scope),
                     root.clone(),
@@ -452,6 +453,13 @@ async fn main() -> Result<()> {
                     agent_config.pod_filter.as_deref().unwrap_or_default(),
                 )
                 .context("cannot start the scope publisher")?;
+                // The first reconciliation (pods may have changed since
+                // startup selected them), before the readers start and
+                // before the agent reports ready. Err: disarming failed.
+                publisher
+                    .pods_changed()
+                    .await
+                    .context("scope publisher: first reconciliation failed")?;
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 // §3.2: the cgroup selector stops admitting if a v1
                 // net_cls/net_prio hierarchy appears at runtime (refused at
@@ -649,8 +657,7 @@ async fn main() -> Result<()> {
             outcome = smoke_test_wait(smoke_test, &event_stats) => {
                 exit_result = outcome;
             }
-            e = publisher_failed(publisher_handle) => {
-                tracing::error!(error = %format!("{e:#}"), "Scope publisher failed; exiting");
+            e = publisher_failed(publisher_handle, &shared_ebpf, &scope) => {
                 exit_result = Err(e);
             }
         }
@@ -706,16 +713,21 @@ fn check_prctl(ret: i32) -> Result<()> {
     Ok(())
 }
 
-/// The publisher's error, if it ends with one (the agent must exit then);
-/// never resolves otherwise.
+/// The publisher task ending, for any reason, is a fatal capture stop
+/// (disarm, revoke, log): resolves with the error the agent exits with.
+/// Never resolves without a publisher.
 #[cfg(target_os = "linux")]
-async fn publisher_failed(handle: Option<tokio::task::JoinHandle<Result<()>>>) -> anyhow::Error {
-    if let Some(h) = handle
-        && let Ok(Err(e)) = h.await
-    {
-        return e;
+async fn publisher_failed(
+    handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    ebpf: &Arc<std::sync::Mutex<loader::EbpfState>>,
+    scope: &pipeline::Scope,
+) -> anyhow::Error {
+    match handle {
+        Some(h) => {
+            scope_publisher::supervise(h, scope_publisher::AyaMaps(Arc::clone(ebpf)), scope).await
+        }
+        None => std::future::pending().await,
     }
-    std::future::pending().await
 }
 
 /// The log filter directives: `debug` with `--verbose`, else `RUST_LOG`

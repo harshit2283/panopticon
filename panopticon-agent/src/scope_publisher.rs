@@ -20,13 +20,22 @@
 //! only then is the stop logged. If disarming fails, [`run`] returns an
 //! error and the agent exits (its programs are never pinned, so they
 //! detach with it).
+//!
+//! The publisher task ending any other way (a panic, an error, or its
+//! channel closing while the agent runs) is also a fatal stop, run by
+//! [`supervise`], after which the agent exits.
+//!
+//! Startup: the publisher subscribes to Kubernetes changes when it is
+//! created, then the agent runs the first reconciliation
+//! ([`Publisher::pods_changed`]) before it starts the ring readers or
+//! reports ready.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::config::PodFilter;
@@ -67,6 +76,9 @@ pub struct Publisher<M> {
     disabled: Option<String>,
     /// After a fatal stop: nothing more is published.
     stopped: bool,
+    /// Kubernetes change notifications, subscribed at creation so that no
+    /// change after the first reconciliation is missed.
+    pods_rx: Option<watch::Receiver<u64>>,
 }
 
 impl<M: ScopeMaps> Publisher<M> {
@@ -87,6 +99,7 @@ impl<M: ScopeMaps> Publisher<M> {
             Ok(())
         })?;
         Ok(Self {
+            pods_rx: k8s.as_ref().map(|m| m.subscribe()),
             cgroup_ids: resolve(&root, cgroup_filter, &[])?.ids,
             maps,
             scope,
@@ -266,8 +279,7 @@ impl<M: ScopeMaps> Publisher<M> {
     /// when disarming failed: the agent must exit.
     async fn fatal_stop(&mut self, why: String) -> Result<()> {
         self.stopped = true;
-        let disarmed = self.maps.with(&mut |m| m.disarm());
-        self.scope.stop().await;
+        let disarmed = stop_capture(&mut self.maps, &self.scope).await;
         match disarmed {
             Ok(()) => {
                 error!(
@@ -289,14 +301,21 @@ impl<M: ScopeMaps> Publisher<M> {
     }
 }
 
-/// The publisher task. Returns an error only when the agent must exit.
+/// Disarm the kernel on every capture path, then revoke the current
+/// pipeline (for good). Returns the disarm's result.
+pub async fn stop_capture<M: ScopeMaps>(maps: &mut M, scope: &Scope) -> Result<()> {
+    let disarmed = maps.with(&mut |m| m.disarm());
+    scope.stop().await;
+    disarmed
+}
+
+/// The publisher task, after the first reconciliation (see the module
+/// docs). Returns an error only when the agent must exit.
 pub async fn run<M: ScopeMaps>(
     mut publisher: Publisher<M>,
     mut rx: mpsc::Receiver<ScopeMsg>,
 ) -> Result<()> {
-    let mut pods = publisher.k8s.as_ref().map(|m| m.subscribe());
-    // Pods may have changed since startup selected them.
-    publisher.pods_changed().await?;
+    let mut pods = publisher.pods_rx.take();
     loop {
         let pods_changed = async {
             match pods.as_mut() {
@@ -317,6 +336,33 @@ pub async fn run<M: ScopeMaps>(
                 }
             }
         }
+    }
+}
+
+/// Wait for the publisher task (`task`). It never ends while the agent
+/// runs, so any end (an error, a panic, or a return) is a fatal stop:
+/// disarm through `maps`, revoke `scope`, then log. Returns the error the
+/// agent exits with.
+pub async fn supervise<M: ScopeMaps>(
+    task: tokio::task::JoinHandle<Result<()>>,
+    mut maps: M,
+    scope: &Scope,
+) -> anyhow::Error {
+    let why = match task.await {
+        Ok(Ok(())) => anyhow::anyhow!("the scope publisher stopped"),
+        Ok(Err(e)) => e,
+        Err(e) if e.is_panic() => anyhow::anyhow!("the scope publisher panicked"),
+        Err(_) => anyhow::anyhow!("the scope publisher was cancelled"),
+    };
+    let disarmed = stop_capture(&mut maps, scope).await;
+    error!(
+        reason = %format!("{why:#}"),
+        disarmed = disarmed.is_ok(),
+        "Scope publisher ended: capture stopped (pipeline revoked); exiting"
+    );
+    match disarmed {
+        Ok(()) => why,
+        Err(e) => why.context(format!("disarming the kernel failed too ({e:#})")),
     }
 }
 
