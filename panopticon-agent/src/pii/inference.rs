@@ -10,13 +10,17 @@ use super::tokenizer::{PiiTokenizer, TokenizedInput};
 use super::{PiiCategory, PiiEntity, PiiSource};
 
 /// ONNX inference engine for NER-based PII detection. The model session
-/// is immutable and shared by every capture pipeline; the tokenizer may
-/// cache inputs (BPE), so each pipeline loads its own
-/// ([`for_pipeline`](Self::for_pipeline), Revision 1 item 6).
+/// is shared by every capture pipeline; the tokenizer may cache inputs
+/// (BPE), so each pipeline builds its own
+/// ([`for_pipeline`](Self::for_pipeline), Revision 1 item 6) from the
+/// tokenizer.json bytes read and validated once at startup.
 pub struct OnnxInference {
-    session: std::sync::Arc<Session>,
+    // ponytail: one session behind a mutex (ort's `run` takes `&mut`)
+    // serialises inference across workers, within the inference sampler's
+    // budget; a session per worker if ML throughput ever matters.
+    session: std::sync::Arc<std::sync::Mutex<Session>>,
     tokenizer: PiiTokenizer,
-    tokenizer_path: String,
+    tokenizer_json: std::sync::Arc<[u8]>,
     /// Label mapping from model output indices to NER labels.
     labels: Vec<NerLabel>,
 }
@@ -31,7 +35,10 @@ impl OnnxInference {
             .commit_from_file(model_path)
             .context("Failed to load ONNX model")?;
 
-        let tokenizer = PiiTokenizer::from_file(tokenizer_path)?;
+        let tokenizer_json: std::sync::Arc<[u8]> = std::fs::read(tokenizer_path)
+            .with_context(|| format!("cannot read the tokenizer {tokenizer_path}"))?
+            .into();
+        let tokenizer = PiiTokenizer::from_bytes(&tokenizer_json)?;
 
         // Standard DistilBERT-NER label order
         let labels = vec![
@@ -49,19 +56,20 @@ impl OnnxInference {
         info!(model = model_path, "ONNX NER model loaded");
 
         Ok(Self {
-            session: std::sync::Arc::new(session),
+            session: std::sync::Arc::new(std::sync::Mutex::new(session)),
             tokenizer,
-            tokenizer_path: tokenizer_path.to_string(),
+            tokenizer_json,
             labels,
         })
     }
 
-    /// The shared model with a freshly loaded tokenizer.
+    /// The shared model with a fresh tokenizer, built from the startup
+    /// bytes (never re-read from disk). An error fails the pipeline build.
     pub fn for_pipeline(&self) -> Result<Self> {
         Ok(Self {
             session: std::sync::Arc::clone(&self.session),
-            tokenizer: PiiTokenizer::from_file(&self.tokenizer_path)?,
-            tokenizer_path: self.tokenizer_path.clone(),
+            tokenizer: PiiTokenizer::from_bytes(&self.tokenizer_json)?,
+            tokenizer_json: std::sync::Arc::clone(&self.tokenizer_json),
             labels: self.labels.clone(),
         })
     }
@@ -80,16 +88,21 @@ impl OnnxInference {
         let attention_mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask)
             .context("Failed to create attention_mask array")?;
 
-        let outputs = self
-            .session
-            .run(ort::inputs![input_ids_array, attention_mask_array]?)
+        let input_ids_tensor = ort::value::Tensor::from_array(input_ids_array)
+            .context("Failed to create input_ids tensor")?;
+        let attention_mask_tensor = ort::value::Tensor::from_array(attention_mask_array)
+            .context("Failed to create attention_mask tensor")?;
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let outputs = session
+            .run(ort::inputs![input_ids_tensor, attention_mask_tensor])
             .context("ONNX inference failed")?;
 
-        // Output shape: (1, seq_len, num_labels)
-        let logits = outputs[0]
+        // Output shape: (1, seq_len, num_labels), row-major.
+        let (_shape, logits) = outputs[0]
             .try_extract_tensor::<f32>()
             .context("Failed to extract logits tensor")?;
-        let logits_view = logits.view();
+        let n_labels = self.labels.len();
+        let at = |i: usize, j: usize| logits[i * n_labels + j];
 
         // Argmax + softmax confidence per token
         let mut bio_labels: Vec<(NerLabel, f32)> = Vec::with_capacity(seq_len);
@@ -100,7 +113,7 @@ impl OnnxInference {
 
             // Find max for numerical stability
             for j in 0..self.labels.len() {
-                let val = logits_view[[0, i, j]];
+                let val = at(i, j);
                 if val > max_val {
                     max_val = val;
                     max_idx = j;
@@ -109,7 +122,7 @@ impl OnnxInference {
 
             // Softmax for confidence
             for j in 0..self.labels.len() {
-                sum_exp += (logits_view[[0, i, j]] - max_val).exp();
+                sum_exp += (at(i, j) - max_val).exp();
             }
             let confidence = 1.0 / sum_exp; // exp(0) / sum_exp
 

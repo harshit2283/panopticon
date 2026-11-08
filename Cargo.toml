@@ -48,8 +48,8 @@ mimalloc = { version = "0.1", default-features = false }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
 # ML inference (Phase 5 — optional)
-ort = { version = "2.0.0-rc.11", default-features = false }
-tokenizers = { version = "0.20", default-features = false }
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "std"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 # Service graph (Phase 6)
 petgraph = { version = "0.6", default-features = false }

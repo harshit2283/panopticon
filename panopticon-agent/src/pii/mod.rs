@@ -286,23 +286,22 @@ impl PiiEngine {
         &self,
         gate: Arc<crate::io_gate::IoGate>,
         dispatch: tracing::Dispatch,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             config: self.config.clone(),
             regex: Arc::clone(&self.regex),
             sampler: Arc::new(InferenceSampler::new(self.max_inferences)),
             max_inferences: self.max_inferences,
             external: self.external_client(gate, dispatch),
             external_service: self.external_service.clone(),
+            // A tokenizer that does not build fails the pipeline build:
+            // ML detection never silently turns into regex alone.
             #[cfg(feature = "ml")]
-            onnx: self.onnx.as_ref().and_then(|o| match o.for_pipeline() {
-                Ok(o) => Some(Arc::new(o)),
-                Err(e) => {
-                    warn!(error = %e, "Failed to load the tokenizer, ML inference disabled");
-                    None
-                }
-            }),
-        }
+            onnx: match &self.onnx {
+                Some(o) => Some(Arc::new(o.for_pipeline()?)),
+                None => None,
+            },
+        })
     }
 
     fn pii_url_allowed(url: &str, allowlist: &[String]) -> bool {
@@ -959,7 +958,9 @@ mod tests {
         };
         let engine = PiiEngine::new(&config, &[]);
         let gate = crate::io_gate::IoGate::new();
-        let p = engine.for_pipeline(gate, tracing::Dispatch::default());
+        let p = engine
+            .for_pipeline(gate, tracing::Dispatch::default())
+            .unwrap();
         assert!(Arc::ptr_eq(&engine.regex, &p.regex));
         assert!(!Arc::ptr_eq(&engine.sampler, &p.sampler));
         assert!(!Arc::ptr_eq(
