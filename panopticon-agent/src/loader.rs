@@ -272,7 +272,27 @@ pub fn load_and_attach(
             );
         }
     }
-    if config.tls_scan_enabled {
+    let restricted_scope = !scope::is_unscoped_full(scope_config(config).0);
+    if config.tls_scan_enabled && restricted_scope {
+        // Restricted modes (cgroup_skb): a socket's tuple is recorded only
+        // if that socket is itself in scope, which needs its SOCK_STATE.
+        // Only fentry can read it; the tracepoint and kprobe variants are
+        // never attached here (tls_probes.rs `tls_tcp_sendmsg_scoped`).
+        for (prog, function) in [
+            ("tls_tcp_sendmsg_scoped", "tcp_sendmsg"),
+            ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
+        ] {
+            if !attach_fentry(&mut ebpf, prog, function, &mut links) {
+                warn!(
+                    prog,
+                    function,
+                    "restricted capture scope needs fentry with sk_storage for TLS socket \
+                     addresses; tracepoint and kprobe fallbacks refused, TLS events will \
+                     carry no addresses"
+                );
+            }
+        }
+    } else if config.tls_scan_enabled {
         // Give TLS connections their socket addresses (see tls_probes.rs):
         // sock tracepoints (6.3+, RHEL 9) when their record layout matches,
         // else fentry where the kernel has BTF, else kprobes.
