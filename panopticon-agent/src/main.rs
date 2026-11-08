@@ -21,6 +21,8 @@ pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;
 mod scope_select;
+#[cfg(test)]
+mod statics_check;
 mod util;
 
 /// Panopticon Agent — eBPF-powered network observability

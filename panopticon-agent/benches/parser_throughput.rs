@@ -105,7 +105,7 @@ fn bench_parsers(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("parser_exchange");
     for (name, proto, exchange) in &cases {
-        let mut fsm = ProtocolFsmAdapter::new(*proto);
+        let mut fsm = ProtocolFsmAdapter::new(*proto, &Default::default());
         // Guard against benchmarking a parser that never completes a message.
         for _ in 0..3 {
             assert_eq!(

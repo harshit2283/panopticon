@@ -23,7 +23,7 @@
 //! and dropped, so the stream stays in sync.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
@@ -186,31 +186,34 @@ fn is_flexible(api_key: i16, api_version: i16) -> bool {
 
 // ── Topic IDs ────────────────────────────────────────────────────────────
 
-/// Topic IDs are cluster-wide UUIDs, so names learned from a Metadata
-/// response on one connection resolve Fetch (v13+) traffic on any other.
-fn topic_names() -> &'static Mutex<HashMap<[u8; 16], String>> {
-    static NAMES: OnceLock<Mutex<HashMap<[u8; 16], String>>> = OnceLock::new();
-    NAMES.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Topic ID -> name, learned from Metadata responses. Topic IDs are
+/// cluster-wide UUIDs, so names learned on one connection resolve Fetch
+/// (v13+) traffic on any other. The map is captured-derived: one per
+/// capture pipeline, shared by that pipeline's parsers and dropped with it
+/// (DESIGN §3), never process-global.
+#[derive(Clone, Default)]
+pub struct KafkaTopics(Arc<Mutex<HashMap<[u8; 16], String>>>);
 
-fn remember_topic_id(id: [u8; 16], name: &str) {
-    if id == [0; 16] || name.is_empty() {
-        return;
-    }
-    if let Ok(mut names) = topic_names().lock() {
-        if names.len() >= MAX_TOPIC_IDS && !names.contains_key(&id) {
-            names.clear();
+impl KafkaTopics {
+    fn remember(&self, id: [u8; 16], name: &str) {
+        if id == [0; 16] || name.is_empty() {
+            return;
         }
-        names.insert(id, name.to_string());
+        if let Ok(mut names) = self.0.lock() {
+            if names.len() >= MAX_TOPIC_IDS && !names.contains_key(&id) {
+                names.clear();
+            }
+            names.insert(id, name.to_string());
+        }
     }
-}
 
-/// Name for a topic ID, or its hex form if no Metadata response named it.
-fn topic_name_for_id(id: &[u8; 16]) -> String {
-    if let Some(name) = topic_names().lock().ok().and_then(|n| n.get(id).cloned()) {
-        return name;
+    /// Name for a topic ID, or its hex form if no Metadata response named it.
+    fn name_for(&self, id: &[u8; 16]) -> String {
+        if let Some(name) = self.0.lock().ok().and_then(|n| n.get(id).cloned()) {
+            return name;
+        }
+        id.iter().map(|b| format!("{b:02x}")).collect()
     }
-    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Wire Reader ──────────────────────────────────────────────────────────
@@ -347,8 +350,10 @@ impl<'a> Reader<'a> {
 /// What was decoded from one request or response body. Decoding stops at
 /// the first field that runs past the captured data; fields found until then
 /// are kept.
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct BodyInfo {
+    /// The pipeline's topic ID map.
+    ids: KafkaTopics,
     topics: Vec<String>,
     /// Topics whose partitions carried records (Fetch responses).
     topics_with_records: Vec<String>,
@@ -371,9 +376,9 @@ impl BodyInfo {
     }
 }
 
-fn read_topic(r: &mut Reader<'_>, by_id: bool) -> Option<String> {
+fn read_topic(r: &mut Reader<'_>, by_id: bool, ids: &KafkaTopics) -> Option<String> {
     if by_id {
-        r.uuid().map(|id| topic_name_for_id(&id))
+        r.uuid().map(|id| ids.name_for(&id))
     } else {
         r.string()
     }
@@ -387,7 +392,7 @@ fn parse_produce_request(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo) 
     info.acks = Some(r.i16()?);
     r.i32()?; // timeout_ms
     for _ in 0..r.array_len()?.unwrap_or(0) {
-        let topic = read_topic(r, version >= 13)?;
+        let topic = read_topic(r, version >= 13, &info.ids)?;
         info.add_topic(topic);
         for _ in 0..r.array_len()?.unwrap_or(0) {
             r.i32()?; // partition index
@@ -405,7 +410,7 @@ fn parse_produce_request(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo) 
 
 fn parse_produce_response(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo) -> Option<()> {
     for _ in 0..r.array_len()?.unwrap_or(0) {
-        let topic = read_topic(r, version >= 13)?;
+        let topic = read_topic(r, version >= 13, &info.ids)?;
         info.add_topic(topic);
         for _ in 0..r.array_len()?.unwrap_or(0) {
             r.i32()?; // partition index
@@ -438,7 +443,7 @@ fn parse_metadata_request(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo)
             let id = r.uuid()?;
             let name = r.string()?;
             info.add_topic(if name.is_empty() && id != [0; 16] {
-                topic_name_for_id(&id)
+                info.ids.name_for(&id)
             } else {
                 name
             });
@@ -474,7 +479,7 @@ fn parse_metadata_response(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo
         info.set_error(r.i16()?);
         let name = r.string()?;
         if version >= 10 {
-            remember_topic_id(r.uuid()?, &name);
+            info.ids.remember(r.uuid()?, &name);
         }
         if version >= 1 {
             r.i8()?; // is_internal
@@ -515,7 +520,7 @@ fn parse_fetch_request(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo) ->
         r.skip(8)?; // session_id, session_epoch
     }
     for _ in 0..r.array_len()?.unwrap_or(0) {
-        let topic = read_topic(r, version >= 13)?;
+        let topic = read_topic(r, version >= 13, &info.ids)?;
         info.add_topic(topic);
         for _ in 0..r.array_len()?.unwrap_or(0) {
             r.i32()?; // partition
@@ -546,7 +551,7 @@ fn parse_fetch_response(r: &mut Reader<'_>, version: i16, info: &mut BodyInfo) -
         r.i32()?; // session_id
     }
     for _ in 0..r.array_len()?.unwrap_or(0) {
-        let topic = read_topic(r, version >= 13)?;
+        let topic = read_topic(r, version >= 13, &info.ids)?;
         info.add_topic(topic.clone());
         for _ in 0..r.array_len()?.unwrap_or(0) {
             r.i32()?; // partition_index
@@ -748,6 +753,7 @@ pub struct KafkaParser {
     server: Side,
     /// Pending requests, matched to responses by correlation ID.
     pending_requests: VecDeque<PendingRequest>,
+    topics: KafkaTopics,
 }
 
 /// Frame complete in the buffer, or a prefix of it.
@@ -758,12 +764,19 @@ struct Frame<'a> {
 }
 
 impl KafkaParser {
+    /// A parser with its own topic ID map (tests, standalone use).
     pub fn new() -> Self {
+        Self::with_topics(KafkaTopics::default())
+    }
+
+    /// A parser resolving topic IDs through `topics`, its pipeline's map.
+    pub fn with_topics(topics: KafkaTopics) -> Self {
         Self {
             state: State::Idle,
             client: Side::default(),
             server: Side::default(),
             pending_requests: VecDeque::new(),
+            topics,
         }
     }
 
@@ -858,7 +871,10 @@ impl KafkaParser {
         // Header: client_id is a classic nullable string even in header v2.
         let mut r = Reader::new(&b[8..], false);
         let client_id = r.string().filter(|s| !s.is_empty());
-        let mut info = BodyInfo::default();
+        let mut info = BodyInfo {
+            ids: self.topics.clone(),
+            ..BodyInfo::default()
+        };
         if client_id.is_some() || r.pos > 0 {
             r.flexible = flexible;
             if r.tagged_fields().is_some() {
@@ -908,7 +924,10 @@ impl KafkaParser {
         let (key, version) = (pending.api_key, pending.api_version);
         // ApiVersions responses always use header v0 (no tagged fields).
         let mut r = Reader::new(&b[4..], is_flexible(key, version) && key != 18);
-        let mut info = BodyInfo::default();
+        let mut info = BodyInfo {
+            ids: self.topics.clone(),
+            ..BodyInfo::default()
+        };
         let mut status = None;
         if r.tagged_fields().is_some() {
             let parsed = match key {
@@ -1369,7 +1388,8 @@ mod tests {
     fn fetch_v16_resolves_topic_id_and_extracts_records() {
         let id = [7u8; 16];
         // Learn the name from a Metadata v12 response on another connection.
-        let mut meta = KafkaParser::new();
+        let topics = KafkaTopics::default();
+        let mut meta = KafkaParser::with_topics(topics.clone());
         let mut w = W::new(true);
         w.arr(0).i8(1).i8(0).tags();
         let req = request(3, 12, 1, Some("c"), &w.b);
@@ -1380,7 +1400,17 @@ mod tests {
         w.i8(0).arr(0).i32(0).tags().tags();
         feed_exchange(&mut meta, &req, &response(3, 12, 1, &w.b));
 
-        let mut p = KafkaParser::new();
+        // Another pipeline's parser never learned it (DESIGN §3).
+        let mut other = KafkaParser::new();
+        let batch = record_batch(&[("k", "v")]);
+        let m = feed_exchange(
+            &mut other,
+            &fetch_v16_request(4),
+            &fetch_v16_response(4, id, &batch),
+        );
+        assert_eq!(m.path.as_deref(), Some("07".repeat(16).as_str()));
+
+        let mut p = KafkaParser::with_topics(topics);
         let batch = record_batch(&[("k-tok_9_", r#"{"email":"z@example.com"}"#)]);
         let m = feed_exchange(
             &mut p,
