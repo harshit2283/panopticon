@@ -969,12 +969,13 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     if pids(running) != pids(new) {
         return Err("changing pid_filter needs a restart".into());
     }
-    // DESIGN §3 lets cgroup_filter/pod_filter change at runtime (widening,
-    // or narrowing through pipeline revocation), but that needs the runtime
-    // scope publisher, a later stage. Until it lands they are restart-only,
-    // so nothing narrows without the revocation.
-    if running.cgroup_filter != new.cgroup_filter || running.pod_filter != new.pod_filter {
-        return Err("changing cgroup_filter or pod_filter needs a restart".into());
+    // The cgroup_filter / pod_filter selectors may change at runtime: the
+    // scope publisher applies them (a narrowing revokes the capture
+    // pipeline). Whether the cgroup selector exists at all is part of the
+    // kernel scope mode, set at startup.
+    let selector = |c: &AgentConfig| c.cgroup_filter.is_some() || c.pod_filter.is_some();
+    if selector(running) != selector(new) {
+        return Err("adding or removing cgroup_filter/pod_filter needs a restart".into());
     }
     if running.capture_backend != new.capture_backend || running.cgroup2_path != new.cgroup2_path {
         return Err("changing [capture] backend or cgroup2_path needs a restart".into());
@@ -1504,19 +1505,24 @@ mod tests {
             assert!(e.contains("cgroup_skb"), "{e}");
         }
 
-        // Restart-only until the runtime scope publisher lands.
+        // The selectors change at runtime (the scope publisher applies
+        // them); adding or removing the selector needs a restart.
         let running = ok("cgroup_filter = [\"a\"]\n");
         assert_eq!(
-            check_restart_only(&running, &ok("cgroup_filter = [\"a\"]\n")),
+            check_restart_only(&running, &ok("cgroup_filter = [\"b\"]\n")),
             Ok(())
         );
-        let e = check_restart_only(&running, &ok("cgroup_filter = [\"b\"]\n")).unwrap_err();
-        assert!(e.contains("cgroup_filter or pod_filter"), "{e}");
         let pods = load_config_from_str(&format!(
             "{CG}[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n"
         ))
         .unwrap();
-        assert!(check_restart_only(&running, &pods).is_err());
+        assert_eq!(check_restart_only(&running, &pods), Ok(()));
+        let none = load_config_from_str(CG).unwrap();
+        let e = check_restart_only(&running, &none).unwrap_err();
+        assert!(
+            e.contains("adding or removing cgroup_filter/pod_filter"),
+            "{e}"
+        );
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {

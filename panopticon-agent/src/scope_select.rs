@@ -3,8 +3,8 @@
 //!
 //! A cgroup id is the inode number of its directory. Every unresolved
 //! selector selects nothing; nothing here ever falls back to capturing all.
-//! Startup only for now: the runtime publisher (pod churn, reload) is a
-//! later stage and will call [`publish`] with the previous set.
+//! Startup publishes here ([`startup_publish`]); at runtime the scope
+//! publisher (`scope_publisher.rs`) calls [`publish`] with the previous set.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::{BTreeSet, HashMap};
@@ -223,6 +223,14 @@ pub trait AllowMap {
     fn insert(&mut self, id: u64) -> Result<()>;
     fn remove(&mut self, id: u64) -> Result<()>;
     fn bump_gen(&mut self) -> Result<()>;
+    /// The ids in `CGROUP_ALLOW` now.
+    fn ids(&mut self) -> Result<BTreeSet<u64>>;
+    /// `CONFIG_SCOPE_GEN` now.
+    fn generation(&mut self) -> Result<u64>;
+    /// Stop capture in the kernel on every path: packets, new socket
+    /// state, and TLS plaintext. The fatal stop after a failed runtime
+    /// publication.
+    fn disarm(&mut self) -> Result<()>;
 }
 
 /// What a publication changed. Only `added`: widening. Any `removed`:
@@ -309,7 +317,7 @@ mod linux {
     use aya::Ebpf;
     use aya::maps::{Array, HashMap as BpfHashMap, MapData, MapError};
     use panopticon_common::CONFIG_SCOPE_GEN;
-    use tracing::{error, info};
+    use tracing::info;
 
     /// `CGROUP_ALLOW` and `CONFIG` of a loaded object.
     pub struct AyaAllow<'a>(pub &'a mut Ebpf);
@@ -323,14 +331,10 @@ mod linux {
             )?)
         }
 
-        /// The ids in `CGROUP_ALLOW` now.
-        pub fn ids(&self) -> Result<BTreeSet<u64>> {
-            let m: BpfHashMap<&MapData, u64, u8> = BpfHashMap::try_from(
-                self.0
-                    .map("CGROUP_ALLOW")
-                    .context("CGROUP_ALLOW map not found")?,
-            )?;
-            Ok(m.keys().collect::<Result<_, _>>()?)
+        fn config(&mut self) -> Result<Array<&mut MapData, u64>> {
+            Ok(Array::try_from(
+                self.0.map_mut("CONFIG").context("CONFIG map not found")?,
+            )?)
         }
     }
 
@@ -354,10 +358,43 @@ mod linux {
         }
 
         fn bump_gen(&mut self) -> Result<()> {
-            let mut cfg: Array<&mut MapData, u64> =
-                Array::try_from(self.0.map_mut("CONFIG").context("CONFIG map not found")?)?;
+            let mut cfg = self.config()?;
             let g = cfg.get(&CONFIG_SCOPE_GEN, 0)?;
             cfg.set(CONFIG_SCOPE_GEN, g + 1, 0)?;
+            Ok(())
+        }
+
+        fn ids(&mut self) -> Result<BTreeSet<u64>> {
+            let m: BpfHashMap<&MapData, u64, u8> = BpfHashMap::try_from(
+                self.0
+                    .map("CGROUP_ALLOW")
+                    .context("CGROUP_ALLOW map not found")?,
+            )?;
+            Ok(m.keys().collect::<Result<_, _>>()?)
+        }
+
+        fn generation(&mut self) -> Result<u64> {
+            Ok(self.config()?.get(&CONFIG_SCOPE_GEN, 0)?)
+        }
+
+        /// What the kernel honours (panopticon-ebpf, read at this stage):
+        /// `CONFIG_CAPTURE_ENABLED = 0` stops the cgroup_skb packet path
+        /// (`sock_capture.rs` `try_skb`, kTLS and UDP included);
+        /// `CONFIG_SCOPE_ARMED = 0` stops the socket-state writers; TLS
+        /// plaintext checks neither, but drops every call once the scope
+        /// mode is a sampled/head mode (`tls_call_scope`,
+        /// `scope::tls_mode_allowed`), so the mode gains those bits. The
+        /// mode stays non-zero (never unscoped `full`).
+        fn disarm(&mut self) -> Result<()> {
+            use panopticon_common::scope::{SCOPE_HEAD, SCOPE_SAMPLE};
+            use panopticon_common::{
+                CONFIG_CAPTURE_ENABLED, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_MODE,
+            };
+            let mut cfg = self.config()?;
+            cfg.set(CONFIG_CAPTURE_ENABLED, 0, 0)?;
+            let mode = cfg.get(&CONFIG_SCOPE_MODE, 0)?;
+            cfg.set(CONFIG_SCOPE_MODE, mode | SCOPE_SAMPLE | SCOPE_HEAD, 0)?;
+            cfg.set(CONFIG_SCOPE_ARMED, 0, 0)?;
             Ok(())
         }
     }
@@ -400,35 +437,22 @@ mod linux {
     }
 
     /// Every 10 s, recheck for a v1 net_cls/net_prio hierarchy (§3.2). On
-    /// the first sighting the cgroup selector stops admitting: `CGROUP_ALLOW`
-    /// is emptied (one generation bump) and stays empty until a restart,
-    /// which then refuses. Not a full narrowing: records already admitted
-    /// are not revoked (that needs the runtime publisher's pipeline
-    /// revocation).
-    pub fn spawn_net_cls_watch(state: std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>) {
+    /// the first sighting the cgroup selector stops admitting: the scope
+    /// publisher empties `CGROUP_ALLOW` as a narrowing (with the pipeline
+    /// revocation) and keeps it empty until a restart, which then refuses.
+    pub fn spawn_net_cls_watch(
+        publisher: tokio::sync::mpsc::Sender<crate::scope_publisher::ScopeMsg>,
+    ) {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                let Some(why) = net_cls_problem() else {
-                    continue;
-                };
-                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                let mut map = AyaAllow(&mut st.ebpf);
-                let r = map
-                    .ids()
-                    .and_then(|cur| publish(&mut map, &cur, &BTreeSet::new()));
-                let outcome = match &r {
-                    Ok(d) => format!("CGROUP_ALLOW emptied ({} removed)", d.removed.len()),
-                    Err(e) => format!("emptying CGROUP_ALLOW failed: {e:#}"),
-                };
-                error!(
-                    reason = %why,
-                    outcome = %outcome,
-                    "cgroup_filter/pod_filter stopped admitting: the kernel may no longer \
-                     record cgroup v2 membership of new sockets; restart to re-check"
-                );
-                return;
+                if let Some(why) = net_cls_problem() {
+                    let _ = publisher
+                        .send(crate::scope_publisher::ScopeMsg::Disable(why))
+                        .await;
+                    return;
+                }
             }
         });
     }
@@ -629,6 +653,15 @@ mod tests {
         fn bump_gen(&mut self) -> Result<()> {
             self.0.push("gen".into());
             Ok(())
+        }
+        fn ids(&mut self) -> Result<BTreeSet<u64>> {
+            unimplemented!()
+        }
+        fn generation(&mut self) -> Result<u64> {
+            unimplemented!()
+        }
+        fn disarm(&mut self) -> Result<()> {
+            unimplemented!()
         }
     }
 

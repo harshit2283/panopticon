@@ -57,6 +57,9 @@ pub struct K8sMetadata {
     cap_warned: AtomicBool,
     failures: AtomicU64,
     api_base: String,
+    /// The generation of every published index, for the scope publisher
+    /// (pod_filter re-resolves on each).
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl K8sMetadata {
@@ -73,6 +76,7 @@ impl K8sMetadata {
             cap_warned: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             api_base: api_base.to_string(),
+            changed: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -161,6 +165,11 @@ impl K8sMetadata {
     pub fn pods(&self) -> Vec<model::PodRecord> {
         let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         store.pods.values().cloned().collect()
+    }
+
+    /// Notified on every published index (pods or services changed).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// API requests that failed so far.

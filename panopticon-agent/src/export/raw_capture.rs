@@ -2,10 +2,12 @@
 //! format (see `replay.rs`), for users who need the bytes themselves — their
 //! own PII classifiers, evidence retention, or checking the agent's output.
 //!
-//! - Written by a dedicated thread so file IO never blocks workers; when the
-//!   writer falls behind, events are dropped and counted
-//!   (`panopticon_raw_capture_dropped_total`).
-//! - The file is created owner-only (0600) and truncated at startup.
+//! - Written by a dedicated thread per capture pipeline so file IO never
+//!   blocks workers; when the writer falls behind, events are dropped and
+//!   counted (`panopticon_raw_capture_dropped_total`).
+//! - The file is created owner-only (0600) and truncated at startup, once
+//!   ([`open`]): every pipeline appends whole records to it under its own
+//!   gate, so a narrowing never writes a second header or a split record.
 //! - Writing stops at `max_bytes` so a forgotten flag cannot fill the disk.
 //! - Writing stops, and the file is closed, as soon as a reload tightens
 //!   the privacy mode below `full`: events still queued are not written.
@@ -17,7 +19,7 @@
 
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,16 +30,19 @@ use panopticon_common::DataEvent;
 use tracing::{error, info, warn};
 
 use crate::config::{PrivacyGate, PrivacyMode};
-use crate::replay::{CaptureReader, CaptureWriter};
+use crate::io_gate::{IoGate, RecordFile, Refused};
+use crate::replay::{CAPTURE_RECORD_BYTES, CaptureReader, capture_header, encode_capture_record};
 
 /// Bytes per record in the file: u32 length prefix + fixed-size DataEvent.
-const RECORD_BYTES: u64 = 4 + std::mem::size_of::<DataEvent>() as u64;
+#[cfg(test)]
+const RECORD_BYTES: u64 = CAPTURE_RECORD_BYTES as u64;
 /// Magic + version + start timestamp + event count.
+#[cfg(test)]
 const HEADER_BYTES: u64 = 6 + 4 + 8 + 8;
-/// How often the writer flushes when idle and checks for shutdown.
+/// How often the writer checks for shutdown and a tightened mode when idle.
 const WRITER_TICK: Duration = Duration::from_millis(200);
 
-/// Cloneable sender side, held by every worker.
+/// Cloneable sender side, held by every worker of one pipeline.
 #[derive(Clone)]
 pub struct RawCaptureHandle {
     tx: SyncSender<DataEvent>,
@@ -45,7 +50,8 @@ pub struct RawCaptureHandle {
     /// skip recording instead of counting every event as a drop.
     stopped: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    dropped: Arc<AtomicU64>,
+    /// The shared file, which counts drops over every pipeline.
+    file: Arc<RecordFile>,
 }
 
 impl RawCaptureHandle {
@@ -63,65 +69,71 @@ impl RawCaptureHandle {
         event.payload[len..].fill(0);
         match self.tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            Err(TrySendError::Full(_)) => self.file.count_dropped(1),
             Err(TrySendError::Disconnected(_)) => self.stopped.store(true, Ordering::Relaxed),
         }
     }
 
-    /// Events dropped because the writer could not keep up.
+    /// Events dropped because a writer could not keep up (every pipeline).
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.file.dropped()
     }
 
-    /// Ask the writer to drain what is queued, flush and exit.
+    /// Ask the writer to drain what is queued and exit.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
-/// Open `path` and start the writer thread. It writes only while
-/// `privacy` is `full`.
-pub fn spawn(
-    path: &str,
-    max_bytes: u64,
-    queue_capacity: usize,
-    start_timestamp_ns: u64,
-    privacy: Arc<PrivacyGate>,
-) -> Result<(RawCaptureHandle, JoinHandle<()>)> {
-    let file = super::open_private(path, false).context("raw capture file")?;
-    let writer = CaptureWriter::new(file, start_timestamp_ns)
-        .with_context(|| format!("failed to write capture header to {path}"))?;
+/// Create the capture file at `path` (fresh, owner-only) with its header.
+/// `max_bytes` caps the whole file, header included.
+pub fn open(path: &str, max_bytes: u64, start_timestamp_ns: u64) -> Result<Arc<RecordFile>> {
+    RecordFile::create(path, &capture_header(start_timestamp_ns), max_bytes, false)
+        .with_context(|| format!("raw capture file {path}"))
+}
 
+/// Start one pipeline's writer thread on `file`, writing under `gate`, and
+/// only while `privacy` is `full`. It logs through `dispatch`.
+pub fn spawn(
+    file: Arc<RecordFile>,
+    gate: Arc<IoGate>,
+    queue_capacity: usize,
+    privacy: Arc<PrivacyGate>,
+    dispatch: tracing::Dispatch,
+) -> Result<(RawCaptureHandle, JoinHandle<()>)> {
     let (tx, rx) = sync_channel(queue_capacity);
     let handle = RawCaptureHandle {
         tx,
         stopped: Arc::new(AtomicBool::new(false)),
         shutdown: Arc::new(AtomicBool::new(false)),
-        dropped: Arc::new(AtomicU64::new(0)),
+        file: Arc::clone(&file),
     };
     let stopped = Arc::clone(&handle.stopped);
     let shutdown = Arc::clone(&handle.shutdown);
-    let path = path.to_string();
     let thread = std::thread::Builder::new()
         .name("raw-capture".into())
-        .spawn(move || writer_loop(writer, rx, max_bytes, &path, &stopped, &shutdown, &privacy))
+        .spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                writer_loop(&file, &gate, rx, &stopped, &shutdown, &privacy)
+            })
+        })
         .context("failed to spawn raw capture writer thread")?;
     Ok((handle, thread))
 }
 
-fn writer_loop<W: Write>(
-    mut writer: CaptureWriter<W>,
+fn writer_loop(
+    file: &RecordFile,
+    gate: &IoGate,
     rx: Receiver<DataEvent>,
-    max_bytes: u64,
-    path: &str,
     stopped: &AtomicBool,
     shutdown: &AtomicBool,
     privacy: &PrivacyGate,
 ) {
-    let mut written = HEADER_BYTES;
-    let mut write = |writer: &mut CaptureWriter<W>, event: &DataEvent| -> bool {
+    let path = file.path().to_string();
+    let mut events = 0u64;
+    let mut record = Vec::with_capacity(CAPTURE_RECORD_BYTES);
+    // False once this writer must stop.
+    let mut write = |event: &DataEvent| -> bool {
         // Checked per record: what was queued under `full` is not written
         // once a reload has tightened the mode.
         if privacy.get() != PrivacyMode::Full {
@@ -129,43 +141,46 @@ fn writer_loop<W: Write>(
                 path,
                 "Privacy mode tightened — raw capture stopped and closed"
             );
+            file.close();
             return false;
         }
-        if written + RECORD_BYTES > max_bytes {
-            warn!(
-                path,
-                max_bytes, "Raw capture size limit reached — raw capture stopped"
-            );
-            return false;
+        record.clear();
+        encode_capture_record(event, &mut record);
+        match file.write(gate, &record) {
+            Ok(()) => {
+                events += 1;
+                true
+            }
+            // The size cap (logged by the file), a closed file, or a
+            // revoked pipeline: nothing more is written.
+            Err(Refused::Full | Refused::Closed | Refused::Revoked) => false,
+            Err(Refused::Io(e)) => {
+                error!(path, error = %e, "Raw capture write failed — raw capture stopped");
+                false
+            }
         }
-        if let Err(e) = writer.write_event(event) {
-            error!(path, error = %e, "Raw capture write failed — raw capture stopped");
-            return false;
-        }
-        written += RECORD_BYTES;
-        true
     };
 
     loop {
         match rx.recv_timeout(WRITER_TICK) {
             Ok(event) => {
-                if !write(&mut writer, &event) {
+                if !write(&event) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                let _ = writer.flush();
                 if privacy.get() != PrivacyMode::Full {
                     warn!(
                         path,
                         "Privacy mode tightened — raw capture stopped and closed"
                     );
+                    file.close();
                     break;
                 }
                 if shutdown.load(Ordering::Relaxed) {
                     // Drain whatever is still queued, then exit.
                     while let Ok(event) = rx.try_recv() {
-                        if !write(&mut writer, &event) {
+                        if !write(&event) {
                             break;
                         }
                     }
@@ -176,9 +191,8 @@ fn writer_loop<W: Write>(
         }
     }
     stopped.store(true, Ordering::Relaxed);
-    match writer.finish() {
-        Ok(events) => info!(path, events, bytes = written, "Raw capture closed"),
-        Err(e) => error!(path, error = %e, "Raw capture flush failed"),
+    if !gate.is_revoked() {
+        info!(path, events, "Raw capture writer stopped");
     }
 }
 
@@ -254,6 +268,22 @@ mod tests {
 
     fn full() -> Arc<PrivacyGate> {
         Arc::new(PrivacyGate::new(PrivacyMode::Full))
+    }
+
+    fn spawn(
+        path: &str,
+        max_bytes: u64,
+        queue: usize,
+        ts: u64,
+        privacy: Arc<PrivacyGate>,
+    ) -> Result<(RawCaptureHandle, JoinHandle<()>)> {
+        super::spawn(
+            open(path, max_bytes, ts)?,
+            IoGate::new(),
+            queue,
+            privacy,
+            tracing::Dispatch::default(),
+        )
     }
 
     /// Codex #2: a tighten below `full` stops the writer and closes the
@@ -368,6 +398,45 @@ mod tests {
         let cut = &bytes[..bytes.len() - 100]; // second record cut short
         let mut out = Vec::new();
         assert_eq!(decode_to_jsonl(cut, &mut out).unwrap(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Revision 1 item 4: one header for the whole file; a later pipeline
+    /// appends records after a revoked one, which writes nothing more.
+    #[test]
+    fn pipelines_share_one_file_and_header() {
+        let path = tmp_path("shared");
+        let file = open(&path, 1 << 20, 0).unwrap();
+        let (old_gate, new_gate) = (IoGate::new(), IoGate::new());
+        let start = |gate: &Arc<IoGate>| {
+            super::spawn(
+                Arc::clone(&file),
+                Arc::clone(gate),
+                64,
+                full(),
+                tracing::Dispatch::default(),
+            )
+            .unwrap()
+        };
+        let (old, old_thread) = start(&old_gate);
+        old.record(&event(b"old-written", 11));
+        std::thread::sleep(Duration::from_millis(300));
+        old_gate.revoke();
+        old.record(&event(b"old-after-revoke", 16));
+        let (new, new_thread) = start(&new_gate);
+        new.record(&event(b"new-written", 11));
+        for (h, t) in [(old, old_thread), (new, new_thread)] {
+            h.shutdown();
+            t.join().unwrap();
+        }
+        let mut out = Vec::new();
+        let n = decode_to_jsonl(std::fs::File::open(&path).unwrap(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        assert_eq!(n, 2, "{out}");
+        assert!(out.contains(&b64.encode(b"old-written")));
+        assert!(out.contains(&b64.encode(b"new-written")));
+        assert!(!out.contains(&b64.encode(b"old-after-revoke")));
         std::fs::remove_file(&path).ok();
     }
 

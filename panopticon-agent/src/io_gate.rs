@@ -196,14 +196,6 @@ impl RecordFile {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).file = None;
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .file
-            .is_none()
-    }
-
     pub fn count_dropped(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
     }
@@ -243,14 +235,6 @@ pub struct GatedIo<T> {
 }
 
 impl<T> GatedIo<T> {
-    pub fn new(gate: Arc<IoGate>, inner: T) -> Self {
-        Self {
-            gate,
-            inner,
-            pause_point: None,
-        }
-    }
-
     /// Gate one poll: `f` runs under the read guard, or is refused.
     fn gated<R>(
         self: Pin<&mut Self>,

@@ -193,12 +193,21 @@ struct Found {
 }
 
 /// Thread-safe PII detection engine. Cloneable (Arc internals).
+///
+/// Built once at startup; each capture pipeline then takes its own copy
+/// ([`for_pipeline`](Self::for_pipeline)): the regexes and the ONNX model
+/// session are immutable and shared, while everything that holds captured
+/// state (the sampler's seen templates, the tokenizer, the external client
+/// and its connections) is per pipeline (DESIGN §3, Revision 1 item 6).
 #[derive(Clone)]
 pub struct PiiEngine {
     config: PiiConfig,
     regex: Arc<RegexPrefilter>,
     sampler: Arc<InferenceSampler>,
+    max_inferences: u32,
     external: Option<Arc<ExternalPiiClient>>,
+    /// The validated external service settings: (url, timeout_ms, rate).
+    external_service: Option<(String, u32, f64)>,
     #[cfg(feature = "ml")]
     onnx: Option<Arc<OnnxInference>>,
 }
@@ -213,7 +222,7 @@ impl PiiEngine {
             _ => 100,
         };
 
-        let external = match &config.mode {
+        let external_service = match &config.mode {
             PiiMode::External {
                 url,
                 sample_rate,
@@ -229,11 +238,7 @@ impl PiiEngine {
                     }
 
                     if allowed {
-                        Some(Arc::new(ExternalPiiClient::new(
-                            url.clone(),
-                            *timeout_ms,
-                            *sample_rate,
-                        )))
+                        Some((url.clone(), *timeout_ms, *sample_rate))
                     } else {
                         tracing::warn!(url = %url, "External PII URL rejected by allowlist");
                         None
@@ -246,13 +251,57 @@ impl PiiEngine {
         #[cfg(feature = "ml")]
         let onnx = Self::init_onnx(config);
 
-        Self {
+        let mut engine = Self {
             config: config.clone(),
             regex: Arc::new(RegexPrefilter::new()),
             sampler: Arc::new(InferenceSampler::new(max_inferences)),
-            external,
+            max_inferences,
+            external: None,
+            external_service,
             #[cfg(feature = "ml")]
             onnx,
+        };
+        // Standalone use (tests, replay): an external client on a gate of
+        // its own. The agent gives each pipeline its own instead.
+        engine.external =
+            engine.external_client(crate::io_gate::IoGate::new(), tracing::Dispatch::default());
+        engine
+    }
+
+    fn external_client(
+        &self,
+        gate: Arc<crate::io_gate::IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> Option<Arc<ExternalPiiClient>> {
+        let (url, timeout_ms, rate) = self.external_service.clone()?;
+        Some(Arc::new(ExternalPiiClient::new(
+            url, timeout_ms, rate, gate, dispatch,
+        )))
+    }
+
+    /// This engine for one capture pipeline: shared regexes and model, a
+    /// fresh sampler, tokenizer and external client (writing under `gate`,
+    /// logging through `dispatch`).
+    pub fn for_pipeline(
+        &self,
+        gate: Arc<crate::io_gate::IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> Self {
+        Self {
+            config: self.config.clone(),
+            regex: Arc::clone(&self.regex),
+            sampler: Arc::new(InferenceSampler::new(self.max_inferences)),
+            max_inferences: self.max_inferences,
+            external: self.external_client(gate, dispatch),
+            external_service: self.external_service.clone(),
+            #[cfg(feature = "ml")]
+            onnx: self.onnx.as_ref().and_then(|o| match o.for_pipeline() {
+                Ok(o) => Some(Arc::new(o)),
+                Err(e) => {
+                    warn!(error = %e, "Failed to load the tokenizer, ML inference disabled");
+                    None
+                }
+            }),
         }
     }
 
@@ -896,6 +945,25 @@ mod tests {
         let cloned = engine.clone();
         let report = cloned.scan("email: user@test.org").unwrap();
         assert!(!report.entities.is_empty());
+    }
+
+    #[test]
+    fn pipeline_copies_share_regexes_but_not_captured_state() {
+        let mut config = PiiConfig::default();
+        config.mode = PiiMode::External {
+            url: "http://pii.local/detect".to_string(),
+            sample_rate: 1.0,
+            timeout_ms: 100,
+        };
+        let engine = PiiEngine::new(&config, &[]);
+        let gate = crate::io_gate::IoGate::new();
+        let p = engine.for_pipeline(gate, tracing::Dispatch::default());
+        assert!(Arc::ptr_eq(&engine.regex, &p.regex));
+        assert!(!Arc::ptr_eq(&engine.sampler, &p.sampler));
+        assert!(!Arc::ptr_eq(
+            engine.external.as_ref().unwrap(),
+            p.external.as_ref().unwrap()
+        ));
     }
 
     #[test]

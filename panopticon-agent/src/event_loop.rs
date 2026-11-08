@@ -1,5 +1,5 @@
-// EventStats and RateLimiter are cross-platform (used by metrics module on macOS),
-// but their callers (EventLoop, consume_data_events, etc.) are Linux-only.
+// The ring readers (EventLoop, consume_*) are Linux-only; the workers and
+// everything after the ring read run on every platform (tests drive them).
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
@@ -7,64 +7,73 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
+use arc_swap::ArcSwap;
 #[cfg(target_os = "linux")]
 use aya::maps::perf::PerfEventArrayBuffer;
 #[cfg(target_os = "linux")]
 use aya::maps::{PerfEventArray, RingBuf};
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
+#[cfg(target_os = "linux")]
+use panopticon_common::parse_data_event_bytes;
 use panopticon_common::{
-    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TLS_KEY_BIT,
-    data_event_record_len,
+    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN,
+    TCP_FLAG_RST, TLS_KEY_BIT, data_event_record_len, read_data_event_into,
 };
 #[cfg(target_os = "linux")]
-use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST, parse_data_event_bytes, read_data_event_into};
-#[cfg(target_os = "linux")]
 use tokio::io::unix::AsyncFd;
-#[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 #[cfg(target_os = "linux")]
-use tracing::{debug, info, warn};
+use tracing::warn;
+use tracing::{debug, info};
 
-#[cfg(target_os = "linux")]
 use crate::graph::{ConnectionTuple, GraphBuilder};
+use crate::io_gate::IoGate;
+use crate::pipeline::PipelineHandle;
 use crate::protocol::detect::detect_protocol;
 use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
-#[cfg(target_os = "linux")]
 use crate::util::format_ipv4;
 #[cfg(target_os = "linux")]
+use crate::{config::AgentConfig, loader::EventSource};
 use crate::{
-    config::{AgentConfig, PrivacyGate, PrivacyMode},
+    config::{PrivacyGate, PrivacyMode},
+    export::audit::PiiAuditLog,
     export::json::JsonExportHandle,
     export::otlp::OtlpExportHandle,
-    loader::EventSource,
     pii::PiiEngine,
 };
 
-#[cfg(target_os = "linux")]
-struct WorkerTaskContext {
-    stats: Arc<EventStats>,
-    idle_timeout: Duration,
-    log_events: bool,
-    max_connections_tracked: usize,
-    pii_engine: Option<PiiEngine>,
-    json_export: Option<JsonExportHandle>,
-    otlp_export: Option<OtlpExportHandle>,
-    audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
-    graph_builder: Option<Arc<GraphBuilder>>,
-    raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
-    max_body_bytes: usize,
-    privacy: Arc<PrivacyGate>,
+/// What a worker holds of its pipeline. Everything here belongs to one
+/// capture pipeline, except the aggregate `stats` and the `privacy` mode.
+pub(crate) struct WorkerTaskContext {
+    pub stats: Arc<EventStats>,
+    pub idle_timeout: Duration,
+    pub log_events: bool,
+    pub max_connections_tracked: usize,
+    pub pii_engine: Option<PiiEngine>,
+    pub json_export: Option<JsonExportHandle>,
+    pub otlp_export: Option<OtlpExportHandle>,
+    pub audit_log: Option<PiiAuditLog>,
+    pub graph_builder: Option<Arc<GraphBuilder>>,
+    pub raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
+    pub max_body_bytes: usize,
+    pub privacy: Arc<PrivacyGate>,
     /// pid_filter / sampling settings for the worker's capture gate.
-    gate: crate::capture_gate::GateConfig,
+    pub capture_gate: crate::capture_gate::GateConfig,
+    /// Live cgroup_skb capture: the kernel made every scope decision, and
+    /// its close records only free state.
+    pub kernel_scope: bool,
+    /// The pipeline's I/O gate (test pause points key on it).
+    pub io_gate: Arc<IoGate>,
+    /// The pipeline's Kafka topic ID map.
+    pub kafka_topics: crate::protocol::kafka::KafkaTopics,
 }
 
-#[cfg(target_os = "linux")]
 struct MessageContext<'a> {
     privacy: PrivacyMode,
     worker_id: usize,
@@ -73,8 +82,9 @@ struct MessageContext<'a> {
     pii_engine: &'a Option<PiiEngine>,
     json_export: &'a Option<JsonExportHandle>,
     otlp_export: &'a Option<OtlpExportHandle>,
-    audit_log: &'a Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
+    audit_log: &'a Option<PiiAuditLog>,
     graph_builder: &'a Option<Arc<GraphBuilder>>,
+    io_gate: &'a IoGate,
     event: &'a DataEvent,
     /// Whether this event's sender is the connection's server, when known.
     sender_is_server: Option<bool>,
@@ -185,6 +195,10 @@ pub struct EventStats {
     /// cgroup_skb: events dropped at the ring read because their scope
     /// generation is below the admission floor (a narrowing came after it).
     pub drops_stale_scope_gen: AtomicU64,
+    /// Events dropped at the ring read because no capture pipeline is
+    /// installed (a pipeline build failed after a narrowing, or capture
+    /// stopped).
+    pub drops_no_pipeline: AtomicU64,
     /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
     /// (refreshed from the map; indexed by `scope::DROP_*`).
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
@@ -215,6 +229,7 @@ impl EventStats {
             sampled_out_events: AtomicU64::new(0),
             head_only_cut_events: AtomicU64::new(0),
             drops_stale_scope_gen: AtomicU64::new(0),
+            drops_no_pipeline: AtomicU64::new(0),
             scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -234,8 +249,8 @@ impl AdmissionFloor {
         self.0.fetch_max(generation, Ordering::SeqCst);
     }
 
-    /// Loaded once per drained batch.
-    fn get(&self) -> u32 {
+    /// Loaded once per drained batch, after the pipeline handle.
+    pub(crate) fn get(&self) -> u32 {
         self.0.load(Ordering::SeqCst)
     }
 }
@@ -316,187 +331,71 @@ impl RateLimiter {
 
 // ── Event Loop ───────────────────────────────────────────────────────────
 
+/// The ring readers. Everything after the ring read is the current capture
+/// pipeline (`pipeline.rs`), whose handle the readers load from `slot`.
 #[cfg(target_os = "linux")]
 pub struct EventLoop {
     config: AgentConfig,
     stats: Arc<EventStats>,
-    pii_engine: Option<PiiEngine>,
-    json_export_handle: Option<JsonExportHandle>,
-    otlp_export_handle: Option<OtlpExportHandle>,
-    audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
-    graph_builder: Option<Arc<GraphBuilder>>,
-    raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
-    privacy: Arc<PrivacyGate>,
+    slot: Arc<ArcSwap<PipelineHandle>>,
     admission_floor: AdmissionFloor,
+}
+
+/// What every ring reader shares.
+#[cfg(target_os = "linux")]
+struct ReaderCtx {
+    slot: Arc<ArcSwap<PipelineHandle>>,
+    rate_limiter: Arc<RateLimiter>,
+    stats: Arc<EventStats>,
+    floor: AdmissionFloor,
 }
 
 #[cfg(target_os = "linux")]
 impl EventLoop {
-    /// `privacy` is the gate the exporters were started with, so a reload
-    /// that tightens it reaches the workers and every writer at once.
     pub fn new(
         config: AgentConfig,
-        privacy: Arc<PrivacyGate>,
-        pii_engine: Option<PiiEngine>,
-        json_export_handle: Option<JsonExportHandle>,
-        otlp_export_handle: Option<OtlpExportHandle>,
-        audit_log: Option<Arc<std::sync::Mutex<crate::export::audit::PiiAuditLog>>>,
-        graph_builder: Option<GraphBuilder>,
+        stats: Arc<EventStats>,
+        slot: Arc<ArcSwap<PipelineHandle>>,
+        admission_floor: AdmissionFloor,
     ) -> Self {
         Self {
-            privacy,
             config,
-            stats: Arc::new(EventStats::new()),
-            pii_engine,
-            json_export_handle,
-            otlp_export_handle,
-            audit_log,
-            graph_builder: graph_builder.map(Arc::new),
-            raw_capture: None,
-            admission_floor: AdmissionFloor::default(),
+            stats,
+            slot,
+            admission_floor,
         }
-    }
-
-    /// The ring readers' admission floor, for the scope publisher to raise.
-    pub fn admission_floor(&self) -> AdmissionFloor {
-        self.admission_floor.clone()
-    }
-
-    /// Record every processed event, unredacted, to a raw capture file.
-    pub fn with_raw_capture(
-        mut self,
-        handle: crate::export::raw_capture::RawCaptureHandle,
-    ) -> Self {
-        self.raw_capture = Some(handle);
-        self
-    }
-
-    /// Feed recorded events through one worker: exactly the path live events
-    /// take after the ring buffer (parsing, PII, graph, export). For
-    /// measuring user-space throughput without kernel or scheduling noise.
-    pub async fn replay_through_worker(&self, events: Vec<DataEvent>) -> Result<()> {
-        let (tx, rx) = mpsc::channel::<EventBatch>(4);
-        let ctx = WorkerTaskContext {
-            stats: Arc::clone(&self.stats),
-            idle_timeout: self.config.idle_connection_timeout,
-            log_events: self.config.log_events,
-            max_connections_tracked: self.config.max_connections_tracked,
-            pii_engine: self.pii_engine.clone(),
-            json_export: self.json_export_handle.clone(),
-            otlp_export: self.otlp_export_handle.clone(),
-            audit_log: self.audit_log.clone(),
-            graph_builder: self.graph_builder.clone(),
-            raw_capture: None,
-            max_body_bytes: self.config.max_body_bytes,
-            privacy: Arc::clone(&self.privacy),
-            gate: crate::capture_gate::GateConfig::from_config(&self.config),
-        };
-        let worker = tokio::spawn(worker_task(0, rx, ctx));
-        let mut batch = EventBatch::default();
-        for event in &events {
-            batch.push(event);
-            if batch.is_full() && tx.send(std::mem::take(&mut batch)).await.is_err() {
-                break;
-            }
-        }
-        if !batch.is_empty() {
-            let _ = tx.send(batch).await;
-        }
-        drop(tx);
-        worker.await?;
-        Ok(())
     }
 
     pub fn stats(&self) -> &Arc<EventStats> {
         &self.stats
     }
 
-    /// The privacy mode in effect, for tightening it on config reload.
-    pub fn privacy(&self) -> &Arc<PrivacyGate> {
-        &self.privacy
-    }
-
-    /// Main entry point: spawn workers, consume RingBufs, route events.
+    /// Main entry point: consume the kernel's events and route them to the
+    /// current pipeline's workers.
     pub async fn run(self, event_source: EventSource) -> Result<()> {
-        let num_workers = self.config.max_worker_count;
-        if num_workers == 0 {
+        if self.config.max_worker_count == 0 {
             bail!("max_worker_count must be >= 1");
         }
-        let channel_cap = self.config.worker_channel_capacity;
-        if channel_cap == 0 {
+        if self.config.worker_channel_capacity == 0 {
             bail!("worker_channel_capacity must be >= 1");
         }
-        let idle_timeout = self.config.idle_connection_timeout;
-        let log_events = self.config.log_events;
-        let max_connections_tracked = self.config.max_connections_tracked;
 
-        // Create per-worker channels
-        let mut senders = Vec::with_capacity(num_workers);
-        let mut worker_handles = Vec::with_capacity(num_workers);
-
-        // Capacity is configured in events; the channels carry batches.
-        let batch_cap = channel_cap.div_ceil(WORKER_BATCH);
-        let gate = crate::capture_gate::GateConfig::from_config(&self.config);
-        for worker_id in 0..num_workers {
-            let (tx, rx) = mpsc::channel::<EventBatch>(batch_cap);
-            senders.push(tx);
-
-            let stats = Arc::clone(&self.stats);
-            let pii = self.pii_engine.clone();
-            let exporter = self.json_export_handle.clone();
-            let otlp_exporter = self.otlp_export_handle.clone();
-            let audit_log = self.audit_log.clone();
-            let graph = self.graph_builder.clone();
-            let worker_ctx = WorkerTaskContext {
-                stats,
-                idle_timeout,
-                log_events,
-                max_connections_tracked,
-                pii_engine: pii,
-                json_export: exporter,
-                otlp_export: otlp_exporter,
-                audit_log,
-                graph_builder: graph,
-                raw_capture: self.raw_capture.clone(),
-                max_body_bytes: self.config.max_body_bytes,
-                privacy: Arc::clone(&self.privacy),
-                gate: gate.clone(),
-            };
-            let handle = tokio::spawn(worker_task(worker_id, rx, worker_ctx));
-            worker_handles.push(handle);
-        }
-
-        info!(
-            workers = num_workers,
-            channel_capacity = channel_cap,
-            "Worker pool started"
-        );
-
-        // Rate limiter
+        // Rate limiter (aggregate: counts, not captured data)
         let rate_limiter = Arc::new(RateLimiter::new(self.config.max_events_per_sec));
 
         // Rate limiter refill task (every 100ms for smooth rate limiting)
         let rl = Arc::clone(&rate_limiter);
-        let pii_for_refill = self.pii_engine.clone();
         let refill_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(100));
-            let mut tick_count = 0u64;
             loop {
                 interval.tick().await;
                 rl.refill();
-                tick_count += 1;
-                // PII sampler refill every 1 second (10 ticks)
-                if tick_count.is_multiple_of(10)
-                    && let Some(pii) = pii_for_refill.as_ref()
-                {
-                    pii.refill_sampler();
-                }
             }
         });
 
-        // Stats reporting task (every 10 seconds) — also flushes graph + prunes stale edges
+        // Stats reporting task (every 10 seconds): aggregate counters only
+        // (DESIGN §3, exempt), so it logs outside every pipeline.
         let stats_ref = Arc::clone(&self.stats);
-        let graph_for_stats = self.graph_builder.clone();
         let stats_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -528,81 +427,33 @@ impl EventLoop {
                         // TODO: set CONFIG_CAPTURE_ENABLED = 0 in eBPF CONFIG map when backpressure is high
                     }
                 }
-
-                if let Some(gb) = graph_for_stats.as_ref() {
-                    let flows = gb.flush();
-                    // Edge timestamps come from bpf_ktime_get_ns (monotonic,
-                    // since boot); wall-clock time here wiped the whole graph
-                    // on every flush.
-                    gb.prune(crate::util::monotonic_now_ns());
-                    if let Ok(dag) = gb.dag().lock() {
-                        info!(
-                            received,
-                            dropped,
-                            processed,
-                            active_connections = active,
-                            drops_rate_limit = drops_rate,
-                            drops_channel_full = drops_channel,
-                            drops_parser_error = drops_parser,
-                            evictions_capacity = evictions_cap,
-                            evictions_idle = evictions_idle,
-                            backpressure_events = backpressure,
-                            graph_nodes = dag.node_count(),
-                            graph_edges = dag.edge_count(),
-                            flushed_flows = flows.len(),
-                            "Event stats"
-                        );
-                    } else {
-                        info!(
-                            received,
-                            dropped,
-                            processed,
-                            active_connections = active,
-                            drops_rate_limit = drops_rate,
-                            drops_channel_full = drops_channel,
-                            drops_parser_error = drops_parser,
-                            evictions_capacity = evictions_cap,
-                            evictions_idle = evictions_idle,
-                            backpressure_events = backpressure,
-                            "Event stats"
-                        );
-                    }
-                } else {
-                    info!(
-                        received,
-                        dropped,
-                        processed,
-                        active_connections = active,
-                        drops_rate_limit = drops_rate,
-                        drops_channel_full = drops_channel,
-                        drops_parser_error = drops_parser,
-                        evictions_capacity = evictions_cap,
-                        evictions_idle = evictions_idle,
-                        backpressure_events = backpressure,
-                        "Event stats"
-                    );
-                }
+                info!(
+                    received,
+                    dropped,
+                    processed,
+                    active_connections = active,
+                    drops_rate_limit = drops_rate,
+                    drops_channel_full = drops_channel,
+                    drops_parser_error = drops_parser,
+                    evictions_capacity = evictions_cap,
+                    evictions_idle = evictions_idle,
+                    backpressure_events = backpressure,
+                    "Event stats"
+                );
             }
         });
 
+        let reader = Arc::new(ReaderCtx {
+            slot: Arc::clone(&self.slot),
+            rate_limiter,
+            stats: Arc::clone(&self.stats),
+            floor: self.admission_floor.clone(),
+        });
         // Consume kernel events inline — this is the main blocking call.
-        let data_result = consume_data_events(
-            event_source,
-            &senders,
-            &rate_limiter,
-            &self.stats,
-            &self.admission_floor,
-        )
-        .await;
+        let data_result = consume_data_events(event_source, reader).await;
 
-        // Cleanup
         refill_handle.abort();
         stats_handle.abort();
-        drop(senders); // Close channels → workers will drain and exit
-        for handle in worker_handles {
-            let _ = handle.await;
-        }
-
         data_result
     }
 }
@@ -610,20 +461,10 @@ impl EventLoop {
 /// Consume events from the kernel and route to workers.
 /// Branches based on the EventSource (RingBuf for >= 5.8, PerfEventArray for older).
 #[cfg(target_os = "linux")]
-async fn consume_data_events(
-    event_source: EventSource,
-    senders: &[mpsc::Sender<EventBatch>],
-    rate_limiter: &Arc<RateLimiter>,
-    stats: &Arc<EventStats>,
-    floor: &AdmissionFloor,
-) -> Result<()> {
+async fn consume_data_events(event_source: EventSource, reader: Arc<ReaderCtx>) -> Result<()> {
     match event_source {
-        EventSource::RingBuf(rings) => {
-            consume_ringbufs(rings, senders, rate_limiter, stats, floor).await
-        }
-        EventSource::PerfEventArray(perf_array) => {
-            consume_perf_array(perf_array, senders, rate_limiter, stats, floor).await
-        }
+        EventSource::RingBuf(rings) => consume_ringbufs(rings, reader).await,
+        EventSource::PerfEventArray(perf_array) => consume_perf_array(perf_array, &reader).await,
     }
 }
 
@@ -633,17 +474,18 @@ async fn consume_data_events(
 /// 1K connections, and every millisecond it lagged became kernel drops).
 /// Each connection's events are in one shard, drained by one thread into
 /// FIFO worker channels, so per-connection order is kept.
+///
+/// The drain threads are long-lived and outside every pipeline: they log
+/// nothing derived from captured data, and hold a pipeline handle only for
+/// the length of one drained batch.
 #[cfg(target_os = "linux")]
 async fn consume_ringbufs(
     rings: Vec<RingBuf<aya::maps::MapData>>,
-    senders: &[mpsc::Sender<EventBatch>],
-    rate_limiter: &Arc<RateLimiter>,
-    stats: &Arc<EventStats>,
-    floor: &AdmissionFloor,
+    reader: Arc<ReaderCtx>,
 ) -> Result<()> {
     /// Stops the drain threads when this future ends or is dropped (shutdown
-    /// drops it): they exit within one poll timeout, releasing their worker
-    /// channel senders so the workers can drain and finish.
+    /// drops it): they exit within one poll timeout, releasing their
+    /// pipeline handles so the workers can drain and finish.
     struct StopOnDrop(Arc<AtomicBool>);
     impl Drop for StopOnDrop {
         fn drop(&mut self) {
@@ -659,24 +501,13 @@ async fn consume_ringbufs(
     );
     let shards = rings.len();
     for (shard, ring) in rings.into_iter().enumerate() {
-        let senders = senders.to_vec();
-        let rate_limiter = Arc::clone(rate_limiter);
-        let stats = Arc::clone(stats);
-        let floor = floor.clone();
+        let reader = Arc::clone(&reader);
         let stop = Arc::clone(&stop.0);
         let exit_tx = exit_tx.clone();
         std::thread::Builder::new()
             .name(format!("ring-drain-{shard}"))
             .spawn(move || {
-                let result = drain_thread(
-                    ring,
-                    (shard, shards),
-                    &senders,
-                    &rate_limiter,
-                    &stats,
-                    &floor,
-                    &stop,
-                );
+                let result = drain_thread(ring, (shard, shards), &reader, &stop);
                 let _ = exit_tx.send(result);
             })
             .context("Failed to spawn a ring buffer drain thread")?;
@@ -702,10 +533,7 @@ async fn consume_ringbufs(
 fn drain_thread(
     mut ring: RingBuf<aya::maps::MapData>,
     (shard, shards): (usize, usize),
-    senders: &[mpsc::Sender<EventBatch>],
-    rate_limiter: &RateLimiter,
-    stats: &EventStats,
-    floor: &AdmissionFloor,
+    reader: &ReaderCtx,
     stop: &AtomicBool,
 ) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -743,14 +571,7 @@ fn drain_thread(
             }
             return Err(err).context("epoll_wait on ring buffer");
         }
-        let drained = drain_ringbuf(
-            &mut ring,
-            &mut scratch,
-            WorkerBatcher::new(senders, stats, shard, shards),
-            rate_limiter,
-            stats,
-            floor.get(),
-        );
+        let drained = drain_ringbuf(&mut ring, &mut scratch, reader, shard, shards);
         // Woken by the kernel: traffic is flowing, keep the tight bound.
         interval = if woken > 0 {
             RINGBUF_DRAIN_INTERVAL
@@ -785,53 +606,106 @@ fn next_drain_interval(current: Duration, drained: usize) -> Duration {
 /// Drain every pending event from the ring buffer and route it to workers.
 /// Copies each event's header and payload bytes once into the routing
 /// scratch, and from there into the worker's batch: never a whole 4KB
-/// DataEvent. `floor` is the admission floor, loaded once for the batch.
+/// DataEvent. The whole batch is admitted against one snapshot
+/// ([`Admission`]).
 #[cfg(target_os = "linux")]
 fn drain_ringbuf(
     ring: &mut RingBuf<aya::maps::MapData>,
     scratch: &mut DataEvent,
-    mut batcher: WorkerBatcher<'_>,
-    rate_limiter: &RateLimiter,
-    stats: &EventStats,
-    floor: u32,
+    reader: &ReaderCtx,
+    shard: usize,
+    shards: usize,
 ) -> usize {
+    let mut admission = Admission::new(&reader.slot, &reader.floor, &reader.stats, shard, shards);
     let mut drained = 0;
-    let mut received = 0;
-    let mut stale = 0;
     while let Some(item) = ring.next() {
         drained += 1;
         if !read_data_event_into(item.as_ref(), scratch) {
             continue; // Malformed event, skip
         }
-        let event: &DataEvent = scratch;
-        received += 1;
-        // Before dispatch: computed under a scope a narrowing has revoked.
-        if below_floor(event, floor) {
-            stale += 1;
-            continue;
-        }
-
-        // Rate limit check
-        if !rate_limiter.try_acquire() {
-            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-            stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
-        // Route to worker by connection key (deterministic affinity).
-        batcher.push(connection_key(event), event);
+        admission.offer(scratch, &reader.rate_limiter);
     }
-    batcher.flush();
-    // One shared-counter update per drain, not per event: every drain
-    // thread bumps it.
-    stats.events_received.fetch_add(received, Ordering::Relaxed);
-    if stale > 0 {
-        stats.events_dropped.fetch_add(stale, Ordering::Relaxed);
-        stats
-            .drops_stale_scope_gen
-            .fetch_add(stale, Ordering::Relaxed);
-    }
+    admission.finish();
     drained
+}
+
+/// One drained batch's admission (DESIGN §3, review 11 finding 2): the
+/// pipeline handle is loaded once, *then* the admission floor, and the
+/// floor check, the dispatch and the hand-off to workers all use that
+/// snapshot. Batches pending in the [`WorkerBatcher`] keep their
+/// destination: they are never moved to a newer pipeline, and die with
+/// theirs if it is revoked.
+///
+/// The load order matters: the publisher raises the floor before it
+/// installs a new pipeline, so a reader that sees the new pipeline also
+/// sees the raised floor and cannot admit an old-generation event into it.
+/// A reader still holding the old pipeline may admit one there; that
+/// pipeline's gate is revoked before the change is reported applied.
+pub(crate) struct Admission<'a> {
+    batcher: WorkerBatcher,
+    floor: u32,
+    stats: &'a EventStats,
+    received: u64,
+    stale: u64,
+}
+
+impl<'a> Admission<'a> {
+    pub(crate) fn new(
+        slot: &arc_swap::ArcSwap<PipelineHandle>,
+        floor: &AdmissionFloor,
+        stats: &'a EventStats,
+        shard: usize,
+        shards: usize,
+    ) -> Self {
+        let handle = slot.load_full(); // first: see above
+        let floor = floor.get(); // then the floor
+        Self {
+            batcher: WorkerBatcher::new(handle, shard, shards),
+            floor,
+            stats,
+            received: 0,
+            stale: 0,
+        }
+    }
+
+    /// Admit or drop one event.
+    pub(crate) fn offer(&mut self, event: &DataEvent, rate_limiter: &RateLimiter) {
+        self.received += 1;
+        // Before dispatch: computed under a scope a narrowing has revoked.
+        if below_floor(event, self.floor) {
+            self.stale += 1;
+            return;
+        }
+        if !rate_limiter.try_acquire() {
+            self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        crate::test_hooks::pause(
+            crate::test_hooks::READER_AFTER_ADMISSION,
+            &self.batcher.handle.gate,
+        );
+        // Route to worker by connection key (deterministic affinity).
+        self.batcher.push(connection_key(event), event, self.stats);
+    }
+
+    /// Send what is pending and count the batch.
+    pub(crate) fn finish(mut self) {
+        self.batcher.flush(self.stats);
+        // One shared-counter update per drain, not per event: every drain
+        // thread bumps it.
+        self.stats
+            .events_received
+            .fetch_add(self.received, Ordering::Relaxed);
+        if self.stale > 0 {
+            self.stats
+                .events_dropped
+                .fetch_add(self.stale, Ordering::Relaxed);
+            self.stats
+                .drops_stale_scope_gen
+                .fetch_add(self.stale, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Events handed to a worker in one channel message, packed back to back:
@@ -846,7 +720,7 @@ pub(crate) struct EventBatch {
 
 impl EventBatch {
     /// Append `event`'s header and its captured payload bytes.
-    fn push(&mut self, event: &DataEvent) {
+    pub(crate) fn push(&mut self, event: &DataEvent) {
         if self.bytes.capacity() == 0 {
             // One fixed-size allocation per batch, never regrown: a batch
             // is sent once it reaches WORKER_BATCH_BYTES, so this always
@@ -880,11 +754,11 @@ impl EventBatch {
     }
 
     /// Ready to send: WORKER_BATCH events or WORKER_BATCH_BYTES bytes.
-    fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.len >= WORKER_BATCH || self.bytes.len() >= WORKER_BATCH_BYTES
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -904,7 +778,7 @@ impl EventBatch {
 /// batch instead of per event: per-event sends woke a parked worker thread
 /// for almost every packet at moderate rates, which cost more CPU than
 /// parsing the packet.
-const WORKER_BATCH: usize = 64;
+pub(crate) const WORKER_BATCH: usize = 64;
 
 /// Most bytes per batch (plus the event that crosses it). Bounds the memory
 /// a worker's queued batches hold to about channel slots × 68 KB, whatever
@@ -925,62 +799,60 @@ fn worker_index(routing_key: u64, shard: usize, shards: usize, workers: usize) -
     (shard + shards * (routing_key as usize % per_shard)) % workers
 }
 
-/// Groups events per worker during one ring buffer drain.
-#[cfg(target_os = "linux")]
-struct WorkerBatcher<'a> {
-    senders: &'a [mpsc::Sender<EventBatch>],
+/// Groups events per worker during one ring buffer drain, for the workers
+/// of one pipeline snapshot.
+struct WorkerBatcher {
+    handle: Arc<PipelineHandle>,
     pending: Vec<EventBatch>,
-    stats: &'a EventStats,
     shard: usize,
     shards: usize,
 }
 
-#[cfg(target_os = "linux")]
-impl<'a> WorkerBatcher<'a> {
-    fn new(
-        senders: &'a [mpsc::Sender<EventBatch>],
-        stats: &'a EventStats,
-        shard: usize,
-        shards: usize,
-    ) -> Self {
+impl WorkerBatcher {
+    fn new(handle: Arc<PipelineHandle>, shard: usize, shards: usize) -> Self {
         Self {
-            senders,
-            pending: senders.iter().map(|_| EventBatch::default()).collect(),
-            stats,
+            pending: handle
+                .senders
+                .iter()
+                .map(|_| EventBatch::default())
+                .collect(),
+            handle,
             shard,
             shards,
         }
     }
 
-    fn push(&mut self, routing_key: u64, event: &DataEvent) {
-        if self.senders.is_empty() {
+    fn push(&mut self, routing_key: u64, event: &DataEvent, stats: &EventStats) {
+        let workers = self.handle.senders.len();
+        if workers == 0 {
+            // No pipeline installed: dropped, counted.
+            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+            stats.drops_no_pipeline.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let idx = worker_index(routing_key, self.shard, self.shards, self.senders.len());
+        let idx = worker_index(routing_key, self.shard, self.shards, workers);
         self.pending[idx].push(event);
         if self.pending[idx].is_full() {
-            self.send(idx);
+            self.send(idx, stats);
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self, stats: &EventStats) {
         for idx in 0..self.pending.len() {
             if !self.pending[idx].is_empty() {
-                self.send(idx);
+                self.send(idx, stats);
             }
         }
     }
 
     /// try_send: never block the reader. Drop the batch if the worker is
     /// behind.
-    fn send(&mut self, idx: usize) {
+    fn send(&mut self, idx: usize, stats: &EventStats) {
         let batch = std::mem::take(&mut self.pending[idx]);
         let n = batch.len() as u64;
-        if self.senders[idx].try_send(batch).is_err() {
-            self.stats.events_dropped.fetch_add(n, Ordering::Relaxed);
-            self.stats
-                .drops_channel_full
-                .fetch_add(n, Ordering::Relaxed);
+        if self.handle.senders[idx].try_send(batch).is_err() {
+            stats.events_dropped.fetch_add(n, Ordering::Relaxed);
+            stats.drops_channel_full.fetch_add(n, Ordering::Relaxed);
         }
     }
 }
@@ -989,10 +861,7 @@ impl<'a> WorkerBatcher<'a> {
 #[cfg(target_os = "linux")]
 async fn consume_perf_array(
     mut perf_array: PerfEventArray<aya::maps::MapData>,
-    senders: &[mpsc::Sender<EventBatch>],
-    rate_limiter: &RateLimiter,
-    stats: &EventStats,
-    floor: &AdmissionFloor,
+    reader: &ReaderCtx,
 ) -> Result<()> {
     let cpus = aya::util::online_cpus().map_err(|(path, error)| {
         anyhow::anyhow!("Failed to get online CPUs from {path}: {error}")
@@ -1020,35 +889,11 @@ async fn consume_perf_array(
     // Unlike RingBuf, PerfEventArray Events arrive per-CPU and may be globally out-of-order.
     // Flow parsing is per-connection so out-of-order across *different* connections is fine.
     while let Some(event) = event_rx.recv().await {
-        stats.events_received.fetch_add(1, Ordering::Relaxed);
-        // One event per receive: the floor is loaded for each.
-        if below_floor(&event, floor.get()) {
-            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-            stats.drops_stale_scope_gen.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
-        if !rate_limiter.try_acquire() {
-            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-            stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
-        let routing_cookie = connection_key(&event);
-
-        let num_workers = senders.len();
-        let worker_idx = if num_workers > 0 {
-            (routing_cookie as usize) % num_workers
-        } else {
-            0
-        };
-
-        let mut batch = EventBatch::default();
-        batch.push(&event);
-        if senders[worker_idx].try_send(batch).is_err() {
-            stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-            stats.drops_channel_full.fetch_add(1, Ordering::Relaxed);
-        }
+        // One event per receive: the snapshot (pipeline, then floor) is
+        // taken for each.
+        let mut admission = Admission::new(&reader.slot, &reader.floor, &reader.stats, 0, 1);
+        admission.offer(&event, &reader.rate_limiter);
+        admission.finish();
     }
 
     for handle in reader_handles {
@@ -1106,14 +951,19 @@ async fn perf_reader_task(
     }
 }
 
-/// Worker task: receives events from its channel, maintains per-connection state.
-#[cfg(target_os = "linux")]
-async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: WorkerTaskContext) {
+/// Worker task: receives events from its channel, maintains per-connection
+/// state. Runs under its pipeline's tracing `Dispatch`.
+pub(crate) async fn worker_task(
+    worker_id: usize,
+    mut rx: mpsc::Receiver<EventBatch>,
+    ctx: WorkerTaskContext,
+) {
     use crate::capture_gate::{CaptureGate, Verdict};
 
-    let manager = ConnectionFsmManager::new(ctx.max_connections_tracked);
+    let manager =
+        ConnectionFsmManager::with_topics(ctx.max_connections_tracked, ctx.kafka_topics.clone());
     let mut owners = OwnerTable::new(ctx.max_connections_tracked);
-    let mut gate = CaptureGate::new(ctx.gate.clone(), ctx.max_connections_tracked);
+    let mut gate = CaptureGate::new(ctx.capture_gate.clone(), ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(5);
 
@@ -1129,10 +979,13 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
                 continue;
             }
             let cookie = connection_key(&scratch);
-            // A close record (cgroup_skb sockops STATE_CB) is sent for every
-            // socket the kernel tracks, in scope or not, with its tuple and
-            // owner: it frees the connection's state and reaches no sink.
-            if scratch.event_type == EventType::SockClose {
+            // Live cgroup_skb: a close record (sockops STATE_CB) is sent for
+            // every socket the kernel tracks, in scope or not, with its
+            // tuple and owner: it frees the connection's state and reaches
+            // no sink. Counted processed (it is consumed here). On TC and in
+            // replay a close takes the gated path below, as before.
+            if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
+                ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
                 end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
                 continue;
             }
@@ -1205,7 +1058,6 @@ async fn worker_task(worker_id: usize, mut rx: mpsc::Receiver<EventBatch>, ctx: 
 
 /// Everything after the capture gate: raw dump, logging, parsing, PII,
 /// graph and export of one admitted event.
-#[cfg(target_os = "linux")]
 fn process_event(
     worker_id: usize,
     ctx: &WorkerTaskContext,
@@ -1215,6 +1067,7 @@ fn process_event(
     event: &DataEvent,
     cookie: u64,
 ) {
+    crate::test_hooks::pause(crate::test_hooks::WORKER_BEFORE_SINK, &ctx.io_gate);
     // Read per event (an atomic load): a reload may have tightened it.
     let privacy = ctx.privacy.get();
     let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
@@ -1270,6 +1123,7 @@ fn process_event(
                             otlp_export: &ctx.otlp_export,
                             audit_log: &ctx.audit_log,
                             graph_builder: &ctx.graph_builder,
+                            io_gate: &ctx.io_gate,
                             event,
                             sender_is_server,
                             max_body_bytes: ctx.max_body_bytes,
@@ -1290,6 +1144,7 @@ fn process_event(
                             otlp_export: &ctx.otlp_export,
                             audit_log: &ctx.audit_log,
                             graph_builder: &ctx.graph_builder,
+                            io_gate: &ctx.io_gate,
                             event,
                             sender_is_server,
                             max_body_bytes: ctx.max_body_bytes,
@@ -1315,9 +1170,10 @@ fn process_event(
         }
     }
 
-    // Handle connection close: TCP RST, or FIN
-    // from both sides (after this packet's payload was parsed).
+    // Handle connection close: socket close (TC and replay), TCP RST, or
+    // FIN from both sides (after this packet's payload was parsed).
     let closed = match event.event_type {
+        EventType::SockClose => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
             manager.note_fin(cookie, sender_endpoint(event), event.direction)
@@ -1330,7 +1186,6 @@ fn process_event(
 }
 
 /// Free everything a worker holds for connection `cookie`.
-#[cfg(target_os = "linux")]
 fn end_connection(
     ctx: &WorkerTaskContext,
     manager: &ConnectionFsmManager,
@@ -1467,7 +1322,6 @@ fn feed_event(
     Some(results)
 }
 
-#[cfg(target_os = "linux")]
 fn guarded_handle_messages(
     msgs: impl IntoIterator<Item = crate::protocol::L7Message>,
     ctx: &MessageContext<'_>,
@@ -1475,7 +1329,6 @@ fn guarded_handle_messages(
     guarded(ctx.stats, ctx.worker_id, || handle_messages(msgs, ctx));
 }
 
-#[cfg(target_os = "linux")]
 fn handle_messages(
     msgs: impl IntoIterator<Item = crate::protocol::L7Message>,
     ctx: &MessageContext<'_>,
@@ -1543,9 +1396,7 @@ fn handle_messages(
                 })
                 .collect();
 
-            if let Ok(mut log) = audit_arc.lock() {
-                let _ = log.emit(&entries);
-            }
+            let _ = audit_arc.emit(&entries);
         }
 
         // OTLP export (channel-based — drop when full, never block workers)
@@ -1586,6 +1437,9 @@ fn handle_messages(
                 pid: ctx.event.pid,
             };
             gb.record_with_server(&conn_tuple, ctx.sender_is_server, &msg, pii_report.as_ref());
+            if msg.protocol == crate::protocol::Protocol::Dns {
+                crate::test_hooks::pause(crate::test_hooks::BEFORE_DNS_INSERT, ctx.io_gate);
+            }
             gb.observe_dns(&msg);
         }
 
@@ -1616,7 +1470,6 @@ fn handle_messages(
 /// end's name, as the service graph names it, and its `ip:port`. In
 /// `metrics_only` the name never comes from DNS answers (payload-derived):
 /// a Kubernetes name or the address.
-#[cfg(target_os = "linux")]
 fn audit_service(
     ctx: &MessageContext<'_>,
     protocol: crate::protocol::Protocol,

@@ -1,19 +1,29 @@
 #![allow(dead_code)]
 //! External PII service client for offloading detection to HTTP endpoint.
+//!
+//! The payload text it sends is captured data, so the client belongs to
+//! one capture pipeline and its connections are made by `GatedConnector`:
+//! every socket write (TLS records included, TLS sits above the gate) goes
+//! through the pipeline's gate, and nothing is sent once it is revoked
+//! (Revision 1 item 6).
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use http_body_util::{BodyExt, Full};
+use hyper_util::client::legacy::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::{PiiCategory, PiiEntity, PiiSource};
+use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate};
 
 /// Client for calling external PII detection service.
 pub struct ExternalPiiClient {
     url: String,
     timeout_ms: u32,
     sample_rate: f64,
-    client: reqwest::Client,
+    client: Client<GatedConnector, Full<bytes::Bytes>>,
 }
 
 /// Request body sent to external PII service.
@@ -41,18 +51,50 @@ pub struct PiiServiceEntity {
 }
 
 impl ExternalPiiClient {
-    pub fn new(url: String, timeout_ms: u32, sample_rate: f64) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms as u64))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
+    /// A client whose connections write through `gate`; its connection
+    /// tasks log through `dispatch`.
+    pub fn new(
+        url: String,
+        timeout_ms: u32,
+        sample_rate: f64,
+        gate: Arc<IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> Self {
+        let client = Client::builder(DispatchExecutor(dispatch))
+            .pool_max_idle_per_host(4)
+            .build(GatedConnector::with_tls(gate));
         Self {
             url,
             timeout_ms,
             sample_rate,
             client,
         }
+    }
+
+    /// POST `body` as JSON and read the whole response, within the timeout.
+    async fn post(&self, body: Vec<u8>) -> Result<(http::StatusCode, bytes::Bytes), String> {
+        let request = http::Request::post(self.url.as_str())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(bytes::Bytes::from(body)))
+            .map_err(|e| e.to_string())?;
+        let exchange = async {
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = response.status();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| e.to_string())?
+                .to_bytes();
+            Ok((status, body))
+        };
+        tokio::time::timeout(Duration::from_millis(self.timeout_ms as u64), exchange)
+            .await
+            .map_err(|_| "timed out".to_string())?
     }
 
     /// Check if this payload should be sampled based on hash.
@@ -81,7 +123,8 @@ impl ExternalPiiClient {
             template_hash,
         };
 
-        let response = match self.client.post(&self.url).json(&request).send().await {
+        let body = serde_json::to_vec(&request).ok()?;
+        let (status, response) = match self.post(body).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("External PII service request failed: {}", e);
@@ -89,12 +132,12 @@ impl ExternalPiiClient {
             }
         };
 
-        if !response.status().is_success() {
-            warn!("External PII service returned status {}", response.status());
+        if !status.is_success() {
+            warn!("External PII service returned status {}", status);
             return None;
         }
 
-        let pii_response: PiiServiceResponse = match response.json().await {
+        let pii_response: PiiServiceResponse = match serde_json::from_slice(&response) {
             Ok(r) => r,
             Err(e) => {
                 warn!("Failed to parse external PII response: {}", e);
@@ -170,23 +213,80 @@ fn parse_category(s: &str) -> Option<PiiCategory> {
 mod tests {
     use super::*;
 
+    impl ExternalPiiClient {
+        fn open(url: String, timeout_ms: u32, sample_rate: f64) -> Self {
+            Self::new(
+                url,
+                timeout_ms,
+                sample_rate,
+                IoGate::new(),
+                tracing::Dispatch::default(),
+            )
+        }
+    }
+
+    /// One fake service; every request on one kept-alive client.
+    #[tokio::test]
+    async fn requests_go_through_the_gate_and_stop_at_revocation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let s = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let s = Arc::clone(&s);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = conn.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        s.lock().unwrap().extend_from_slice(&buf[..n]);
+                        let body = br#"{"entities":[{"category":"EMAIL","start":0,"end":5,"confidence":0.9}]}"#;
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                        let _ = conn.write_all(head.as_bytes()).await;
+                        let _ = conn.write_all(body).await;
+                    }
+                });
+            }
+        });
+        let gate = IoGate::new();
+        let client = ExternalPiiClient::new(
+            format!("http://{addr}/detect"),
+            2000,
+            1.0,
+            Arc::clone(&gate),
+            tracing::Dispatch::default(),
+        );
+        let found = client.scan("alice-before", None).await.unwrap();
+        assert_eq!(found[0].category, PiiCategory::Email);
+        gate.revoke();
+        assert!(client.scan("bobby-after", None).await.is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+        assert!(seen.contains("alice-before"), "{seen}");
+        assert!(!seen.contains("bobby-after"), "{seen}");
+    }
+
     #[test]
     fn test_should_sample_always() {
-        let client = ExternalPiiClient::new("http://localhost".to_string(), 5000, 1.0);
+        let client = ExternalPiiClient::open("http://localhost".to_string(), 5000, 1.0);
         assert!(client.should_sample("any text"));
         assert!(client.should_sample("another text"));
     }
 
     #[test]
     fn test_should_sample_never() {
-        let client = ExternalPiiClient::new("http://localhost".to_string(), 5000, 0.0);
+        let client = ExternalPiiClient::open("http://localhost".to_string(), 5000, 0.0);
         assert!(!client.should_sample("any text"));
         assert!(!client.should_sample("another text"));
     }
 
     #[test]
     fn test_should_sample_deterministic() {
-        let client = ExternalPiiClient::new("http://localhost".to_string(), 5000, 0.5);
+        let client = ExternalPiiClient::open("http://localhost".to_string(), 5000, 0.5);
         let text = "test payload";
         let first = client.should_sample(text);
         let second = client.should_sample(text);
@@ -205,7 +305,7 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let client =
-            ExternalPiiClient::new("http://pii.example.com/detect".to_string(), 3000, 0.01);
+            ExternalPiiClient::open("http://pii.example.com/detect".to_string(), 3000, 0.01);
         assert_eq!(client.url, "http://pii.example.com/detect");
         assert_eq!(client.timeout_ms, 3000);
         assert!((client.sample_rate - 0.01).abs() < f64::EPSILON);
