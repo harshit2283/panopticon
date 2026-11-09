@@ -519,6 +519,10 @@ impl Scope {
     /// Fatal capture stop: install the closed handle and revoke the current
     /// pipeline, for good (no rebuild follows).
     pub async fn stop(&self) {
+        self.shared
+            .stats
+            .capture_stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut current = self.current.lock().await;
         self.slot.store(PipelineHandle::closed());
         if let Some(old) = current.take() {

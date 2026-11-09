@@ -946,6 +946,10 @@ fn publisher_ending_any_way_is_a_fatal_stop() {
             let e = format!("{e:#}");
             assert!(gate.is_revoked(), "{case}");
             assert!(
+                env.shared.stats.capture_stopped.load(Ordering::Relaxed),
+                "{case}: reported not ready"
+            );
+            assert!(
                 env.scope.gate().await.is_none(),
                 "{case}: no pipeline after"
             );

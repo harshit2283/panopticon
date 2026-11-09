@@ -426,7 +426,7 @@ use `metrics_only`.
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | 200 while the process is up (liveness) |
-| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown. The body also counts caught worker panics, if any |
+| `/readyz` | 200 once eBPF programs are attached; 503 during shutdown, and for good after capture was stopped by a failed scope publication (the agent stays up, disarmed; restart it). The body also counts caught worker panics, if any |
 | `/metrics` | Prometheus text format |
 | `/debug/state` | JSON counters (no traffic content) |
 
