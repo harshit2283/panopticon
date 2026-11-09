@@ -17,8 +17,8 @@ use aya_ebpf::{
 use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
 
 use crate::maps::{
-    PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROC_EPOCH,
-    PROCESS_EVENTS, TLS_CALL, TLS_SCRATCH,
+    PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROCESS_EVENTS,
+    TLS_CALL, TLS_SCRATCH,
 };
 
 // ── Process Exec ───────────────────────────────────────────────────────────
@@ -73,8 +73,6 @@ fn try_sched_process_exec(_ctx: &TracePointContext) -> Result<(), ()> {
     // SAFETY: helper takes no arguments and only reads the current task.
     let cgroup_id: u64 = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
     let _ = PID_CGROUP_MAP.insert(pid, cgroup_id, 0);
-    // A new image is a new process instance (maps.rs PROC_EPOCH).
-    let _ = PROC_EPOCH.insert(&pid, &unsafe { bpf_ktime_get_ns() }, 0);
 
     Ok(())
 }
@@ -125,9 +123,6 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         }
     }
     let _ = PID_FILTER.remove(&pid);
-    // The process instance ends: Go read entries it left can never match a
-    // later process that reuses the tgid (maps.rs GO_READ_ARGS).
-    let _ = PROC_EPOCH.remove(&pid);
 
     let comm = read_comm(ctx)?;
 

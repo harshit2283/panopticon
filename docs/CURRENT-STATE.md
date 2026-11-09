@@ -99,10 +99,14 @@ production-hardened compliance platform.
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
     without BTF is not validated yet.
-  - Go `crypto/tls` reads and writes (Go 1.17+ register ABI) are validated
-    the same way: 100% recall from both processes, except that about 1 run
-    in 5 mispairs one exchange in 500 in the client view. Binaries built with `-s`
-    (no symbol table) are not found; arm64 is untested.
+  - Go `crypto/tls`: writes only (Go 1.17+ register ABI). Reads are no
+    longer captured: the arguments saved at a read's entry cannot be proven
+    to still belong to that call at its return (a stack-backed buffer moves
+    when the goroutine's stack grows; a read that unwinds without returning
+    leaves them for a later call), and abandoned entries could not be
+    reclaimed on the supported kernels. Earlier read-and-write recall figures
+    no longer apply. Binaries built with `-s` (no symbol table) are not
+    found; arm64 is untested.
 - TCP stream integrity (TC capture):
   - Each direction's next expected sequence number is tracked
     (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,

@@ -94,8 +94,8 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 /// pid_filter maps): their contents are only valid for the run that wrote
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
-/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_ARGS,
-/// PROC_EPOCH): owner-only maps whose entries belong to this run's probes.
+/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL): owner-only
+/// maps whose entries belong to this run's probes.
 const PINNED_MAP_NAMES: [&str; 9] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
@@ -626,22 +626,10 @@ fn attach_tls_uprobes_to(
                     if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
                         attached += 1;
                     }
-                    if let Some(read) = read
-                        && attach_uprobe(
-                            ebpf,
-                            "go_tls_read_entry",
-                            path,
-                            read.entry_offset,
-                            None,
-                            links,
-                        )
-                    {
-                        attached += 1;
-                        for &ret in &read.ret_offsets {
-                            if attach_uprobe(ebpf, "go_tls_read_ret", path, ret, None, links) {
-                                attached += 1;
-                            }
-                        }
+                    // Go TLS reads are not captured (tls_probes.rs module
+                    // comment): their probes are not attached.
+                    if read.is_some() {
+                        debug!(pid = target.pid, "Go TLS reads not captured; writes only");
                     }
                 }
                 GoVersion::StackAbi => {
@@ -1424,8 +1412,6 @@ CapPrm:\t00000000ffffffff
             "PID_EXITED_LOST",
             "TLS_SCRATCH",
             "TLS_CALL",
-            "GO_READ_ARGS",
-            "PROC_EPOCH",
         ] {
             assert!(!pinned_map_names().any(|n| n == m), "{m} is pinned");
         }

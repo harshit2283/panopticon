@@ -47,8 +47,6 @@ pub const TLS_PROGRAMS: [&str; 9] = [
     "ssl_read_ex_entry",
     "ssl_read_ret",
     "go_tls_write_entry",
-    "go_tls_read_entry",
-    "go_tls_read_ret",
 ];
 
 /// The settings a restricted mode came from, for refusal messages.
