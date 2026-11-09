@@ -157,6 +157,13 @@ pub struct Resolved {
 /// not the one discovered, an unresolvable `cgroup_filter` path, and the
 /// root cgroup (id 1) or the attach root itself (§3.2). An unresolvable pod
 /// is not selected.
+///
+/// Other targets have no cgroup v2 and no openat2: always refuses.
+#[cfg(not(target_os = "linux"))]
+pub fn resolve(_root: &Path, _paths: &[String], _pods: &[SelectedPod]) -> Result<Resolved> {
+    anyhow::bail!("refusing cgroup_filter/pod_filter: cgroup selection needs Linux")
+}
+
 #[cfg(target_os = "linux")]
 pub fn resolve(root: &Path, paths: &[String], pods: &[SelectedPod]) -> Result<Resolved> {
     use crate::config::cgroup_filter_rel;

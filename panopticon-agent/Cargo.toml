@@ -9,7 +9,7 @@ default = ["compression"]
 # Named pause points for the narrowing tests (DESIGN §10 T-2); always on
 # in unit tests.
 scope-test-hooks = []
-ml = ["dep:ort", "dep:tokenizers"]
+ml = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 compression = ["dep:flate2", "dep:snap", "dep:zstd"]
 
 [dependencies]
@@ -50,6 +50,7 @@ zeroize = { version = "1", features = ["derive"] }
 # ML inference (optional — requires ONNX Runtime)
 ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+ndarray = { version = "0.17", optional = true, default-features = false, features = ["std"] }
 
 # Service graph
 petgraph = { workspace = true }
@@ -97,6 +98,7 @@ cargo_metadata = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 futures-util = { version = "0.3", default-features = false }
+proc-macro2 = { version = "1", default-features = false }
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic", "trace"] }
 criterion = { workspace = true }
 

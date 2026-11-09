@@ -1061,7 +1061,7 @@ impl ProtocolParser for KafkaParser {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ── Frame builders ───────────────────────────────────────────────────
@@ -1384,21 +1384,40 @@ mod tests {
         request(1, 16, cid, Some("consumer"), &w.b)
     }
 
+    /// A Metadata v12 exchange (request, response) whose response names
+    /// topic `id` `topic`.
+    pub(crate) fn metadata_v12_exchange(cid: i32, topic: &str, id: [u8; 16]) -> [Vec<u8>; 2] {
+        let mut w = W::new(true);
+        w.arr(0).i8(1).i8(0).tags();
+        let req = request(3, 12, cid, Some("c"), &w.b);
+        let mut w = W::new(true);
+        w.i32(0).arr(0).str(None).i32(1);
+        w.arr(1).i16(0).str(Some(topic));
+        w.b.extend_from_slice(&id);
+        w.i8(0).arr(0).i32(0).tags().tags();
+        [req, response(3, 12, cid, &w.b)]
+    }
+
+    /// A Fetch v16 exchange (request, response) of one record of topic
+    /// `id`.
+    pub(crate) fn fetch_v16_exchange(
+        cid: i32,
+        id: [u8; 16],
+        key: &str,
+        value: &str,
+    ) -> [Vec<u8>; 2] {
+        let batch = record_batch(&[(key, value)]);
+        [fetch_v16_request(cid), fetch_v16_response(cid, id, &batch)]
+    }
+
     #[test]
     fn fetch_v16_resolves_topic_id_and_extracts_records() {
         let id = [7u8; 16];
         // Learn the name from a Metadata v12 response on another connection.
         let topics = KafkaTopics::default();
         let mut meta = KafkaParser::with_topics(topics.clone());
-        let mut w = W::new(true);
-        w.arr(0).i8(1).i8(0).tags();
-        let req = request(3, 12, 1, Some("c"), &w.b);
-        let mut w = W::new(true);
-        w.i32(0).arr(0).str(None).i32(1);
-        w.arr(1).i16(0).str(Some("payments.settled"));
-        w.b.extend_from_slice(&id);
-        w.i8(0).arr(0).i32(0).tags().tags();
-        feed_exchange(&mut meta, &req, &response(3, 12, 1, &w.b));
+        let [req, resp] = metadata_v12_exchange(1, "payments.settled", id);
+        feed_exchange(&mut meta, &req, &resp);
 
         // Another pipeline's parser never learned it (DESIGN §3).
         let mut other = KafkaParser::new();

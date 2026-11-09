@@ -1,7 +1,7 @@
 //! HuggingFace tokenizer wrapper for PII ML inference.
 //! Only compiled with the `ml` feature.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokenizers::Tokenizer;
 
 /// Wraps a HuggingFace tokenizer with a max token limit.
@@ -11,9 +11,9 @@ pub struct PiiTokenizer {
 }
 
 impl PiiTokenizer {
-    /// Load tokenizer from a tokenizer.json file.
-    pub fn from_file(path: &str) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(path)
+    /// Build a tokenizer from the contents of a tokenizer.json file.
+    pub fn from_bytes(json: &[u8]) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(json)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         Ok(Self {
             tokenizer,

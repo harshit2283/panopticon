@@ -29,7 +29,8 @@
 //!   full), so a count never restarts. A full table admits no new state:
 //!   new connections then pass nothing.
 
-// The workers that use it are Linux-only; the logic is tested everywhere.
+// Only the Linux capture path drives the workers that use it; the logic
+// is tested everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::hash_map::RandomState;

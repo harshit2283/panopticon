@@ -233,7 +233,9 @@ impl Pipeline {
         let pii = shared
             .pii
             .as_ref()
-            .map(|e| e.for_pipeline(Arc::clone(&gate), dispatch.clone()));
+            .map(|e| e.for_pipeline(Arc::clone(&gate), dispatch.clone()))
+            .transpose()
+            .context("cannot set up PII detection for the pipeline")?;
         let otlp = if cfg.otlp.enabled {
             let (handle, worker) = OtlpExportHandle::spawn(
                 &cfg.otlp,

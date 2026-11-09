@@ -953,6 +953,34 @@ async fn perf_reader_task(
 
 /// Worker task: receives events from its channel, maintains per-connection
 /// state. Runs under its pipeline's tracing `Dispatch`.
+/// A worker's connection table. The connections it still holds leave the
+/// shared `active_connections` gauge when it is dropped: when the worker
+/// ends, and when a narrowing discards the worker's pipeline (its task is
+/// aborted), so the gauge never keeps a discarded pipeline's connections.
+struct TrackedConnections {
+    manager: ConnectionFsmManager,
+    stats: Arc<EventStats>,
+}
+
+impl std::ops::Deref for TrackedConnections {
+    type Target = ConnectionFsmManager;
+    fn deref(&self) -> &ConnectionFsmManager {
+        &self.manager
+    }
+}
+
+impl Drop for TrackedConnections {
+    fn drop(&mut self) {
+        let n = self.manager.len() as u64;
+        let _ =
+            self.stats
+                .active_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(n))
+                });
+    }
+}
+
 pub(crate) async fn worker_task(
     worker_id: usize,
     mut rx: mpsc::Receiver<EventBatch>,
@@ -960,8 +988,13 @@ pub(crate) async fn worker_task(
 ) {
     use crate::capture_gate::{CaptureGate, Verdict};
 
-    let manager =
-        ConnectionFsmManager::with_topics(ctx.max_connections_tracked, ctx.kafka_topics.clone());
+    let manager = TrackedConnections {
+        manager: ConnectionFsmManager::with_topics(
+            ctx.max_connections_tracked,
+            ctx.kafka_topics.clone(),
+        ),
+        stats: Arc::clone(&ctx.stats),
+    };
     let mut owners = OwnerTable::new(ctx.max_connections_tracked);
     let mut gate = CaptureGate::new(ctx.capture_gate.clone(), ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
@@ -1441,6 +1474,9 @@ fn handle_messages(
                 crate::test_hooks::pause(crate::test_hooks::BEFORE_DNS_INSERT, ctx.io_gate);
             }
             gb.observe_dns(&msg);
+            if msg.protocol == crate::protocol::Protocol::Dns {
+                crate::test_hooks::pause(crate::test_hooks::AFTER_DNS_INSERT, ctx.io_gate);
+            }
         }
 
         // JSON export (channel-based — no mutex, no per-event flush). Last, so
