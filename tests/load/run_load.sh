@@ -94,11 +94,14 @@ CONF=$OUT/load.toml
   esac
   printf '[capture]\nbackend = "%s"\n' "${BACKEND:-tc}"
 } >"$CONF"
+# Only when asked for: AGENT_ARGS may carry its own --config.
+CONFARG=()
+[[ -n ${BACKEND:-}${SCOPE:-}${TOML:-} ]] && CONFARG=(--config "$CONF")
 EXPORT=(--json-export "$OUT/agent.jsonl")
 [[ ${NO_EXPORT:-0} == 1 ]] && EXPORT=()
 if [[ ${NO_AGENT:-0} != 1 ]]; then
   # shellcheck disable=SC2086
-  "$AGENT" -i "$IFACE" --config "$CONF" "${EXPORT[@]}" --metrics-bind "$METRICS" \
+  "$AGENT" -i "$IFACE" ${CONFARG[@]+"${CONFARG[@]}"} "${EXPORT[@]}" --metrics-bind "$METRICS" \
     ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
   AP=$!
 fi
