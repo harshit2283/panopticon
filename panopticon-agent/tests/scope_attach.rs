@@ -947,8 +947,12 @@ fn scope_programs_load_attach_and_hold() {
     let _ = drain(&mut ring);
 
     // A listener that carries another socket's acceptor (an accepted socket
-    // that reached TCP_CLOSE without REUSED, then listen()): its children
-    // are never initialised.
+    // that reached TCP_CLOSE without REUSED, then listen()): a listed
+    // acceptor, no listed owner. Its children, accepted by an unlisted
+    // process, are never initialised, and the accept hook leaves the cloned
+    // acceptor untouched (rewriting `accept_cookie` first would let a
+    // concurrent passive ESTABLISHED adopt the cloned ACCEPTOR_LISTED).
+    // Accepts spin so some race their child's ESTABLISHED.
     {
         let l0 = TcpListener::bind("127.0.0.1:0").unwrap();
         let _c0 = TcpStream::connect(l0.local_addr().unwrap()).unwrap();
@@ -970,6 +974,8 @@ fn scope_programs_load_attach_and_hold() {
         let mut st = state(&ebpf, &s0).unwrap();
         assert_eq!((st.acceptor_tgid, st.accept_cookie), (me, cookie(&s0)));
         st.flags &= !FLAG_REUSED; // as if STATE_CB had never been set
+        st.pid_bits = ACCEPTOR_LISTED; // no listed owner
+        let foreign = st.accept_cookie;
         {
             let mut map: SkStorage<&mut MapData, SockState> =
                 SkStorage::try_from(ebpf.map_mut("SOCK_STATE").unwrap()).unwrap();
@@ -986,25 +992,68 @@ fn scope_programs_load_attach_and_hold() {
                 libc::getsockname(s0.as_raw_fd(), (&raw mut a).cast(), &mut len);
                 u16::from_be(a.sin_port)
             };
-            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            c.write_all(b"relisten").unwrap();
-            // SAFETY: valid listening fd; the result is a new fd we own.
-            let k = unsafe {
-                use std::os::fd::FromRawFd;
-                let fd = libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
-                assert!(fd >= 0, "accept on the re-listened socket");
-                std::os::fd::OwnedFd::from_raw_fd(fd)
-            };
-            let ks = state(&ebpf, &k).expect("clone");
-            assert_ne!(
-                ks.init_cookie,
-                cookie(&k),
-                "foreign acceptor: never initialised"
-            );
-            assert!(
-                !drain(&mut ring).iter().any(|e| e.0 == cookie(&k)),
-                "nothing captured on it"
-            );
+            {
+                let mut pids: HashMap<_, u32, u8> =
+                    HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+                pids.remove(&me).unwrap(); // the acceptor is unlisted
+            }
+            let dial = std::thread::spawn(move || {
+                (0..64)
+                    .map(|_| {
+                        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                        c.write_all(b"relisten").unwrap();
+                        c
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // SAFETY: valid fd.
+            unsafe { libc::fcntl(s0.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+            let mut kids = Vec::new();
+            while kids.len() < 64 {
+                // SAFETY: valid listening fd; a non-negative result is a new fd we own.
+                let fd = unsafe {
+                    libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut())
+                };
+                if fd >= 0 {
+                    // SAFETY: fd is ours.
+                    kids.push(unsafe {
+                        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                    });
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "accept: {e}");
+                    std::hint::spin_loop();
+                }
+            }
+            let clients = dial.join().unwrap();
+            for mut c in &clients {
+                c.write_all(b"after").unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let ev = drain(&mut ring);
+            for k in &kids {
+                let ks = state(&ebpf, k).expect("clone");
+                assert_ne!(
+                    ks.init_cookie,
+                    cookie(k),
+                    "foreign acceptor: never initialised"
+                );
+                assert_eq!(
+                    (ks.accept_cookie, ks.acceptor_tgid, ks.pid_bits),
+                    (foreign, me, ACCEPTOR_LISTED),
+                    "the accept hook left the cloned acceptor untouched"
+                );
+                assert!(
+                    !ev.iter().any(|e| e.0 == cookie(k)),
+                    "nothing captured on it"
+                );
+            }
+            {
+                let mut pids: HashMap<_, u32, u8> =
+                    HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+                pids.insert(me, 1, 0).unwrap();
+            }
+            drop((kids, clients));
             println!("RELISTEN OK");
         }
     }
