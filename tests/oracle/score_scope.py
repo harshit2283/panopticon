@@ -30,8 +30,6 @@ Checks:
   noaddr:TAG          export events with a TAG marker carry no address
   addr:TAG:R          share of export events with a TAG marker that carry
                       an address >= R
-  addrk:TAG:R         addr, unless the run dropped kTLS payload (a socket
-                      with the kTLS ULP never gets a TLS address, §3.5)
   inport:TAG:PORT     no TAG marker in a raw-dump event on PORT
   someport:TAG:PORT   some TAG marker in a raw-dump event on PORT
   someport:PORT       some raw-dump event on PORT
@@ -256,7 +254,7 @@ for c in sys.argv[2:]:
         share = len(got) / max(len(want), 1)
         check(want and share >= float(r), "%s after widening: recall %d/%d (%.1f%%) >= %s"
               % (tag, len(got), len(want), 100 * share, r))
-    elif kind in ("noaddr", "addr", "addrk"):
+    elif kind in ("noaddr", "addr"):
         tag, _, r = arg.partition(":")
         mark = "B2M-%s-" % tag
         evs = [e for e in export if mark in json.dumps(e)]
@@ -265,8 +263,6 @@ for c in sys.argv[2:]:
         what = "%s: %d/%d events carry an address" % (tag, len(with_addr), len(evs))
         if kind == "noaddr":
             check(evs and not with_addr, what + " (want none)")
-        elif kind == "addrk" and scope_drops("ktls_payload"):
-            print("  skip %s: sockets were kTLS-marked (ktls_payload > 0), which gives no address" % what)
         else:
             check(evs and share >= float(r), "%s (>= %s)" % (what, r))
     elif kind == "drop":

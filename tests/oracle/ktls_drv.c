@@ -3,12 +3,18 @@
 // 32-bit (the 32-bit build reaches the kernel through the compat paths):
 //
 //   ktls_drv ulp   PORT TAG N   TCP_ULP "tls" on both ends of A, no keys:
-//                               the payload stays plaintext on the wire
+//                               an ordinary socket, plaintext on the wire
 //   ktls_drv keys  PORT TAG N   as ulp, plus TLS_TX and TLS_RX (AES-GCM-128):
 //                               ciphertext on the wire
 //   ktls_drv uring PORT TAG N   as ulp, the ULP set through io_uring
 //                               (SOCKET_URING_OP_SETSOCKOPT, Linux 6.7+)
-//   ktls_drv recv  PORT TAG N   as ulp, and what A's server end receives is
+//   ktls_drv half  PORT TAG N   as ulp, plus a TLS_RX key on the client end
+//                               and a TLS_TX key on the server end: both ends
+//                               have a key installed, and the client's
+//                               markers are plaintext on the wire (the
+//                               packet-path view of hardware offload)
+//   ktls_drv uhalf PORT TAG N   as half, ULP and keys through io_uring (6.7+)
+//   ktls_drv recv  PORT TAG N   as half, and what A's server end receives is
 //   ktls_drv splice PORT TAG N  relayed to an ordinary connection B on
 //                               PORT+1, by read+write or by splice
 //
@@ -77,15 +83,25 @@ struct gcm128 {
 	uint8_t iv[8], key[16], salt[4], rec_seq[8];
 };
 
-static void keys(int fd)
+static struct gcm128 key(void)
 {
 	struct gcm128 k = {.version = 0x0303, .cipher = 51};
 	memset(k.key, 7, sizeof(k.key));
 	memset(k.iv, 3, sizeof(k.iv));
-	if (setsockopt(fd, SOL_TLS_, TLS_TX_, &k, sizeof(k)))
-		die("setsockopt TLS_TX");
-	if (setsockopt(fd, SOL_TLS_, TLS_RX_, &k, sizeof(k)))
-		die("setsockopt TLS_RX");
+	return k;
+}
+
+static void key_dir(int fd, int dir)
+{
+	struct gcm128 k = key();
+	if (setsockopt(fd, SOL_TLS_, dir, &k, sizeof(k)))
+		die(dir == TLS_TX_ ? "setsockopt TLS_TX" : "setsockopt TLS_RX");
+}
+
+static void keys(int fd)
+{
+	key_dir(fd, TLS_TX_);
+	key_dir(fd, TLS_RX_);
 }
 
 // io_uring with one SQE: IORING_OP_URING_CMD / SOCKET_URING_OP_SETSOCKOPT.
@@ -115,7 +131,7 @@ struct sqe {
 	uint64_t optval, pad2;
 };
 
-static void uring_ulp(int fd)
+static void uring_setsockopt(int fd, int level, int optname, const void *val, int len, const char *what)
 {
 	struct uring_params p;
 	memset(&p, 0, sizeof(p));
@@ -129,15 +145,14 @@ static void uring_ulp(int fd)
 				0x10000000);
 	if (sq == MAP_FAILED || cq == MAP_FAILED || sqes == MAP_FAILED)
 		die("mmap io_uring");
-	static const char name[] = "tls";
 	memset(&sqes[0], 0, sizeof(sqes[0]));
 	sqes[0].opcode = 46; // IORING_OP_URING_CMD
 	sqes[0].fd = fd;
 	sqes[0].cmd_op = 3; // SOCKET_URING_OP_SETSOCKOPT
-	sqes[0].level = SOL_TCP_;
-	sqes[0].optname = TCP_ULP_;
-	sqes[0].optlen = 3;
-	sqes[0].optval = (uintptr_t)name;
+	sqes[0].level = level;
+	sqes[0].optname = optname;
+	sqes[0].optlen = len;
+	sqes[0].optval = (uintptr_t)val;
 	uint32_t *tail = (uint32_t *)(sq + p.sq_off.tail);
 	((uint32_t *)(sq + p.sq_off.array))[*tail & *(uint32_t *)(sq + p.sq_off.ring_mask)] = 0;
 	__atomic_store_n(tail, *tail + 1, __ATOMIC_RELEASE);
@@ -147,9 +162,20 @@ static void uring_ulp(int fd)
 	int32_t res = *(int32_t *)(cq + p.cq_off.cqes + (head & *(uint32_t *)(cq + p.cq_off.ring_mask)) * 16 + 8);
 	if (res < 0) {
 		errno = -res;
-		die("io_uring setsockopt TCP_ULP");
+		die(what);
 	}
 	close(r);
+}
+
+static void uring_ulp(int fd)
+{
+	uring_setsockopt(fd, SOL_TCP_, TCP_ULP_, "tls", 3, "io_uring setsockopt TCP_ULP");
+}
+
+static void uring_key_dir(int fd, int dir)
+{
+	struct gcm128 k = key();
+	uring_setsockopt(fd, SOL_TLS_, dir, &k, sizeof(k), "io_uring setsockopt SOL_TLS");
 }
 
 static void readn(int fd, char *buf, int n)
@@ -165,13 +191,14 @@ static void readn(int fd, char *buf, int n)
 int main(int argc, char **argv)
 {
 	if (argc < 5) {
-		fprintf(stderr, "usage: ktls_drv ulp|keys|uring|recv|splice PORT TAG N\n");
+		fprintf(stderr, "usage: ktls_drv ulp|keys|uring|half|uhalf|recv|splice PORT TAG N\n");
 		return 2;
 	}
 	const char *mode = argv[1], *tag = argv[3];
 	int port = atoi(argv[2]), n = atoi(argv[4]), c, s, bc = -1, bs = -1;
 	pair(port, &c, &s);
-	if (!strcmp(mode, "uring")) {
+	int relay = !strcmp(mode, "recv") || !strcmp(mode, "splice");
+	if (!strcmp(mode, "uring") || !strcmp(mode, "uhalf")) {
 		uring_ulp(c);
 		uring_ulp(s);
 	} else {
@@ -181,8 +208,13 @@ int main(int argc, char **argv)
 	if (!strcmp(mode, "keys")) {
 		keys(c);
 		keys(s);
+	} else if (!strcmp(mode, "uhalf")) {
+		uring_key_dir(c, TLS_RX_);
+		uring_key_dir(s, TLS_TX_);
+	} else if (!strcmp(mode, "half") || relay) {
+		key_dir(c, TLS_RX_);
+		key_dir(s, TLS_TX_);
 	}
-	int relay = !strcmp(mode, "recv") || !strcmp(mode, "splice");
 	if (relay)
 		pair(port + 1, &bc, &bs);
 	int pipefd[2];

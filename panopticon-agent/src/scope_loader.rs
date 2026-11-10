@@ -11,6 +11,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use aya::util::KernelVersion;
 use aya::{
     Btf, Ebpf,
     programs::{CgroupAttachMode, CgroupSkbAttachType, ProgramError},
@@ -36,7 +37,29 @@ pub const SOCK_CREATE: &str = "scope_sock_create";
 pub const SOCKOPS: &str = "scope_sockops";
 pub const ACCEPT4: &str = "scope_accept4";
 pub const ACCEPT2: &str = "scope_accept2";
-pub const SET_ULP: &str = "scope_set_ulp";
+/// The kTLS key-install markers (DESIGN §3.5), `(function, variants)`:
+/// `sock_common_setsockopt` (and `compat_sock_common_setsockopt` where the
+/// kernel has it, before 5.9 with CONFIG_COMPAT), each with the one variant
+/// whose `struct socket` layout loads; else (5.9 to 6.0, where the first
+/// takes a struct argument trampolines do not support)
+/// `security_socket_setsockopt` and `__cgroup_bpf_run_filter_setsockopt`
+/// (where the kernel has it), and before 5.14 also `tcp_set_ulp` (SMC).
+pub const SOL_TLS_MARKERS: [(&str, &[&str]); 5] = [
+    (
+        "sock_common_setsockopt",
+        &["scope_sol_tls", "scope_sol_tls_wq"],
+    ),
+    (
+        "compat_sock_common_setsockopt",
+        &["scope_sol_tls_compat", "scope_sol_tls_compat_wq"],
+    ),
+    ("security_socket_setsockopt", &["scope_sol_tls_lsm"]),
+    (
+        "__cgroup_bpf_run_filter_setsockopt",
+        &["scope_sol_tls_cgroup"],
+    ),
+    ("tcp_set_ulp", &["scope_set_ulp"]),
+];
 pub const EXIT_TP: &str = "sched_process_exit";
 /// TLS uprobe programs; the scope gate lives in their shared emit path.
 pub const TLS_PROGRAMS: &[&str] = &[
@@ -115,6 +138,9 @@ pub struct LoadReport {
     pub accept: Option<&'static str>,
     /// Whether the scope writers loaded (required in restricted modes).
     pub writers: bool,
+    /// The kTLS key-install marker variant loaded for each function in
+    /// [`SOL_TLS_MARKERS`] the kernel has.
+    pub markers: Vec<&'static str>,
     /// Whether the sched_process_exit tracepoint loaded (required with
     /// pid_filter).
     pub exit_tp: bool,
@@ -139,11 +165,7 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
         })?;
     }
     let mut writers = true;
-    for (p, target) in [
-        (SOCK_CREATE, None),
-        (SOCKOPS, None),
-        (SET_ULP, Some("tcp_set_ulp")),
-    ] {
+    for (p, target) in [(SOCK_CREATE, None), (SOCKOPS, None)] {
         if let Err(e) = load_program(ebpf, p, target) {
             if restricted {
                 return Err(e.context(format!(
@@ -154,6 +176,20 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
             writers = false;
         }
     }
+    let markers = match load_markers(ebpf) {
+        Ok(m) => m,
+        Err(e) if restricted => {
+            return Err(e.context(format!(
+                "refusing {settings}: every mode except unscoped full needs the kTLS \
+                 key-install marker"
+            )));
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "kTLS marker unavailable; unscoped full continues");
+            writers = false;
+            Vec::new()
+        }
+    };
     let accept = [ACCEPT4, ACCEPT2]
         .into_iter()
         .find(|p| load_program(ebpf, p, Some("inet_csk_accept")).is_ok());
@@ -194,8 +230,70 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
     Ok(LoadReport {
         accept,
         writers,
+        markers,
         exit_tp,
     })
+}
+
+/// Load the kTLS key-install markers ([`SOL_TLS_MARKERS`]): the programs to
+/// attach, or why the kernel cannot be marked.
+fn load_markers(ebpf: &mut Ebpf) -> Result<Vec<&'static str>> {
+    let mut errors = Vec::new();
+    let mut load = |ebpf: &mut Ebpf, (func, variants): (&str, &[&'static str])| {
+        variants
+            .iter()
+            .copied()
+            .find(|p| match load_program(ebpf, p, Some(func)) {
+                Ok(()) => true,
+                Err(e) => {
+                    errors.push(format!("{e:#}"));
+                    false
+                }
+            })
+    };
+    let [common, compat, lsm, cgroup, ulp] = SOL_TLS_MARKERS;
+    // The first hook, then its companion, required where the kernel has it.
+    let (first, second) = match load(ebpf, common) {
+        Some(p) => (Some(p), compat),
+        None => (load(ebpf, lsm), cgroup),
+    };
+    let mut markers: Vec<&'static str> = first.into_iter().collect();
+    match load(ebpf, second) {
+        Some(q) => markers.push(q),
+        None if !kernel_has_symbol(second.0) => {}
+        None => markers.clear(),
+    }
+    if first.is_none() {
+        markers.clear();
+    }
+    // Past the LSM hook, SMC calls its TCP socket's `ops->setsockopt`
+    // directly, and before 5.14 it passes `TCP_ULP` through to that socket:
+    // there a ULP attach marks too (the rule before key-install marking).
+    if markers.first().is_some_and(|p| lsm.1.contains(p))
+        && KernelVersion::current().map_or(true, |v| v < KernelVersion::new(5, 14, 0))
+    {
+        match load(ebpf, ulp) {
+            Some(p) => markers.push(p),
+            None => markers.clear(),
+        }
+    }
+    if markers.is_empty() {
+        bail!("no complete set loads: {}", errors.join("; "));
+    }
+    Ok(markers)
+}
+
+/// Whether `/proc/kallsyms` lists `name`. Unreadable counts as present, so
+/// its hook is required (errs toward refusing).
+fn kernel_has_symbol(name: &str) -> bool {
+    use std::io::BufRead;
+    let Ok(f) = File::open("/proc/kallsyms") else {
+        return true;
+    };
+    std::io::BufReader::new(f)
+        .lines()
+        .map_while(|l| l.ok())
+        .any(|l| l.split_whitespace().nth(2) == Some(name))
 }
 
 // ── cgroup v2 root ─────────────────────────────────────────────────────────
@@ -322,7 +420,7 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
 /// 3. write the `pid_filter` candidates (PID_CANDIDATES), then attach
 ///    sched_process_exit, so every candidate exit from here on is recorded
 ///    in PID_EXITED for [`arm`];
-/// 4. the tcp_set_ulp marker, so no socket attaches kTLS unmarked;
+/// 4. the kTLS key-install markers, so no socket installs kTLS keys unmarked;
 /// 5. both capture hooks and fexit accept;
 /// 6. sock_create and sockops.
 ///
@@ -375,7 +473,7 @@ pub fn attach_disarmed(
         ));
     }
     if report.writers {
-        order.push((SET_ULP, restricted));
+        order.extend(report.markers.iter().map(|&p| (p, restricted)));
     }
     order.extend([(SKB_INGRESS, true), (SKB_EGRESS, true)]);
     order.extend(report.accept.map(|p| (p, false)));
@@ -707,7 +805,6 @@ pub fn take_instance_lock() -> Result<()> {
 /// Whether aya attaches cgroup programs through bpf_link (5.7+), whose
 /// attachment dies with the agent. The same test aya makes.
 pub fn uses_links() -> bool {
-    use aya::util::KernelVersion;
     KernelVersion::current().is_ok_and(|v| v >= KernelVersion::new(5, 7, 0))
 }
 
