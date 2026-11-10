@@ -16,8 +16,9 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "test_hooks.rs",
-        "SOCKET_TAP",
-        "tests and scope-test-hooks builds only: the test oracle of socket writes",
+        "TAPS",
+        "tests and scope-test-hooks builds only: the test oracle of socket writes, \
+         what revoked gates refused, and OTLP exports",
     ),
     ("main.rs", "GLOBAL", "the global allocator"),
     (

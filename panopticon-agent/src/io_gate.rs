@@ -28,13 +28,17 @@ use anyhow::{Context as _, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::instrument::WithSubscriber;
 
+use crate::test_hooks::SOCKET_SENT;
+
 /// Revoked once, for good. See the module docs.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct IoGate(RwLock<bool>);
 
 impl IoGate {
     pub fn new() -> Arc<Self> {
-        Arc::default()
+        let gate = Arc::default();
+        crate::test_hooks::new_gate(&gate);
+        gate
     }
 
     /// The read guard while the gate is open; None once revoked. Hold it
@@ -313,10 +317,11 @@ pub struct GatedIo<T> {
 }
 
 impl<T> GatedIo<T> {
-    /// Gate one poll: `f` runs under the read guard, or is refused.
+    /// Gate one poll of `op`: `f` runs under the read guard, or is refused.
     fn gated<R>(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
+        op: &'static str,
         f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>>
     where
@@ -329,6 +334,9 @@ impl<T> GatedIo<T> {
             return Poll::Pending;
         }
         let Some(_open) = this.gate.open() else {
+            crate::test_hooks::tap_gate(crate::test_hooks::SOCKET_REFUSED, &this.gate, || {
+                format!("{op}\n").into_bytes()
+            });
             return Poll::Ready(Err(refused()));
         };
         f(Pin::new(&mut this.inner), cx)
@@ -352,9 +360,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let port = self.peer_port;
-        let r = self.gated(cx, |io, cx| io.poll_write(cx, buf));
+        let r = self.gated(cx, "write", |io, cx| io.poll_write(cx, buf));
         if let Poll::Ready(Ok(n)) = r {
-            crate::test_hooks::tap(port, &buf[..n]);
+            crate::test_hooks::tap(SOCKET_SENT, port, &buf[..n]);
         }
         r
     }
@@ -365,11 +373,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let port = self.peer_port;
-        let r = self.gated(cx, |io, cx| io.poll_write_vectored(cx, bufs));
+        let r = self.gated(cx, "write", |io, cx| io.poll_write_vectored(cx, bufs));
         if let Poll::Ready(Ok(mut n)) = r {
             for b in bufs {
                 let k = n.min(b.len());
-                crate::test_hooks::tap(port, &b[..k]);
+                crate::test_hooks::tap(SOCKET_SENT, port, &b[..k]);
                 n -= k;
             }
         }
@@ -381,11 +389,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.gated(cx, |io, cx| io.poll_flush(cx))
+        self.gated(cx, "flush", |io, cx| io.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.gated(cx, |io, cx| io.poll_shutdown(cx))
+        self.gated(cx, "shutdown", |io, cx| io.poll_shutdown(cx))
     }
 }
 
@@ -627,6 +635,9 @@ impl Drop for GatedLine {
         }
         if let Some(_open) = self.log.gate.open() {
             (self.log.sink)(&self.buf);
+        } else {
+            let line = std::mem::take(&mut self.buf);
+            crate::test_hooks::tap_gate(crate::test_hooks::LOG_REFUSED, &self.log.gate, || line);
         }
     }
 }
