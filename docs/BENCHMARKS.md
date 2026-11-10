@@ -1121,7 +1121,7 @@ high ends are under connection churn):
 | cgroup_skb `pid_filter`, 200 KB | 70.5K | 99.99% | 4.01 | 56.9 | 123 MiB | 0-112 / 0 / 0-1.2K | 17.7 |
 | TC, new connection per request, 64 | 27.7K | 100% | 0.45 | 16.0 | 90 MiB | 0 / 0 / 0 | 4.87 |
 | cgroup_skb unscoped, new connection per request | 26.5K | 99.92% | 0.77 | 28.9 | 112 MiB | 0 / 0 / 507 | 9.88 |
-| cgroup_skb `pid_filter`, new connection per request | 26.8K | **56.51%** | 0.38 | 13.9 | 113 MiB | 0 / 0 / 0 (`no_owner` 115K) | 8.48 |
+| cgroup_skb `pid_filter`, new connection per request | 26.8K | **56.51%** (before the owner fix; 100% after) | 0.38 | 13.9 | 113 MiB | 0 / 0 / 0 (`no_owner` 115K) | 8.48 |
 
 **Fixed 20K req/s:**
 
@@ -1134,7 +1134,7 @@ high ends are under connection churn):
 | 4K connections, no agent | 67 / 3,262 | 52.2 | – | – | – | – |
 | 4K, TC | 70 / 4,812 | 55.3 | 0.27 | 13.7 | 100% | 1.3 / 2.6 ms |
 | 4K, cgroup_skb unscoped | 74 / 4,452 | 58.7 | 0.53 | 26.9 | 100% (two views) | 1.3 / 2.1 ms |
-| 4K, cgroup_skb `pid_filter` | 72 / 4,915 | 56.6 | 0.28 | 14.4 | 99.49% | 1.3 / 2.1-3.1 ms |
+| 4K, cgroup_skb `pid_filter` | 72 / 4,915 | 56.6 | 0.28 | 14.4 | 99.49% (before the owner fix; 100% after) | 1.3 / 2.1-3.1 ms |
 
 Kernel → worker latency was measured in a separate build with the same
 stamping as in the scaling study (every 64th event). The p50 is set by the
@@ -1161,21 +1161,39 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   the 16 MiB of ring holds far fewer events. At 1K connections, with the same
   event count as TC, `pid_filter` lost 2.6-7.7K events in the kernel ring,
   where TC lost none.
-- **`pid_filter` loses data from servers whose listener predates the agent.**
-  This is the case after any agent restart. A connection accepted from such a
-  listener has no recorded owner until `accept()` returns, and bytes before
-  that are dropped (`no_owner`). Under connection churn that was 44% of
-  requests, and at 4K connections opening at 20K req/s, 0.5%. With 64
-  keep-alive connections, a whole connection (1 of 64) was lost in 6 of 27
-  runs, and at 200 connections in 1 of 3. That second path is the accept
-  being recorded before the connection's ESTABLISHED callback, which then
-  clears it.
-  - With the server's listener created after the agent started
-    (`SERVER_LATE=1`), the same cells measure 100% recall with no `no_owner`
-    drops, and so does `cgroup_filter` under churn.
-  - TC's `pid_filter` holds packets in user space until the owner is known,
-    and loses none.
-  - Prefer `cgroup_filter` with this backend.
+- **`pid_filter` lost data from servers whose listener predates the agent
+  (fixed since; see below).** This is the case after any agent restart. In
+  the runs above, a connection accepted from such a listener had no recorded
+  owner until `accept()` returned, and bytes before that were dropped
+  (`no_owner`): 44% of requests under connection churn, and 0.5% at 4K
+  connections opening at 20K req/s. With 64 keep-alive connections, a whole
+  connection (1 of 64) was lost in 6 of 27 runs, and at 200 connections in
+  1 of 3: the kernel can hand a connection to `accept()` before its
+  ESTABLISHED callback runs, and that callback cleared the recorded
+  acceptor. With the server's listener created after the agent started
+  (`SERVER_LATE=1`), the same cells measured 100%.
+
+**`pid_filter` recall after the owner fix** (7.0, 32 vCPUs, n=3, median
+[min-max]). The agent now gives a listener that predates it an owner when
+every process holding the listener is in `pid_filter` (else, as before,
+its connections are captured from `accept()` on), and a connection keeps
+its acceptor whichever runs first. `SERVER_LATE=0` is the listener before
+the agent:
+
+| Cell | TC `pid_filter` | cgroup_skb, `SERVER_LATE=0` | cgroup_skb, `SERVER_LATE=1` | `no_owner` drops (cgroup_skb) |
+|---|---|---|---|---|
+| New connection per request, 64 | 100% | 100% (was 56.51%) | 100% | 0 |
+| 64 keep-alive, closed loop | 100% | 100% | 100% | 0 |
+| 1K keep-alive, closed loop | 99.94% [99.84-100] | 99.84% [99.73-99.90] | 99.74% [99.63-99.92] | 0 |
+| 4K connections at 20K req/s | 100% | 100% (was 99.49%) | 100% | 0 |
+
+At 1K connections the remaining gap to TC is kernel ring drops (about 6K
+per run on both `SERVER_LATE` settings, see Ring capacity), not ownership.
+A listener shared with a process that is not in `pid_filter` (for example
+a pre-fork master left out of the list, or systemd socket activation)
+still gets no owner: those connections are captured from `accept()` on.
+On RHEL 8 (no `pidfd_getfd`) no listener that predates the agent gets an
+owner. `cgroup_filter` has neither gap.
 
 **Caveats.**
 

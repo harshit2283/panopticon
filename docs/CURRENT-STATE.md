@@ -65,10 +65,11 @@ production-hardened compliance platform.
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
   loopback and both ends of node-local connections, about twice the events
   and agent CPU. Known costs: fixed-size ring records (kernel drops at 1K
-  connections where TC has none), and `pid_filter` misses traffic accepted
-  from a listener that predates the agent (44% of requests under connection
-  churn, and now and then a whole keep-alive connection); `cgroup_filter`
-  has no such gap.
+  connections where TC has none). `pid_filter` matches TC's recall, also for
+  a server whose listener predates the agent, when every process holding
+  that listener is listed; a listener shared with an unlisted process (and
+  any such listener on RHEL 8) is captured from `accept()` on.
+  `cgroup_filter` has no such gap.
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 
