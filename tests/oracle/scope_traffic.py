@@ -24,7 +24,9 @@ Environment:
   GAP       seconds between requests (default 0.05)
 
 OUT gets one JSON line per completed request: marker, send time (epoch
-seconds), local and remote address, pid. Runs on python 3.6+.
+seconds), local and remote address, pid, and the client's start time
+("run"). A client started again on the same OUT (a container restart)
+continues its numbering. Runs on python 3.6+.
 """
 import array
 import json
@@ -117,11 +119,13 @@ def exchange(sock, rf, marker):
 
 
 def run(tag, n, out, connect, one_connection=False):
-    pid = os.getpid()
+    pid, started = os.getpid(), time.time()
+    # A restarted client (a container restart) continues the numbering.
+    i0 = sum(1 for _ in open(out)) if os.path.exists(out) else 0
     with open(out, "a") as f:
         sock = rf = None
-        i = 0
-        while n == 0 or i < n:
+        i = i0
+        while n == 0 or i < i0 + n:
             marker = "B2M-%s-%d" % (tag, i)
             t = time.time()
             try:
@@ -140,7 +144,7 @@ def run(tag, n, out, connect, one_connection=False):
                 continue
             la, ra = sock.getsockname(), sock.getpeername()
             f.write(json.dumps({"m": marker, "t": t, "laddr": la[0], "lport": la[1],
-                                "raddr": ra[0], "rport": ra[1], "pid": pid}) + "\n")
+                                "raddr": ra[0], "rport": ra[1], "pid": pid, "run": started}) + "\n")
             f.flush()
             i += 1
             time.sleep(GAP)

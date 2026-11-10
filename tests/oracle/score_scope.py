@@ -6,7 +6,9 @@ DIR holds the run's sinks: agent.log (stdout + stderr, --log-events, -v),
 agent.jsonl (event export), audit.jsonl (PII audit), raw.pncap (raw dump)
 and raw.jsonl (its decode), metrics.txt and debug_state.json (scraped at
 the end), and one truth file per traffic tag, TAG.truth.jsonl
-(scope_traffic.py / scope_go_tls.go). A marker is B2M-<TAG>-<seq>.
+(scope_traffic.py / scope_go_tls.go). A marker is B2M-<TAG>-<seq>. With
+DIR/stop_t (epoch seconds), truth after it is ignored (traffic that ran on
+while the agent stopped).
 
 Checks:
   none:TAG            no marker of TAG in any sink
@@ -21,21 +23,28 @@ Checks:
                       sink's bytes written after the change was reported
                       applied (offsets), up to the sizes just before the
                       next change started ("until_offsets")
-  widened:TAG:R       with DIR/widened.json ({"t"}): recall of TAG's markers
-                      sent from t + 1 s on >= R
+  restart:TAG:R       TAG's client ran more than once (a container restart);
+                      recall of the last run's markers >= R
+  widened:TAG:R       with DIR/widened.json ({"t", "until"}): recall of TAG's
+                      markers sent from t + 1 s (to "until", if set) >= R
   noaddr:TAG          export events with a TAG marker carry no address
   addr:TAG:R          share of export events with a TAG marker that carry
                       an address >= R
+  addrk:TAG:R         addr, unless the run dropped kTLS payload (a socket
+                      with the kTLS ULP never gets a TLS address, §3.5)
   inport:TAG:PORT     no TAG marker in a raw-dump event on PORT
   someport:TAG:PORT   some TAG marker in a raw-dump event on PORT
   someport:PORT       some raw-dump event on PORT
   noport:PORT         no raw-dump or export event on PORT
   tuples:TAG          the raw dump's tuples of TAG's connections, per view
-                      (client: the truth's local address) and direction,
-                      are exactly DIR/expect.json's (E: an ephemeral port)
+                      (client: a local address in expect.json's
+                      comma-separated client_ip) and direction,
+                      are exactly DIR/expect.json's (E: any port it does
+                      not name: the client's, possibly NAT-remapped)
   drvok:TAG           DIR/TAG.out says the fixture finished ("OK")
   exit:nonzero        the agent did not start (DIR/agent.exit)
   info:TAG            report (never fails) how many TAG markers were exported
+                      and how many of their export events carry an address
   drop:REASON         panopticon_scope_dropped_events_total{reason} > 0
   log:REGEX           the agent log matches REGEX
   nolog:REGEX         the agent log does not match REGEX
@@ -88,8 +97,13 @@ def sinks():
     yield "raw payloads", raw_payloads
 
 
+# Traffic that outlives the agent (pods, stopped after it) counts only up
+# to 0.5 s before DIR/stop_t, when the run began to stop.
+STOP = float(read("stop_t") or "inf") - 0.5
+
+
 def truth(tag):
-    return jsonl("%s.truth.jsonl" % tag)
+    return [t for t in jsonl("%s.truth.jsonl" % tag) if t["t"] < STOP]
 
 
 def ip_patterns(ips):
@@ -114,6 +128,12 @@ def on_port(e, port):
     return port in (e.get("src_port"), e.get("dst_port"))
 
 
+def scope_drops(reason):
+    m = re.search(rb'^panopticon_scope_dropped_events_total\{reason="%s"\} (\S+)' % reason.encode(),
+                  data["metrics.txt"], re.M)
+    return float(m.group(1)) if m else 0
+
+
 def exported(tag):
     """Markers of TAG in the export."""
     pat = re.compile(r"B2M-%s-\d+" % re.escape(tag))
@@ -134,7 +154,10 @@ for c in sys.argv[2:]:
     elif kind == "some":
         check(exported(arg), "%s: %d markers in the export (want some)" % (arg, len(exported(arg))))
     elif kind == "info":
-        print("  info %s: %d markers exported of %d sent" % (arg, len(exported(arg)), len(truth(arg))))
+        mark = "B2M-%s-" % arg
+        evs = [e for e in export if mark in json.dumps(e)]
+        print("  info %s: %d markers exported of %d sent; %d of %d export events carry an address"
+              % (arg, len(exported(arg)), len(truth(arg)), sum(bool(e.get("src_addr")) for e in evs), len(evs)))
     elif kind == "truth":
         check(truth(arg), "%s traffic ran (%d requests)" % (arg, len(truth(arg))))
     elif kind == "notruth":
@@ -163,16 +186,19 @@ for c in sys.argv[2:]:
                 check(n > 0, "port %d: %d of %d raw events carry %s markers (want some)" % (port, n, len(evs), parts[0]))
     elif kind == "tuples":
         want = json.loads(read("expect.json"))[arg]
-        client = want.pop("client_ip")
-        eph = {t["lport"] for t in truth(arg)}
+        client = want.pop("client_ip").split(",")
+        # Every port the expectation does not name is the client's own, as
+        # bound or as NAT remapped it on a conntrack clash (ingress is seen
+        # after every translation, §2.3).
+        fixed = {int(p) for v in want.values() for p in re.findall(r":(\d+)", v)}
         mark = ("B2M-%s-" % arg).encode()
         seen = {}
         for e in raw_events:
             if mark not in e["data"]:
                 continue
             local = e["src"] if e["direction"] == "Egress" else e["dst"]
-            view = "%s %s" % ("client" if local == client else "server", e["direction"])
-            fmt = lambda a, p: "%s:%s" % (a, "E" if p in eph else p)
+            view = "%s %s" % ("client" if local in client else "server", e["direction"])
+            fmt = lambda a, p: "%s:%s" % (a, p if p in fixed else "E")
             seen.setdefault(view, set()).add(fmt(e["src"], e["src_port"]) + ">" + fmt(e["dst"], e["dst_port"]))
         for view, t in sorted(want.items()):
             got = seen.pop(view, set())
@@ -213,28 +239,38 @@ for c in sys.argv[2:]:
                 hits = [mark] if mark in data[name] else []
                 hits += [p.pattern for p in pats if p.search(data[name])]
                 check(not hits, "%s (scraped after): no %s marker%s" % (name, tag, " or " + ip if ip else ""))
+    elif kind == "restart":
+        tag, r = arg.split(":")
+        runs = sorted({t["run"] for t in truth(tag)})
+        want = {t["m"] for t in truth(tag) if runs and t["run"] == runs[-1]}
+        got = exported(tag) & want
+        share = len(got) / max(len(want), 1)
+        check(len(runs) > 1 and share >= float(r), "%s: %d client runs; the last one's recall %d/%d (%.1f%%) >= %s"
+              % (tag, len(runs), len(got), len(want), 100 * share, r))
     elif kind == "widened":
         tag, r = arg.split(":")
-        t0 = json.loads(read("widened.json"))["t"] + 1.0
-        want = {t["m"] for t in truth(tag) if t["t"] >= t0}
+        w = json.loads(read("widened.json"))
+        t0, t1 = w["t"] + 1.0, w.get("until", float("inf"))
+        want = {t["m"] for t in truth(tag) if t0 <= t["t"] < t1}
         got = exported(tag) & want
         share = len(got) / max(len(want), 1)
         check(want and share >= float(r), "%s after widening: recall %d/%d (%.1f%%) >= %s"
               % (tag, len(got), len(want), 100 * share, r))
-    elif kind in ("noaddr", "addr"):
+    elif kind in ("noaddr", "addr", "addrk"):
         tag, _, r = arg.partition(":")
         mark = "B2M-%s-" % tag
         evs = [e for e in export if mark in json.dumps(e)]
         with_addr = [e for e in evs if e.get("src_addr") or e.get("dst_addr")]
+        share = len(with_addr) / max(len(evs), 1)
+        what = "%s: %d/%d events carry an address" % (tag, len(with_addr), len(evs))
         if kind == "noaddr":
-            check(evs and not with_addr, "%s: %d events, %d with an address (want none)" % (tag, len(evs), len(with_addr)))
+            check(evs and not with_addr, what + " (want none)")
+        elif kind == "addrk" and scope_drops("ktls_payload"):
+            print("  skip %s: sockets were kTLS-marked (ktls_payload > 0), which gives no address" % what)
         else:
-            share = len(with_addr) / max(len(evs), 1)
-            check(evs and share >= float(r), "%s: %d/%d events carry an address (>= %s)" % (tag, len(with_addr), len(evs), r))
+            check(evs and share >= float(r), "%s (>= %s)" % (what, r))
     elif kind == "drop":
-        m = re.search(rb'^panopticon_scope_dropped_events_total\{reason="%s"\} (\S+)' % arg.encode(),
-                      data["metrics.txt"], re.M)
-        v = float(m.group(1)) if m else 0
+        v = scope_drops(arg)
         check(v > 0, "scope drops %s = %g > 0" % (arg, v))
     elif kind == "log":
         check(re.search(arg.encode(), log_text, re.M), "log matches /%s/" % arg)

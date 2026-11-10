@@ -22,6 +22,12 @@
 #   ktls_scoped   splice) and WireGuard, in unscoped full, scoped full and
 #   ktls_head     head_only
 #   refuse_cgroup RHEL 8 (no host cgroup2): cgroup_filter is refused
+#   k8s           k3s_up, k8s_pods, k8s_tuples, k3s_down in one run (k3s is
+#                 never left running for other oracles):
+#   k8s_pods      T-5 / T-10: pod_filter; a container restart in a selected
+#                 pod, a matching pod added (widening) and relabelled out
+#                 (narrowing) under traffic, unmatched pods, TLS in pods
+#   k8s_tuples    T-18: ClusterIP, NodePort, hostNetwork, REDIRECT in a pod
 #
 # Usage: sudo tests/oracle/run_scope.sh OUT scenario...
 # Env: AGENT (agent binary), PY (python3 with a shared libssl), GO_TLS (a
@@ -67,6 +73,7 @@ cleanup() {
   foreign_detach
   [[ -e ${FOREIGN_PIN}2 ]] && FOREIGN_PIN=${FOREIGN_PIN}2 foreign_detach
   mountpoint -q /run/b2-cg2 && umount /run/b2-cg2
+  [[ -n ${K3S_STARTED:-} ]] && run_k3s_down
   netcls_down
   if [[ -n $CGR ]]; then
     for c in a b c; do
@@ -141,18 +148,20 @@ agent_stop() {
   [[ -f $d/raw.pncap ]] && "$AGENT" --privacy-mode full --decode-capture "$d/raw.pncap" >"$d/raw.jsonl"
 }
 
-# applied DIR REGEX: wait (40 s) for REGEX in the agent log; print
-# {"t": the line's timestamp, "offsets": each sink's size, the log's at the line's end}.
+# applied DIR REGEX [FROM]: wait (40 s) for REGEX in the agent log (past
+# byte FROM); print {"t": the line's timestamp, "offsets": each sink's size,
+# the log's at the line's end}.
 applied() {
   "$PY" -I - "$@" <<'EOF'
 import datetime, json, os, re, sys, time
 d, pat = sys.argv[1], re.compile(sys.argv[2].encode())
+start = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 ansi = re.compile(rb"\x1b\[[0-9;]*m")
 end = time.time() + 40
 while time.time() < end:
     raw = open(d + "/agent.log", "rb").read()
-    pos = 0
-    for line in raw.splitlines(True):
+    pos = start
+    for line in raw[start:].splitlines(True):
         pos += len(line)
         clean = ansi.sub(b"", line)
         if pat.search(clean):
@@ -282,7 +291,12 @@ run_tls_scoped() {
   fi
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"
-  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 none:ON none:PS recall:PR:0.98 noaddr:PR)
+  # OSEL's own sockets are in scope: its calls carry their address, unless
+  # the library attached the kTLS ULP (OpenSSL 3.0 does on every socket
+  # BIO), which marks the socket KTLS and gives no address. Go writes never
+  # carry one (no return probe).
+  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 none:ON none:PS recall:PR:0.98 noaddr:PR
+                addrk:OSEL:0.95 info:GSEL)
   if [[ $how == pid ]]; then
     sleep 1
     kill $dummy; wait $dummy 2>/dev/null
@@ -581,6 +595,182 @@ run_ktls() {
   score "$d" "${checks[@]}"
 }
 
+# ── Kubernetes (k3s): T-5, T-18, T-10 pod_filter ──────────────────────────
+# k3s_up installs k3s (once) and starts it; k3s_down stops it and removes
+# its pods, interfaces and iptables rules (k3s-killall.sh), so the VM is
+# left as other oracles expect. The agent runs on the node, outside a pod,
+# with a service account token and the API server's CA where an in-cluster
+# agent finds them, and NODE_NAME.
+
+K=(k3s kubectl)
+SA=/var/run/secrets/kubernetes.io/serviceaccount
+IMAGE=python:3.12-slim
+
+run_k3s_up() {
+  if ! command -v k3s >/dev/null; then
+    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_ENABLE=true INSTALL_K3S_SKIP_START=true \
+      INSTALL_K3S_EXEC="--disable traefik --disable servicelb --disable metrics-server --write-kubeconfig-mode 644" \
+      sh - || { STATUS=1; return; }
+  fi
+  systemctl start k3s
+  K3S_STARTED=1
+  for _ in $(seq 150); do "${K[@]}" get node 2>/dev/null | grep -q ' Ready' && break; sleep 2; done
+  "${K[@]}" get node -o wide
+  "${K[@]}" create sa b2-agent 2>/dev/null
+  "${K[@]}" create clusterrolebinding b2-agent --clusterrole=view --serviceaccount=default:b2-agent 2>/dev/null
+  mkdir -p $SA
+  "${K[@]}" create token b2-agent --duration 12h >$SA/token
+  cp /var/lib/rancher/k3s/server/tls/server-ca.crt $SA/ca.crt
+  k3s crictl pull $IMAGE >/dev/null && log "k3s ready, $IMAGE pulled"
+}
+
+run_k3s_down() {
+  "${K[@]}" delete ns b2 --wait=false 2>/dev/null
+  [[ -x /usr/local/bin/k3s-killall.sh ]] && /usr/local/bin/k3s-killall.sh >/dev/null 2>&1
+  rm -rf /var/run/secrets/kubernetes.io
+  K3S_STARTED=
+  log "k3s stopped: $(ip -br link | grep -cE 'cni0|flannel') k3s interfaces left"
+}
+
+k8s_env() {
+  export KUBERNETES_SERVICE_HOST=127.0.0.1 KUBERNETES_SERVICE_PORT=6443
+  export NODE_NAME=$("${K[@]}" get node -o jsonpath='{.items[0].metadata.name}')
+}
+
+# pod NAME LABEL DIR [hostnet] -- container specs "name|ENV=V,...|cmd args"
+pod() {
+  local name=$1 label=$2 d=$3 hostnet=false
+  shift 3
+  [[ $1 == hostnet ]] && { hostnet=true; shift; }
+  shift # --
+  {
+    printf 'apiVersion: v1\nkind: Pod\nmetadata: {name: %s, namespace: b2, labels: {app: %s}}\n' "$name" "$label"
+    printf 'spec:\n  hostNetwork: %s\n  terminationGracePeriodSeconds: 1\n  containers:\n' $hostnet
+    local c cname envs cmd
+    for c in "$@"; do
+      IFS='|' read -r cname envs cmd <<<"$c"
+      printf '  - name: %s\n    image: %s\n    command: [%s]\n    env:\n' "$cname" $IMAGE \
+        "$(printf '"%s",' python3 -I /oracle/scope_traffic.py $cmd | sed 's/,$//')"
+      printf '    - {name: GO, value: /truth/go}\n'
+      local e
+      for e in ${envs//,/ }; do printf '    - {name: %s, value: "%s"}\n' "${e%%=*}" "${e#*=}"; done
+      printf '    volumeMounts: [{name: o, mountPath: /oracle}, {name: t, mountPath: /truth}]\n'
+    done
+    printf '  volumes:\n  - {name: o, hostPath: {path: %s}}\n  - {name: t, hostPath: {path: %s}}\n' "$HERE" "$d"
+  } | "${K[@]}" apply -f - >/dev/null
+}
+pod_ip() { "${K[@]}" -n b2 get pod "$1" -o jsonpath='{.status.podIP}'; }
+pods_ready() { "${K[@]}" -n b2 wait --for=condition=Ready pod --all --timeout=180s >/dev/null; }
+fresh_ns() { # a new, empty namespace b2 (an earlier one may still be terminating)
+  "${K[@]}" delete ns b2 --ignore-not-found --timeout=180s >/dev/null
+  "${K[@]}" create ns b2 >/dev/null
+}
+
+run_k8s_pods() {
+  local d=$OUT/k8s_pods; mkdir -p "$d"
+  cp "$OUT/cert.pem" "$OUT/key.pem" "$d/"
+  fresh_ns
+  local tls="TLS=1,TLS_CERT=/truth/cert.pem,TLS_KEY=/truth/key.pem"
+  local cli="EVERY=5,GAP=0.05"
+  pod sel-1 b2sel "$d" -- "srv||server 8080" "cli|$cli|client 8080 K1 0 /truth/K1.truth.jsonl"
+  pod uns-1 b2other "$d" -- "srv||server 8080" "cli|$cli|client 8080 K3 0 /truth/K3.truth.jsonl"
+  pod sel-tls b2sel "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PT 0 /truth/PT.truth.jsonl"
+  pod uns-tls b2other "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PU 0 /truth/PU.truth.jsonl"
+  pods_ready
+  k8s_env
+  conf "$d" $'[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
+  agent_start "$d" || { score "$d" log:NEVER; return; }
+  touch "$d/go"; sleep 6
+  # Container restart in a selected pod: the client's container is killed
+  # and restarted by the kubelet, in a new container cgroup in the pod's.
+  # SIGKILL: the client is its container's init, which ignores SIGTERM.
+  log "k8s: restarting sel-1/cli"
+  pkill -9 -f 'scope_traffic.py client 8080 K1 '
+  for _ in $(seq 60); do
+    [[ $("${K[@]}" -n b2 get pod sel-1 -o jsonpath='{.status.containerStatuses[?(@.name=="cli")].restartCount}') -ge 1 ]] &&
+      "${K[@]}" -n b2 get pod sel-1 | grep -q '2/2' && break
+    sleep 1
+  done
+  sleep 8
+  # A matching pod added at runtime: a widening by the pod watcher.
+  log "k8s: adding sel-2"
+  local from; from=$(stat -c %s "$d/agent.log")
+  pod sel-2 b2sel "$d" -- "srv||server 8080" "cli|$cli|client 8080 K2 0 /truth/K2.truth.jsonl"
+  applied "$d" 'Scope widened: applied.*kubernetes' "$from" >"$d/widened.json" || STATUS=1
+  sleep 10
+  # A pod that stops matching while its traffic runs: a narrowing.
+  local ip2; ip2=$(pod_ip sel-2)
+  log "k8s: relabelling sel-2 ($ip2) out of the selection"
+  "$PY" -I -c 'import json, sys, time; w = json.load(open(sys.argv[1])); w["until"] = time.time()
+json.dump(w, open(sys.argv[1], "w"))' "$d/widened.json"
+  from=$(stat -c %s "$d/agent.log")
+  "${K[@]}" -n b2 label pod sel-2 app=b2gone --overwrite >/dev/null
+  applied "$d" 'Scope narrowed: applied.*kubernetes' "$from" >"$d/narrowed.json" || STATUS=1
+  curl -sf "http://$METRICS/metrics" >"$d/metrics_after.txt"
+  curl -sf "http://$METRICS/debug/state" >"$d/debug_after.json"
+  sleep 8
+  date +%s.%N >"$d/stop_t" # the pods' traffic runs on while the agent stops
+  "${K[@]}" -n b2 get pods -o wide >"$d/pods.txt"
+  "${K[@]}" delete ns b2 --wait=false >/dev/null
+  sleep 2
+  agent_stop "$d"
+  score "$d" recall:K1:0.95 restart:K1:0.95 widened:K2:0.95 "narrow:K2:$ip2" truth:K3 none:K3 \
+    recall:PT:0.95 truth:PU none:PU info:PT
+}
+
+# T-18 on Kubernetes: ClusterIP, NodePort (from the node), hostNetwork, and
+# an Istio-style inbound REDIRECT (8081 -> 8080) in the server pod's netns.
+run_k8s_tuples() {
+  local d=$OUT/k8s_tuples; mkdir -p "$d"
+  fresh_ns
+  local cli="EVERY=5,GAP=0.05"
+  pod srv b2srv "$d" -- "srv|HOST=0.0.0.0|server 8080"
+  pod hn b2hn "$d" hostnet -- "srv|HOST=0.0.0.0|server 31601"
+  printf 'apiVersion: v1\nkind: Service\nmetadata: {name: b2svc, namespace: b2}\nspec:\n  type: NodePort\n  selector: {app: b2srv}\n  ports: [{port: 80, targetPort: 8080, nodePort: 30080}]\n' |
+    "${K[@]}" apply -f - >/dev/null
+  pods_ready
+  local node vip srv # the node's first InternalIP (IPv4; an IPv6 one may follow)
+  node=$("${K[@]}" get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' | awk '{print $1}')
+  vip=$("${K[@]}" -n b2 get svc b2svc -o jsonpath='{.spec.clusterIP}'); srv=$(pod_ip srv)
+  pod cli1 b2cli "$d" -- "cli|$cli,HOST=$vip|client 80 CI 0 /truth/CI.truth.jsonl"
+  pod cli2 b2cli "$d" -- "cli|$cli,HOST=$node|client 31601 HN 0 /truth/HN.truth.jsonl"
+  pod cli3 b2cli "$d" -- "cli|$cli,HOST=$srv|client 8081 RP 0 /truth/RP.truth.jsonl"
+  pod cliu b2other "$d" -- "cli|$cli,HOST=$vip|client 80 CU 0 /truth/CU.truth.jsonl"
+  pods_ready
+  local spid; spid=$(pgrep -f 'scope_traffic.py server 8080' | head -1)
+  nsenter -t "$spid" -n iptables -t nat -A PREROUTING -p tcp --dport 8081 -j REDIRECT --to-ports 8080
+  bg env CGROUP=b2/a GO=$d/go HOST=$node EVERY=5 GAP=0.05 $TRAFFIC client 30080 NP 0 "$d/NP.truth.jsonl"
+  local c1 c2 c3 cu cni
+  c1=$(pod_ip cli1); c2=$(pod_ip cli2); c3=$(pod_ip cli3); cu=$(pod_ip cliu)
+  cni=$(ip -4 -o addr show cni0 | awk '{print $4}' | cut -d/ -f1)
+  # §2.3: egress after the socket's own netns's netfilter (NodePort from the
+  # node: DNAT in OUTPUT, MASQUERADE in POSTROUTING, both before the hook),
+  # before NAT in netns crossed later (ClusterIP: the node's DNAT); ingress
+  # as delivered, after every translation (REDIRECT: the redirected port).
+  cat >"$d/expect.json" <<EOF
+{"CI": {"client Egress": "$c1:E>$vip:80", "client Ingress": "$vip:80>$c1:E",
+        "server Egress": "$srv:8080>$c1:E", "server Ingress": "$c1:E>$srv:8080", "client_ip": "$c1"},
+ "NP": {"client Egress": "$cni:E>$srv:8080", "client Ingress": "$node:30080>$node:E",
+        "server Egress": "$srv:8080>$cni:E", "server Ingress": "$cni:E>$srv:8080", "client_ip": "$node,$cni"},
+ "HN": {"client Egress": "$c2:E>$node:31601", "client Ingress": "$node:31601>$c2:E",
+        "server Egress": "$node:31601>$c2:E", "server Ingress": "$c2:E>$node:31601", "client_ip": "$c2"},
+ "RP": {"client Egress": "$c3:E>$srv:8081", "client Ingress": "$srv:8081>$c3:E",
+        "server Egress": "$srv:8081>$c3:E", "server Ingress": "$c3:E>$srv:8080", "client_ip": "$c3"},
+ "CU": {"server Egress": "$srv:8080>$cu:E", "server Ingress": "$cu:E>$srv:8080", "client_ip": "$cu"}}
+EOF
+  k8s_env
+  conf "$d" $'cgroup_filter = ["b2/a"]\n\n[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2srv" }\n\n[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2cli" }\n\n[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2hn" }'
+  agent_start "$d" || { score "$d" log:NEVER; return; }
+  touch "$d/go"; sleep 14
+  date +%s.%N >"$d/stop_t" # the pods' traffic runs on while the agent stops
+  stop_pids
+  "${K[@]}" delete ns b2 --wait=false >/dev/null
+  sleep 2
+  agent_stop "$d"
+  score "$d" recall:CI:0.97 recall:NP:0.97 recall:HN:0.97 recall:RP:0.97 truth:CU \
+    tuples:CI tuples:NP tuples:HN tuples:RP tuples:CU
+}
+
 run_refuse_cgroup() {
   local d=$OUT/refuse_cgroup; mkdir -p "$d"
   conf "$d" 'cgroup_filter = ["b2/a"]'
@@ -604,6 +794,11 @@ for s in "$@"; do
     tuples) run_tuples ;;
     ktls_full | ktls_scoped | ktls_head) run_ktls "${s#ktls_}" ;;
     refuse_cgroup) run_refuse_cgroup ;;
+    k8s) run_k3s_up; run_k8s_pods; agent_kill; stop_pids; run_k8s_tuples; agent_kill; run_k3s_down ;;
+    k3s_up) run_k3s_up ;;
+    k3s_down) run_k3s_down ;;
+    k8s_pods) run_k8s_pods ;;
+    k8s_tuples) run_k8s_tuples ;;
     *) log "unknown scenario $s"; STATUS=1 ;;
   esac
   agent_kill; stop_pids
