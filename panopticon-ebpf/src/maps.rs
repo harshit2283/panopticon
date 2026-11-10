@@ -149,20 +149,18 @@ pub fn shard_submit_flags(shard: u32) -> u64 {
 pub static ZEROS: Array<[u8; MAX_PAYLOAD_SIZE]> = Array::with_max_entries(1, 0);
 
 /// Zero the MAX_PAYLOAD_SIZE bytes at `dst` (tracing programs): one kernel
-/// copy from ZEROS. A store loop costs the verifier thousands of steps per
-/// path (ssl_write_ret no longer loaded); a failed copy also zeroes `dst`.
-/// Every ring reservation is fully written before submit: ring memory is
-/// not zeroed between records and user space maps all of it.
+/// copy from `zeros`, ZEROS' value, looked up once by the caller (a lookup
+/// per call doubled ssl_write_ret's verifier states per chunk). A store
+/// loop costs the verifier thousands of steps per path; a failed copy also
+/// zeroes `dst`. Every ring reservation is fully written before submit:
+/// ring memory is not zeroed between records and user space maps all of it.
 #[inline(always)]
-pub unsafe fn zero_payload(dst: *mut u8) {
-    let src = ZEROS
-        .get_ptr(0)
-        .map_or(core::ptr::null(), |p| p as *const u8);
+pub unsafe fn zero_payload(dst: *mut u8, zeros: *const [u8; MAX_PAYLOAD_SIZE]) {
     unsafe {
         aya_ebpf::helpers::generated::bpf_probe_read_kernel(
             dst as *mut core::ffi::c_void,
             MAX_PAYLOAD_SIZE as u32,
-            src as *const core::ffi::c_void,
+            zeros as *const core::ffi::c_void,
         );
     }
 }

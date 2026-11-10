@@ -929,6 +929,9 @@ fn emit_tls_event<C: EbpfContext>(
     // loop body is kept branch-light: the verifier walks every iteration.
     // Every chunk of one connection object goes to the same shard, in order.
     let shard = shard_for(conn);
+    let Some(zeros) = crate::maps::ZEROS.get_ptr(0) else {
+        return Ok(());
+    };
     let mut off = 0usize;
     for i in 0..MAX_TLS_CHUNKS {
         if off >= len {
@@ -950,7 +953,7 @@ fn emit_tls_event<C: EbpfContext>(
         // would show an earlier record. Zeroed whole before the copy (the
         // copy length is not a constant).
         unsafe {
-            crate::maps::zero_payload((*event).payload.as_mut_ptr());
+            crate::maps::zero_payload((*event).payload.as_mut_ptr(), zeros);
         }
         populate_tls_event(event, &h, unsafe { buf.add(off) }, chunk);
         entry.submit(shard_submit_flags(shard));
