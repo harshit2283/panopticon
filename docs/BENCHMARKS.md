@@ -1054,7 +1054,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 
 Requirements: root on Linux 5.8+, a release build
 (`cargo build -p panopticon-agent --release`), Docker for the database and
-messaging runs, Python with `pip install pyroute2 redis 'psycopg[binary]'
+messaging runs, iproute2, Python with `pip install redis 'psycopg[binary]'
 pymysql mysql-connector-python cryptography grpcio confluent-kafka kafka-python
 pika dnspython`, and Go for the load generator and the Go TLS oracle.
 

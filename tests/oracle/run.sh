@@ -13,8 +13,8 @@
 # be captured.
 #
 # Usage: sudo tests/oracle/run.sh [requests=2000] [seed=1234] [min_recall=0.99]
-# Needs: root, a built agent (target/release/panopticon-agent), python3 with
-# pyroute2 (pip install pyroute2), nsenter.
+# Needs: root, a built agent (target/release/panopticon-agent), python3,
+# iproute2, nsenter.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.

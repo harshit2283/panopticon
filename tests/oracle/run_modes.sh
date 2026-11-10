@@ -22,8 +22,8 @@
 #
 # Usage: sudo tests/oracle/run_modes.sh [requests=300] [seed=1234] [min_recall=0.99] [modes="full redacted metrics_only"]
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
-# python3 with pyroute2 (set PYTHON), a python3 linked against a shared
-# libssl, nsenter, curl.
+# python3 (set PYTHON) linked against a shared libssl, iproute2, nsenter,
+# curl.
 set -euo pipefail
 NS=${ORACLE_NS:-pclient}
 IFACE=${ORACLE_IF:-pv0}

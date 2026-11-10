@@ -11,9 +11,9 @@
 # MIN_RECALL or any raw PII value reaches the export.
 #
 # Usage: sudo tests/oracle/run_messaging.sh [ops=500] [seed=7] [min_recall=0.99] [protos="kafka amqp dns"]
-# Needs: root, docker, a built agent, python3 with pyroute2, confluent-kafka,
+# Needs: root, docker, iproute2, a built agent, python3 with confluent-kafka,
 # kafka-python, pika, dnspython:
-#   pip install pyroute2 confluent-kafka kafka-python pika dnspython
+#   pip install confluent-kafka kafka-python pika dnspython
 # Images can be overridden: KAFKA_IMAGE (default apache/kafka:3.8.0),
 # RABBITMQ_IMAGE (default rabbitmq:3.13), e.g.
 # KAFKA_IMAGE=mirror.gcr.io/apache/kafka:3.8.0

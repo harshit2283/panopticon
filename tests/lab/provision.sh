@@ -51,6 +51,6 @@ command -v bpf-linker >/dev/null ||
   cargo +"$BPF_TOOLCHAIN" install -q bpf-linker --locked --version "$BPF_LINKER_VERSION"
 
 sudo "$PY" -m venv "$VENV"
-sudo "$VENV/bin/pip" install -q --timeout 120 pyroute2 redis 'psycopg[binary]' pymysql cryptography \
+sudo "$VENV/bin/pip" install -q --timeout 120 redis 'psycopg[binary]' pymysql cryptography \
   grpcio mysql-connector-python confluent-kafka kafka-python pika dnspython
 echo "provisioned: kernel $(uname -r), $(rustc +"$BPF_TOOLCHAIN" -V), $(bpf-linker --version), $(go version)"
