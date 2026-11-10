@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf, SkStorage};
 use aya::programs::Program;
-use aya::{Ebpf, EbpfLoader, Pod};
+use aya::{Ebpf, EbpfLoader};
 use panopticon_common::scope::*;
 use panopticon_common::*;
 use scope_loader::*;
@@ -41,18 +41,31 @@ const TARGETS: [(&str, &str); 13] = [
     ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
 ];
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RawState([u64; 8]);
-// SAFETY: plain integers.
-unsafe impl Pod for RawState {}
-
 fn state(ebpf: &Ebpf, fd: &impl AsRawFd) -> Option<SockState> {
-    let map: SkStorage<&MapData, RawState> =
+    let map: SkStorage<&MapData, SockState> =
         SkStorage::try_from(ebpf.map("SOCK_STATE").unwrap()).unwrap();
-    let raw = map.get(&fd.as_raw_fd(), 0).ok()?;
-    // SAFETY: SockState is repr(C), 64 bytes of integers.
-    Some(unsafe { std::mem::transmute::<RawState, SockState>(raw) })
+    map.get(&fd.as_raw_fd(), 0).ok()
+}
+
+/// pidfd_getfd exists (5.6+): ENOSYS is the only error with an fd of -1.
+fn pidfd_getfd_exists() -> bool {
+    // SAFETY: plain syscall on invalid fds.
+    unsafe { libc::syscall(438, -1, -1, 0u32) };
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
+/// A dup of `fd` in process `pid` (pidfd_open + pidfd_getfd).
+fn fd_of(pid: u32, fd: i32) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain syscalls; non-negative results are fds we own.
+    unsafe {
+        let pidfd = libc::syscall(434, pid as libc::pid_t, 0u32);
+        assert!(pidfd >= 0, "pidfd_open {pid}");
+        let got = libc::syscall(438, pidfd as i32, fd, 0u32);
+        libc::close(pidfd as i32);
+        assert!(got >= 0, "pidfd_getfd {pid} {fd}");
+        std::os::fd::OwnedFd::from_raw_fd(got as i32)
+    }
 }
 
 fn cookie(fd: &impl AsRawFd) -> u64 {
@@ -387,6 +400,31 @@ fn scope_programs_load_attach_and_hold() {
         "load failures {failed:?}, allowed {allowed:?}"
     );
 
+    // Pre-agent listeners for arm-time owner initialisation (§3.1), made
+    // before any other process is spawned: `holder` (listed) holds LA alone
+    // and LB together with this process (unlisted at arm).
+    let la = TcpListener::bind("127.0.0.1:0").unwrap();
+    let lb = TcpListener::bind("127.0.0.1:0").unwrap();
+    let la_port = la.local_addr().unwrap().port();
+    let (la_raw, lb_raw) = (la.as_raw_fd(), lb.as_raw_fd());
+    let mut holder = {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new("sleep");
+        c.arg("60");
+        // SAFETY: dup2 only, between fork and exec; dup2 clears CLOEXEC.
+        unsafe {
+            c.pre_exec(move || {
+                if libc::dup2(la_raw, 100) < 0 || libc::dup2(lb_raw, 101) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        c.spawn().unwrap()
+    };
+    drop(la);
+    let holder_pid = holder.id();
+
     // Sockets that predate the attach: a listener and a connected client.
     let pre_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut pre_client = TcpStream::connect(pre_listener.local_addr().unwrap()).unwrap();
@@ -442,9 +480,10 @@ fn scope_programs_load_attach_and_hold() {
         .unwrap();
     let (sel_pid, gone_pid, p_pid) = (sel.id(), gone.id(), p.id());
     let (early_pid, late_pid) = (held_early.id(), held_late.id());
-    let pids = [sel_pid, gone_pid, early_pid, late_pid, p_pid];
+    let pids = [sel_pid, gone_pid, early_pid, late_pid, p_pid, holder_pid];
     let candidates = snapshot_candidates(&pids);
     let pidfd = candidates[0].pidfd.is_some();
+    let candidates_pidfd = pidfd && pidfd_getfd_exists();
     println!("METHOD {}", if pidfd { "pidfd" } else { "start_time" });
     assert!(
         candidates[1].pidfd.is_none() && candidates[1].start.is_none(),
@@ -885,6 +924,45 @@ fn scope_programs_load_attach_and_hold() {
         drops(&ebpf, DROP_OUT_OF_SCOPE) >= oos0 + 2,
         "unlisted: out_of_scope"
     );
+
+    // ── pre-agent listeners (§3.1): initialised at arm with their owner
+    // iff every holder is listed; a child of one is in scope from its first
+    // byte, before any accept()
+    let getfd = candidates_pidfd;
+    if getfd {
+        let la_fd = fd_of(holder_pid, 100);
+        let ls = state(&ebpf, &la_fd).expect("LA initialised at arm");
+        assert_eq!(
+            (ls.owner_tgid, ls.pid_bits, ls.pid_epoch, ls.init_cookie),
+            (holder_pid, OWNER_LISTED, 77, 0),
+            "LA owner: its only holder"
+        );
+        let lb_fd = fd_of(holder_pid, 101);
+        assert!(
+            state(&ebpf, &lb_fd).is_none(),
+            "LB, also held by an unlisted process: not initialised"
+        );
+    }
+    let no0 = drops(&ebpf, DROP_NO_OWNER);
+    let mut ca = TcpStream::connect(("127.0.0.1", la_port)).unwrap();
+    let mut cb = TcpStream::connect(lb.local_addr().unwrap()).unwrap();
+    ca.write_all(b"preLA").unwrap();
+    cb.write_all(b"preLB").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let ev = drain(&mut ring);
+    let la_in = ev
+        .iter()
+        .any(|e| e.1 == Direction::Ingress && e.3 == b"preLA");
+    println!("LISTENER_INIT pidfd_getfd={getfd} la_captured={la_in}");
+    assert_eq!(la_in, getfd, "LA's child in scope before accept: {ev:?}");
+    assert!(
+        !ev.iter().any(|e| e.3 == b"preLB"),
+        "LB's child not in scope before accept: {ev:?}"
+    );
+    assert!(drops(&ebpf, DROP_NO_OWNER) > no0, "LB's child: no_owner");
+    drop((ca, cb));
+    holder.kill().unwrap();
+    holder.wait().unwrap();
     {
         let mut pids: HashMap<_, u32, u8> =
             HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
@@ -904,6 +982,117 @@ fn scope_programs_load_attach_and_hold() {
         !ev.iter().any(|e| e.0 == cookie(&c3)),
         "old verdict stays OUT"
     );
+
+    // ── accept() before PASSIVE_ESTABLISHED (§3.1): a child is queued for
+    // accept before its ESTABLISHED callback runs, so a spinning accept can
+    // return it first. Whatever the order, it keeps its listed acceptor.
+    // `listener`: owner unlisted (state cloned); `pre_listener`: no state.
+    for (name, l) in [("cloned", &listener), ("no_state", &pre_listener)] {
+        let addr = l.local_addr().unwrap();
+        l.set_nonblocking(true).unwrap();
+        let (mut first, mut lost, mut total) = (0, 0, 0);
+        for _ in 0..8 {
+            let n = 250;
+            let dial = std::thread::spawn(move || {
+                (0..n)
+                    .map(|_| TcpStream::connect(addr).unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut kids = Vec::new();
+            while kids.len() < n {
+                match l.accept() {
+                    Ok((k, _)) => {
+                        if state(&ebpf, &k).is_none_or(|s| s.init_cookie != cookie(&k)) {
+                            first += 1;
+                        }
+                        kids.push(k);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::hint::spin_loop(),
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+            let clients = dial.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for k in &kids {
+                let ok = state(&ebpf, k).is_some_and(|s| {
+                    s.init_cookie == cookie(k)
+                        && s.acceptor_tgid == me
+                        && s.accept_cookie == cookie(k)
+                        && s.pid_bits & ACCEPTOR_LISTED != 0
+                });
+                lost += !ok as u32;
+            }
+            total += n;
+            drop((kids, clients));
+        }
+        l.set_nonblocking(false).unwrap();
+        println!("ACCEPT_RACE {name} accept_first={first} of {total} lost={lost}");
+        assert_eq!(lost, 0, "{name}: children that lost their acceptor");
+    }
+    let _ = drain(&mut ring);
+
+    // A listener that carries another socket's acceptor (an accepted socket
+    // that reached TCP_CLOSE without REUSED, then listen()): its children
+    // are never initialised.
+    {
+        let l0 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _c0 = TcpStream::connect(l0.local_addr().unwrap()).unwrap();
+        let (s0, _) = l0.accept().unwrap();
+        drop(l0);
+        let unspec = libc::sockaddr {
+            sa_family: libc::AF_UNSPEC as u16,
+            sa_data: [0; 14],
+        };
+        // SAFETY: valid fd and sockaddr.
+        let rc = unsafe {
+            libc::connect(
+                s0.as_raw_fd(),
+                &unspec,
+                std::mem::size_of::<libc::sockaddr>() as u32,
+            )
+        };
+        assert_eq!(rc, 0, "connect(AF_UNSPEC)");
+        let mut st = state(&ebpf, &s0).unwrap();
+        assert_eq!((st.acceptor_tgid, st.accept_cookie), (me, cookie(&s0)));
+        st.flags &= !FLAG_REUSED; // as if STATE_CB had never been set
+        {
+            let mut map: SkStorage<&mut MapData, SockState> =
+                SkStorage::try_from(ebpf.map_mut("SOCK_STATE").unwrap()).unwrap();
+            map.insert(&s0, st, 0).unwrap();
+        }
+        // SAFETY: valid fd.
+        if unsafe { libc::listen(s0.as_raw_fd(), 8) } != 0 {
+            println!("RELISTEN skipped ({})", std::io::Error::last_os_error());
+        } else {
+            // SAFETY: valid fd and out-pointers.
+            let port = unsafe {
+                let mut a: libc::sockaddr_in = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+                libc::getsockname(s0.as_raw_fd(), (&raw mut a).cast(), &mut len);
+                u16::from_be(a.sin_port)
+            };
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"relisten").unwrap();
+            // SAFETY: valid listening fd; the result is a new fd we own.
+            let k = unsafe {
+                use std::os::fd::FromRawFd;
+                let fd = libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+                assert!(fd >= 0, "accept on the re-listened socket");
+                std::os::fd::OwnedFd::from_raw_fd(fd)
+            };
+            let ks = state(&ebpf, &k).expect("clone");
+            assert_ne!(
+                ks.init_cookie,
+                cookie(&k),
+                "foreign acceptor: never initialised"
+            );
+            assert!(
+                !drain(&mut ring).iter().any(|e| e.0 == cookie(&k)),
+                "nothing captured on it"
+            );
+            println!("RELISTEN OK");
+        }
+    }
 
     // ── TLS addresses (restricted): an address belongs to one OpenSSL call
     // and only to an in-scope socket of that call (tls_probes.rs TLS_CALL)

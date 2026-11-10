@@ -31,6 +31,7 @@ openssl, bpftool (T-12). Writes OUT/<test>/result.json per test.
 import array
 import base64
 import collections
+import errno
 import ctypes
 import json
 import math
@@ -782,11 +783,20 @@ def prefork_clients(port, run, count):
     return out
 
 
+def pidfd_getfd_exists():
+    """pidfd_getfd (5.6+, syscall 438 on x86-64): ENOSYS is the only error
+    for an fd of -1 where it is missing."""
+    LIBC.syscall(438, -1, -1, 0)
+    return ctypes.get_errno() != errno.ENOSYS
+
+
 def prefork_case(t, run, mode, listed, port):
-    """One pre-fork run; `listed` is "M" or "A". Checks per DESIGN §3.1."""
+    """One pre-fork run; `listed` is "M", "A" or "MAB" (every process).
+    Checks per DESIGN §3.1."""
     m = Proc(prefork_master, port, mode)
     pids = m.get()
-    ag = Agent(t, run, "pid_filter = [%d]" % pids[listed]).start()
+    sel = ", ".join(str(pids[k]) for k in listed)
+    ag = Agent(t, run, "pid_filter = [%s]" % sel).start()
     m.go()
     pids.update(m.get())
     time.sleep(0.5)
@@ -798,11 +808,20 @@ def prefork_case(t, run, mode, listed, port):
     t.note("%s: connections per worker %s" % (run, dict(by)))
     if not t.check(by["A"] and by["B"], "%s: both workers accepted connections" % run):
         return
+    # Every holder listed: the pre-agent listener is initialised at arming
+    # (DESIGN §3.1.2) where pidfd_getfd exists; else, as worker-listed,
+    # every child from accept() on.
+    init = listed != "MAB" or pidfd_getfd_exists()
+    if not init:
+        t.note("%s: no pidfd_getfd, listener not initialised" % run)
     m_in, m_out = [], []
     for cid, name in conns:
         marks = ["B1Q1x" + cid, "B1P1x" + cid, "B1Q2x" + cid, "B1P2x" + cid]
-        if listed == "M":
+        if listed == "M" or (listed == "MAB" and init):
             m_in += marks
+        elif listed == "MAB":
+            m_out.append(marks[0])  # before accept() returned
+            m_in += marks[1:]
         elif name == "A":
             m_out.append(marks[0])  # before accept() returned
             m_in += marks[1:]
@@ -814,6 +833,14 @@ def prefork_case(t, run, mode, listed, port):
     if listed == "M":
         bad = [e for e in evs if e["owner_tgid"] != pids["M"]]
         what = "every event's owner is the listed master"
+    elif listed == "MAB" and init:
+        # A pre-agent listener initialised at arming: owner = its lowest holder.
+        low = min(pids[k] for k in listed)
+        bad = [e for e in evs if e["owner_tgid"] != low]
+        what = "every event's owner is the listener's lowest holder"
+    elif listed == "MAB":
+        bad = [e for e in evs if e["acceptor_tgid"] not in (pids["A"], pids["B"])]
+        what = "every event's acceptor is a listed worker"
     else:
         bad = [e for e in evs if e["acceptor_tgid"] != pids["A"]]
         what = "every event's acceptor is the listed worker A"
@@ -831,12 +858,19 @@ def t3(t):
 
 def t15(t):
     """T-15: pre-fork server, master-listed (listener created under the
-    agent) and worker-listed (listener and workers predate the agent)."""
+    agent) and worker-listed (listener and workers predate the agent). And
+    every holder of the pre-agent listener listed: initialised at arming
+    (DESIGN §3.1.2), so bytes before accept() are captured."""
     prefork_case(t, "master_M", "master", "M", PORT + 150)
     ag = prefork_case(t, "pre_A", "pre", "A", PORT + 151)
     if ag:
         t.check(ag.scope_drop("no_owner") > 0,
                 "bytes before accept() on a pre-agent listener counted no_owner")
+    # Bytes before accept() are among the in-scope marks checked there (other
+    # node traffic may count no_owner, so the counter is only noted).
+    ag = prefork_case(t, "pre_MAB", "pre", "MAB", PORT + 152)
+    if ag:
+        t.note("pre_MAB: no_owner %d" % ag.scope_drop("no_owner"))
 
 
 # ── T-4 PID reuse ──────────────────────────────────────────────────────────
