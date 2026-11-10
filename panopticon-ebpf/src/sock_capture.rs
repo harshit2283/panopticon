@@ -570,8 +570,8 @@ struct Packet {
 
 const ETH_P_IP_BE: u32 = (0x0800u16).to_be() as u32;
 
-/// Order per packet (§3): eligibility, kTLS, initialisation, (UDP head
-/// reservation), verdict, head cut, copy and emit.
+/// Order per packet (§3): eligibility, initialisation, (UDP head
+/// reservation), verdict, kTLS, head cut, copy and emit.
 #[inline(always)]
 fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     if cfg(CONFIG_CAPTURE_ENABLED) == 0 {
@@ -612,11 +612,6 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     let sk = sk as *mut c_void;
     let mode = scope_mode();
     let st = state_of(sk, false);
-
-    // ── kTLS: the payload may be plaintext at this hook (§3.5)
-    if !is_unscoped_full(mode) && !st.is_null() && rd!(st, flags) & FLAG_KTLS != 0 {
-        return drop(DROP_KTLS_PAYLOAD);
-    }
 
     // ── initialisation
     let cookie = unsafe { bpf_get_socket_cookie(skb as *mut c_void) };
@@ -674,6 +669,14 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Ok(g) => g,
         Err(reason) => return drop(reason),
     };
+
+    // ── kTLS: the payload may be plaintext at this hook (§3.5). After the
+    // verdict, so an in-scope kTLS socket has its IN verdict cached (its TLS
+    // calls get their address, `sock_addr_checked`); before every emit, so
+    // none of its payload leaves outside unscoped full.
+    if flags & FLAG_KTLS != 0 {
+        return drop(DROP_KTLS_PAYLOAD);
+    }
 
     // ── TCP stream offset (every mode), then the head cut
     let tcp_off = if !udp && flags & FLAG_BASELINE != 0 {

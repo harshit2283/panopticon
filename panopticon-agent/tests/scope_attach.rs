@@ -567,7 +567,7 @@ fn scope_programs_load_attach_and_hold() {
     );
 
     // After arming: a socket that attaches the tls ULP is marked, and its
-    // payload dropped outside unscoped full.
+    // payload dropped outside unscoped full, after its verdict is cached.
     if ulp {
         let mut tk = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
         let (mut tk_srv, _) = lw.accept().unwrap();
@@ -582,6 +582,11 @@ fn scope_programs_load_attach_and_hold() {
         let _ = tk_srv.read(&mut buf).unwrap();
         assert!(!drain(&mut ring).iter().any(|e| e.0 == cookie(&tk)));
         assert!(drops(&ebpf, DROP_KTLS_PAYLOAD) > k0);
+        assert_eq!(
+            cached_verdict(state(&ebpf, &tk).unwrap().verdict_word, 1),
+            Some(VERDICT_IN),
+            "verdict cached before the kTLS drop"
+        );
     }
 
     // ── runtime: unscoped full
