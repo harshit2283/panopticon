@@ -1258,11 +1258,16 @@ def t11(t):
     pre_a, _ = pre_l.accept()
     pre_c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def owner_listener(p):                         # listed; its listener predates the agent
-        ls = listener(port + 1, "127.0.0.1")
+    # A listener that predates the agent, held by a listed process and by
+    # this (unlisted) one: not every holder is listed, so arming gives it no
+    # owner, and its children are selected only from accept() on (no_owner).
+    # Held by the listed process alone, arming would own it.
+    shared_l = listener(port + 1, "127.0.0.1")
+
+    def owner_listener(p):                         # listed; inherits shared_l
         p.report({"ok": 1})
         p.wait_go()
-        ls.close()
+        shared_l.close()
     s = Proc(owner_listener)
     s.get()
     lrep = listener(port + 2, "127.0.0.1")
@@ -1312,7 +1317,7 @@ def t11(t):
          lambda: (r.go(b"repair"), time.sleep(3)), 1)
     ag.stop()
     s.go()
-    for x in held + [pre_c, pre_a, pre_l, lrep]:
+    for x in held + [pre_c, pre_a, pre_l, lrep, shared_l]:
         unlisten(x)
     check_absent(t, ag, [b"B1T11TLSMODE"], "TLS plaintext under head_only")
 
