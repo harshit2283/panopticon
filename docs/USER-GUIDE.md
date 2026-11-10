@@ -507,8 +507,16 @@ Each decoded line is one captured packet or TLS buffer:
  "ip_proto":6,"pid":0,"tid":0,"tls_library":"None",
  "connection_id":1600164996631529749,
  "payload_len":164,"orig_len":164,"truncated":false,
+ "tcp_seq":3735928559,"tcp_flags":24,"cgroup_id":0,
+ "stream_off":18446744073709551615,"owner_tgid":0,"acceptor_tgid":0,
+ "scope_gen":0,"role":0,
  "payload_b64":"R0VUIC9sZW4vNTAwMD9lbWFpbD1hbGljZSU0MGV4YW1wbGUuY29t..."}
 ```
+
+`cgroup_id`, `stream_off` (stream offset of the first byte, 2^64 - 1 when not
+computed), `owner_tgid`, `acceptor_tgid`, `scope_gen` and `role` (1 client,
+2 server) are set by the `cgroup_skb` backend; on TC they are 0 and
+`stream_off` is 2^64 - 1.
 
 - **Nothing is redacted** — passwords, tokens and personal data are written
   as they appeared on the wire (or as plaintext for TLS captured via

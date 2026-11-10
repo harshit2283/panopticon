@@ -12,13 +12,13 @@
 #   rate=0 means as fast as the client can go; newconn=1 opens a TCP
 #   connection per request (connection-tracking stress), newconn=fin does
 #   the same but closes with a plain FIN instead of Connection: close.
-# Env: MIN_RECALL (unset = report only), PYTHON (with pyroute2), AGENT_ARGS,
+# Env: MIN_RECALL (unset = report only), PYTHON, AGENT_ARGS,
 #      KEEP=1 to keep the (large) export and id list, NO_EXPORT=1 to run
 #      without the JSON export (no recall score; isolates its cost),
 #      NO_AGENT=1 to run the same load with no agent (application baseline).
 # With rate>0 the client holds a fixed rate and reports achieved vs target
 # (a miss over 2% marks the run invalid) and client latency percentiles.
-# Needs: root, go, a built agent, python3 with pyroute2.
+# Needs: root, go, a built agent, python3, iproute2.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.

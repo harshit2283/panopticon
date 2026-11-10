@@ -12,10 +12,10 @@
 # Exits non-zero if any protocol's recall is below MIN_RECALL.
 #
 # Usage: sudo tests/oracle/run_protocols.sh [ops=500] [seed=7] [min_recall=0.99]
-# Needs: root, docker, a built agent, python3 with pyroute2, redis,
+# Needs: root, docker, iproute2, a built agent, python3 with redis,
 # psycopg[binary], pymysql, cryptography (MySQL 8 full auth over plaintext),
 # grpcio:
-#   pip install pyroute2 redis 'psycopg[binary]' pymysql cryptography grpcio \
+#   pip install redis 'psycopg[binary]' pymysql cryptography grpcio \
 #     mysql-connector-python
 # Images can be overridden, e.g. REDIS_IMAGE=mirror.gcr.io/library/redis:7.4.
 set -euo pipefail
