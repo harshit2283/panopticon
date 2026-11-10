@@ -309,7 +309,8 @@ fn write_counted(w: &mut impl Write, mut buf: &[u8]) -> (usize, io::Result<()>) 
 pub struct GatedIo<T> {
     gate: Arc<IoGate>,
     inner: T,
-    /// The test pause point checked before each gated write.
+    /// The test pause point checked before each gated write, flush or
+    /// shutdown.
     pause_point: Option<&'static str>,
     /// The peer's port (keys the tests' record of socket writes).
     peer_port: u16,
@@ -503,7 +504,8 @@ impl GatedConnector {
         }
     }
 
-    /// Check test pause point `point` before every gated write.
+    /// Check test pause point `point` before every gated write, flush or
+    /// shutdown.
     pub fn with_pause_point(mut self, point: &'static str) -> Self {
         self.pause_point = Some(point);
         self

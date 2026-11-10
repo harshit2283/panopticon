@@ -25,8 +25,9 @@ pub const AFTER_DNS_INSERT: &str = "after_dns_insert";
 pub const WORKER_HOLDING_RESOLVED: &str = "worker_holding_resolved";
 /// A ring reader, after it admitted an event, before the hand-off.
 pub const READER_AFTER_ADMISSION: &str = "reader_after_admission";
-/// An OTLP export writing to its socket, before the gate check (async:
-/// the write stays pending, as on a socket with a full send buffer).
+/// An OTLP connection's socket I/O (write, flush, shutdown), before the
+/// gate check (async: it stays pending, as on a socket with a full send
+/// buffer).
 pub const OTLP_IN_FLIGHT_EXPORT: &str = "otlp_in_flight_export";
 
 /// Taps: what a test reads back, by kind and key ([`tap`], [`tap_gate`]).
