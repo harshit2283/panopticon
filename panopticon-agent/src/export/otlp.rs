@@ -28,10 +28,9 @@ use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::sync::mpsc;
-use tracing::instrument::WithSubscriber;
 
 use crate::config::{OtlpConfig, PrivacyGate, PrivacyMode};
-use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate};
+use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate, dispatched};
 use crate::protocol::L7Message;
 
 /// An event to be exported via OTLP.
@@ -164,10 +163,10 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
         // response headers and then stalls would otherwise hold the SDK's
         // batch thread, and every span it keeps, for good (the transport's
         // own timeout ends at the headers).
-        let task = self.runtime.spawn(
-            async move { tokio::time::timeout(EXPORT_TIMEOUT, export).await }
-                .with_subscriber(dispatch),
-        );
+        let task = self.runtime.spawn(dispatched(
+            async move { tokio::time::timeout(EXPORT_TIMEOUT, export).await },
+            dispatch,
+        ));
         Box::pin(async move {
             let result = match task.await {
                 Ok(Ok(result)) => result,
@@ -230,7 +229,7 @@ impl OtlpExportHandle {
         let tracer = provider.tracer("panopticon-agent.otlp");
 
         let (tx, mut rx) = mpsc::channel::<(PrivacyMode, OtlpEvent)>(buffer_size);
-        let task = tokio::spawn(
+        let task = tokio::spawn(dispatched(
             async move {
                 let emit = |(mode, event)| {
                     if privacy.allows(mode) {
@@ -246,9 +245,9 @@ impl OtlpExportHandle {
                         emit(event);
                     }
                 }
-            }
-            .with_subscriber(dispatch),
-        );
+            },
+            dispatch,
+        ));
 
         Ok((Self { tx }, OtlpWorker { task, provider }))
     }

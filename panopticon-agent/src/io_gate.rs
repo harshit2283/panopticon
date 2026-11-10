@@ -26,7 +26,6 @@ use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::instrument::WithSubscriber;
 
 use crate::test_hooks::SOCKET_SENT;
 
@@ -571,8 +570,9 @@ impl tower_service::Service<http::Uri> for GatedConnector {
 }
 
 /// Spawns each future on the Tokio runtime under the pipeline's tracing
-/// `Dispatch`: tonic's and hyper's internal connection tasks then log only
-/// through the pipeline's gated writer (Revision 1 item 2).
+/// `Dispatch` ([`dispatched`]): tonic's and hyper's internal connection
+/// tasks then log only through the pipeline's gated writer (Revision 1
+/// item 2).
 #[derive(Clone)]
 pub struct DispatchExecutor(pub tracing::Dispatch);
 
@@ -582,7 +582,49 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, fut: F) {
-        tokio::spawn(fut.with_subscriber(self.0.clone()));
+        tokio::spawn(dispatched(fut, self.0.clone()));
+    }
+}
+
+/// `fut`, polled and dropped under `dispatch`. Tracing's `with_subscriber`
+/// covers polls only: a task's future is dropped after it completes, or
+/// when it is aborted, outside them, and what it logs then goes to the
+/// process-wide subscriber (h2 logs its streams' state, a collector's
+/// GOAWAY debug data included, from its connection's `Drop`).
+pub fn dispatched<F: Future>(fut: F, dispatch: tracing::Dispatch) -> Dispatched<F> {
+    Dispatched {
+        fut: Some(Box::pin(fut)),
+        dispatch,
+    }
+}
+
+/// See [`dispatched`].
+pub struct Dispatched<F> {
+    fut: Option<Pin<Box<F>>>,
+    dispatch: tracing::Dispatch,
+}
+
+impl<F: Future> Future for Dispatched<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = &mut *self;
+        tracing::dispatcher::with_default(&this.dispatch, || {
+            let fut = this.fut.as_mut().expect("polled after completion");
+            let out = fut.as_mut().poll(cx);
+            if out.is_ready() {
+                this.fut = None; // dropped here, under the dispatch
+            }
+            out
+        })
+    }
+}
+
+impl<F> Drop for Dispatched<F> {
+    fn drop(&mut self) {
+        if let Some(fut) = self.fut.take() {
+            tracing::dispatcher::with_default(&self.dispatch, || drop(fut));
+        }
     }
 }
 
@@ -662,6 +704,48 @@ mod tests {
             .join(format!("panopticon-gate-{name}-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// A spawned task's future logs through its dispatch also when it is
+    /// dropped: after it completed, and when it is aborted.
+    #[tokio::test]
+    async fn a_dispatched_future_is_dropped_under_its_dispatch() {
+        struct LogOnDrop(&'static str, bool);
+        impl Future for LogOnDrop {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                if self.1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for LogOnDrop {
+            fn drop(&mut self) {
+                tracing::warn!("{}", self.0);
+            }
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let l = Arc::clone(&lines);
+        let sink: LogSink = Arc::new(move |b: &[u8]| l.lock().unwrap().extend_from_slice(b));
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(GatedLog::new(IoGate::new(), sink))
+                .finish(),
+        );
+        tokio::spawn(dispatched(
+            LogOnDrop("dropped-completed", true),
+            dispatch.clone(),
+        ))
+        .await
+        .unwrap();
+        let aborted = tokio::spawn(dispatched(LogOnDrop("dropped-aborted", false), dispatch));
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        let lines = String::from_utf8(lines.lock().unwrap().clone()).unwrap();
+        assert!(lines.contains("dropped-completed"), "{lines}");
+        assert!(lines.contains("dropped-aborted"), "{lines}");
     }
 
     #[test]

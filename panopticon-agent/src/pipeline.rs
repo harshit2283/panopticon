@@ -23,7 +23,6 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::instrument::WithSubscriber;
 
 use crate::capture_gate::GateConfig;
 use crate::config::{AgentConfig, CaptureBackend, PrivacyGate};
@@ -33,7 +32,7 @@ use crate::export::json::{JsonExportHandle, JsonExporter};
 use crate::export::otlp::{OtlpExportHandle, OtlpWorker};
 use crate::export::raw_capture::{self, RawCaptureHandle};
 use crate::graph::GraphBuilder;
-use crate::io_gate::{GatedLog, IoGate, LogSink, RecordFile};
+use crate::io_gate::{GatedLog, IoGate, LogSink, RecordFile, dispatched};
 use crate::k8s::K8sMetadata;
 use crate::pii::PiiEngine;
 
@@ -306,12 +305,12 @@ impl Pipeline {
                 io_gate: Arc::clone(&gate),
                 kafka_topics: kafka_topics.clone(),
             };
-            workers.push(tokio::spawn(
-                crate::event_loop::worker_task(worker_id, rx, ctx)
-                    .with_subscriber(dispatch.clone()),
-            ));
+            workers.push(tokio::spawn(dispatched(
+                crate::event_loop::worker_task(worker_id, rx, ctx),
+                dispatch.clone(),
+            )));
         }
-        let housekeeping = tokio::spawn(housekeeping(graph, pii).with_subscriber(dispatch.clone()));
+        let housekeeping = tokio::spawn(dispatched(housekeeping(graph, pii), dispatch.clone()));
         tracing::dispatcher::with_default(&dispatch, || {
             tracing::info!(workers = workers.len(), "Capture pipeline started");
         });
