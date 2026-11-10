@@ -840,6 +840,39 @@ mod record_tests {
     }
 
     #[test]
+    fn record_accepts_header_only_and_size_class_records() {
+        // cgroup_skb close record: the 96-byte header, nothing after it.
+        let mut e: DataEvent = unsafe { core::mem::zeroed() };
+        e.event_type = EventType::SockClose;
+        e.socket_cookie = 7;
+        let bytes = &as_bytes(&e)[..DATA_EVENT_HEADER_LEN];
+        assert_eq!(data_event_record_len(bytes), Some(DATA_EVENT_HEADER_LEN));
+        let mut out: DataEvent = unsafe { core::mem::zeroed() };
+        assert!(read_data_event_into(bytes, &mut out));
+        assert_eq!(
+            (out.event_type, out.socket_cookie),
+            (EventType::SockClose, 7)
+        );
+        assert!(out.payload_bytes().is_empty());
+
+        // cgroup_skb packet record: reserved at a payload size class (here
+        // 64 bytes) larger than what it carries; the rest is not payload.
+        e.event_type = EventType::TcPacket;
+        e.payload_len = 5;
+        e.orig_len = 5;
+        e.payload[..5].copy_from_slice(b"hello");
+        e.payload[5..64].fill(0xAA);
+        let bytes = &as_bytes(&e)[..DATA_EVENT_HEADER_LEN + 64];
+        assert_eq!(
+            data_event_record_len(bytes),
+            Some(DATA_EVENT_HEADER_LEN + 5)
+        );
+        assert!(read_data_event_into(bytes, &mut out));
+        assert_eq!(out.payload_bytes(), b"hello");
+        assert_eq!(out.payload[5], 0, "slack past payload_len is not copied");
+    }
+
+    #[test]
     fn record_rejects_truncated_oversized_and_invalid() {
         let mut e: DataEvent = unsafe { core::mem::zeroed() };
         e.payload_len = 10;

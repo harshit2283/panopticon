@@ -74,10 +74,12 @@ pub fn clear_scope_fields(event: *mut DataEvent) {
 // the CPU count (CONFIG_RING_SHARD_MASK) and resizes every shard at load
 // time so the active ones split a fixed total (loader DATA_RING_TOTAL_BYTES).
 //
-// TC packets are copied in at their captured size (emit_scratch_event), but
-// TLS and socket events keep fixed 4,168-byte reserves (see EVENT_SCRATCH),
-// so one connection's TLS burst has a single shard to fill: ~250 records at
-// 1 MiB per shard on a 64-CPU node, where the single 16 MiB ring held ~3,900.
+// TC packets are copied in at their captured size (emit_scratch_event) and
+// cgroup_skb packets and close records reserved at a size class that holds
+// them (SizedEvent), but TLS events and TC's socket events keep fixed
+// 4,168-byte reserves (see EVENT_SCRATCH), so one connection's TLS burst has
+// a single shard to fill: ~250 records at 1 MiB per shard on a 64-CPU node,
+// where the single 16 MiB ring held ~3,900.
 
 /// Size each shard is declared with; the loader overrides it.
 const DATA_RING_DECLARED_BYTES: u32 = 1024 * 1024;
@@ -98,24 +100,24 @@ macro_rules! data_rings {
             }
         }
 
-        /// Reserve a fixed-size DataEvent in shard `shard`.
+        /// Reserve a `T` in shard `shard`.
         #[inline(always)]
-        pub fn shard_reserve(shard: u32) -> Option<RingBufEntry<DataEvent>> {
+        pub fn shard_reserve_as<T: 'static>(shard: u32) -> Option<RingBufEntry<T>> {
             match shard {
-                $($i => $name.reserve::<DataEvent>(0),)*
+                $($i => $name.reserve::<T>(0),)*
                 _ => None,
             }
         }
 
-        /// Submit flags for a DataEvent just reserved in shard `shard`.
+        /// Submit flags for a `T` just reserved in shard `shard`.
         #[inline(always)]
-        pub fn shard_submit_flags(shard: u32) -> u64 {
-            const RECORD: u64 = ring_record_bytes(core::mem::size_of::<DataEvent>() as u64);
+        pub fn shard_submit_flags_for<T>(shard: u32) -> u64 {
+            let record = ring_record_bytes(core::mem::size_of::<T>() as u64);
             let pending = match shard {
                 $($i => $name.query(BPF_RB_AVAIL_DATA as u64),)*
                 _ => 0,
             };
-            wakeup_flags(pending.saturating_sub(RECORD), RECORD)
+            wakeup_flags(pending.saturating_sub(record), record)
         }
     };
 }
@@ -127,6 +129,30 @@ data_rings!(
     12 => DATA_EVENTS_12, 13 => DATA_EVENTS_13, 14 => DATA_EVENTS_14, 15 => DATA_EVENTS_15,
 );
 const _: () = assert!(DATA_RING_SHARDS == 16, "data_rings! declares 16 shards");
+
+/// Reserve a fixed-size DataEvent in shard `shard`.
+#[inline(always)]
+pub fn shard_reserve(shard: u32) -> Option<RingBufEntry<DataEvent>> {
+    shard_reserve_as::<DataEvent>(shard)
+}
+
+/// Submit flags for a DataEvent just reserved in shard `shard`.
+#[inline(always)]
+pub fn shard_submit_flags(shard: u32) -> u64 {
+    shard_submit_flags_for::<DataEvent>(shard)
+}
+
+/// A DataEvent record cut to its header and `N` payload bytes: the
+/// cgroup_skb and sockops records (sock_capture.rs `emit`, `on_tcp_close`)
+/// are reserved at the smallest such size that holds what they carry. Only
+/// header fields and the first `N` payload bytes may be written through a
+/// `*mut DataEvent` cast of it; user space reads `payload_len` bytes and
+/// ignores the rest (`data_event_record_len`).
+#[repr(C)]
+pub struct SizedEvent<const N: usize> {
+    pub header: [u8; DATA_EVENT_HEADER_LEN],
+    pub payload: [u8; N],
+}
 
 /// The shard for a connection's events.
 #[inline(always)]

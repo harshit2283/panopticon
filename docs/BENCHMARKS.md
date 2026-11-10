@@ -514,9 +514,11 @@ Two bottlenecks were measured:
   per connection is that ring's reserve order, exactly as with one ring.
 - **TC records at captured size.** TC builds the event in the per-CPU
   scratch map and copies the header plus the captured bytes into the ring,
-  instead of reserving a fixed 4,168-byte record. TLS and socket events
-  keep fixed reserves, because a uprobe can be preempted mid-event and a
-  shared scratch slot would be overwritten.
+  instead of reserving a fixed 4,168-byte record. TLS events and TC's
+  connect/accept events keep fixed reserves, because a uprobe can be
+  preempted mid-event and a shared scratch slot would be overwritten. (The
+  `cgroup_skb` backend reserves each packet at a payload size class instead;
+  see its section below.)
 - **One drain thread per shard.** Draining has its own threads (woken by
   edge-triggered epoll or the 2 ms tick), not the tokio main loop. Each
   event is copied once, at header plus `payload_len`, into packed worker
@@ -620,7 +622,7 @@ VM (5.15 verifier included).
 
 **Limits.**
 
-- **TLS bursts.** TLS and socket events still use fixed 4,168-byte records,
+- **TLS bursts.** TLS events and TC's connect/accept events still use fixed 4,168-byte records,
   and one connection's events all go to one shard. A shard holds about 250
   of them on a 64-CPU node (1 MiB per shard), where the single ring held
   about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy
@@ -1049,6 +1051,10 @@ of the agent's programs):
 | cgroup_skb `pid_filter` / `cgroup_filter` | 2.44 / 2.45 | 2.06 / 2.02 | 1.86 / 1.91 | 1.91 / 1.80 | 1.81 / – |
 | cgroup_skb out of scope | 1.22 | 0.90 | 0.76 | 0.89 | 0.75 |
 
+Measured before compact records (Compact records, below). On 7.0 they lower
+`cgroup_skb` ns per packet run by 1-11% under load; the other four kernels
+were not re-run.
+
 - **Scoped, it costs 1.4-1.6x TC per request in the kernel here** (up to
   1.8x in the sustained runs below). The program is
   cheaper per run, but it runs twice as often: the client socket's packets
@@ -1092,12 +1098,17 @@ high ends are under connection churn):
 - **Per new connection.** With one request per connection (1K connections/s),
   the kernel time per request is 4.9-5.4 µs on TC. On `cgroup_skb` it is
   7.9-9.9 µs unscoped, 7.4-10.1 µs with `pid_filter`, and 6.4-8.2 µs out of
-  scope. The hooks above account for 3.5-4.4 µs of each new local connection.
-- **Close records.** Every TCP socket close also sends one fixed-size
-  (4,168-byte) close record to user space, in every mode, whether the socket
-  is in scope or not.
+  scope (before compact records; out of scope on 7.0 it is now 7.6 µs, 8.8
+  before, without the close records). The hooks above account for 3.5-4.4 µs
+  of each new local connection.
+- **Close records.** A TCP socket's close sends a 96-byte close record to
+  user space only if a packet record of that socket was emitted (the only
+  sockets user space holds state for). Before compact records (below),
+  every TCP socket close sent a 4,168-byte one, in every mode, in scope or
+  not.
 
-**Sustained load (7.0, 32 vCPUs), closed loop:**
+**Sustained load (7.0, 32 vCPUs), closed loop.** Measured before compact
+records; the cells they change are re-measured under Compact records below.
 
 | Config | req/s | Recall | Agent cores | Agent µs/req | Peak RSS | Drops (kernel / channel / export) | Kernel µs/req |
 |---|---|---|---|---|---|---|---|
@@ -1143,9 +1154,11 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
 **Findings.**
 
 - **Scoped, it matches TC at 64 connections.** `pid_filter` delivers TC's
-  throughput, recall and agent CPU there. At 1K connections it costs about
-  13% more agent CPU (4.07 against 3.61 cores) and drops some events in the
-  kernel ring (see Ring capacity). The kernel spends about 0.9-1.0 µs more
+  throughput, recall and agent CPU there. At 1K connections it cost about
+  13% more agent CPU (4.07 against 3.61 cores) and dropped some events in
+  the kernel ring; with compact records it uses less agent CPU than TC
+  (3.41 against 3.70 cores) and drops none (see Compact records). The
+  kernel spends about 0.9-1.0 µs more
   per request (1.4-1.7x TC's), and 1.8x at 4K connections opening at 20K
   req/s. The application does not measurably slow down.
 - **Cutting in the kernel saves user space.** With `head_only`, the agent
@@ -1153,14 +1166,15 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   user space), and the application runs faster than on TC.
 - **Unscoped capture of node-local traffic doubles the work.** Both ends of
   every local connection are captured. That means twice the events, about
-  twice the agent CPU, and, at 1K connections, kernel ring drops and export
-  queue overflow (recall 84.8%). At 200 KB bodies, throughput is 13% below
-  TC's.
-- **Ring capacity.** Every event `cgroup_skb` captures reserves a fixed
-  4,168-byte record, where TC outputs the header plus the captured bytes. So
-  the 16 MiB of ring holds far fewer events. At 1K connections, with the same
-  event count as TC, `pid_filter` lost 2.6-7.7K events in the kernel ring,
-  where TC lost none.
+  twice the agent CPU, and, at 1K connections, export queue overflow
+  (recall 84.7%; before compact records also 0.8-0.9M kernel ring drops).
+  At 200 KB bodies, throughput is 13% below TC's.
+- **Ring capacity.** Each packet record is reserved at the header plus the
+  smallest power-of-two payload class (64 to 4,096 bytes) that holds the
+  captured bytes, and a close record is the 96-byte header. Before that,
+  every record was a fixed 4,168 bytes, and at 1K connections `pid_filter`
+  lost 2.6-8.2K events in the kernel ring where TC lost none. Now it loses
+  none (see Compact records).
 - **`pid_filter` loses data from servers whose listener predates the agent.**
   This is the case after any agent restart. A connection accepted from such a
   listener has no recorded owner until `accept()` returns, and bytes before
@@ -1176,6 +1190,42 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   - TC's `pid_filter` holds packets in user space until the owner is known,
     and loses none.
   - Prefer `cgroup_filter` with this backend.
+
+**Compact records** (7.0, 32 vCPUs, same rig and settings as the sustained
+runs, three interleaved runs of each binary: before = fixed 4,168-byte
+records and a close record for every TCP socket, after = size-class records
+and close records only for sockets that emitted):
+
+| Config | Build | req/s | Recall | Agent cores | Agent µs/req | Drops (kernel / export) | Kernel ns/run | Kernel µs/req |
+|---|---|---|---|---|---|---|---|---|
+| `pid_filter`, 64 | before | 201.9K | 100.00% | 2.33 [2.23-2.45] | 11.5 | 0 [0-202] / 0 [0-2.2K] | 564 | 2.41 |
+| | after | 198.9K | 98.43% [98.42-100] | 2.04 [2.00-2.04] | 10.2 | 0 / 0 | 503 | 2.17 |
+| unscoped, 64 | before | 196.1K | 99.47% (two views) | 4.78 | 24.3 | 11.7K [11.4-11.8K] / 109K | 917 | 3.87 |
+| | after | 196.6K | 99.32% (two views) | 4.49 | 23.0 | 0 / 161K | 835 | 3.55 |
+| `pid_filter`, 1K | before | 313.3K | 99.75% | 4.04 [3.89-4.18] | 13.2 | 4.7K [3.2-8.2K] / 12K | 565 | 2.41 |
+| | after | 318.3K | 99.77% | 3.41 [3.30-3.82] | 11.1 | 0 / 9.8K | 524 | 2.26 |
+| unscoped, 1K | before | 304.1K | 82.16% (two views) | 6.56 | 21.6 | 927K [852-948K] / 3.79M | 865 | 3.66 |
+| | after | 304.9K | 84.68% (two views) | 6.32 | 20.9 | 0 / 4.06M | 852 | 3.61 |
+| TC, 1K | after | 323.4K | 99.95% | 3.70 | 11.8 | 0 / 3.1K | 646 | 1.49 |
+| out of scope, 1K new connections/s | before | 994 | (out of scope) | 0.04 | 38 | 0 / 0 | 187 | 8.82 |
+| | after | 994 | (out of scope) | 0.01 | 10 | 0 / 0 | 181 | 7.60 |
+
+- **No kernel ring drops left.** In four more runs of each `pid_filter`
+  cell (another batch, after first), the kernel ring dropped 2.7-6.6K events
+  per run at 1K connections before and none after. Records hold the header
+  plus the captured bytes rounded up to a power of two (at least 64), so
+  the rings hold many times more of them.
+- **Cheaper in the kernel and in user space.** Kernel time per packet fell
+  by 1-11% and agent CPU by 4-16%. Scoped at 1K connections the agent now
+  uses less CPU than TC.
+- **Out-of-scope sockets cost user space nothing.** Out of scope at 1K new
+  connections/s, user space received 20,000 close records per 10 s run
+  before and none after; the agent's CPU per request fell from 38 to 10 µs.
+- **Recall.** The 98.43% and the unscoped export overflow are not from this
+  change: one keep-alive connection (1 of 64) lost to `no_owner` in 2 of 3
+  runs here, and 1 of 4 before and after in the second batch (the
+  pre-agent listener gap below); the export queue overflows the same way
+  with both builds.
 
 **Caveats.**
 
