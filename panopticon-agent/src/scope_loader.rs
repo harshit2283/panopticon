@@ -283,17 +283,25 @@ fn load_markers(ebpf: &mut Ebpf) -> Result<Vec<&'static str>> {
     Ok(markers)
 }
 
-/// Whether `/proc/kallsyms` lists `name`. Unreadable counts as present, so
-/// its hook is required (errs toward refusing).
+/// Whether `/proc/kallsyms` lists `name`. Only a complete, successful scan
+/// can establish absence: an open or read error counts as present, so its
+/// hook is required (errs toward refusing).
 fn kernel_has_symbol(name: &str) -> bool {
-    use std::io::BufRead;
-    let Ok(f) = File::open("/proc/kallsyms") else {
-        return true;
-    };
-    std::io::BufReader::new(f)
-        .lines()
-        .map_while(|l| l.ok())
-        .any(|l| l.split_whitespace().nth(2) == Some(name))
+    match File::open("/proc/kallsyms") {
+        Ok(f) => lists_symbol(std::io::BufReader::new(f), name),
+        Err(_) => true,
+    }
+}
+
+fn lists_symbol(r: impl std::io::BufRead, name: &str) -> bool {
+    for line in r.lines() {
+        match line {
+            Ok(l) if l.split_whitespace().nth(2) == Some(name) => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 // ── cgroup v2 root ─────────────────────────────────────────────────────────
@@ -1020,6 +1028,29 @@ pub fn remove_stale_legacy(ebpf: &Ebpf, cgroup: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that yields `head`, then fails.
+    struct FailsAfter(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(b)? {
+                0 => Err(std::io::Error::other("ENOMEM")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_complete_scan_establishes_absence() {
+        let syms = "ffff t foo\nffff T bar\n";
+        assert!(lists_symbol(syms.as_bytes(), "bar"));
+        assert!(!lists_symbol(syms.as_bytes(), "baz"));
+        let failing = std::io::BufReader::new(FailsAfter(std::io::Cursor::new(syms.into())));
+        assert!(
+            lists_symbol(failing, "baz"),
+            "a read error must count as present"
+        );
+    }
 
     #[test]
     fn stat_fields_survive_a_hostile_comm() {
