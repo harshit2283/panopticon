@@ -15,16 +15,32 @@
 # Env: MIN_RECALL (unset = report only), PYTHON, AGENT_ARGS,
 #      KEEP=1 to keep the (large) export and id list, NO_EXPORT=1 to run
 #      without the JSON export (no recall score; isolates its cost),
-#      NO_AGENT=1 to run the same load with no agent (application baseline).
+#      NO_AGENT=1 to run the same load with no agent (application baseline),
+#      BACKEND=tc|cgroup_skb ([capture] backend; default tc),
+#      SCOPE= (unscoped) | server (pid_filter = the server) | other
+#        (pid_filter = an idle process: every packet out of scope) | cgroup
+#        (cgroup_filter = a cgroup holding only the server; cgroup_skb on a
+#        cgroup2 host) | head (head_only, HEAD_BYTES, default 4096) |
+#        sample (connection_sample, SAMPLE_RATE, default 0.5),
+#      TOML= extra top-level config lines (e.g. max_events_per_sec = 100000000),
+#      LOADGEN= a prebuilt loadgen binary (no Go needed on the host),
+#      LOOPBACK=1 to run client and server over 127.0.0.1 in the host
+#        namespace: node-local traffic, which TC on an interface never sees
+#        and the cgroup_skb backend sees at both sockets.
+# The cgroup_skb backend captures every local socket: unscoped, it sees
+# both the client's and the server's socket of each exchange (two views,
+# about twice the events of TC on the veth, which sees each packet once).
+# SCOPE=server is the comparable server-only view.
 # With rate>0 the client holds a fixed rate and reports achieved vs target
 # (a miss over 2% marks the run invalid) and client latency percentiles.
-# Needs: root, go, a built agent, python3, iproute2.
+# Needs: root, go (or LOADGEN), a built agent, python3, iproute2.
 set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.
 NS=${ORACLE_NS:-pclient}
 IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
+[[ ${LOOPBACK:-0} == 1 ]] && HOST_IP=127.0.0.1
 CONC=${1:-64}
 DUR=${2:-20s}
 RATE=${3:-0}
@@ -42,21 +58,44 @@ METRICS=127.0.0.1:9435
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
   [[ -n ${SP:-} ]] && kill "$SP" 2>/dev/null || true
+  [[ -n ${IDLE:-} ]] && kill "$IDLE" 2>/dev/null || true
+  [[ -n ${CG:-} ]] && sleep 0.2 && rmdir "$CG" 2>/dev/null || true
   "$PY" "$ORACLE/netns.py" down >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-go build -o "$OUT/loadgen" "$HERE/loadgen.go"
+if [[ -n ${LOADGEN:-} ]]; then cp "$LOADGEN" "$OUT/loadgen"; else go build -o "$OUT/loadgen" "$HERE/loadgen.go"; fi
 sysctl -qw kernel.bpf_stats_enabled=1
 "$PY" "$ORACLE/netns.py" down >/dev/null 2>&1 || true
 "$PY" "$ORACLE/netns.py" up
-"$OUT/loadgen" server -addr "$HOST_IP:$PORT" &
+if [[ ${SCOPE:-} == cgroup ]]; then
+  CG=/sys/fs/cgroup/${NS}-load
+  mkdir -p "$CG"
+  # shellcheck disable=SC2016
+  bash -c 'echo $$ > "$1/cgroup.procs" && exec "$2" server -addr "$3"' _ "$CG" "$OUT/loadgen" "$HOST_IP:$PORT" &
+else
+  "$OUT/loadgen" server -addr "$HOST_IP:$PORT" &
+fi
 SP=$!
+CONF=$OUT/load.toml
+{
+  [[ -n ${TOML:-} ]] && printf '%s\n' "$TOML"
+  case ${SCOPE:-} in
+    "") ;;
+    server) echo "pid_filter = [$SP]" ;;
+    other) sleep 100000 & IDLE=$!; echo "pid_filter = [$IDLE]" ;;
+    cgroup) echo "cgroup_filter = [\"${CG#/sys/fs/cgroup}\"]" ;;
+    head) echo 'sampling_mode = "head_only"'; echo "head_only_bytes = ${HEAD_BYTES:-4096}" ;;
+    sample) echo 'sampling_mode = "connection_sample"'; echo "sample_rate = ${SAMPLE_RATE:-0.5}" ;;
+    *) echo "unknown SCOPE=$SCOPE" >&2; exit 2 ;;
+  esac
+  printf '[capture]\nbackend = "%s"\n' "${BACKEND:-tc}"
+} >"$CONF"
 EXPORT=(--json-export "$OUT/agent.jsonl")
 [[ ${NO_EXPORT:-0} == 1 ]] && EXPORT=()
 if [[ ${NO_AGENT:-0} != 1 ]]; then
   # shellcheck disable=SC2086
-  "$AGENT" -i "$IFACE" "${EXPORT[@]}" --metrics-bind "$METRICS" \
+  "$AGENT" -i "$IFACE" --config "$CONF" "${EXPORT[@]}" --metrics-bind "$METRICS" \
     ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
   AP=$!
 fi
@@ -65,11 +104,15 @@ sleep 4
 NC=()
 [[ $NEWCONN == 1 ]] && NC=(-newconn)
 [[ $NEWCONN == fin ]] && NC=(-fin)
+CLIENT=(nsenter --net=/var/run/netns/$NS)
+[[ ${LOOPBACK:-0} == 1 ]] && CLIENT=()
+# Kernel cost over the load window only (not startup or earlier traffic).
+[[ -n ${AP:-} ]] && python3 -I "$ORACLE/bpf_cost.py" --snap "$AP" >"$OUT/bpf0.json"
 START=$(date +%s.%N)
 # CPU is counted from here: startup work (TLS scan, map setup) is excluded.
 read -r SUT0 SST0 < <(awk '{print $14, $15}' "/proc/$SP/stat")
 [[ -n ${AP:-} ]] && read -r UT0 ST0 < <(awk '{print $14, $15}' "/proc/$AP/stat")
-nsenter --net=/var/run/netns/$NS "$OUT/loadgen" client \
+"${CLIENT[@]}" "$OUT/loadgen" client \
   -url "http://$HOST_IP:$PORT" -c "$CONC" -d "$DUR" -rate "$RATE" -size "$SIZE" \
   "${NC[@]}" -out "$OUT/ids.txt" | tee "$OUT/client.txt"
 # Server CPU over the load (its own process: handlers, plus the softirq and
@@ -89,7 +132,8 @@ if [[ ${NO_AGENT:-0} == 1 ]]; then
 fi
 sleep 3  # let the agent drain
 
-python3 -I "$ORACLE/bpf_cost.py" "$AP"
+python3 -I "$ORACLE/bpf_cost.py" "$AP" "$OUT/bpf0.json"
+echo "time_wait: host=$(ss -Htan state time-wait | wc -l) client_ns=$(ip netns exec "$NS" ss -Htan state time-wait | wc -l)"
 curl -s "http://$METRICS/metrics" >"$OUT/metrics.txt" || true
 python3 -I - "$OUT/metrics.txt" <<'EOF'
 import re, sys
@@ -102,6 +146,10 @@ keys = ["events_received", "events_dropped", "kernel_ringbuf_drops", "drops_rate
         "drops_channel_full", "drops_export_full", "drops_parser_error", "capture_truncated",
         "raw_capture_dropped", "pii_detections", "active_connections"]
 print("metrics: " + " ".join(f"{k}={int(vals[k])}" for k in keys if k in vals))
+scope = re.findall(r'^panopticon_scope_dropped_events_total\{reason="([a-z_]+)"\} ([0-9.e+]+)$',
+                   open(sys.argv[1]).read(), re.M)
+if scope:
+    print("scope_drops: " + " ".join(f"{r}={int(float(v))}" for r, v in scope if float(v)))
 open(sys.argv[1] + ".received", "w").write(str(int(vals.get("events_received", 0))))
 open(sys.argv[1] + ".pii", "w").write(str(int(vals.get("pii_detections", 0))))
 EOF
