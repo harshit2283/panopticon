@@ -837,9 +837,10 @@ fn dns_answer_inserted_after_applied_names_nothing_new() {
             // Positive control: a name the pipeline learned names its flows.
             let other = 0x0A63_0007;
             env.feed(&dns_exchange("seen-dns.example", other, 6, 1));
+            env.wait_for("seen-dns.example", &["json"]).await; // the answer
             env.feed(&exchange_to(other, "old-before", 18031, 1));
             env.wait_for("old-before", PATHS).await;
-            env.wait_for("seen-dns.example", &["json"]).await;
+            env.wait_for("seen-dns.example", &["audit"]).await; // names the flow
 
             // old-dns.example -> SERVER, inserted by the old pipeline only once
             // the change is applied.
@@ -1061,6 +1062,9 @@ fn kafka_topic_names_do_not_outlive_their_pipeline() {
                 metadata_v12_exchange(1, "old-topic.secret", id),
                 1,
             ));
+            // The Fetch runs on another connection (and worker): only once
+            // the Metadata is parsed does the pipeline know the topic.
+            env.wait_for("Metadata", &["json"]).await;
             env.feed(&kafka(41002, fetch_v16_exchange(2, id, "k", "v"), 1));
             env.wait_for("old-topic.secret", &["json"]).await; // the Fetch, named
             env.scope.narrow(2).await;
