@@ -130,7 +130,8 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           # /readyz turns 200 once eBPF programs are attached (independent of
-          # traffic volume) and 503 once shutdown begins.
+          # traffic volume) and 503 once shutdown begins, or for good once a
+          # failed scope publication stopped capture.
           startupProbe:
             httpGet:
               path: /healthz

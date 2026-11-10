@@ -2,7 +2,8 @@
 //!
 //! Serves on `metrics_bind` address (e.g. "0.0.0.0:9090"):
 //! - `/healthz`  — liveness probe (always 200)
-//! - `/readyz`   — readiness probe (200 once probes are attached, 503 during shutdown)
+//! - `/readyz`   — readiness probe (200 once probes are attached; 503 during
+//!   shutdown and after capture was stopped for good)
 //! - `/metrics`  — Prometheus text exposition format
 //! - `/debug/state` — JSON dump of internal state
 
@@ -65,6 +66,11 @@ async fn healthz() -> &'static str {
 ///
 /// Parser / PII panics are caught per step and the workers keep running, so
 /// they do not make the agent unready; the body reports how many there were.
+///
+/// After a fatal scope publication failure capture is stopped for good (the
+/// kernel disarmed, the pipeline revoked) and the agent reports not ready
+/// rather than exiting: a restart would re-arm capture until the failure
+/// recurs, and the stop must err toward not capturing.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let panics = state.stats.worker_panics.load(Ordering::Relaxed);
     let note = if panics > 0 {
@@ -72,7 +78,12 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         String::new()
     };
-    if state.ready.load(Ordering::Relaxed) {
+    if state.stats.capture_stopped.load(Ordering::Relaxed) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: capture stopped (scope publication failed){note}"),
+        )
+    } else if state.ready.load(Ordering::Relaxed) {
         (StatusCode::OK, format!("ready{note}"))
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, format!("not ready{note}"))
@@ -190,6 +201,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_not_ready_once_capture_stopped() {
+        let state = make_test_state();
+        state.ready.store(true, Ordering::Relaxed);
+        state.stats.capture_stopped.store(true, Ordering::Relaxed);
+        let resp = make_app(state)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

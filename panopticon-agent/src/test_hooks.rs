@@ -20,6 +20,9 @@ pub const WORKER_BEFORE_SINK: &str = "worker_before_sink";
 pub const BEFORE_DNS_INSERT: &str = "before_dns_insert";
 /// A worker, right after it inserted a DNS answer into the cache.
 pub const AFTER_DNS_INSERT: &str = "after_dns_insert";
+/// A worker holding a resolved service name in a local, before it writes
+/// the PII audit entries that carry it.
+pub const WORKER_HOLDING_RESOLVED: &str = "worker_holding_resolved";
 /// A ring reader, after it admitted an event, before the hand-off.
 pub const READER_AFTER_ADMISSION: &str = "reader_after_admission";
 /// An OTLP export writing to its socket, before the gate check (async:
@@ -89,6 +92,28 @@ mod imp {
         Poll::Pending
     }
 
+    /// Every byte gated sockets wrote, by peer port (all pipelines, all
+    /// tests): what left the process over the network.
+    static SOCKET_TAP: Mutex<Vec<(u16, Vec<u8>)>> = Mutex::new(Vec::new());
+
+    /// Record bytes a gated socket to `port` wrote.
+    pub fn tap(port: u16, bytes: &[u8]) {
+        let mut tap = SOCKET_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        match tap.iter_mut().find(|(p, _)| *p == port) {
+            Some((_, b)) => b.extend_from_slice(bytes),
+            None => tap.push((port, bytes.to_vec())),
+        }
+    }
+
+    /// Everything gated sockets to `port` wrote so far.
+    pub fn tapped(port: u16) -> Vec<u8> {
+        let tap = SOCKET_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        tap.iter()
+            .find(|(p, _)| *p == port)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default()
+    }
+
     /// An armed point. Dropping it releases a paused thread.
     pub struct Armed {
         key: Key,
@@ -141,6 +166,10 @@ mod imp {
 #[cfg(not(any(test, feature = "scope-test-hooks")))]
 #[inline(always)]
 pub fn pause(_point: &'static str, _gate: &crate::io_gate::IoGate) {}
+
+#[cfg(not(any(test, feature = "scope-test-hooks")))]
+#[inline(always)]
+pub fn tap(_port: u16, _bytes: &[u8]) {}
 
 #[cfg(not(any(test, feature = "scope-test-hooks")))]
 #[inline(always)]

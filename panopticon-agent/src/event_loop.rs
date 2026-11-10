@@ -2,9 +2,7 @@
 // everything after the ring read run on every platform (tests drive them).
 #![allow(dead_code)]
 
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,6 +197,9 @@ pub struct EventStats {
     /// installed (a pipeline build failed after a narrowing, or capture
     /// stopped).
     pub drops_no_pipeline: AtomicU64,
+    /// Capture was stopped for good (a fatal scope publication failure):
+    /// the agent stays up, disarmed, and reports not ready.
+    pub capture_stopped: AtomicBool,
     /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
     /// (refreshed from the map; indexed by `scope::DROP_*`).
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
@@ -230,6 +231,7 @@ impl EventStats {
             head_only_cut_events: AtomicU64::new(0),
             drops_stale_scope_gen: AtomicU64::new(0),
             drops_no_pipeline: AtomicU64::new(0),
+            capture_stopped: AtomicBool::new(false),
             scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -1411,6 +1413,7 @@ fn handle_messages(
         {
             use crate::export::audit::{AuditAction, AuditEntry};
             let (service, service_addr) = audit_service(ctx, msg.protocol);
+            crate::test_hooks::pause(crate::test_hooks::WORKER_HOLDING_RESOLVED, ctx.io_gate);
             let entries: Vec<AuditEntry> = report
                 .entities
                 .iter()

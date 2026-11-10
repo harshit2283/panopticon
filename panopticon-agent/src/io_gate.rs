@@ -308,6 +308,8 @@ pub struct GatedIo<T> {
     inner: T,
     /// The test pause point checked before each gated write.
     pause_point: Option<&'static str>,
+    /// The peer's port (keys the tests' record of socket writes).
+    peer_port: u16,
 }
 
 impl<T> GatedIo<T> {
@@ -349,7 +351,12 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.gated(cx, |io, cx| io.poll_write(cx, buf))
+        let port = self.peer_port;
+        let r = self.gated(cx, |io, cx| io.poll_write(cx, buf));
+        if let Poll::Ready(Ok(n)) = r {
+            crate::test_hooks::tap(port, &buf[..n]);
+        }
+        r
     }
 
     fn poll_write_vectored(
@@ -357,7 +364,16 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GatedIo<T> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.gated(cx, |io, cx| io.poll_write_vectored(cx, bufs))
+        let port = self.peer_port;
+        let r = self.gated(cx, |io, cx| io.poll_write_vectored(cx, bufs));
+        if let Poll::Ready(Ok(mut n)) = r {
+            for b in bufs {
+                let k = n.min(b.len());
+                crate::test_hooks::tap(port, &b[..k]);
+                n -= k;
+            }
+        }
+        r
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -515,6 +531,7 @@ impl GatedConnector {
             gate: self.gate,
             inner: tcp,
             pause_point: self.pause_point,
+            peer_port: port,
         };
         Ok(match tls {
             None => GatedStream::Plain(io),

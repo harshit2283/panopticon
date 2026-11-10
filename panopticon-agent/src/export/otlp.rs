@@ -91,10 +91,11 @@ impl OtlpWorker {
     }
 }
 
-/// How long one export may wait for the collector (tests: shorter, so
-/// an unanswered export's successor runs within the test).
+/// The deadline of one whole export: request, response headers, body and
+/// trailers (tests: shorter, so an unanswered export's successor runs
+/// within the test).
 const EXPORT_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_secs(1)
+    Duration::from_secs(3)
 } else {
     Duration::from_secs(10)
 };
@@ -117,21 +118,22 @@ fn gated_channel(
     let ep = tonic::transport::Endpoint::from_shared(endpoint.to_string())
         .with_context(|| format!("invalid OTLP endpoint {endpoint}"))?
         .executor(DispatchExecutor(dispatch))
-        .connect_timeout(Duration::from_secs(10))
-        // An export the collector never answers fails instead of holding
-        // the SDK's batch thread (and the spans it retains) for good.
-        .timeout(EXPORT_TIMEOUT);
+        .connect_timeout(Duration::from_secs(10));
     Ok(ep.connect_with_connector_lazy(
         GatedConnector::plain(gate).with_pause_point(crate::test_hooks::OTLP_IN_FLIGHT_EXPORT),
     ))
 }
 
 /// A span exporter whose calls and futures run under the pipeline's
-/// tracing `Dispatch` (see the module docs).
+/// tracing `Dispatch` (see the module docs), each export under one
+/// deadline ([`EXPORT_TIMEOUT`]).
 #[derive(Debug)]
 struct DispatchExporter<E> {
     inner: E,
     dispatch: tracing::Dispatch,
+    /// The Tokio runtime: the SDK polls exports on its own thread, which
+    /// has no timer, so each export runs as a runtime task.
+    runtime: tokio::runtime::Handle,
 }
 
 impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
@@ -143,10 +145,27 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send>,
     > {
+        use opentelemetry_sdk::error::OTelSdkError;
         let dispatch = self.dispatch.clone();
         let inner = &mut self.inner;
         let export = tracing::dispatcher::with_default(&dispatch, || inner.export(batch));
-        Box::pin(export.with_subscriber(dispatch))
+        // The whole export under one deadline. A collector that sends the
+        // response headers and then stalls would otherwise hold the SDK's
+        // batch thread, and every span it keeps, for good (the transport's
+        // own timeout ends at the headers).
+        let task = self.runtime.spawn(
+            async move { tokio::time::timeout(EXPORT_TIMEOUT, export).await }
+                .with_subscriber(dispatch),
+        );
+        Box::pin(async move {
+            match task.await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(OTelSdkError::Timeout(EXPORT_TIMEOUT)),
+                Err(e) => Err(OTelSdkError::InternalFailure(format!(
+                    "OTLP export task ended: {e}"
+                ))),
+            }
+        })
     }
 
     fn shutdown(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -182,6 +201,7 @@ impl OtlpExportHandle {
                 .build()
                 .context("failed to build OTLP gRPC span exporter")?,
             dispatch: dispatch.clone(),
+            runtime: tokio::runtime::Handle::current(),
         };
 
         let resource = Resource::builder_empty()

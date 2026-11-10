@@ -28,8 +28,20 @@ pub struct OnnxInference {
 impl OnnxInference {
     /// Create a new inference engine from model and tokenizer paths.
     pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
+        // ONNX Runtime's own diagnostics can quote what inference ran on
+        // (a kernel error naming an out-of-range index from a captured
+        // token). Its default logger writes to stdio from native threads,
+        // outside every pipeline's gate, so it is silenced for the
+        // environment and the session. Inference errors still come back as
+        // `Result`s and are logged by the calling pipeline (gated).
+        let silent: ort::logging::LoggerFunction = std::sync::Arc::new(|_, _, _, _, _| {});
+        let _ = ort::init()
+            .with_logger(std::sync::Arc::clone(&silent))
+            .commit();
         let session = Session::builder()
             .context("Failed to create ONNX session builder")?
+            .with_logger(silent)
+            .context("Failed to set the ONNX session logger")?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
             .context("Failed to set optimization level")?
             .commit_from_file(model_path)
