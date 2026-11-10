@@ -187,6 +187,19 @@ fn drain(ring: &mut RingBuf<MapData>) -> Vec<(u64, Direction, u64, Vec<u8>)> {
     out
 }
 
+/// Drain ring 0: every event with its record's length in the ring.
+fn drain_records(ring: &mut RingBuf<MapData>) -> Vec<(DataEvent, usize)> {
+    let mut out = Vec::new();
+    while let Some(item) = ring.next() {
+        // SAFETY: all-zero is a valid DataEvent.
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        if read_data_event_into(&item, &mut e) {
+            out.push((e, item.len()));
+        }
+    }
+    out
+}
+
 fn load_any(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     let target = TARGETS.iter().find(|(p, _)| *p == name).map(|(_, f)| *f);
     let is_scope_kind = matches!(
@@ -751,7 +764,18 @@ fn scope_programs_load_attach_and_hold() {
     let lc = state(&ebpf, &late_child).expect("child of a pre-agent listener");
     assert_eq!(lc.init_cookie, cookie(&late_child));
     assert_eq!((lc.owner_tgid, lc.acceptor_tgid, lc.pid_epoch), (0, me, 77));
+    let _ = drain(&mut ring);
+    // A socket that never had a packet record emitted sends no close.
+    let late_cookie = cookie(&late);
+    assert_eq!(state(&ebpf, &late).map(|s| s.emitted), Some(0));
     drop(late);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(
+        !drain_records(&mut ring)
+            .iter()
+            .any(|(e, _)| e.socket_cookie == late_cookie),
+        "no record for a socket that carried no data"
+    );
 
     // connect(AF_UNSPEC): revoked for good (REUSED).
     let unspec = libc::sockaddr {
@@ -770,8 +794,40 @@ fn scope_programs_load_attach_and_hold() {
     let cs = state(&ebpf, &client).unwrap();
     assert_eq!(cs.init_cookie, 0, "STATE_CB revoked at TCP_CLOSE");
     assert_ne!(cs.flags & FLAG_REUSED, 0);
-    let ev = drain(&mut ring);
-    let _ = ev; // the SockClose record has no payload; drained only
+    // The client carried data: its close is sent, as the header only.
+    assert_eq!(cs.emitted, 1);
+    let closes: Vec<_> = drain_records(&mut ring)
+        .into_iter()
+        .filter(|(e, _)| e.event_type == EventType::SockClose)
+        .collect();
+    assert!(
+        closes
+            .iter()
+            .any(|(e, n)| e.socket_cookie == cookie(&client) && *n == DATA_EVENT_HEADER_LEN),
+        "header-only close record for the client: {:?}",
+        closes
+            .iter()
+            .map(|(e, n)| (e.socket_cookie, *n))
+            .collect::<Vec<_>>()
+    );
+
+    // Packet records are reserved at the smallest payload size class that
+    // holds the captured bytes: 100 bytes go in a 128-byte class.
+    let mut c3 = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut s3, _) = listener.accept().unwrap();
+    c3.write_all(&[7u8; 100]).unwrap();
+    let _ = s3.read(&mut buf).unwrap();
+    let recs = drain_records(&mut ring);
+    assert!(
+        recs.iter().any(|(e, n)| e.socket_cookie == cookie(&c3)
+            && e.payload_bytes() == [7u8; 100]
+            && *n == DATA_EVENT_HEADER_LEN + 128),
+        "100-byte packet in a 128-byte class: {:?}",
+        recs.iter()
+            .map(|(e, n)| (e.socket_cookie, e.payload_len, *n))
+            .collect::<Vec<_>>()
+    );
+    drop((c3, s3));
 
     // ── head_only, N = 3
     set(&mut ebpf, CONFIG_HEAD_BYTES, 3);

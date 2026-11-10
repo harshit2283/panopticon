@@ -45,8 +45,8 @@ use panopticon_common::{
 };
 
 use crate::maps::{
-    CGROUP_ALLOW, CONFIG, IPV6_DROPS, PID_FILTER, count_kernel_drop, count_scope_drop, shard_for,
-    shard_reserve, shard_submit_flags,
+    CGROUP_ALLOW, CONFIG, IPV6_DROPS, PID_FILTER, SizedEvent, count_kernel_drop, count_scope_drop,
+    shard_for, shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -428,7 +428,11 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
 }
 
 /// Any transition to TCP_CLOSE (close, `connect(AF_UNSPEC)`): revoke
-/// initialisation for good, then tell user space the socket ended.
+/// initialisation for good, then tell user space the socket ended, if it
+/// can hold state for it: only packet records create per-socket state in
+/// user space on this backend, so a socket none was emitted for
+/// (`SockState::emitted`) gets no close record. The record is the header
+/// only (96 bytes, `SizedEvent<0>`).
 #[inline(always)]
 fn on_tcp_close(ctx: &SockOpsContext) {
     let ops = ctx.ops;
@@ -442,14 +446,18 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     }
     wr!(st, init_cookie, 0);
     wr!(st, flags, rd!(st, flags) | FLAG_REUSED);
+    if rd!(st, emitted) == 0 {
+        return;
+    }
 
     let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
     let shard = shard_for(cookie);
-    let Some(mut entry) = shard_reserve(shard) else {
+    let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
         count_kernel_drop();
         return;
     };
-    let event = entry.as_mut_ptr();
+    // Header fields only: they all lie in the reserved record.
+    let event = entry.as_mut_ptr() as *mut DataEvent;
     unsafe {
         (*event).timestamp_ns = bpf_ktime_get_ns();
         (*event).socket_cookie = cookie;
@@ -473,7 +481,7 @@ fn on_tcp_close(ctx: &SockOpsContext) {
         (*event).acceptor_tgid = rd!(st, acceptor_tgid);
         (*event).role = role_of(rd!(st, flags));
     }
-    entry.submit(shard_submit_flags(shard));
+    entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
 }
 
 // ── accept: the acceptor, on the child only ────────────────────────────────
@@ -718,19 +726,21 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
                 off = position(o);
             }
         }
+        mark_emitted(st);
         let st = if initialised { st } else { null_mut() };
-        let take = pkt.payload_len;
         return emit(
             ctx,
-            sk,
-            st,
-            cookie,
-            direction,
-            udp,
-            &pkt,
-            take,
-            off,
-            scope_gen(),
+            &Record {
+                sk,
+                st,
+                cookie,
+                direction,
+                udp,
+                pkt: &pkt,
+                take: pkt.payload_len,
+                stream_off: off,
+                scope_gen: scope_gen(),
+            },
         );
     }
     if !initialised {
@@ -796,7 +806,21 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
             return drop(DROP_HEAD_CUT);
         }
     }
-    emit(ctx, sk, st, cookie, direction, udp, &pkt, take, off, g)
+    mark_emitted(st);
+    emit(
+        ctx,
+        &Record {
+            sk,
+            st,
+            cookie,
+            direction,
+            udp,
+            pkt: &pkt,
+            take,
+            stream_off: off,
+            scope_gen: g,
+        },
+    )
 }
 
 /// `DataEvent::stream_off` for an offset: a segment from before the origin
@@ -952,77 +976,105 @@ fn parse(ctx: &SkBuffContext, udp: bool) -> Result<Packet, ()> {
     })
 }
 
-/// Reserve a DataEvent in the socket's ring shard and copy the first `take`
-/// payload bytes into it. Reserved, not built in EVENT_SCRATCH: egress runs
-/// in process context, where a softirq or another task on the CPU could
-/// overwrite a shared per-CPU slot mid-event and mix two sockets' bytes.
-// ponytail: fixed 4 KiB reserves cost ring space per small packet; a
-// nesting-safe scratch + compact output is the upgrade (T-19).
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn emit(
-    ctx: &SkBuffContext,
+/// A packet record's fields, for [`emit_sized`].
+struct Record<'a> {
     sk: *mut c_void,
     st: *mut SockState,
     cookie: u64,
     direction: Direction,
     udp: bool,
-    pkt: &Packet,
+    pkt: &'a Packet,
     take: u32,
     stream_off: u64,
     scope_gen: u32,
-) -> Result<(), ()> {
-    let shard = shard_for(cookie);
-    let Some(mut entry) = shard_reserve(shard) else {
+}
+
+/// Mark `st`'s socket as having had a packet record emitted, so its close
+/// is sent (`on_tcp_close`). Set before the record is reserved.
+#[inline(always)]
+fn mark_emitted(st: *mut SockState) {
+    if !st.is_null() && rd!(st, emitted) == 0 {
+        wr!(st, emitted, 1);
+    }
+}
+
+/// Send a packet record with its first `take` payload bytes to the socket's
+/// ring shard, reserved at the smallest power-of-two payload size class
+/// (64 to 4,096 bytes) that holds them: the header plus less than twice the
+/// captured bytes (a whole 4,168-byte DataEvent before T-19's fix).
+/// Reserved in the ring, never built in a shared per-CPU buffer: egress
+/// runs in process context, where a softirq or (on a preemptible kernel)
+/// another task on the CPU can run these programs again mid-event; with
+/// nothing shared between runs, nesting cannot mix two sockets' bytes.
+#[inline(always)]
+fn emit(ctx: &SkBuffContext, r: &Record) -> Result<(), ()> {
+    match r.take {
+        0..=64 => emit_sized::<64>(ctx, r),
+        65..=128 => emit_sized::<128>(ctx, r),
+        129..=256 => emit_sized::<256>(ctx, r),
+        257..=512 => emit_sized::<512>(ctx, r),
+        513..=1024 => emit_sized::<1024>(ctx, r),
+        1025..=2048 => emit_sized::<2048>(ctx, r),
+        _ => emit_sized::<MAX_PAYLOAD_SIZE>(ctx, r),
+    }
+}
+
+#[inline(always)]
+fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()> {
+    let shard = shard_for(r.cookie);
+    let Some(mut entry) = shard_reserve_as::<SizedEvent<N>>(shard) else {
         count_kernel_drop();
         return Ok(());
     };
-    let event: *mut DataEvent = entry.as_mut_ptr();
+    let rec = entry.as_mut_ptr();
+    // Header fields through the DataEvent layout (all within the record);
+    // the payload only through `rec.payload`, N bytes.
+    let event = rec as *mut DataEvent;
+    let pkt = r.pkt;
     unsafe {
         (*event).timestamp_ns = bpf_ktime_get_ns();
-        (*event).socket_cookie = cookie;
+        (*event).socket_cookie = r.cookie;
         (*event).event_type = EventType::TcPacket;
-        (*event).direction = direction;
+        (*event).direction = r.direction;
         (*event).pid = 0;
         (*event).tgid = 0;
         (*event).src_addr = pkt.src_addr;
         (*event).dst_addr = pkt.dst_addr;
         (*event).src_port = pkt.src_port;
         (*event).dst_port = pkt.dst_port;
-        (*event).ip_proto = if udp { IPPROTO_UDP } else { IPPROTO_TCP } as u8;
+        (*event).ip_proto = if r.udp { IPPROTO_UDP } else { IPPROTO_TCP } as u8;
         (*event).tls_library = TlsLibrary::None;
         (*event).tcp_flags = pkt.tcp_flags;
         (*event).tcp_seq = pkt.seq;
         (*event).tcp_ack = pkt.ack;
         (*event).orig_len = pkt.payload_len;
         crate::maps::clear_scope_fields(event);
-        (*event).cgroup_id = bpf_sk_cgroup_id(sk);
-        (*event).stream_off = stream_off;
-        (*event).scope_gen = scope_gen;
+        (*event).cgroup_id = bpf_sk_cgroup_id(r.sk);
+        (*event).stream_off = r.stream_off;
+        (*event).scope_gen = r.scope_gen;
+        let st = r.st;
         if !st.is_null() {
             (*event).owner_tgid = rd!(st, owner_tgid);
             (*event).acceptor_tgid = rd!(st, acceptor_tgid);
             (*event).role = role_of(rd!(st, flags));
         }
-        // The verifier needs the length provably in [1, MAX]; see
-        // tc_capture.rs populate_tc_event for why it is laundered.
-        let want = if take > MAX_PAYLOAD_SIZE as u32 {
-            MAX_PAYLOAD_SIZE as u32
-        } else {
-            take
-        };
+        // The verifier needs the length provably in [1, N]; see
+        // tc_capture.rs populate_tc_event for why it is laundered. `take`
+        // is in [1, N] here (the class was chosen by it, and the largest
+        // class is MAX_PAYLOAD_SIZE), so the mask changes nothing at runtime.
+        let want = if r.take > N as u32 { N as u32 } else { r.take };
         let opaque = read_volatile(&want);
-        let len = (opaque.wrapping_sub(1) & (MAX_PAYLOAD_SIZE as u32 - 1)) + 1;
+        let len = (opaque.wrapping_sub(1) & (N as u32 - 1)) + 1;
         let ret = bpf_skb_load_bytes(
             ctx.skb.skb as *const c_void,
             pkt.payload_off,
-            (*event).payload.as_mut_ptr() as *mut c_void,
+            (&raw mut (*rec).payload) as *mut c_void,
             len,
         );
         (*event).payload_len = if ret == 0 { len } else { 0 };
     }
-    entry.submit(shard_submit_flags(shard));
+    entry.submit(shard_submit_flags_for::<SizedEvent<N>>(shard));
     Ok(())
 }
 
-const _: () = assert!(MAX_PAYLOAD_SIZE.is_power_of_two());
+const _: () = assert!(MAX_PAYLOAD_SIZE.is_power_of_two() && MAX_PAYLOAD_SIZE > 2048);

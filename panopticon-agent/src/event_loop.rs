@@ -1014,11 +1014,12 @@ pub(crate) async fn worker_task(
                 continue;
             }
             let cookie = connection_key(&scratch);
-            // Live cgroup_skb: a close record (sockops STATE_CB) is sent for
-            // every socket the kernel tracks, in scope or not, with its
-            // tuple and owner: it frees the connection's state and reaches
-            // no sink. Counted processed (it is consumed here). On TC and in
-            // replay a close takes the gated path below, as before.
+            // Live cgroup_skb: a close record (sockops STATE_CB, the header
+            // only) is sent for every socket the kernel emitted a packet
+            // record for, in scope now or not, with its tuple and owner: it
+            // frees the connection's state and reaches no sink. Counted
+            // processed (it is consumed here). On TC and in replay a close
+            // takes the gated path below, as before.
             if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
                 ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
                 end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
