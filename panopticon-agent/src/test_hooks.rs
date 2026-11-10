@@ -25,9 +25,25 @@ pub const AFTER_DNS_INSERT: &str = "after_dns_insert";
 pub const WORKER_HOLDING_RESOLVED: &str = "worker_holding_resolved";
 /// A ring reader, after it admitted an event, before the hand-off.
 pub const READER_AFTER_ADMISSION: &str = "reader_after_admission";
-/// An OTLP export writing to its socket, before the gate check (async:
-/// the write stays pending, as on a socket with a full send buffer).
+/// An OTLP connection's socket I/O (write, flush, shutdown), before the
+/// gate check (async: it stays pending, as on a socket with a full send
+/// buffer).
 pub const OTLP_IN_FLIGHT_EXPORT: &str = "otlp_in_flight_export";
+
+/// Taps: what a test reads back, by kind and key ([`tap`], [`tap_gate`]).
+/// Bytes gated sockets wrote, by peer port.
+pub const SOCKET_SENT: &str = "socket_sent";
+/// Socket operations a revoked gate refused (`write`, `flush`,
+/// `shutdown`), one line each, by gate.
+pub const SOCKET_REFUSED: &str = "socket_refused";
+/// Log lines a revoked gate dropped, by gate.
+pub const LOG_REFUSED: &str = "log_refused";
+/// Each OTLP export, by gate: `export start <n> spans` and each span's
+/// attributes when the SDK hands it a batch, `export end <result>` when
+/// it ends.
+pub const OTLP_EXPORTS: &str = "otlp_exports";
+/// One byte per span the OTLP task handed the SDK, by gate.
+pub const OTLP_EMITTED: &str = "otlp_emitted";
 
 #[cfg(any(test, feature = "scope-test-hooks"))]
 pub use imp::*;
@@ -92,26 +108,57 @@ mod imp {
         Poll::Pending
     }
 
-    /// Every byte gated sockets wrote, by peer port (all pipelines, all
-    /// tests): what left the process over the network.
-    static SOCKET_TAP: Mutex<Vec<(u16, Vec<u8>)>> = Mutex::new(Vec::new());
+    /// Every tap, by (kind, key): a peer port, or a gate's address.
+    static TAPS: Mutex<Vec<(Key, Vec<u8>)>> = Mutex::new(Vec::new());
 
-    /// Record bytes a gated socket to `port` wrote.
-    pub fn tap(port: u16, bytes: &[u8]) {
-        let mut tap = SOCKET_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        match tap.iter_mut().find(|(p, _)| *p == port) {
+    fn taps() -> std::sync::MutexGuard<'static, Vec<(Key, Vec<u8>)>> {
+        TAPS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record `bytes` under `kind` for peer port `port`.
+    pub fn tap(kind: &'static str, port: u16, bytes: &[u8]) {
+        record((kind, port as usize), bytes);
+    }
+
+    /// Record `bytes()` under `kind` for `gate`'s pipeline.
+    pub fn tap_gate(kind: &'static str, gate: &IoGate, bytes: impl FnOnce() -> Vec<u8>) {
+        record((kind, gate_key(gate)), &bytes());
+    }
+
+    fn record(key: Key, bytes: &[u8]) {
+        let mut taps = taps();
+        match taps.iter_mut().find(|(k, _)| *k == key) {
             Some((_, b)) => b.extend_from_slice(bytes),
-            None => tap.push((port, bytes.to_vec())),
+            None => taps.push((key, bytes.to_vec())),
         }
     }
 
-    /// Everything gated sockets to `port` wrote so far.
-    pub fn tapped(port: u16) -> Vec<u8> {
-        let tap = SOCKET_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        tap.iter()
-            .find(|(p, _)| *p == port)
+    /// Everything recorded under `kind` for peer port `port` so far.
+    pub fn tapped(kind: &'static str, port: u16) -> Vec<u8> {
+        read((kind, port as usize))
+    }
+
+    /// Everything recorded under `kind` for `gate`'s pipeline so far.
+    pub fn tapped_gate(kind: &'static str, gate: &IoGate) -> Vec<u8> {
+        read((kind, gate_key(gate)))
+    }
+
+    fn read(key: Key) -> Vec<u8> {
+        taps()
+            .iter()
+            .find(|(k, _)| *k == key)
             .map(|(_, b)| b.clone())
             .unwrap_or_default()
+    }
+
+    fn gate_key(gate: &IoGate) -> usize {
+        gate as *const IoGate as usize
+    }
+
+    /// A new gate: drop what an earlier gate at the same address left.
+    pub fn new_gate(gate: &IoGate) {
+        let key = gate_key(gate);
+        taps().retain(|((_, k), _)| *k != key);
     }
 
     /// An armed point. Dropping it releases a paused thread.
@@ -169,7 +216,20 @@ pub fn pause(_point: &'static str, _gate: &crate::io_gate::IoGate) {}
 
 #[cfg(not(any(test, feature = "scope-test-hooks")))]
 #[inline(always)]
-pub fn tap(_port: u16, _bytes: &[u8]) {}
+pub fn tap(_kind: &'static str, _port: u16, _bytes: &[u8]) {}
+
+#[cfg(not(any(test, feature = "scope-test-hooks")))]
+#[inline(always)]
+pub fn tap_gate(
+    _kind: &'static str,
+    _gate: &crate::io_gate::IoGate,
+    _bytes: impl FnOnce() -> Vec<u8>,
+) {
+}
+
+#[cfg(not(any(test, feature = "scope-test-hooks")))]
+#[inline(always)]
+pub fn new_gate(_gate: &crate::io_gate::IoGate) {}
 
 #[cfg(not(any(test, feature = "scope-test-hooks")))]
 #[inline(always)]

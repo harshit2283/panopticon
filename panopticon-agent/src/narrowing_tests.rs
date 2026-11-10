@@ -20,8 +20,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::config::{AgentConfig, PrivacyGate, PrivacyMode};
 use crate::event_loop::{AdmissionFloor, RateLimiter};
+use crate::io_gate::IoGate;
 use crate::pipeline::{Scope, Shared};
-use crate::test_hooks;
+use crate::test_hooks::{self, OTLP_EXPORTS, SOCKET_REFUSED, SOCKET_SENT};
 
 // ── A fake OTLP collector that records every byte it receives ──────────
 
@@ -373,7 +374,10 @@ impl Env {
             ("logs", self.logs.lock().unwrap().clone()),
             ("otlp", self.otlp.lock().unwrap().clone()),
             ("global", global_log().lock().unwrap().clone()),
-            ("socket", test_hooks::tapped(self.collector.port)),
+            (
+                "socket",
+                test_hooks::tapped(SOCKET_SENT, self.collector.port),
+            ),
         ]
     }
 
@@ -431,10 +435,16 @@ impl Env {
             }
             let from = at.saturating_sub(needle.len().saturating_sub(1));
             let after = &bytes[from.min(bytes.len())..];
-            assert!(
-                !contains(after, needle),
-                "{needle} reached {name} after applied"
-            );
+            if let Some(i) = after
+                .windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+            {
+                let near = &after[i.saturating_sub(300)..(i + 300).min(after.len())];
+                panic!(
+                    "{needle} reached {name} after applied: {:?}",
+                    String::from_utf8_lossy(near)
+                );
+            }
         }
     }
 }
@@ -448,6 +458,82 @@ impl Drop for Env {
 fn contains(hay: &[u8], needle: &str) -> bool {
     hay.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
+
+/// Whether one line of `hay` holds every needle.
+fn line_with(hay: &[u8], needles: &[&str]) -> bool {
+    String::from_utf8_lossy(hay)
+        .lines()
+        .any(|l| needles.iter().all(|n| l.contains(n)))
+}
+
+/// Poll `cond` until it holds (true), or for `limit` (false).
+async fn until(limit: Duration, cond: impl Fn() -> bool) -> bool {
+    for _ in 0..limit.as_millis() / 50 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cond()
+}
+
+/// The socket operations `gate` refused (`test_hooks::SOCKET_REFUSED`).
+fn refused_ops(gate: &IoGate) -> String {
+    String::from_utf8_lossy(&test_hooks::tapped_gate(SOCKET_REFUSED, gate)).into_owned()
+}
+
+/// For a failed premise: the exports of `gate`'s pipeline (spans elided)
+/// and the socket operations its gate refused.
+fn export_story(gate: &IoGate) -> String {
+    let exports: Vec<_> = otlp_exports(gate)
+        .lines()
+        .filter(|l| l.starts_with("export "))
+        .map(str::to_string)
+        .collect();
+    format!("exports: {exports:?}; refused: {:?}", refused_ops(gate))
+}
+
+/// The OTLP exports of `gate`'s pipeline, as `test_hooks::OTLP_EXPORTS`
+/// records them.
+fn otlp_exports(gate: &IoGate) -> String {
+    String::from_utf8_lossy(&test_hooks::tapped_gate(OTLP_EXPORTS, gate)).into_owned()
+}
+
+/// In an `otlp_exports` record: (exports started, exports ended, spans
+/// the started exports carried).
+fn export_counts(record: &str) -> (usize, usize, usize) {
+    let (mut started, mut ended, mut spans) = (0, 0, 0);
+    for l in record.lines() {
+        if let Some(n) = l.strip_prefix("export start ") {
+            started += 1;
+            spans += n.trim_end_matches(" spans").parse::<usize>().unwrap();
+        } else if l.starts_with("export end ") {
+            ended += 1;
+        }
+    }
+    (started, ended, spans)
+}
+
+/// In an `otlp_exports` record: the end line of the first export that
+/// carried `marker`, once it has ended.
+fn export_end<'a>(record: &'a str, marker: &str) -> Option<&'a str> {
+    record
+        .split("export start ")
+        .skip(1)
+        .find(|export| export.contains(marker))?
+        .lines()
+        .find(|l| l.starts_with("export end "))
+}
+
+/// An export end caused by its transport failing (the gate refusing its
+/// socket's I/O): an error, not the deadline's.
+fn failed_in_transport(end: &str) -> bool {
+    end.starts_with("export end Err(") && !end.contains("Timeout")
+}
+
+/// What tonic's decoder logs when the response stream fails (with the
+/// failed stream's status, which quotes the collector's GOAWAY).
+const DECODER_ERROR: &str = "decoder inner stream error";
 
 // ── Synthetic events ───────────────────────────────────────────────────
 
@@ -655,8 +741,9 @@ fn reader_paused_after_admission_keeps_its_old_destination() {
     );
 }
 
-/// An OTLP export writing to its socket when the change lands (paused
-/// before the socket gate), and the old SDK's shutdown export: refused.
+/// An OTLP export in flight when the change lands (its connection's
+/// socket I/O paused before the gate), and the old SDK's shutdown export:
+/// refused.
 #[test]
 fn in_flight_otlp_export_is_refused_after_applied() {
     t2("in_flight_otlp_export_is_refused_after_applied", 4, async {
@@ -668,14 +755,43 @@ fn in_flight_otlp_export_is_refused_after_applied() {
         let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
         env.feed(&exchange("old-inflight", 18022, 1));
         env.wait_for("old-inflight", &["json", "logs"]).await;
+        // The premise: the export carrying old-inflight has started, and
+        // its connection's I/O is held at the gate, so it cannot end.
+        assert!(
+            until(WAIT, || otlp_exports(&old).contains("old-inflight")).await,
+            "the old export never started: {}",
+            export_story(&old)
+        );
         assert!(
             hook.wait_reached(WAIT),
-            "no OTLP write reached the pause point"
+            "the old connection's I/O never reached the pause point"
         );
 
         env.scope.narrow(2).await;
         let applied = env.marks();
+        let record = otlp_exports(&old);
+        assert_eq!(
+            export_end(&record, "old-inflight"),
+            None,
+            "the old export was not in flight across the change"
+        );
         drop(hook);
+        // ...and it ends because the gate refused its I/O (not by its
+        // deadline, and not sent).
+        assert!(
+            until(WAIT, || export_end(&otlp_exports(&old), "old-inflight")
+                .is_some())
+            .await,
+            "the old export never ended: {}",
+            export_story(&old)
+        );
+        let record = otlp_exports(&old);
+        assert!(
+            failed_in_transport(export_end(&record, "old-inflight").unwrap())
+                && !refused_ops(&old).is_empty(),
+            "the gate did not end the old export: {}",
+            export_story(&old)
+        );
 
         env.feed(&exchange("new-after", 18023, 2));
         env.wait_for("new-after", &["otlp"]).await;
@@ -710,6 +826,7 @@ fn otlp_errors_log_only_through_the_pipeline() {
         env.feed(&exchange("goaway-old", 18101, 1));
         // The request is read and answered with headers; the body stalls.
         env.wait_for("goaway-old", &["otlp"]).await;
+        let old = env.scope.gate().await.unwrap();
         env.scope.narrow(2).await;
         let applied = env.marks();
         // `conns`: the old pipeline's connection, then the new one's (it
@@ -727,12 +844,36 @@ fn otlp_errors_log_only_through_the_pipeline() {
                 .unwrap();
         };
         inject(1, b"collector error quoting goaway-old-echo");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Ordering, forced: the old export's decoder failed on the GOAWAY
+        // and logged it into the old pipeline's revoked log before the new
+        // pipeline exports anything (an old export that ended any other
+        // way, e.g. by its deadline, fails here).
+        assert!(
+            until(WAIT, || {
+                line_with(
+                    &test_hooks::tapped_gate(test_hooks::LOG_REFUSED, &old),
+                    &[DECODER_ERROR, "goaway-old-echo"],
+                )
+            })
+            .await,
+            "the old decoder never logged the GOAWAY into its revoked log"
+        );
 
         env.feed(&exchange("goaway-new", 18102, 2));
         env.wait_for("goaway-new", &["otlp"]).await;
         inject(2, b"collector error quoting goaway-new-echo");
-        env.wait_for("goaway-new-echo", &["logs"]).await;
+        // Positive control: the same decoder line, on the new pipeline's
+        // export, reaches the new pipeline's log.
+        assert!(
+            until(WAIT, || {
+                line_with(
+                    &env.logs.lock().unwrap(),
+                    &[DECODER_ERROR, "goaway-new-echo"],
+                )
+            })
+            .await,
+            "the new decoder never logged the GOAWAY"
+        );
 
         env.assert_absent_after(&applied, "goaway-old");
         let leaked = global_lines_with("goaway-");
@@ -759,11 +900,21 @@ fn a_stalled_response_body_does_not_hold_the_exporter() {
         4,
         async {
             let env = Env::with("otlp-stall", "info", Reply::Stall).await;
+            let gate = env.scope.gate().await.unwrap();
             env.feed(&exchange("stall-first", 18141, 1));
             env.wait_for("stall-first", &["otlp"]).await;
             env.feed(&exchange("stall-second", 18142, 1));
             env.wait_for_within("stall-second", &["otlp"], Duration::from_secs(20))
                 .await;
+            // The premise: the stalled body held the first export until its
+            // deadline ended it.
+            let record = otlp_exports(&gate);
+            let first = record.find("export end ").expect("an export ended");
+            assert!(
+                record[first..].starts_with("export end Err(Timeout"),
+                "the first export did not end by its deadline: {}",
+                record[first..].lines().next().unwrap()
+            );
             env.scope.shutdown().await;
         },
     );
@@ -773,7 +924,8 @@ fn a_stalled_response_body_does_not_hold_the_exporter() {
 /// reads nothing: the request's bytes wait in the agent's HTTP/2 buffers)
 /// across the change. After applied nothing of the old generation leaves
 /// through any socket, any file or any log, even once the collector reads
-/// again and grants the credit the old connection was waiting for.
+/// again and grants the credit the old connection was waiting for: the
+/// gate refuses the connection's I/O and the in-flight export fails.
 #[test]
 fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
     t2(
@@ -781,16 +933,29 @@ fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
         4,
         async {
             let env = Env::with("otlp-backlog", "info", Reply::Paused).await;
-            // Past the SDK queue (2048 spans) and many times the 64 KiB a
-            // connection may send unacknowledged.
+            let old = env.scope.gate().await.unwrap();
+            // Past the SDK queue (2048 spans; two per exchange) and many
+            // times the 64 KiB a connection may send unacknowledged. Fed at
+            // the workers' pace (their channels hold 64 batches), so none
+            // is dropped before the SDK.
+            let processed = || env.shared.stats.events_processed.load(Ordering::Relaxed);
+            let deadline = tokio::time::Instant::now() + WAIT;
             for i in 0..2500u16 {
                 env.feed(&exchange("old-backlog", 20000 + i, 1));
+                let fed = 2 * (u64::from(i) + 1);
+                while i % 25 == 24 && processed() < fed {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the workers never caught up"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
             }
             env.wait_for("old-backlog", &["socket"]).await;
-            // The premise: writes are blocked with the batch part-sent, its
-            // remaining bytes retained in the agent's HTTP/2 buffers.
+            // The premise, 1: writes are blocked with the batch part-sent,
+            // its remaining bytes retained in the agent's HTTP/2 buffers.
             let sent = || {
-                String::from_utf8_lossy(&test_hooks::tapped(env.collector.port))
+                String::from_utf8_lossy(&test_hooks::tapped(SOCKET_SENT, env.collector.port))
                     .matches("old-backlog")
                     .count()
             };
@@ -798,9 +963,64 @@ fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert_eq!(sent(), before, "writes are not blocked");
             assert!(before < 512, "the whole batch was sent ({before} spans)");
+            // The premise, 2: the SDK queue is full. More spans entered the
+            // SDK than its queue (2048) and one batch being assembled (512)
+            // hold beyond what the exports started so far took, so some
+            // were dropped at a full queue.
+            let emitted = test_hooks::tapped_gate(test_hooks::OTLP_EMITTED, &old).len();
+            let (_, _, exported) = export_counts(&otlp_exports(&old));
+            assert!(
+                emitted > exported + 2048 + 512,
+                "the SDK queue never filled: {emitted} spans in, {exported} exported"
+            );
+            // The premise, 3: the collector reads again: it takes in every
+            // byte the agent sent (granting credit for it), while the old
+            // connection's I/O is held at the gate.
+            let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
+            env.collector.reads.resume();
+            assert!(
+                until(WAIT, || {
+                    env.otlp.lock().unwrap().len()
+                        >= test_hooks::tapped(SOCKET_SENT, env.collector.port).len()
+                })
+                .await,
+                "the collector never read what the agent sent"
+            );
+            assert!(
+                hook.wait_reached(WAIT),
+                "the old connection's I/O never reached the pause point"
+            );
             env.scope.narrow(2).await;
             let applied = env.marks();
-            env.collector.reads.resume();
+            // The premise, 4: the export carrying old-backlog is in flight
+            // across the change (started, not ended).
+            let record = otlp_exports(&old);
+            let (started, ended, _) = export_counts(&record);
+            let last = record.rsplit("export start ").next().unwrap();
+            assert!(
+                started == ended + 1 && last.contains("old-backlog"),
+                "no old export in flight across the change: {}",
+                export_story(&old)
+            );
+            drop(hook);
+            // ...and it ends because the gate refused its I/O (not by its
+            // deadline): its retained bytes are never sent.
+            assert!(
+                until(WAIT, || export_counts(&otlp_exports(&old)).1 > ended).await,
+                "the in-flight export never ended: {}",
+                export_story(&old)
+            );
+            let record = otlp_exports(&old);
+            let end = record
+                .lines()
+                .filter(|l| l.starts_with("export end "))
+                .nth(ended)
+                .unwrap();
+            assert!(
+                failed_in_transport(end) && !refused_ops(&old).is_empty(),
+                "the gate did not end the in-flight export: {}",
+                export_story(&old)
+            );
             env.feed(&exchange("new-after", 18151, 2));
             env.wait_for_within("new-after", &["socket"], Duration::from_secs(20))
                 .await;
@@ -809,6 +1029,8 @@ fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
             // applied that sat in the kernel; `socket` is what left the
             // agent, and when.
             env.assert_absent_after_except(&applied, "old-backlog", &["otlp"]);
+            let ok = otlp_exports(&old).matches("export end Ok").count();
+            assert_eq!(ok, 0, "an old export succeeded: {}", export_story(&old));
             env.scope.shutdown().await;
         },
     );
@@ -1117,9 +1339,10 @@ fn a_failed_old_audit_write_is_not_retried_after_applied() {
 }
 
 /// The collector never answers: an old export stays unanswered across the
-/// change, and nothing of the old generation reaches the collector after
-/// applied (the transport's retained bytes included) while the new
-/// pipeline exports.
+/// change, with old spans queued behind it, and nothing of the old
+/// generation reaches the collector after applied (the transport's
+/// retained bytes included) while the new pipeline exports, even once the
+/// old batch thread exports what it kept queued.
 #[test]
 fn an_unanswered_old_export_sends_nothing_after_applied() {
     t2(
@@ -1127,17 +1350,56 @@ fn an_unanswered_old_export_sends_nothing_after_applied() {
         4,
         async {
             let env = Env::with("otlp-hang", "info", Reply::Hang).await;
+            let old = env.scope.gate().await.unwrap();
             env.feed(&exchange("old-unanswered", 18131, 1));
             env.wait_for("old-unanswered", &["otlp"]).await; // sent, never answered
             env.feed(&exchange("old-queued", 18132, 1));
-            env.wait_for("old-queued", &["json"]).await;
+            // The premise, 1: old-queued is in the SDK, behind the export
+            // (more spans entered the SDK than the exports took).
+            assert!(
+                until(WAIT, || {
+                    let (_, _, exported) = export_counts(&otlp_exports(&old));
+                    test_hooks::tapped_gate(test_hooks::OTLP_EMITTED, &old).len() > exported
+                })
+                .await,
+                "old-queued never reached the SDK"
+            );
             env.scope.narrow(2).await;
             let applied = env.marks();
+            // The premise, 2: the old export is still in flight (started,
+            // not ended) across the change, and carries only old-unanswered.
+            let record = otlp_exports(&old);
+            let (started, ended, _) = export_counts(&record);
+            assert_eq!(
+                (started, ended),
+                (1, 0),
+                "not one export in flight across the change: {record}"
+            );
+            assert!(record.contains("old-unanswered") && !record.contains("old-queued"));
             env.feed(&exchange("new-after", 18133, 2));
             env.wait_for("new-after", &["otlp"]).await;
-            // The old export times out (3 s in tests); the old batch thread
-            // then exports what it kept queued, into the revoked gate.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Forced: the old export times out (3 s in tests); the old batch
+            // thread then exports what it kept queued, into the revoked
+            // gate. Wait until that export has ended.
+            assert!(
+                until(Duration::from_secs(20), || {
+                    let r = otlp_exports(&old);
+                    let (started, ended, _) = export_counts(&r);
+                    r.contains("old-queued") && started == ended
+                })
+                .await,
+                "the old batch thread never exported old-queued"
+            );
+            let record = otlp_exports(&old);
+            let first = record.find("export end ").unwrap();
+            assert!(
+                record[first..].starts_with("export end Err(Timeout"),
+                "the unanswered export did not end by its deadline: {record}"
+            );
+            assert!(
+                !record.contains("export end Ok"),
+                "an old export succeeded: {record}"
+            );
             env.assert_absent_after(&applied, "old-");
             env.scope.shutdown().await;
         },

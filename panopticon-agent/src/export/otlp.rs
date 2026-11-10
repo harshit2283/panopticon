@@ -28,10 +28,9 @@ use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::sync::mpsc;
-use tracing::instrument::WithSubscriber;
 
 use crate::config::{OtlpConfig, PrivacyGate, PrivacyMode};
-use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate};
+use crate::io_gate::{DispatchExecutor, GatedConnector, IoGate, dispatched};
 use crate::protocol::L7Message;
 
 /// An event to be exported via OTLP.
@@ -134,6 +133,8 @@ struct DispatchExporter<E> {
     /// The Tokio runtime: the SDK polls exports on its own thread, which
     /// has no timer, so each export runs as a runtime task.
     runtime: tokio::runtime::Handle,
+    /// The pipeline's gate (keys the tests' record of exports).
+    gate: Arc<IoGate>,
 }
 
 impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
@@ -145,7 +146,16 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send>,
     > {
+        use crate::test_hooks::{OTLP_EXPORTS, tap_gate};
         use opentelemetry_sdk::error::OTelSdkError;
+        tap_gate(OTLP_EXPORTS, &self.gate, || {
+            let mut t = format!("export start {} spans\n", batch.len());
+            for span in &batch {
+                t += &format!("{:?}\n", span.attributes);
+            }
+            t.into_bytes()
+        });
+        let gate = Arc::clone(&self.gate);
         let dispatch = self.dispatch.clone();
         let inner = &mut self.inner;
         let export = tracing::dispatcher::with_default(&dispatch, || inner.export(batch));
@@ -153,18 +163,22 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
         // response headers and then stalls would otherwise hold the SDK's
         // batch thread, and every span it keeps, for good (the transport's
         // own timeout ends at the headers).
-        let task = self.runtime.spawn(
-            async move { tokio::time::timeout(EXPORT_TIMEOUT, export).await }
-                .with_subscriber(dispatch),
-        );
+        let task = self.runtime.spawn(dispatched(
+            async move { tokio::time::timeout(EXPORT_TIMEOUT, export).await },
+            dispatch,
+        ));
         Box::pin(async move {
-            match task.await {
+            let result = match task.await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err(OTelSdkError::Timeout(EXPORT_TIMEOUT)),
                 Err(e) => Err(OTelSdkError::InternalFailure(format!(
                     "OTLP export task ended: {e}"
                 ))),
-            }
+            };
+            tap_gate(OTLP_EXPORTS, &gate, || {
+                format!("export end {result:?}\n").into_bytes()
+            });
+            result
         })
     }
 
@@ -193,7 +207,7 @@ impl OtlpExportHandle {
         gate: Arc<IoGate>,
         dispatch: tracing::Dispatch,
     ) -> Result<(Self, OtlpWorker)> {
-        let channel = gated_channel(&config.endpoint, gate, dispatch.clone())?;
+        let channel = gated_channel(&config.endpoint, Arc::clone(&gate), dispatch.clone())?;
         let span_exporter = DispatchExporter {
             inner: opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
@@ -202,6 +216,7 @@ impl OtlpExportHandle {
                 .context("failed to build OTLP gRPC span exporter")?,
             dispatch: dispatch.clone(),
             runtime: tokio::runtime::Handle::current(),
+            gate: Arc::clone(&gate),
         };
 
         let resource = Resource::builder_empty()
@@ -214,11 +229,14 @@ impl OtlpExportHandle {
         let tracer = provider.tracer("panopticon-agent.otlp");
 
         let (tx, mut rx) = mpsc::channel::<(PrivacyMode, OtlpEvent)>(buffer_size);
-        let task = tokio::spawn(
+        let task = tokio::spawn(dispatched(
             async move {
                 let emit = |(mode, event)| {
                     if privacy.allows(mode) {
                         emit_event(&tracer, event);
+                        crate::test_hooks::tap_gate(crate::test_hooks::OTLP_EMITTED, &gate, || {
+                            vec![b'+']
+                        });
                     }
                 };
                 while let Some(event) = rx.recv().await {
@@ -227,9 +245,9 @@ impl OtlpExportHandle {
                         emit(event);
                     }
                 }
-            }
-            .with_subscriber(dispatch),
-        );
+            },
+            dispatch,
+        ));
 
         Ok((Self { tx }, OtlpWorker { task, provider }))
     }
