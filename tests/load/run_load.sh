@@ -23,6 +23,9 @@
 #        cgroup2 host) | head (head_only, HEAD_BYTES, default 4096) |
 #        sample (connection_sample, SAMPLE_RATE, default 0.5),
 #      TOML= extra top-level config lines (e.g. max_events_per_sec = 100000000),
+#      SERVER_LATE=1 to start the server's listener after the agent (the
+#        default starts it before, so with SCOPE=server its children have no
+#        owner until accept() returns),
 #      LOADGEN= a prebuilt loadgen binary (no Go needed on the host),
 #      LOOPBACK=1 to run client and server over 127.0.0.1 in the host
 #        namespace: node-local traffic, which TC on an interface never sees
@@ -68,14 +71,14 @@ if [[ -n ${LOADGEN:-} ]]; then cp "$LOADGEN" "$OUT/loadgen"; else go build -o "$
 sysctl -qw kernel.bpf_stats_enabled=1
 "$PY" "$ORACLE/netns.py" down >/dev/null 2>&1 || true
 "$PY" "$ORACLE/netns.py" up
-if [[ ${SCOPE:-} == cgroup ]]; then
-  CG=/sys/fs/cgroup/${NS}-load
-  mkdir -p "$CG"
-  # shellcheck disable=SC2016
-  bash -c 'echo $$ > "$1/cgroup.procs" && exec "$2" server -addr "$3"' _ "$CG" "$OUT/loadgen" "$HOST_IP:$PORT" &
-else
-  "$OUT/loadgen" server -addr "$HOST_IP:$PORT" &
-fi
+# The server's PID is known before it listens: with SERVER_LATE=1 it waits
+# on a FIFO and creates its listening socket only after the agent started.
+mkfifo "$OUT/go"
+[[ ${SERVER_LATE:-0} == 1 ]] || echo go >"$OUT/go" &
+[[ ${SCOPE:-} == cgroup ]] && CG=/sys/fs/cgroup/${NS}-load && mkdir -p "$CG"
+# shellcheck disable=SC2016
+bash -c '[[ -n $1 ]] && echo $$ > "$1/cgroup.procs"; read -r _ <"$2"; exec "$3" server -addr "$4"' \
+  _ "${CG:-}" "$OUT/go" "$OUT/loadgen" "$HOST_IP:$PORT" &
 SP=$!
 CONF=$OUT/load.toml
 {
@@ -100,6 +103,7 @@ if [[ ${NO_AGENT:-0} != 1 ]]; then
   AP=$!
 fi
 sleep 4
+if [[ ${SERVER_LATE:-0} == 1 ]]; then echo go >"$OUT/go"; sleep 1; fi
 
 NC=()
 [[ $NEWCONN == 1 ]] && NC=(-newconn)
