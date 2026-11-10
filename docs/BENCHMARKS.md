@@ -1052,8 +1052,8 @@ of the agent's programs):
 | cgroup_skb out of scope | 1.22 | 0.90 | 0.76 | 0.89 | 0.75 |
 
 Measured before compact records (Compact records, below). On 7.0 they lower
-`cgroup_skb` ns per packet run by 1-11% under load; the other four kernels
-were not re-run.
+`cgroup_skb` ns per packet run by 1-11% under load, less about 25 ns for
+clearing each record's unused bytes; the other four kernels were not re-run.
 
 - **Scoped, it costs 1.4-1.6x TC per request in the kernel here** (up to
   1.8x in the sustained runs below). The program is
@@ -1238,6 +1238,13 @@ and close records only for sockets that emitted):
 - **Cheaper in the kernel and in user space.** Kernel time per packet fell
   by 1-11% and agent CPU by 4-16%. Scoped at 1K connections the agent now
   uses less CPU than TC.
+- **Clearing unused bytes.** Every byte of a reserved record is now written
+  (the ring is mapped whole into user space and not zeroed between
+  records), which costs one more helper call per packet: `pid_filter` at 1K
+  connections, 531 [509-531] ns per packet run before and 556 [555-571]
+  after (2.28 against 2.38 kernel µs per request), with no kernel drops,
+  99.92% against 99.86% recall and 3.70 against 3.67 agent cores (n=3,
+  same rig).
 - **Out-of-scope sockets cost user space nothing.** Out of scope at 1K new
   connections/s, user space received 20,000 close records per 10 s run
   before and none after; the agent's CPU per request fell from 38 to 10 µs.
