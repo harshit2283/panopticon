@@ -1148,10 +1148,11 @@ fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()>
         // would show an earlier record. The load covers [0, len), and
         // len > N/2 in every class above 64 (the smallest class that holds
         // `take`), so only [N/2, N) is zeroed before it; the 64-byte class
-        // is zeroed whole. A failed load zeroes [0, N/2) as well.
+        // is zeroed whole. A failed load clears what it was given (the
+        // helper's `err_clear`), and [0, N/2) is zeroed again then.
         let payload = (&raw mut (*rec).payload) as *mut u8;
         let lo = if N == 64 { 0 } else { N / 2 };
-        crate::maps::zero_u64s(payload.add(lo), N - lo);
+        skb_zero(ctx, payload.add(lo), (N - lo) as u32);
         let ret = bpf_skb_load_bytes(
             ctx.skb.skb as *const c_void,
             pkt.payload_off,
@@ -1161,12 +1162,33 @@ fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()>
         (*event).payload_len = if ret == 0 {
             len
         } else {
-            crate::maps::zero_u64s(payload, lo);
+            skb_zero(ctx, payload, lo as u32);
             0
         };
     }
     entry.submit(shard_submit_flags_for::<SizedEvent<N>>(shard));
     Ok(())
+}
+
+/// Zero `n` (constant) bytes at `dst` in one helper call: `bpf_skb_load_bytes`
+/// from an offset past any packet (over INT_MAX, and over 0xffff, the
+/// check before 5.x) fails and clears its destination (net/core/filter.c
+/// `bpf_skb_load_bytes`, `err_clear`, on every supported kernel). A store
+/// loop made scope_skb_ingress too large for the verifier. scope_attach
+/// checks the published slack is zero on every lab kernel.
+#[inline(always)]
+fn skb_zero(ctx: &SkBuffContext, dst: *mut u8, n: u32) {
+    if n == 0 {
+        return;
+    }
+    unsafe {
+        bpf_skb_load_bytes(
+            ctx.skb.skb as *const c_void,
+            0x8000_0000,
+            dst as *mut c_void,
+            n,
+        );
+    }
 }
 
 const _: () = assert!(MAX_PAYLOAD_SIZE.is_power_of_two() && MAX_PAYLOAD_SIZE > 2048);

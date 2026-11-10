@@ -80,7 +80,7 @@ pub fn clear_scope_fields(event: *mut DataEvent) {
 // fixed 4,168-byte reserves (see EVENT_SCRATCH), so one connection's TLS
 // burst has a single shard to fill: ~250 records at 1 MiB per shard on a
 // 64-CPU node, where the single 16 MiB ring held ~3,900. Every reserved byte
-// is written before submit (zero_u64s): user space maps the whole ring.
+// is written before submit: user space maps the whole ring.
 
 /// Size each shard is declared with; the loader overrides it.
 const DATA_RING_DECLARED_BYTES: u32 = 1024 * 1024;
@@ -143,19 +143,35 @@ pub fn shard_submit_flags(shard: u32) -> u64 {
     shard_submit_flags_for::<DataEvent>(shard)
 }
 
-/// Zero `bytes` bytes (a multiple of 8) at the 8-aligned `p`, as 8-byte
-/// stores. Every ring reservation is fully written before submit: ring
-/// memory is not zeroed between records and user space maps all of it.
+/// MAX_PAYLOAD_SIZE zero bytes, never written: the source a TLS chunk's
+/// payload is cleared from (`zero_payload`).
+#[map]
+pub static ZEROS: Array<[u8; MAX_PAYLOAD_SIZE]> = Array::with_max_entries(1, 0);
+
+/// Zero the MAX_PAYLOAD_SIZE bytes at `dst` (tracing programs): one kernel
+/// copy from ZEROS. A store loop costs the verifier thousands of steps per
+/// path (ssl_write_ret no longer loaded); a failed copy also zeroes `dst`.
+/// Every ring reservation is fully written before submit: ring memory is
+/// not zeroed between records and user space maps all of it.
 #[inline(always)]
-pub unsafe fn zero_u64s(p: *mut u8, bytes: usize) {
-    unsafe { core::ptr::write_bytes(p as *mut u64, 0, bytes / 8) };
+pub unsafe fn zero_payload(dst: *mut u8) {
+    let src = ZEROS
+        .get_ptr(0)
+        .map_or(core::ptr::null(), |p| p as *const u8);
+    unsafe {
+        aya_ebpf::helpers::generated::bpf_probe_read_kernel(
+            dst as *mut core::ffi::c_void,
+            MAX_PAYLOAD_SIZE as u32,
+            src as *const core::ffi::c_void,
+        );
+    }
 }
 
 /// A DataEvent record cut to its header and `N` payload bytes: the
 /// cgroup_skb and sockops records (sock_capture.rs `emit`, `on_tcp_close`)
 /// are reserved at the smallest such size that holds what they carry. Only
 /// header fields and the first `N` payload bytes may be written through a
-/// `*mut DataEvent` cast of it, and all of them must be (`zero_u64s`); user
+/// `*mut DataEvent` cast of it, and all of them must be (`skb_zero`); user
 /// space reads `payload_len` bytes and ignores the rest
 /// (`data_event_record_len`).
 #[repr(C, align(8))]

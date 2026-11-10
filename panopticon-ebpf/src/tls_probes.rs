@@ -947,10 +947,10 @@ fn emit_tls_event<C: EbpfContext>(
         let event = entry.as_mut_ptr();
         // Every published byte is written: ring memory is not zeroed and
         // user space maps all of it, so the payload past the copied bytes
-        // would show an earlier record. Zeroed whole (8-byte stores) before
-        // the copy: the copy length is not a constant.
+        // would show an earlier record. Zeroed whole before the copy (the
+        // copy length is not a constant).
         unsafe {
-            crate::maps::zero_u64s((*event).payload.as_mut_ptr(), MAX_PAYLOAD_SIZE);
+            crate::maps::zero_payload((*event).payload.as_mut_ptr());
         }
         populate_tls_event(event, &h, unsafe { buf.add(off) }, chunk);
         entry.submit(shard_submit_flags(shard));
