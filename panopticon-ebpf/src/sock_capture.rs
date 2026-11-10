@@ -1000,8 +1000,9 @@ fn mark_emitted(st: *mut SockState) {
 
 /// Send a packet record with its first `take` payload bytes to the socket's
 /// ring shard, reserved at the smallest power-of-two payload size class
-/// (64 to 4,096 bytes) that holds them: the header plus less than twice the
-/// captured bytes (a whole 4,168-byte DataEvent before T-19's fix).
+/// (64 to 4,096 bytes) that holds them: the header plus the captured bytes
+/// rounded up to a power of two (at least 64), where a whole DataEvent is
+/// 4,168 bytes.
 /// Reserved in the ring, never built in a shared per-CPU buffer: egress
 /// runs in process context, where a softirq or (on a preemptible kernel)
 /// another task on the CPU can run these programs again mid-event; with

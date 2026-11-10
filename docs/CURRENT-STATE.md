@@ -61,11 +61,11 @@ production-hardened compliance platform.
   backend.
 - The `cgroup_skb` backend (not the default) is measured on five kernels
   (preliminary): scoped by `pid_filter`, it matches TC's throughput, recall
-  and agent CPU at 64 connections, and uses about 13% more agent CPU at 1K,
+  and agent CPU at 64 connections, and at 1K uses slightly less agent CPU
+  than TC with no kernel ring drops (records are sized to what they carry),
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
   loopback and both ends of node-local connections, about twice the events
-  and agent CPU. Known costs: fixed-size ring records (kernel drops at 1K
-  connections where TC has none), and `pid_filter` misses traffic accepted
+  and agent CPU. Known cost: `pid_filter` misses traffic accepted
   from a listener that predates the agent (44% of requests under connection
   churn, and now and then a whole keep-alive connection); `cgroup_filter`
   has no such gap.
