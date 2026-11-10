@@ -229,7 +229,7 @@ json.dump(n, open(d + "/narrowed.json", "w"))' "$d"
   stop_pids
   sleep 11 # past one 10 s stats flush
   agent_stop "$d"
-  score "$d" recall:B:0.99 none:C ip:C:10.99.203.1,10.99.203.2 some:A \
+  score "$d" recall:B:0.99 truth:C none:C ip:C:10.99.203.1,10.99.203.2 some:A \
     narrow:A:10.99.201.1,10.99.201.2 widened:A:0.97 \
     'log:Scope narrowed: applied' 'log:Scope widened: applied'
 }
@@ -296,7 +296,7 @@ run_tls_scoped() {
   # the library attached the kTLS ULP (OpenSSL 3.0 does on every socket
   # BIO), which marks the socket KTLS and gives no address. Go writes never
   # carry one (no return probe).
-  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 none:ON none:PS recall:PR:0.98 noaddr:PR
+  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 truth:ON none:ON truth:PS none:PS recall:PR:0.98 noaddr:PR
                 addrk:OSEL:0.95 info:GSEL)
   if [[ $how == pid ]]; then
     sleep 1
