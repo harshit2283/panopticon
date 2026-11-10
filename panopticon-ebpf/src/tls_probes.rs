@@ -6,8 +6,14 @@
 //! TlsData events tagged with the connection object pointer (`SSL*`,
 //! `*tls.Conn`) so user space can tell connections apart.
 //!
-//! Note: Go TLS Read is NOT intercepted in Phase 1. Go's goroutine stack
-//! relocation can crash uretprobes, so we only intercept Go TLS writes.
+//! Go TLS reads are not captured. A read's buffer is only filled when the
+//! call returns, and nothing saved at entry can be proven to still belong
+//! to that call at its return: a stack-backed buffer moves when the
+//! goroutine's stack grows, a Read that unwinds (recovered panic, Goexit)
+//! leaves its arguments behind for a later call on a recycled goroutine,
+//! and the entries of abandoned calls are never reclaimed without a sweep
+//! the supported kernels lack. Go writes copy the caller's buffer at entry
+//! and have none of these problems.
 
 use aya_ebpf::{
     EbpfContext,
@@ -20,9 +26,9 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, GoReadKey, SockTuple, TLS_ACTIVE,
-    TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH,
-    TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY,
+    TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH, TlsCall, TlsConnKey,
+    TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
 };
 use crate::sock_monitor::read_sock_tuple;
 
@@ -66,8 +72,8 @@ fn mark_active(conn: u64) {
 /// current generation (`sock_capture::sock_addr_checked`). That check needs
 /// the socket's `SOCK_STATE`, and `bpf_sk_storage_get` is offered to
 /// tracing (fentry) programs only, not to tracepoint or kprobe programs.
-/// Go TLS is addressless in these modes: writes have no return probe, and
-/// reads are keyed by goroutine, not by the thread the fentry sees.
+/// Go TLS writes are addressless in these modes: they have no return
+/// probe.
 #[tracepoint]
 pub fn tls_sock_send_length(ctx: TracePointContext) {
     let _ = try_tls_sock_length(&ctx);
@@ -221,7 +227,7 @@ fn take_active_if_on(pid_tgid: u64) -> Option<u64> {
 /// probe left, and collects nothing.
 #[inline(always)]
 fn forget_call(pid_tgid: u64) {
-    let _ = TLS_SCRATCH.remove(pid_tgid);
+    let _ = TLS_SCRATCH.remove(&pid_tgid);
     let _ = TLS_CALL.remove(&pid_tgid);
     let _ = take_active(pid_tgid);
 }
@@ -545,7 +551,7 @@ fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 
 /// Intercepts `SSL_read(ssl, buf, num)` entry — stashes the arguments.
 /// The actual data isn't available until the function returns with the
-/// number of bytes read, so we save them in TLS_SCRATCH.
+/// number of bytes read, so `begin_read` saves them for the return probe.
 #[uprobe]
 pub fn ssl_read_entry(ctx: ProbeContext) {
     let _ = try_ssl_read_entry(&ctx);
@@ -556,18 +562,10 @@ fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
-    let args = TlsReadArgs {
-        ssl: ctx.arg(0).ok_or(())?,
-        buf: ctx.arg(1).ok_or(())?,
-        readbytes: 0,
-    };
-    mark_active(args.ssl);
-    if restricted() {
-        begin_call(ctx, args.ssl, 0, 0, 0);
-    }
-    TLS_SCRATCH
-        .insert(bpf_get_current_pid_tgid(), args, 0)
-        .map_err(|_| ())
+    let ssl: u64 = ctx.arg(0).ok_or(())?;
+    let buf: u64 = ctx.arg(1).ok_or(())?;
+    begin_read(ctx, ssl, buf, 0);
+    Ok(())
 }
 
 /// Intercepts `SSL_read_ex(ssl, buf, num, *readbytes)` entry. Shares the
@@ -583,25 +581,42 @@ fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
         return Ok(());
     }
-    let args = TlsReadArgs {
-        ssl: ctx.arg(0).ok_or(())?,
-        buf: ctx.arg(1).ok_or(())?,
-        readbytes: ctx.arg(3).ok_or(())?,
-    };
-    let restricted = restricted();
-    if args.readbytes == 0 {
-        if restricted {
-            drop_call();
-        }
+    let ssl: u64 = ctx.arg(0).ok_or(())?;
+    let buf: u64 = ctx.arg(1).ok_or(())?;
+    let readbytes: u64 = ctx.arg(3).ok_or(())?;
+    if readbytes == 0 {
+        // Opens no call: drop whatever an earlier call left, so this
+        // call's return probe cannot consume it.
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+        let _ = TLS_CALL.remove(&pid_tgid);
         return Ok(());
     }
-    mark_active(args.ssl);
-    if restricted {
-        begin_call(ctx, args.ssl, 0, 0, 0);
+    begin_read(ctx, ssl, buf, readbytes);
+    Ok(())
+}
+
+/// Open an OpenSSL read: restricted modes keep the arguments in the call
+/// slot (`begin_call`), unscoped modes in TLS_SCRATCH, each stamped with
+/// the entry's stack pointer. Owner-only, and a failed insert leaves no
+/// entry at all (fails closed: the return probe emits nothing).
+#[inline(always)]
+fn begin_read(ctx: &ProbeContext, ssl: u64, buf: u64, readbytes: u64) {
+    mark_active(ssl);
+    if restricted() {
+        begin_call(ctx, ssl, buf, 0, readbytes);
+        return;
     }
-    TLS_SCRATCH
-        .insert(bpf_get_current_pid_tgid(), args, 0)
-        .map_err(|_| ())
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = TlsReadArgs {
+        buf,
+        ssl,
+        readbytes,
+        ident: user_sp(ctx.regs),
+    };
+    if TLS_SCRATCH.insert(&pid_tgid, &args, 0).is_err() {
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+    }
 }
 
 /// Return probe for `SSL_read` and `SSL_read_ex` — reads the decrypted data
@@ -620,39 +635,42 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         return Ok(());
     }
 
-    // Look up the arguments saved by the entry probe
-    let args = unsafe {
-        match TLS_SCRATCH.get(pid_tgid) {
-            Some(args) => *args,
-            None => return Ok(()), // Missed the entry probe
-        }
-    };
-
-    // Clean up scratch space (and the marker, if the read was served from
-    // already-buffered TLS records without touching the socket)
-    let _ = TLS_SCRATCH.remove(pid_tgid);
+    // The marker too, if the read was served from already-buffered TLS
+    // records without touching the socket.
     let _ = take_active(pid_tgid);
-    // Restricted modes: this call's own slot, consumed whatever the result.
-    // Without one opened by this frame's entry for this SSL*, the saved
-    // arguments are not proven to be this call's either: nothing is emitted.
-    let addr = if restricted() {
+    // This frame's own saved arguments, consumed whatever the result: the
+    // call slot in restricted modes, TLS_SCRATCH otherwise. Anything not
+    // opened by this frame's entry (a nested call, a missed return) is
+    // dropped and nothing is emitted from it.
+    let (ssl, buf, readbytes, addr) = if restricted() {
         let call = end_call(ctx, pid_tgid);
-        if call.found == 0 || call.conn != args.ssl {
+        if call.found == 0 {
             return Ok(());
         }
-        call.addr
+        (call.conn, call.buf, call.aux, call.addr)
     } else {
-        NO_ADDR
+        let Some(a) = TLS_SCRATCH.get_ptr(&pid_tgid) else {
+            return Ok(()); // missed the entry probe
+        };
+        // SAFETY: this thread's own entry (maps.rs TLS_SCRATCH), read field
+        // by field before the delete.
+        let (ssl, buf, readbytes, ident) =
+            unsafe { ((*a).ssl, (*a).buf, (*a).readbytes, (*a).ident) };
+        let _ = TLS_SCRATCH.remove(&pid_tgid);
+        if !same_frame(ident, user_sp(ctx.regs)) {
+            return Ok(());
+        }
+        (ssl, buf, readbytes, NO_ADDR)
     };
 
     let ret = ctx.ret::<i32>();
     if ret <= 0 {
         return Ok(()); // error / would-block / closed
     }
-    let len = if args.readbytes == 0 {
+    let len = if readbytes == 0 {
         ret as u64
     } else {
-        unsafe { bpf_probe_read_user(args.readbytes as *const u64) }.map_err(|_| ())?
+        unsafe { bpf_probe_read_user(readbytes as *const u64) }.map_err(|_| ())?
     };
     if len == 0 || len > u32::MAX as u64 {
         return Ok(());
@@ -660,8 +678,8 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 
     emit_tls_event(
         ctx,
-        args.ssl,
-        args.buf as *const u8,
+        ssl,
+        buf as *const u8,
         len as usize,
         Direction::Ingress,
         TlsLibrary::OpenSsl,
@@ -677,8 +695,7 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 /// - RCX: length of byte slice
 /// - RDI: capacity of byte slice
 ///
-/// Note: Go TLS Read is intentionally NOT intercepted — uretprobes crash
-/// Go programs due to goroutine stack relocation.
+/// Go TLS reads are not captured (see the module comment).
 #[uprobe]
 pub fn go_tls_write_entry(ctx: ProbeContext) {
     let _ = try_go_tls_write(&ctx);
@@ -704,105 +721,6 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
         TlsLibrary::GoTls,
         NO_ADDR,
     )
-}
-
-// ── Go TLS: crypto/tls.(*Conn).Read ───────────────────────────────────────
-
-/// Entry of `(*Conn).Read(b []byte) (int, error)`: remember the buffer and
-/// connection for this goroutine.
-#[uprobe]
-pub fn go_tls_read_entry(ctx: ProbeContext) {
-    let _ = try_go_tls_read_entry(&ctx);
-}
-
-#[inline(always)]
-fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
-    if !crate::sock_capture::tls_capture_on() {
-        return Ok(());
-    }
-    let (conn, buf, _len) = read_go_write_args(ctx)?; // same argument layout
-    let key = go_read_key(ctx)?;
-    mark_active(conn);
-    let args = TlsReadArgs {
-        buf: buf as u64,
-        ssl: conn,
-        readbytes: 0,
-    };
-    GO_READ_ARGS.insert(&key, &args, 0).map_err(|_| ())
-}
-
-/// A RET instruction of `(*Conn).Read` (attached at every one): the byte
-/// count is the first result register.
-#[uprobe]
-pub fn go_tls_read_ret(ctx: ProbeContext) {
-    let _ = try_go_tls_read_ret(&ctx);
-}
-
-#[inline(always)]
-fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
-    let key = go_read_key(ctx)?;
-    if !crate::sock_capture::tls_capture_on() {
-        let _ = GO_READ_ARGS.remove(&key);
-        return Ok(());
-    }
-    let args = match unsafe { GO_READ_ARGS.get(&key) } {
-        Some(a) => *a,
-        None => return Ok(()), // missed the entry
-    };
-    let _ = GO_READ_ARGS.remove(&key);
-    let n = go_first_result(ctx) as i64;
-    if n <= 0 || n > u32::MAX as i64 {
-        return Ok(());
-    }
-    emit_tls_event(
-        ctx,
-        args.ssl,
-        args.buf as *const u8,
-        n as usize,
-        Direction::Ingress,
-        TlsLibrary::GoTls,
-        NO_ADDR,
-    )
-}
-
-#[inline(always)]
-fn go_read_key(ctx: &ProbeContext) -> Result<GoReadKey, ()> {
-    let goroutine = go_g_register(ctx);
-    if goroutine == 0 {
-        return Err(());
-    }
-    Ok(GoReadKey {
-        tgid: (bpf_get_current_pid_tgid() >> 32) as u32,
-        _pad: 0,
-        goroutine,
-    })
-}
-
-/// The current goroutine (`g`), pinned to a register in Go's ABIInternal:
-/// R14 on x86_64, X28 on arm64.
-#[inline(always)]
-#[cfg(bpf_target_arch = "x86_64")]
-fn go_g_register(ctx: &ProbeContext) -> u64 {
-    unsafe { (*ctx.regs).r14 }
-}
-
-#[inline(always)]
-#[cfg(not(bpf_target_arch = "x86_64"))]
-fn go_g_register(ctx: &ProbeContext) -> u64 {
-    unsafe { (*ctx.regs).regs[28] }
-}
-
-/// First integer result at a RET: RAX on x86_64, X0 on arm64.
-#[inline(always)]
-#[cfg(bpf_target_arch = "x86_64")]
-fn go_first_result(ctx: &ProbeContext) -> u64 {
-    unsafe { (*ctx.regs).rax }
-}
-
-#[inline(always)]
-#[cfg(not(bpf_target_arch = "x86_64"))]
-fn go_first_result(ctx: &ProbeContext) -> u64 {
-    unsafe { (*ctx.regs).regs[0] }
 }
 
 #[inline(always)]

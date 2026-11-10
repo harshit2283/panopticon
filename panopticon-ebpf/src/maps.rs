@@ -257,8 +257,8 @@ pub fn pid_allowed(tgid: u32) -> bool {
     }
 }
 
-/// Arguments of an in-flight `SSL_read` / `SSL_read_ex`, saved by the entry
-/// probe for the return probe.
+/// Arguments of an in-flight `SSL_read` / `SSL_read_ex` (unscoped modes),
+/// saved by the entry probe for the return probe.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlsReadArgs {
@@ -267,18 +267,28 @@ pub struct TlsReadArgs {
     /// `SSL_read_ex`'s `size_t *readbytes`; 0 for `SSL_read`, whose return
     /// value is the byte count.
     pub readbytes: u64,
+    /// User stack pointer at entry, the call's frame identity
+    /// (tls_probes.rs `same_frame`).
+    pub ident: u64,
 }
 
 /// TLS probe state (read arguments between SSL_read entry and return
-/// probes). Key: pid_tgid.
+/// probes, unscoped modes; restricted modes keep them in TLS_CALL). Key:
+/// pid_tgid.
 ///
 /// Must NOT be per-CPU: SSL_read blocks, and the thread is frequently
 /// rescheduled onto another CPU before the uretprobe fires, which made the
-/// lookup miss and silently dropped inbound TLS plaintext. LRU so entries
-/// whose return probe never fires (thread killed mid-read) are reclaimed.
+/// lookup miss and silently dropped inbound TLS plaintext.
+///
+/// Not LRU: an LRU map evicts and recycles elements from any CPU, so a
+/// return probe reading its value could copy another call's buffer address
+/// and export unrelated memory. Same ownership rule as TLS_CALL: only the
+/// owning thread inserts, replaces, reads and deletes its key, and
+/// sched_process_exit removes the key of a thread that exits mid-call. A
+/// full map fails closed: the entry stores nothing and the call emits
+/// nothing. Not pinned (loader.rs `PINNED_MAP_NAMES`): per-call state.
 #[map]
-pub static TLS_SCRATCH: LruHashMap<u64, TlsReadArgs> =
-    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+pub static TLS_SCRATCH: HashMap<u64, TlsReadArgs> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// The TLS call in progress on this CPU: which thread, and its connection
 /// object (`SSL*`, `*tls.Conn`). Set by the TLS entry probes and consumed by
@@ -365,6 +375,11 @@ pub static TLS_CALL: HashMap<u64, TlsCall> = HashMap::with_max_entries(TLS_SCRAT
 
 /// Addresses of each TLS connection, learned on its first socket I/O.
 /// Unscoped modes only; restricted modes use per-call TLS_CALL slots.
+///
+/// Known limitation (attribution only, never plaintext): this is an LRU
+/// map read by pointer in tls_probes.rs `tls_header`, so under pressure an
+/// element can be evicted and recycled by another CPU mid-read, and an
+/// event can carry a mixed or another connection's tuple.
 #[map]
 pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
     LruHashMap::with_max_entries(TLS_SCRATCH_SIZE * 2, 0);
@@ -374,22 +389,6 @@ pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
 /// complete are reclaimed.
 #[map]
 pub static CONNECTING: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
-
-/// A Go `crypto/tls.(*Conn).Read` call in flight: process + goroutine.
-/// Keyed by goroutine (the g register), not thread: a blocked Read parks
-/// the goroutine, which may resume on another OS thread before returning.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct GoReadKey {
-    pub tgid: u32,
-    pub _pad: u32,
-    pub goroutine: u64,
-}
-
-/// Arguments of in-flight Go TLS reads (buf, conn), for the RET probes.
-#[map]
-pub static GO_READ_ARGS: LruHashMap<GoReadKey, TlsReadArgs> =
-    LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.

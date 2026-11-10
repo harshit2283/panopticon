@@ -86,17 +86,40 @@ static TEST_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 #[inline(never)]
 pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i32 {
     let fd = TEST_FD.load(std::sync::atomic::Ordering::SeqCst);
+    run_hook(&PRE_HOOK);
     // SAFETY: buf holds num bytes (the callers in the test).
     let n = unsafe { libc::write(fd, buf.cast(), num as usize) as i32 };
-    if let Some(hook) = TEST_HOOK.lock().unwrap().as_mut() {
-        hook();
-    }
+    run_hook(&TEST_HOOK);
     n
 }
 
-/// Run inside the stand-in SSL_write, after its socket write.
+/// Stand-in for OpenSSL's `SSL_read(ssl, buf, num)`: reads from `TEST_FD`.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn panop_test_ssl_read(_ssl: u64, buf: *mut u8, num: i32) -> i32 {
+    let fd = TEST_FD.load(std::sync::atomic::Ordering::SeqCst);
+    run_hook(&PRE_HOOK);
+    // SAFETY: buf holds num bytes (the callers in the test).
+    let n = unsafe { libc::read(fd, buf.cast(), num as usize) as i32 };
+    run_hook(&TEST_HOOK);
+    n
+}
+
+/// Run inside the stand-ins: PRE_HOOK before their socket I/O, TEST_HOOK
+/// after it.
 type Hook = Box<dyn FnMut() + Send>;
 static TEST_HOOK: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+static PRE_HOOK: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+fn run_hook(h: &std::sync::Mutex<Option<Hook>>) {
+    if let Some(hook) = h.lock().unwrap().as_mut() {
+        hook();
+    }
+}
+
+/// This thread's TLS_CALL slot as the post-I/O hook saw it: 0 absent,
+/// else state + 1.
+static SLOT_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A second stand-in with only the write entry probe attached: an inner
 /// call whose return probe never runs.
@@ -296,7 +319,18 @@ fn scope_programs_load_attach_and_hold() {
     let mut failed = Vec::new();
     for name in &names {
         match load_any(&mut ebpf, name) {
-            Ok(()) => println!("MATRIX {name} load=OK"),
+            Ok(()) => {
+                // The verifier's processed-instruction count, where the
+                // kernel reports it (bpf_prog_info.verified_insns, 5.16+).
+                let insns = ebpf
+                    .program(name)
+                    .and_then(|p| p.info().ok())
+                    .and_then(|i| i.verified_instruction_count());
+                match insns {
+                    Some(n) => println!("MATRIX {name} load=OK verified_insns={n}"),
+                    None => println!("MATRIX {name} load=OK"),
+                }
+            }
             Err(e) => {
                 println!("MATRIX {name} load=FAIL ({e})");
                 failed.push(name.clone());
@@ -942,8 +976,185 @@ fn scope_programs_load_attach_and_hold() {
         .try_into()
         .unwrap();
     p.detach(full_link).unwrap();
-    *TEST_HOOK.lock().unwrap() = None;
     println!("TLS_DISARM OK");
+
+    // ── in flight: a call opened while capture is on, then capture off (or
+    // the scope disarmed) before its socket I/O and return. No address is
+    // filled, no event is emitted, and the call's saved state is removed.
+    use std::sync::atomic::Ordering::SeqCst;
+    let cfg_id = map_id(&ebpf, "CONFIG");
+    let pre = |set_to: Option<(u32, u64)>| {
+        *PRE_HOOK.lock().unwrap() = set_to.map(|(index, v)| -> Hook {
+            Box::new(move || {
+                let mut c: Array<MapData, u64> =
+                    Array::try_from(aya::maps::Map::Array(MapData::from_id(cfg_id).unwrap()))
+                        .unwrap();
+                c.set(index, v, 0).unwrap();
+            })
+        });
+    };
+    *TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+        let slots: HashMap<MapData, u64, [u64; 9]> =
+            HashMap::try_from(aya::maps::Map::HashMap(MapData::from_id(slots_id).unwrap()))
+                .unwrap();
+        let st = slots.get(&pid_tgid, 0).map_or(0, |c| (c[7] >> 32) + 1);
+        SLOT_STATE.store(st, SeqCst);
+    }));
+    let scratch_left = |ebpf: &Ebpf| {
+        let m: HashMap<_, u64, [u64; 4]> =
+            HashMap::try_from(ebpf.map("TLS_SCRATCH").unwrap()).unwrap();
+        m.get(&pid_tgid, 0).is_ok()
+    };
+    let stops = [
+        (CONFIG_CAPTURE_ENABLED, "capture off"),
+        (CONFIG_SCOPE_ARMED, "disarmed"),
+    ];
+    TEST_FD.store(c4.as_raw_fd(), SeqCst);
+    // writes (restricted): control fills, in-flight stops do not
+    assert_eq!(write(ssl, b"w-on".as_ptr(), 4), 4);
+    assert_eq!(SLOT_STATE.swap(0, SeqCst), 2, "control: slot filled");
+    assert!(emitted(&mut ring, b"w-on"), "control: write emitted");
+    for (index, what) in stops {
+        pre(Some((index, 0)));
+        assert_eq!(write(ssl, b"w-stop".as_ptr(), 6), 6);
+        pre(None);
+        set(&mut ebpf, index, 1);
+        assert_eq!(
+            SLOT_STATE.swap(0, SeqCst),
+            1,
+            "{what}: slot opened, never filled"
+        );
+        assert!(!slot_left(&ebpf), "{what}: slot removed at return");
+        assert!(!emitted(&mut ring, b"w-stop"), "{what}: no write event");
+    }
+    // reads: stand-in SSL_read with the read probes and the scoped
+    // receive fentry
+    let mut read_links = Vec::new();
+    for prog in ["ssl_read_ret", "ssl_read_entry"] {
+        let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+        let link = p
+            .attach("panop_test_ssl_read", "/proc/self/exe", Some(me))
+            .unwrap_or_else(|e| panic!("{prog} attaches: {e}"));
+        read_links.push((prog, link));
+    }
+    let recv_link = {
+        let p: &mut aya::programs::FEntry = ebpf
+            .program_mut("tls_tcp_recvmsg_scoped")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        p.attach().expect("tls_tcp_recvmsg_scoped attaches")
+    };
+    let read = std::hint::black_box(panop_test_ssl_read as extern "C" fn(u64, *mut u8, i32) -> i32);
+    let mut rbuf = [0u8; 64];
+    let mut read_once = |s4: &mut TcpStream, payload: &[u8]| {
+        s4.write_all(payload).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(read(ssl, rbuf.as_mut_ptr(), 64), payload.len() as i32);
+    };
+    let _ = drain(&mut ring);
+    read_once(&mut s4, b"r-on");
+    assert_eq!(SLOT_STATE.swap(0, SeqCst), 2, "control: read slot filled");
+    let tls = drain_tls(&mut ring);
+    let e = tls
+        .iter()
+        .find(|e| e.payload_bytes() == b"r-on")
+        .expect("control: read emitted");
+    assert_eq!(
+        (e.direction, e.dst_port as u64),
+        (Direction::Ingress, c4_port),
+        "control: read carries its own address"
+    );
+    for (index, what) in stops {
+        pre(Some((index, 0)));
+        read_once(&mut s4, b"r-stop");
+        pre(None);
+        set(&mut ebpf, index, 1);
+        assert_eq!(
+            SLOT_STATE.swap(0, SeqCst),
+            1,
+            "{what}: read slot never filled"
+        );
+        assert!(!slot_left(&ebpf), "{what}: read slot removed at return");
+        assert!(!emitted(&mut ring, b"r-stop"), "{what}: no read event");
+    }
+    // unscoped reads keep their arguments in TLS_SCRATCH
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    read_once(&mut s4, b"r-full");
+    assert!(
+        emitted(&mut ring, b"r-full"),
+        "control: unscoped read emitted"
+    );
+    assert!(!scratch_left(&ebpf), "control: scratch removed at return");
+    pre(Some((CONFIG_CAPTURE_ENABLED, 0)));
+    read_once(&mut s4, b"r-full-stop");
+    pre(None);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    assert!(
+        !emitted(&mut ring, b"r-full-stop"),
+        "capture off: no unscoped read event"
+    );
+    assert!(
+        !scratch_left(&ebpf),
+        "capture off: scratch removed at return"
+    );
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
+    // address probes with an independently seeded marker
+    let full_link = {
+        let p: &mut aya::programs::FEntry = ebpf
+            .program_mut("tls_tcp_sendmsg_fentry")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        p.attach().expect("tls_tcp_sendmsg_fentry attaches")
+    };
+    let conn_addr_of = |ebpf: &Ebpf, conn: u64| {
+        let m: HashMap<_, [u64; 2], [u32; 3]> =
+            HashMap::try_from(ebpf.map("TLS_CONN_ADDR").unwrap()).unwrap();
+        m.get(&[conn, me as u64], 0).is_ok()
+    };
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 0);
+    set_active(&mut ebpf, [pid_tgid, 0x6001]);
+    c4.write_all(b"m").unwrap();
+    assert!(
+        !conn_addr_of(&ebpf, 0x6001),
+        "capture off: unscoped probe records nothing"
+    );
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    set_active(&mut ebpf, [pid_tgid, 0x6002]);
+    c4.write_all(b"m").unwrap();
+    assert!(
+        conn_addr_of(&ebpf, 0x6002),
+        "control: unscoped probe records"
+    );
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
+    let p: &mut aya::programs::FEntry = ebpf
+        .program_mut("tls_tcp_sendmsg_fentry")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    p.detach(full_link).unwrap();
+    for (index, what) in stops {
+        set(&mut ebpf, index, 0);
+        let c = call(&mut ebpf, 0x6003, &mut [&mut c4]);
+        set(&mut ebpf, index, 1);
+        assert_eq!(state(&c), 0, "{what}: scoped probe fills nothing");
+    }
+    let c = call(&mut ebpf, 0x6004, &mut [&mut c4]);
+    assert_eq!(state(&c), 1, "control: scoped probe fills");
+    for (prog, link) in read_links {
+        let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+        p.detach(link).unwrap();
+    }
+    let p: &mut aya::programs::FEntry = ebpf
+        .program_mut("tls_tcp_recvmsg_scoped")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    p.detach(recv_link).unwrap();
+    println!("TLS_INFLIGHT OK");
+    *TEST_HOOK.lock().unwrap() = None;
     for (prog, link) in uprobe_links {
         let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
         p.detach(link).unwrap();
