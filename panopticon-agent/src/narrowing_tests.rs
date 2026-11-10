@@ -712,9 +712,12 @@ fn otlp_errors_log_only_through_the_pipeline() {
         env.wait_for("goaway-old", &["otlp"]).await;
         env.scope.narrow(2).await;
         let applied = env.marks();
-        let inject = |debug: &[u8]| {
+        // `conns`: the old pipeline's connection, then the new one's (it
+        // connects on its first export).
+        let inject = |conns_open: usize, debug: &[u8]| {
             use std::io::Write;
             let conns = env.collector.conns.lock().unwrap();
+            assert_eq!(conns.len(), conns_open, "which connection gets the GOAWAY");
             conns
                 .last()
                 .unwrap()
@@ -723,12 +726,12 @@ fn otlp_errors_log_only_through_the_pipeline() {
                 .write_all(&goaway(debug))
                 .unwrap();
         };
-        inject(b"collector error quoting goaway-old-echo");
+        inject(1, b"collector error quoting goaway-old-echo");
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         env.feed(&exchange("goaway-new", 18102, 2));
         env.wait_for("goaway-new", &["otlp"]).await;
-        inject(b"collector error quoting goaway-new-echo");
+        inject(2, b"collector error quoting goaway-new-echo");
         env.wait_for("goaway-new-echo", &["logs"]).await;
 
         env.assert_absent_after(&applied, "goaway-old");
@@ -979,6 +982,7 @@ fn process_streams_carry_nothing_old_after_applied() {
         .args([
             "--exact",
             "narrowing_tests::t2_child_process_streams",
+            "--ignored",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -1003,17 +1007,24 @@ fn process_streams_carry_nothing_old_after_applied() {
         after.contains("new-after"),
         "stdout carries the new pipeline"
     );
-    for (name, after) in [("stdout", after), ("stderr", split(&stderr).1)] {
+    let (err_before, err_after) = split(&stderr);
+    assert!(
+        err_before.contains("old-stderr-control"),
+        "stderr is captured"
+    );
+    for (name, after) in [("stdout", after), ("stderr", err_after)] {
         if let Some(i) = after.find("old-") {
-            let line = after[i.saturating_sub(200)..].lines().next().unwrap_or("");
+            let start = after[..i].rfind('\n').map_or(0, |n| n + 1);
+            let line = after[start..].lines().next().unwrap_or("");
             panic!("old marker on {name} after applied: {line}");
         }
     }
 }
 
 /// The child half of `process_streams_carry_nothing_old_after_applied`
-/// (returns at once unless run as that child).
+/// (ignored; returns at once unless run as that child).
 #[test]
+#[ignore = "run by process_streams_carry_nothing_old_after_applied"]
 fn t2_child_process_streams() {
     if !child() {
         return;
@@ -1026,6 +1037,12 @@ fn t2_child_process_streams() {
         let hook = test_hooks::arm(test_hooks::WORKER_BEFORE_SINK, &old);
         env.feed(&exchange("old-held", 18182, 1));
         assert!(hook.wait_reached(WAIT), "worker never reached the sink");
+        {
+            use std::io::Write;
+            std::io::stderr()
+                .write_all(b"old-stderr-control\n")
+                .unwrap();
+        }
         env.scope.narrow(2).await;
         {
             use std::io::Write;
