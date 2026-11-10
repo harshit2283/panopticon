@@ -228,6 +228,15 @@ pub fn decode_to_jsonl<R: io::Read, W: Write>(input: R, mut out: W) -> Result<u6
             "payload_len": payload.len(),
             "orig_len": event.orig_len,
             "truncated": event.truncated_bytes() > 0,
+            "tcp_seq": event.tcp_seq,
+            "tcp_flags": event.tcp_flags,
+            // Capture-scope fields (cgroup_skb backend; 0 / u64::MAX otherwise).
+            "cgroup_id": event.cgroup_id,
+            "stream_off": event.stream_off,
+            "owner_tgid": event.owner_tgid,
+            "acceptor_tgid": event.acceptor_tgid,
+            "scope_gen": event.scope_gen,
+            "role": event.role,
             "payload_b64": b64.encode(payload),
         });
         serde_json::to_writer(&mut out, &record)?;
@@ -341,6 +350,8 @@ mod tests {
         assert_eq!(lines[0]["truncated"], false);
         assert_eq!(lines[1]["orig_len"], 9000);
         assert_eq!(lines[1]["truncated"], true);
+        assert_eq!(lines[0]["stream_off"], 0); // zeroed test event
+        assert_eq!(lines[0]["owner_tgid"], 0);
         std::fs::remove_file(&path).ok();
     }
 
