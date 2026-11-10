@@ -929,35 +929,46 @@ fn emit_tls_event<C: EbpfContext>(
     // loop body is kept branch-light: the verifier walks every iteration.
     // Every chunk of one connection object goes to the same shard, in order.
     let shard = shard_for(conn);
-    let Some(zeros) = crate::maps::ZEROS.get_ptr(0) else {
-        return Ok(());
-    };
+    // Full chunks first: their payload is copied whole (a failed
+    // bpf_probe_read_user zeroes its destination), so every published byte
+    // is written without clearing anything.
     let mut off = 0usize;
-    for i in 0..MAX_TLS_CHUNKS {
-        if off >= len {
+    for _ in 0..MAX_TLS_CHUNKS - 1 {
+        if len - off <= MAX_PAYLOAD_SIZE {
             break;
         }
-        let remaining = len - off;
-        let chunk = if i == MAX_TLS_CHUNKS - 1 || remaining <= MAX_PAYLOAD_SIZE {
-            remaining
-        } else {
-            MAX_PAYLOAD_SIZE
-        };
         let Some(mut entry) = shard_reserve(shard) else {
             crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
+        populate_tls_event(
+            entry.as_mut_ptr(),
+            &h,
+            unsafe { buf.add(off) },
+            MAX_PAYLOAD_SIZE,
+        );
+        entry.submit(shard_submit_flags(shard));
+        off += MAX_PAYLOAD_SIZE;
+    }
+    // The last chunk carries the rest (orig_len counts what is left
+    // uncaptured). Its copy may be short: ring memory is not zeroed and
+    // user space maps all of it, so the payload is cleared before the copy
+    // (once per call, outside the loop: inside it, ssl_write_ret no longer
+    // fit the verifier on 5.15 and RHEL 8).
+    if off < len {
+        let Some(zeros) = crate::maps::ZEROS.get_ptr(0) else {
+            return Ok(());
+        };
+        let Some(mut entry) = shard_reserve(shard) else {
+            crate::maps::count_kernel_drop();
+            return Ok(());
+        };
         let event = entry.as_mut_ptr();
-        // Every published byte is written: ring memory is not zeroed and
-        // user space maps all of it, so the payload past the copied bytes
-        // would show an earlier record. Zeroed whole before the copy (the
-        // copy length is not a constant).
         unsafe {
             crate::maps::zero_payload((*event).payload.as_mut_ptr(), zeros);
         }
-        populate_tls_event(event, &h, unsafe { buf.add(off) }, chunk);
+        populate_tls_event(event, &h, unsafe { buf.add(off) }, len - off);
         entry.submit(shard_submit_flags(shard));
-        off += MAX_PAYLOAD_SIZE;
     }
     Ok(())
 }
