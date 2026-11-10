@@ -31,7 +31,7 @@
 # Env: BACKEND (tc | cgroup_skb), AGENT, HTTP_PORT, TLS_PORT, METRICS, and
 # ORACLE_NS / ORACLE_IF / ORACLE_NET (netns.py).
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
-# python3 (set PYTHON) linked against a shared libssl, iproute2, nsenter,
+# python3 3.7+ (set PYTHON) linked against a shared libssl, iproute2, nsenter,
 # curl.
 set -euo pipefail
 NS=${ORACLE_NS:-pclient}
