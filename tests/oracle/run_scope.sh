@@ -18,7 +18,7 @@
 #   coexist       T-16: a foreign ALLOW_MULTI root cgroup_skb program and a
 #                 systemd IPAddressDeny= unit
 #   tuples        T-18: REDIRECT and TPROXY tuple labels, decisions by socket
-#   ktls_full     T-21: kTLS (native, 32-bit, io_uring), relays (read+write,
+#   ktls_full     T-21: kTLS keys (native, 32-bit, io_uring), relays (read+write,
 #   ktls_scoped   splice) and WireGuard, in unscoped full, scoped full and
 #   ktls_head     head_only
 #   refuse_cgroup RHEL 8 (no host cgroup2): cgroup_filter is refused
@@ -292,12 +292,11 @@ run_tls_scoped() {
   fi
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"
-  # OSEL's own sockets are in scope: its calls carry their address, unless
-  # the library attached the kTLS ULP (OpenSSL 3.0 does on every socket
-  # BIO), which marks the socket KTLS and gives no address. Go writes never
-  # carry one (no return probe).
+  # OSEL's own sockets are in scope: its calls carry their address, also
+  # where the library attaches the kTLS ULP without keys (OpenSSL 3.0 does on
+  # every socket BIO). Go writes never carry one (no return probe).
   local checks=(recall:OSEL:0.98 recall:GSEL:0.98 truth:ON none:ON truth:PS none:PS recall:PR:0.98 noaddr:PR
-                addrk:OSEL:0.95 info:GSEL)
+                addr:OSEL:0.95 info:GSEL)
   if [[ $how == pid ]]; then
     sleep 1
     kill $dummy; wait $dummy 2>/dev/null
@@ -552,15 +551,23 @@ run_ktls() {
   # The kTLS drivers wait for GO in a shell that execs them (same pid).
   local uring=0
   [[ $(uname -r | cut -d. -f1) -ge 7 || ( $(uname -r | cut -d. -f1) -eq 6 && $(uname -r | cut -d. -f2) -ge 7 ) ]] && uring=1
-  local runs="ulp:64:31301:K1 ulp:32:31302:K2 keys:64:31305:K5 recv:64:31310:R1 splice:64:31312:R2"
-  [[ $uring == 1 ]] && runs="$runs uring:64:31303:K3 uring:32:31304:K4"
+  local runs="ulp:64:31301:K1 ulp:32:31302:K2 keys:64:31305:K5 half:64:31306:K6"
+  runs="$runs recv:64:31310:R1 splice:64:31312:R2 half:64:31314:K10"
+  # Before 5.9 (RHEL 8) a 32-bit SOL_TLS setsockopt goes to the TCP
+  # compat_setsockopt, which the tls ULP does not replace: no compat keys.
+  [[ $(uname -r | awk -F. '{print $1 * 100 + $2}') -ge 509 ]] && runs="$runs half:32:31307:K7"
+  [[ $uring == 1 ]] && runs="$runs uring:64:31303:K3 uring:32:31304:K4 uhalf:64:31308:K8 uhalf:32:31309:K9"
   local r
+  # K10 is the one unselected fixture (out of scope in scoped full): a keyed
+  # socket whose verdict is OUT.
   for r in $runs; do
     IFS=: read -r mode bits port tag <<<"$r"
-    bg env "${sel[@]}" sh -c "[ -n \"\$CGROUP\" ] && echo \$\$ >$CGR/\$CGROUP/cgroup.procs;
+    local who=("${sel[@]}")
+    [[ $tag == K10 ]] && who=("${uns[@]}")
+    bg env "${who[@]}" sh -c "[ -n \"\$CGROUP\" ] && echo \$\$ >$CGR/\$CGROUP/cgroup.procs;
       while [ ! -e $d/go ]; do sleep 0.05; done; sleep 2; exec $KTLS_DRV/ktls_drv$bits $mode $port $tag 20" \
       >"$d/$tag.out" 2>&1
-    L="$L $!"
+    [[ $tag == K10 ]] || L="$L $!"
   done
   case $m in
     full) conf "$d" '' ;;
@@ -577,12 +584,16 @@ run_ktls() {
   for r in $runs; do
     IFS=: read -r mode bits port tag <<<"$r"
     checks+=("drvok:$tag")
+    # A ULP without keys is an ordinary socket (captured per its scope and
+    # mode); a socket with a key installed never has an event outside
+    # unscoped full, though the half fixtures' client markers are
+    # plaintext on its wire.
     case $m:$mode in
       full:keys) checks+=("someport:$port" "inport:$tag:$port") ;;  # ciphertext: no marker
       full:*) checks+=("someport:$tag:$port") ;;
-      *:keys) checks+=("noport:$port") ;;
-      *:recv | *:splice) checks+=("inport:$tag:$port" "someport:$tag:$((port + 1))") ;;
-      *) checks+=("none:$tag") ;;
+      *:ulp | *:uring) checks+=("someport:$tag:$port") ;;
+      *:recv | *:splice) checks+=("noport:$port" "someport:$tag:$((port + 1))") ;;
+      *) checks+=("noport:$port" "none:$tag") ;;
     esac
   done
   [[ $m != full ]] && checks+=(drop:ktls_payload)

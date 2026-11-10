@@ -25,10 +25,16 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 7] = [
+const TARGETS: [(&str, &str); 13] = [
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
-    (SET_ULP, "tcp_set_ulp"),
+    ("scope_sol_tls", "sock_common_setsockopt"),
+    ("scope_sol_tls_wq", "sock_common_setsockopt"),
+    ("scope_sol_tls_compat", "compat_sock_common_setsockopt"),
+    ("scope_sol_tls_compat_wq", "compat_sock_common_setsockopt"),
+    ("scope_sol_tls_lsm", "security_socket_setsockopt"),
+    ("scope_sol_tls_cgroup", "__cgroup_bpf_run_filter_setsockopt"),
+    ("scope_set_ulp", "tcp_set_ulp"),
     ("tls_tcp_sendmsg_fentry", "tcp_sendmsg"),
     ("tls_tcp_recvmsg_fentry", "tcp_recvmsg"),
     ("tls_tcp_sendmsg_scoped", "tcp_sendmsg"),
@@ -276,6 +282,22 @@ fn set_tls_ulp(fd: &impl AsRawFd) -> bool {
     unsafe { libc::setsockopt(fd.as_raw_fd(), 6, 31, b"tls".as_ptr().cast(), 3) == 0 }
 }
 
+/// `setsockopt(SOL_TLS, TLS_RX)` with an AES-GCM-128 key: the socket's
+/// receive side becomes kTLS, its sends stay as written.
+fn set_tls_rx_key(fd: &impl AsRawFd) -> bool {
+    set_key(fd, 282, 2) // SOL_TLS, TLS_RX
+}
+
+/// `setsockopt(level, optname)` with a struct tls12_crypto_info_aes_gcm_128
+/// (version, cipher, iv[8], key[16], salt[4], rec_seq[8]).
+fn set_key(fd: &impl AsRawFd, level: i32, optname: i32) -> bool {
+    let mut k = [0u8; 40];
+    k[..2].copy_from_slice(&0x0303u16.to_ne_bytes());
+    k[2..4].copy_from_slice(&51u16.to_ne_bytes());
+    // SAFETY: valid fd and buffer.
+    unsafe { libc::setsockopt(fd.as_raw_fd(), level, optname, k.as_ptr().cast(), 40) == 0 }
+}
+
 /// Spawn a process that sends `payload` to `port`, trying to make it reuse
 /// `pid` (through ns_last_pid). Returns whether the pid was reused.
 fn spawn_with_pid(pid: u32, port: u16, payload: &str) -> bool {
@@ -310,11 +332,21 @@ fn scope_programs_load_attach_and_hold() {
     };
     let report = load_check(&mut ebpf, &setup).expect("production load_check");
     assert!(report.writers && report.exit_tp, "{report:?}");
+    assert!(!report.markers.is_empty(), "{report:?}");
+    println!("MARKERS {:?}", report.markers);
     let accept = report.accept.expect("one inet_csk_accept variant loads");
     let other_accept = if accept == ACCEPT4 { ACCEPT2 } else { ACCEPT4 };
+    // Allowed load failures: the other accept arity, and kTLS marker
+    // variants the load-check did not pick (other layout, absent function).
+    let allowed: Vec<String> = SOL_TLS_MARKERS
+        .iter()
+        .flat_map(|(_, v)| v.iter())
+        .filter(|p| !report.markers.contains(p))
+        .map(|p| p.to_string())
+        .chain([other_accept.to_string()])
+        .collect();
 
-    // ── every other program in the object through the verifier; the only
-    // allowed failure is the other accept arity
+    // ── every other program in the object through the verifier
     let names: Vec<String> = ebpf.programs().map(|(n, _)| n.to_string()).collect();
     let mut failed = Vec::new();
     for name in &names {
@@ -337,7 +369,10 @@ fn scope_programs_load_attach_and_hold() {
             }
         }
     }
-    assert_eq!(failed, vec![other_accept.to_string()], "load failures");
+    assert!(
+        failed.contains(&other_accept.to_string()) && failed.iter().all(|f| allowed.contains(f)),
+        "load failures {failed:?}, allowed {allowed:?}"
+    );
 
     // Sockets that predate the attach: a listener and a connected client.
     let pre_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -447,7 +482,10 @@ fn scope_programs_load_attach_and_hold() {
         }
         println!("MATRIX {p} attach=OK");
     }
-    for p in [EXIT_TP, SET_ULP, accept] {
+    for p in [EXIT_TP, accept]
+        .into_iter()
+        .chain(report.markers.iter().copied())
+    {
         println!("MATRIX {p} attach=OK"); // required by attach_disarmed here
     }
 
@@ -566,22 +604,88 @@ fn scope_programs_load_attach_and_hold() {
         "window sockets counted uninit"
     );
 
-    // After arming: a socket that attaches the tls ULP is marked, and its
-    // payload dropped outside unscoped full.
+    // After arming: the tls ULP alone (no keys) does not mark a socket, and
+    // its payload is captured as any other socket's. Installing a key marks
+    // it (§3.5): its payload is dropped outside unscoped full, after its
+    // verdict is cached, so its TLS calls can still get its address.
     if ulp {
         let mut tk = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
         let (mut tk_srv, _) = lw.accept().unwrap();
         assert!(set_tls_ulp(&tk));
+        assert_eq!(
+            state(&ebpf, &tk).unwrap().flags & FLAG_KTLS,
+            0,
+            "ULP without keys: not marked"
+        );
+        tk.write_all(b"ulp-only").unwrap();
+        let _ = tk_srv.read(&mut buf).unwrap();
+        assert!(
+            drain(&mut ring)
+                .iter()
+                .any(|e| e.0 == cookie(&tk) && e.3 == b"ulp-only"),
+            "ULP without keys: captured"
+        );
+        assert!(set_tls_rx_key(&tk), "TLS_RX key installs");
         assert_ne!(
             state(&ebpf, &tk).unwrap().flags & FLAG_KTLS,
             0,
-            "KTLS marked"
+            "KTLS marked at key install"
         );
         let k0 = drops(&ebpf, DROP_KTLS_PAYLOAD);
+        // TX has no key: these bytes are on the wire as written.
         tk.write_all(b"ktls").unwrap();
         let _ = tk_srv.read(&mut buf).unwrap();
         assert!(!drain(&mut ring).iter().any(|e| e.0 == cookie(&tk)));
         assert!(drops(&ebpf, DROP_KTLS_PAYLOAD) > k0);
+        assert_eq!(
+            cached_verdict(state(&ebpf, &tk).unwrap().verdict_word, 1),
+            Some(VERDICT_IN),
+            "verdict cached before the kTLS drop"
+        );
+        // A SOL_TLS setsockopt on a socket without the ULP fails, and still
+        // marks (on entry, whatever the result).
+        let tn = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
+        let (_tn_srv, _) = lw.accept().unwrap();
+        assert!(!set_tls_rx_key(&tn));
+        assert_ne!(state(&ebpf, &tn).unwrap().flags & FLAG_KTLS, 0);
+        println!("KTLS key-install marking OK");
+
+        // A foreign cgroup/setsockopt program that rewrites (SOL_TCP, 1000)
+        // into (SOL_TLS, TLS_RX) (tests/oracle/sockopt_rewrite.bpf.c): the
+        // marker sees the level the kernel goes on with.
+        match std::env::var("SOCKOPT_REWRITE_OBJ") {
+            Ok(obj) => {
+                let mut foreign = Ebpf::load_file(&obj).expect("foreign object loads");
+                let p: &mut aya::programs::CgroupSockopt = foreign
+                    .program_mut("sockopt_rewrite")
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mode = if uses_links() {
+                    aya::programs::CgroupAttachMode::Single
+                } else {
+                    aya::programs::CgroupAttachMode::AllowMultiple
+                };
+                match p.load().and_then(|()| p.attach(&cgroup, mode)) {
+                    Ok(_) => {
+                        let tr = TcpStream::connect(lw.local_addr().unwrap()).unwrap();
+                        let (_tr_srv, _) = lw.accept().unwrap();
+                        assert!(set_tls_ulp(&tr));
+                        assert!(set_key(&tr, 6, 1000), "rewritten to TLS_RX, key installed");
+                        assert_ne!(
+                            state(&ebpf, &tr).unwrap().flags & FLAG_KTLS,
+                            0,
+                            "rewritten key install marked"
+                        );
+                        println!("KTLS rewrite marking OK");
+                    }
+                    Err(e) => {
+                        println!("KTLS rewrite: cgroup/setsockopt unavailable ({e}), skipped")
+                    }
+                }
+            }
+            Err(_) => println!("KTLS rewrite: SOCKOPT_REWRITE_OBJ not set, skipped"),
+        }
     }
 
     // ── runtime: unscoped full

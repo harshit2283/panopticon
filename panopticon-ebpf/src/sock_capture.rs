@@ -5,8 +5,8 @@
 //! `SOCK_STATE` sk_storage map. The writers of that state are kernel events
 //! only: `cgroup/sock_create` (creator, UDP initialisation), `sockops`
 //! (TCP initialisation at ESTABLISHED, revocation at TCP_CLOSE), fexit
-//! `inet_csk_accept` (acceptor, on the child only) and fentry `tcp_set_ulp`
-//! (sticky KTLS). Every rule errs toward not capturing: a socket whose state
+//! `inet_csk_accept` (acceptor, on the child only) and fentry
+//! `sock_common_setsockopt` (sticky KTLS at kTLS key install). Every rule errs toward not capturing: a socket whose state
 //! is missing, not its own, or not computable is dropped and counted in
 //! `SCOPE_DROPS`, except in unscoped `full` mode, which captures as TC did.
 //!
@@ -19,6 +19,7 @@ use core::ptr::{null_mut, read_volatile, write_volatile};
 use aya_ebpf::{
     EbpfContext,
     bindings::{BPF_F_CLONE, BPF_F_NO_PREALLOC, bpf_map_type::BPF_MAP_TYPE_SK_STORAGE},
+    helpers::bpf_probe_read_kernel,
     helpers::generated::{
         bpf_get_current_ancestor_cgroup_id, bpf_get_current_pid_tgid, bpf_get_prandom_u32,
         bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_ancestor_cgroup_id, bpf_sk_cgroup_id,
@@ -123,8 +124,8 @@ pub(crate) fn scope_mode() -> u64 {
 /// startup is treated exactly like one that predates the agent. That closes
 /// every window in which a dependency of initialised state was not yet in
 /// place: the capture hooks and UDP budgets (a UDP socket could otherwise
-/// move bytes before accounting starts), the tcp_set_ulp marker (a socket
-/// could attach kTLS unmarked), and the exit cleanup and PID_FILTER (pid
+/// move bytes before accounting starts), the kTLS key-install marker (a
+/// socket could install kTLS keys unmarked), and the exit cleanup and PID_FILTER (pid
 /// bits computed from an incomplete list).
 #[inline(always)]
 pub(crate) fn armed() -> bool {
@@ -361,10 +362,11 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
     // socket created during startup has no state (sock_create was
     // disarmed), so as an active socket it stays uninitialised; a child is
     // a new socket and reaches here only after arming, when the capture
-    // hooks and the tcp_set_ulp marker are live. The origins are derived
-    // here from the kernel counters, not from anything seen earlier, and
-    // kTLS can only attach to an established socket, i.e. after this point,
-    // when the marker is already live.
+    // hooks and the kTLS key-install marker are live. The origins are
+    // derived here from the kernel counters, not from anything seen
+    // earlier, and kTLS keys can only be installed on an established socket
+    // (they need the tls ULP, which needs ESTABLISHED), i.e. after this
+    // point, when the marker is already live.
     //
     // A child of a pre-agent listener has nothing to clone: it is a new
     // socket, so it gets fresh state here. Its owner is unknown (epoch 0
@@ -521,16 +523,109 @@ fn on_accept(child: *mut c_void) {
     wr!(st, verdict_word, 0);
 }
 
-// ── ULP attach: sticky KTLS ────────────────────────────────────────────────
+// ── kTLS key install: sticky KTLS ──────────────────────────────────────────
 
-/// Every way of attaching a ULP reaches `tcp_set_ulp`. Marked on entry,
-/// before any key exists, whatever the ULP and the result (§3.5).
-#[fentry(function = "tcp_set_ulp")]
-pub fn scope_set_ulp(ctx: FEntryContext) -> i32 {
-    let st = state_of(ctx.arg(0), false);
+const SOL_TLS: i32 = 282;
+
+/// Every `SOL_TLS` setsockopt on a TCP socket, and so every kTLS key install
+/// (`TLS_TX`, `TLS_RX`), reaches the socket's `sk_prot->setsockopt` through
+/// `sock_common_setsockopt`, and before 5.9 for 32-bit callers through
+/// `compat_sock_common_setsockopt`: the native and compat syscalls, io_uring
+/// and the TLS handshake agent alike (§3.5). Marked on entry, before any key
+/// exists, whatever the option and the result. A ULP attached without keys
+/// (OpenSSL 3.0 does that on every socket) leaves the payload as the
+/// application wrote it, so it is not marked (except `scope_set_ulp`).
+///
+/// `sk` is read from the `struct socket *` argument at a fixed offset, one
+/// variant per layout: 24 since 5.3, 32 before (RHEL 8). The verifier types
+/// the load from BTF, so a variant whose offset is not `sk` passes
+/// `bpf_sk_storage_get` a non-socket and does not load; the loader takes
+/// the variant that does.
+#[inline(always)]
+fn mark_sol_tls(ctx: &FEntryContext, sk_off: usize) {
+    let level: i32 = ctx.arg(1);
+    if level != SOL_TLS {
+        return;
+    }
+    let sock: *const u8 = ctx.arg(0);
+    let sk = unsafe { *(sock.add(sk_off) as *const *mut c_void) };
+    mark_ktls(sk);
+}
+
+#[inline(always)]
+fn mark_ktls(sk: *mut c_void) {
+    if sk.is_null() {
+        return;
+    }
+    let st = state_of(sk, false);
     if !st.is_null() {
         wr!(st, flags, rd!(st, flags) | FLAG_KTLS);
     }
+}
+
+#[fentry(function = "sock_common_setsockopt")]
+pub fn scope_sol_tls(ctx: FEntryContext) -> i32 {
+    mark_sol_tls(&ctx, 24);
+    0
+}
+
+#[fentry(function = "sock_common_setsockopt")]
+pub fn scope_sol_tls_wq(ctx: FEntryContext) -> i32 {
+    mark_sol_tls(&ctx, 32);
+    0
+}
+
+#[fentry(function = "compat_sock_common_setsockopt")]
+pub fn scope_sol_tls_compat(ctx: FEntryContext) -> i32 {
+    mark_sol_tls(&ctx, 24);
+    0
+}
+
+#[fentry(function = "compat_sock_common_setsockopt")]
+pub fn scope_sol_tls_compat_wq(ctx: FEntryContext) -> i32 {
+    mark_sol_tls(&ctx, 32);
+    0
+}
+
+/// Where `sock_common_setsockopt` cannot be traced (5.9 to 6.0: it takes
+/// `sockptr_t` by value, which trampolines support from 6.1), the same mark
+/// from the two places `__sys_setsockopt` passes before it calls
+/// `sock->ops->setsockopt`, the only caller of a TCP socket's
+/// `sock_common_setsockopt` on those kernels apart from SMC (see
+/// `scope_set_ulp`): the LSM hook, for every caller (native and compat),
+/// and the return of the cgroup setsockopt filter, which may rewrite the
+/// level after the LSM hook (it runs only when a cgroup setsockopt program
+/// is attached, never for compat callers, before `ops->setsockopt`).
+#[fentry(function = "security_socket_setsockopt")]
+pub fn scope_sol_tls_lsm(ctx: FEntryContext) -> i32 {
+    mark_sol_tls(&ctx, 24);
+    0
+}
+
+/// `__cgroup_bpf_run_filter_setsockopt(sk, int *level, ...)`: the level the
+/// kernel goes on with. The `int *` is read from the argument array with a
+/// probe read (5.15's verifier loads only struct pointers from it).
+/// Unreadable counts as `SOL_TLS`.
+#[fexit(function = "__cgroup_bpf_run_filter_setsockopt")]
+pub fn scope_sol_tls_cgroup(ctx: FExitContext) -> i32 {
+    let args = ctx.as_ptr() as *const *const i32;
+    let level = unsafe { bpf_probe_read_kernel(args.add(1)) }
+        .and_then(|p| unsafe { bpf_probe_read_kernel(p) })
+        .unwrap_or(SOL_TLS);
+    if level == SOL_TLS {
+        mark_ktls(ctx.arg(0));
+    }
+    0
+}
+
+/// SMC calls its TCP socket's `ops->setsockopt` directly, past the LSM hook,
+/// and before 5.14 passes `TCP_ULP` through to it. So where the LSM hook
+/// marks (5.9 to 6.0) on a kernel older than 5.14, a ULP attach marks too,
+/// on entry, whatever the ULP and the result (the rule before key-install
+/// marking). Every way of attaching a ULP reaches `tcp_set_ulp`.
+#[fentry(function = "tcp_set_ulp")]
+pub fn scope_set_ulp(ctx: FEntryContext) -> i32 {
+    mark_ktls(ctx.arg(0));
     0
 }
 
@@ -570,8 +665,8 @@ struct Packet {
 
 const ETH_P_IP_BE: u32 = (0x0800u16).to_be() as u32;
 
-/// Order per packet (§3): eligibility, kTLS, initialisation, (UDP head
-/// reservation), verdict, head cut, copy and emit.
+/// Order per packet (§3): eligibility, initialisation, (UDP head
+/// reservation), verdict, kTLS, head cut, copy and emit.
 #[inline(always)]
 fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     if cfg(CONFIG_CAPTURE_ENABLED) == 0 {
@@ -612,11 +707,6 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     let sk = sk as *mut c_void;
     let mode = scope_mode();
     let st = state_of(sk, false);
-
-    // ── kTLS: the payload may be plaintext at this hook (§3.5)
-    if !is_unscoped_full(mode) && !st.is_null() && rd!(st, flags) & FLAG_KTLS != 0 {
-        return drop(DROP_KTLS_PAYLOAD);
-    }
 
     // ── initialisation
     let cookie = unsafe { bpf_get_socket_cookie(skb as *mut c_void) };
@@ -674,6 +764,14 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Ok(g) => g,
         Err(reason) => return drop(reason),
     };
+
+    // ── kTLS: the payload may be plaintext at this hook (§3.5). After the
+    // verdict, so an in-scope kTLS socket has its IN verdict cached (its TLS
+    // calls get their address, `sock_addr_checked`); before every emit, so
+    // none of its payload leaves outside unscoped full.
+    if flags & FLAG_KTLS != 0 {
+        return drop(DROP_KTLS_PAYLOAD);
+    }
 
     // ── TCP stream offset (every mode), then the head cut
     let tcp_off = if !udp && flags & FLAG_BASELINE != 0 {

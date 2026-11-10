@@ -44,7 +44,8 @@ pub const ACCEPTOR_LISTED: u8 = 1 << 1;
 pub const FLAG_BASELINE: u8 = 1 << 0;
 pub const FLAG_ROLE_CLIENT: u8 = 1 << 1;
 pub const FLAG_ROLE_SERVER: u8 = 1 << 2;
-/// Sticky, never cleared: the socket attached a ULP (kernel TLS).
+/// Sticky, never cleared: a kernel TLS key was (or may have been) installed
+/// on the socket (a `SOL_TLS` setsockopt, DESIGN §3.5).
 pub const FLAG_KTLS: u8 = 1 << 5;
 /// Sticky: TCP repair was used, so the stream history is unknown.
 pub const FLAG_REPAIRED: u8 = 1 << 6;
