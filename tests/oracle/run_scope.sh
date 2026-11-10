@@ -28,6 +28,7 @@
 #                 pod, a matching pod added (widening) and relabelled out
 #                 (narrowing) under traffic, unmatched pods, TLS in pods
 #   k8s_tuples    T-18: ClusterIP, NodePort, hostNetwork, REDIRECT in a pod
+#   k3s_up, k3s_down  install-and-start / stop k3s on their own
 #
 # Usage: sudo tests/oracle/run_scope.sh OUT scenario...
 # Env: AGENT (agent binary), PY (python3 with a shared libssl), GO_TLS (a
@@ -44,7 +45,7 @@ GO_TLS=${GO_TLS:-}
 KTLS_DRV=${KTLS_DRV:-}
 FOREIGN_OBJ=${FOREIGN_OBJ:-}
 TRAFFIC="$PY -I $HERE/scope_traffic.py"
-METRICS=127.0.0.1:39190
+METRICS=127.0.0.1:31990 # in this oracle's 31xxx range: another oracle may hold 39xxx
 CGR=/sys/fs/cgroup
 [[ $(stat -fc %T $CGR) == cgroup2fs ]] || CGR=
 mkdir -p "$OUT"
