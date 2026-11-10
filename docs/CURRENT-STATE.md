@@ -61,15 +61,19 @@ production-hardened compliance platform.
   backend.
 - The `cgroup_skb` backend (not the default) is measured on five kernels
   (preliminary): scoped by `pid_filter`, it matches TC's throughput, recall
-  and agent CPU at 64 connections, and at 1K uses slightly less agent CPU
+  and agent CPU at 64 keep-alive connections, and at 1K uses slightly less agent CPU
   than TC with no kernel ring drops (records are sized to what they carry),
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
   loopback and both ends of node-local connections, about twice the events
-  and agent CPU. `pid_filter` matches TC's recall, also for
-  a server whose listener predates the agent, when every process holding
-  that listener is listed; a listener shared with an unlisted process (and
-  any such listener on RHEL 8) is captured from `accept()` on.
-  `cgroup_filter` has no such gap.
+  and agent CPU. `pid_filter` matches TC's recall only for a server whose
+  listener was created after the agent started. On a listener that predates
+  the agent (any server not restarted since), a connection is captured from
+  the moment a listed process accepts it, and earlier bytes are dropped:
+  56.6% recall with a new connection per request (TC 100%), 100% with
+  keep-alive connections. Restart the server after the agent, or use
+  `cgroup_filter` / `pod_filter`, which has no such gap. A listener created
+  by a listed process selects every connection accepted on it, also by
+  processes not in the list (docs/USER-GUIDE.md).
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 

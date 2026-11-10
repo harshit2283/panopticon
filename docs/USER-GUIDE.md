@@ -176,6 +176,22 @@ running config is kept.
     forks later (pre-fork workers, helpers), have new PIDs and are **not**
     captured. The filter does not follow process trees: list them and
     restart the agent.
+  - With the `cgroup_skb` backend the decision is made in the kernel, per
+    connection, and differs in two ways:
+    - A listening socket created by a listed process while the agent runs
+      selects every connection accepted on it, whoever accepts it: a worker
+      the listed process forks later, a process that received the socket
+      (`SCM_RIGHTS`, `pidfd_getfd`) or has since exec'd another program, and
+      after the listed process has exited. List only processes whose
+      listening sockets you want captured.
+    - On a listening socket that existed before the agent started (any
+      server not restarted since the agent was), a connection is captured
+      only from the moment a listed process `accept()`s it; bytes that
+      arrive before that are dropped (no packets are held) and counted in
+      `panopticon_scope_dropped_events_total{reason="no_owner"}`. With a new
+      connection per request that loses most requests (docs/BENCHMARKS.md).
+      For full recall, restart the server after the agent, or select by
+      `cgroup_filter` / `pod_filter`, which has no such gap.
 - `sampling_mode = "connection_sample"` with `sample_rate = r` (required,
   0.0 to 1.0): each connection is captured whole or not at all, decided once
   from a keyed hash of the connection (the key is drawn at agent start, so
