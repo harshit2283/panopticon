@@ -1051,6 +1051,10 @@ of the agent's programs):
 | cgroup_skb `pid_filter` / `cgroup_filter` | 2.44 / 2.45 | 2.06 / 2.02 | 1.86 / 1.91 | 1.91 / 1.80 | 1.81 / – |
 | cgroup_skb out of scope | 1.22 | 0.90 | 0.76 | 0.89 | 0.75 |
 
+Measured before compact records (Compact records, below). On 7.0 they lower
+`cgroup_skb` ns per packet run by 1-11% under load; the other four kernels
+were not re-run.
+
 - **Scoped, it costs 1.4-1.6x TC per request in the kernel here** (up to
   1.8x in the sustained runs below). The program is
   cheaper per run, but it runs twice as often: the client socket's packets
@@ -1094,7 +1098,9 @@ high ends are under connection churn):
 - **Per new connection.** With one request per connection (1K connections/s),
   the kernel time per request is 4.9-5.4 µs on TC. On `cgroup_skb` it is
   7.9-9.9 µs unscoped, 7.4-10.1 µs with `pid_filter`, and 6.4-8.2 µs out of
-  scope. The hooks above account for 3.5-4.4 µs of each new local connection.
+  scope (before compact records; out of scope on 7.0 it is now 7.6 µs, 8.8
+  before, without the close records). The hooks above account for 3.5-4.4 µs
+  of each new local connection.
 - **Close records.** A TCP socket's close sends a 96-byte close record to
   user space only if a packet record of that socket was emitted (the only
   sockets user space holds state for). Before compact records (below),
