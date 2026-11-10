@@ -724,6 +724,11 @@ pub fn arm(ebpf: &mut Ebpf, pids: Option<Vec<Candidate>>) -> Result<Vec<(u32, &'
             warn!(pid, reason = why, "pid_filter process not selected");
             remove_pid(&mut filter, pid)?;
         }
+        let listed: Vec<_> = pids
+            .iter()
+            .filter(|c| c.running() && !excluded.iter().any(|&(p, _)| p == c.pid))
+            .collect();
+        init_listeners(ebpf, &listed)?;
     }
     config_array(ebpf)?.set(CONFIG_SCOPE_ARMED, 1, 0)?;
     info!("capture scope armed");
@@ -735,6 +740,326 @@ pub fn arm(ebpf: &mut Ebpf, pids: Option<Vec<Candidate>>) -> Result<Vec<(u32, &'
         }
     } // the pidfds close here
     Ok(excluded)
+}
+
+// ── Pre-agent listeners (DESIGN §3.1) ──────────────────────────────────────
+
+const SYS_PIDFD_GETFD: libc::c_long = 438;
+const KCMP_FILES: libc::c_long = 2;
+const BPF_NOEXIST: u64 = 1;
+const BPF_EXIST: u64 = 2;
+
+/// Who holds each socket, from every fd table and io_uring file table in
+/// `/proc`.
+#[derive(Default)]
+struct Holders {
+    /// socket inode → (tgid, fd in the tgid's own table) per holder; the fd
+    /// is None for a thread's private table or an io_uring file table.
+    by_ino: std::collections::HashMap<u64, Vec<(u32, Option<i32>)>>,
+    /// Why an unlisted process's holdings could not be read in full (then
+    /// any socket may have a holder not seen).
+    incomplete: Option<String>,
+}
+
+impl Holders {
+    /// Every holder of `ino` is listed. With `skip_self` the agent is not
+    /// counted: the second scan sees its own dups of the listeners.
+    fn all_listed(
+        &self,
+        ino: u64,
+        listed: &std::collections::HashSet<u32>,
+        skip_self: bool,
+    ) -> bool {
+        let me = std::process::id();
+        self.incomplete.is_none()
+            && self.by_ino.get(&ino).is_some_and(|hs| {
+                hs.iter()
+                    .all(|&(t, _)| (skip_self && t == me) || listed.contains(&t))
+            })
+    }
+}
+
+fn gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn socket_ino(link: &str) -> Option<u64> {
+    link.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// Scan every process. Only an unlisted process can make a listener
+/// ineligible, so only for those are threads with a table of their own,
+/// io_uring file tables and read errors looked at.
+fn scan_holders(listed: &std::collections::HashSet<u32>) -> Holders {
+    let mut h = Holders::default();
+    let procs = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(e) => {
+            h.incomplete = Some(format!("/proc: {e}"));
+            return h;
+        }
+    };
+    for p in procs.flatten() {
+        let Some(tgid) = p.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let strict = !listed.contains(&tgid);
+        let base = format!("/proc/{tgid}");
+        scan_fd_dir(&mut h, tgid, &base, true, strict);
+        if !strict {
+            continue;
+        }
+        let tasks = match std::fs::read_dir(format!("{base}/task")) {
+            Ok(d) => d,
+            Err(e) if gone(&e) => continue,
+            Err(e) => {
+                h.incomplete.get_or_insert(format!("{base}/task: {e}"));
+                continue;
+            }
+        };
+        for t in tasks.flatten() {
+            let Some(tid) = t.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            // SAFETY: plain syscall on two pids; 0 = same fd table.
+            let same = tid == tgid
+                || unsafe { libc::syscall(libc::SYS_kcmp, tgid, tid, KCMP_FILES, 0, 0) } == 0;
+            if !same {
+                scan_fd_dir(&mut h, tgid, &format!("{base}/task/{tid}"), false, true);
+            }
+        }
+    }
+    h
+}
+
+fn scan_fd_dir(h: &mut Holders, tgid: u32, dir: &str, own: bool, strict: bool) {
+    let fds = match std::fs::read_dir(format!("{dir}/fd")) {
+        Ok(d) => d,
+        Err(e) if gone(&e) => return,
+        Err(e) => {
+            if strict {
+                h.incomplete.get_or_insert(format!("{dir}/fd: {e}"));
+            }
+            return;
+        }
+    };
+    for f in fds.flatten() {
+        let Some(fd) = f.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let link = match std::fs::read_link(f.path()) {
+            Ok(l) => l,
+            Err(e) if gone(&e) => continue,
+            Err(e) => {
+                if strict {
+                    h.incomplete.get_or_insert(format!("{dir}/fd/{fd}: {e}"));
+                }
+                continue;
+            }
+        };
+        let link = link.to_string_lossy();
+        if let Some(ino) = socket_ino(&link) {
+            h.by_ino
+                .entry(ino)
+                .or_default()
+                .push((tgid, own.then_some(fd)));
+        } else if strict && link == "anon_inode:[io_uring]" {
+            scan_io_uring(h, tgid, &format!("{dir}/fdinfo/{fd}"));
+        }
+    }
+}
+
+/// An io_uring's registered files (`UserFiles:` in its fdinfo, one
+/// `<slot>: <path>` line per file). The table is printed only when the
+/// ring's lock was free, so a nonempty table with no lines is unknown.
+fn scan_io_uring(h: &mut Holders, tgid: u32, fdinfo: &str) {
+    let text = match std::fs::read_to_string(fdinfo) {
+        Ok(t) => t,
+        Err(e) if gone(&e) => return,
+        Err(e) => {
+            h.incomplete.get_or_insert(format!("{fdinfo}: {e}"));
+            return;
+        }
+    };
+    let (declared, lines, inos) = io_uring_files(&text);
+    match declared {
+        Some(n) if n == 0 || lines > 0 => {}
+        _ => {
+            h.incomplete
+                .get_or_insert(format!("{fdinfo}: io_uring file table not listed"));
+            return;
+        }
+    }
+    for ino in inos {
+        h.by_ino.entry(ino).or_default().push((tgid, None));
+    }
+}
+
+/// (`UserFiles` count, files listed under it, the socket inodes among
+/// them) of io_uring fdinfo.
+fn io_uring_files(text: &str) -> (Option<u32>, usize, Vec<u64>) {
+    let mut declared = None;
+    let mut listed = 0;
+    let mut inos = Vec::new();
+    let mut lines = text.lines();
+    for line in lines.by_ref() {
+        if let Some(n) = line.strip_prefix("UserFiles:") {
+            declared = n.trim().parse().ok();
+            break;
+        }
+    }
+    for line in lines {
+        let Some((slot, path)) = line.split_once(": ") else {
+            break;
+        };
+        if slot.trim().parse::<u32>().is_err() {
+            break;
+        }
+        listed += 1;
+        inos.extend(socket_ino(path.trim()));
+    }
+    (declared, listed, inos)
+}
+
+fn pidfd_getfd(pidfd: &std::os::fd::OwnedFd, fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: plain syscall; a non-negative result is a new fd we own.
+    let r = unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd.as_raw_fd(), fd, 0u32) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(r as i32) })
+}
+
+fn sockopt_int(fd: &std::os::fd::OwnedFd, opt: i32) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let mut v: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: valid fd and out-pointers of the stated size.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            (&raw mut v).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(v)
+}
+
+/// `fd` is socket inode `ino` and a listening TCP socket.
+fn is_tcp_listener(fd: &std::os::fd::OwnedFd, ino: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid fd and a zeroed out-struct.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || st.st_ino != ino {
+        return false;
+    }
+    sockopt_int(fd, libc::SO_ACCEPTCONN) == Some(1)
+        && sockopt_int(fd, libc::SO_PROTOCOL) == Some(libc::IPPROTO_TCP)
+        && matches!(
+            sockopt_int(fd, libc::SO_DOMAIN),
+            Some(libc::AF_INET | libc::AF_INET6)
+        )
+}
+
+/// Initialise the owner of LISTEN sockets that predate the agent (DESIGN
+/// §3.1), while disarmed: a listener every one of whose holders is a listed
+/// process gets `OWNER_LISTED`, so its children are selected from their
+/// first byte, as for a listener a listed process creates under the agent.
+/// Holders are the processes with the socket in an fd table or an io_uring
+/// file table; one unlisted holder, or an unlisted process whose tables
+/// cannot be read in full, leaves the listener (or every listener) without
+/// state, so pid_filter selects its children from `accept()` on, as before.
+///
+/// Two scans: the state is written under a dead epoch (`!epoch`, never
+/// current), the holders are read again, and only a listener still held by
+/// listed processes alone gets the current epoch. A child cloned before
+/// that write carries the dead epoch and counts `no_owner` until accepted.
+/// Needs `pidfd_getfd` (5.6+) and a pidfd per listed process.
+fn init_listeners(ebpf: &mut Ebpf, listed: &[&Candidate]) -> Result<()> {
+    use panopticon_common::CONFIG_PID_EPOCH;
+    use panopticon_common::scope::{OWNER_LISTED, SockState};
+    let mut pidfds = std::collections::HashMap::new();
+    for c in listed {
+        match &c.pidfd {
+            Some(fd) => pidfds.insert(c.pid, fd),
+            None => {
+                info!("pre-agent listeners not initialised: no pidfd for the listed processes");
+                return Ok(());
+            }
+        };
+    }
+    if pidfds.is_empty() {
+        return Ok(());
+    }
+    let set: std::collections::HashSet<u32> = pidfds.keys().copied().collect();
+    let epoch = config_array(ebpf)?.get(&CONFIG_PID_EPOCH, 0)? as u32;
+    let mut map: aya::maps::SkStorage<&mut aya::maps::MapData, SockState> =
+        aya::maps::SkStorage::try_from(
+            ebpf.map_mut("SOCK_STATE")
+                .context("SOCK_STATE map not found")?,
+        )?;
+
+    let first = scan_holders(&set);
+    if let Some(why) = &first.incomplete {
+        warn!(why = %why, "pre-agent listeners not initialised");
+        return Ok(());
+    }
+    let mut written = Vec::new();
+    for (&ino, holders) in &first.by_ino {
+        if !first.all_listed(ino, &set, false) {
+            continue;
+        }
+        let Some(&(tgid, Some(fd))) = holders.iter().find(|h| h.1.is_some()) else {
+            continue;
+        };
+        let ours = match pidfd_getfd(pidfds[&tgid], fd) {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                info!("pre-agent listeners not initialised: no pidfd_getfd");
+                return Ok(());
+            }
+            Err(_) => continue, // closed meanwhile, or not permitted
+        };
+        if !is_tcp_listener(&ours, ino) {
+            continue;
+        }
+        let state = SockState {
+            owner_tgid: holders.iter().map(|h| h.0).min().unwrap_or(tgid),
+            pid_epoch: !epoch,
+            pid_bits: OWNER_LISTED,
+            ..SockState::default()
+        };
+        // NOEXIST: never overwrite state a kernel writer created.
+        if map.insert(&ours, state, BPF_NOEXIST).is_ok() {
+            written.push((ino, ours, state));
+        }
+    }
+    if written.is_empty() {
+        return Ok(());
+    }
+    let second = scan_holders(&set);
+    let mut done = 0;
+    for (ino, fd, mut state) in written {
+        if !second.all_listed(ino, &set, true) {
+            continue; // stays under the dead epoch
+        }
+        state.pid_epoch = epoch;
+        if map.insert(&fd, state, BPF_EXIST).is_ok() {
+            done += 1;
+        }
+    }
+    info!(
+        listeners = done,
+        "pre-agent listeners initialised (every holder listed)"
+    );
+    Ok(())
 }
 
 /// Remove `pid`. Already absent is fine: never inserted (not running at
@@ -1070,6 +1395,21 @@ mod tests {
             mode_settings(SCOPE_SEL_PID | SCOPE_HEAD),
             "pid_filter, sampling_mode = \"head_only\""
         );
+    }
+
+    #[test]
+    fn io_uring_file_tables() {
+        assert_eq!(socket_ino("socket:[12345]"), Some(12345));
+        assert_eq!(socket_ino("pipe:[7]"), None);
+        let info = "SqMask:\t0x7\nUserFiles:\t3\n    0: socket:[11]\n    1: /tmp/x\n    \
+                    2: socket:[22]\nUserBufs:\t0\n";
+        assert_eq!(io_uring_files(info), (Some(3), 3, vec![11, 22]));
+        // Table not printed (ring lock busy): no lines, so not known.
+        assert_eq!(
+            io_uring_files("UserFiles:\t2\nUserBufs:\t0\n"),
+            (Some(2), 0, vec![])
+        );
+        assert_eq!(io_uring_files("SqMask:\t0x7\n"), (None, 0, vec![]));
     }
 
     #[test]
