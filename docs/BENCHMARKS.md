@@ -1049,7 +1049,8 @@ of the agent's programs):
 | cgroup_skb `pid_filter` / `cgroup_filter` | 2.44 / 2.45 | 2.06 / 2.02 | 1.86 / 1.91 | 1.91 / 1.80 | 1.81 / – |
 | cgroup_skb out of scope | 1.22 | 0.90 | 0.76 | 0.89 | 0.75 |
 
-- **Scoped, it costs 1.4-1.7x TC per request in the kernel.** The program is
+- **Scoped, it costs 1.4-1.6x TC per request in the kernel here** (up to
+  1.8x in the sustained runs below). The program is
   cheaper per run, but it runs twice as often: the client socket's packets
   are checked too, and dropped as out of scope.
 - **Unscoped, it costs 2-2.5x TC** and exports every exchange twice.
@@ -1141,9 +1142,12 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
 
 **Findings.**
 
-- **Scoped, it matches TC.** At 64 and 1K connections, `pid_filter` delivers
-  TC's throughput, recall and agent CPU. The kernel spends about 0.9 µs more
-  per request, but the application does not measurably slow down.
+- **Scoped, it matches TC at 64 connections.** `pid_filter` delivers TC's
+  throughput, recall and agent CPU there. At 1K connections it costs about
+  13% more agent CPU (4.07 against 3.61 cores) and drops some events in the
+  kernel ring (see Ring capacity). The kernel spends about 0.9-1.0 µs more
+  per request (1.4-1.7x TC's), and 1.8x at 4K connections opening at 20K
+  req/s. The application does not measurably slow down.
 - **Cutting in the kernel saves user space.** With `head_only`, the agent
   does almost nothing (0.01 cores against 0.22 on TC, where the cut is in
   user space), and the application runs faster than on TC.
@@ -1161,9 +1165,11 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   This is the case after any agent restart. A connection accepted from such a
   listener has no recorded owner until `accept()` returns, and bytes before
   that are dropped (`no_owner`). Under connection churn that was 44% of
-  requests, and at 4K connections opening at 20K req/s, 0.5%. With keep-alive
-  connections, one whole connection (1 of 64) was occasionally lost: in 2 of
-  15 kernel-cost runs and 2 of 6 fixed-rate runs.
+  requests, and at 4K connections opening at 20K req/s, 0.5%. With 64
+  keep-alive connections, a whole connection (1 of 64) was lost in 6 of 27
+  runs, and at 200 connections in 1 of 3. That second path is the accept
+  being recorded before the connection's ESTABLISHED callback, which then
+  clears it.
   - With the server's listener created after the agent started
     (`SERVER_LATE=1`), the same cells measure 100% recall with no `no_owner`
     drops, and so does `cgroup_filter` under churn.
