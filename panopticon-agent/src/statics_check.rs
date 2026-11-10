@@ -14,6 +14,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "HOOKS",
         "armed test pause points (unit tests and scope-test-hooks builds only)",
     ),
+    (
+        "test_hooks.rs",
+        "SOCKET_TAP",
+        "tests and scope-test-hooks builds only: the test oracle of socket writes",
+    ),
     ("main.rs", "GLOBAL", "the global allocator"),
     (
         "narrowing_tests.rs",

@@ -28,6 +28,24 @@ use crate::test_hooks;
 struct Recorder {
     io: tokio::net::TcpStream,
     seen: Arc<Mutex<Vec<u8>>>,
+    reads: Arc<ReadGate>,
+}
+
+/// Whether the collector reads its sockets yet (a paused collector leaves
+/// the agent's request bytes in its own buffers, as a slow peer would).
+#[derive(Default)]
+struct ReadGate {
+    paused: std::sync::atomic::AtomicBool,
+    waiting: Mutex<Vec<std::task::Waker>>,
+}
+
+impl ReadGate {
+    fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        for w in self.waiting.lock().unwrap().drain(..) {
+            w.wake();
+        }
+    }
 }
 
 impl AsyncRead for Recorder {
@@ -37,6 +55,12 @@ impl AsyncRead for Recorder {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if this.reads.paused.load(Ordering::SeqCst) {
+            this.reads.waiting.lock().unwrap().push(cx.waker().clone());
+            if this.reads.paused.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
         let before = buf.filled().len();
         let r = Pin::new(&mut this.io).poll_read(cx, buf);
         this.seen
@@ -72,11 +96,13 @@ impl tonic::transport::server::Connected for Recorder {
 #[derive(Clone, Copy, PartialEq)]
 enum Reply {
     Accept,
-    /// Reject, quoting the request (a collector may echo what it was sent
-    /// in its error).
-    EchoError,
     /// Never answer.
     Hang,
+    /// Raw HTTP/2: send the response headers, then never the body or the
+    /// trailers.
+    Stall,
+    /// As `Stall`, and read nothing until resumed.
+    Paused,
 }
 
 struct Accept {
@@ -89,7 +115,7 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
 {
     async fn export(
         &self,
-        request: tonic::Request<
+        _request: tonic::Request<
             opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
         >,
     ) -> Result<
@@ -101,38 +127,109 @@ impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Tra
         if self.reply == Reply::Hang {
             std::future::pending::<()>().await;
         }
-        if self.reply == Reply::EchoError {
-            let quoted: String = format!("{:?}", request.into_inner())
-                .chars()
-                .filter(char::is_ascii_graphic)
-                .take(4096)
-                .collect();
-            return Err(tonic::Status::internal(format!("rejected: {quoted}")));
-        }
         Ok(tonic::Response::new(Default::default()))
     }
 }
 
-/// Start the collector; returns its endpoint and the bytes it received.
-async fn collector(reply: Reply) -> (String, Arc<Mutex<Vec<u8>>>) {
+/// A local OTLP collector: its endpoint, the bytes it received, a writable
+/// clone of each accepted socket (to inject raw frames), and its reads.
+struct Collector {
+    endpoint: String,
+    port: u16,
+    seen: Arc<Mutex<Vec<u8>>>,
+    conns: Arc<Mutex<Vec<std::net::TcpStream>>>,
+    reads: Arc<ReadGate>,
+}
+
+/// Start the collector.
+async fn collector(reply: Reply) -> Collector {
     use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}");
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let s = Arc::clone(&seen);
-    let incoming = futures_util::stream::unfold(listener, move |l| {
-        let s = Arc::clone(&s);
-        async move {
-            let r = l.accept().await.map(|(io, _)| Recorder { io, seen: s });
-            Some((r, l))
+    let conns = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(ReadGate::default());
+    reads.paused.store(reply == Reply::Paused, Ordering::SeqCst);
+    let (s, c, r) = (Arc::clone(&seen), Arc::clone(&conns), Arc::clone(&reads));
+    let accept = move |io: tokio::net::TcpStream| {
+        let std = io.into_std().unwrap();
+        c.lock().unwrap().push(std.try_clone().unwrap());
+        Recorder {
+            io: tokio::net::TcpStream::from_std(std).unwrap(),
+            seen: Arc::clone(&s),
+            reads: Arc::clone(&r),
         }
-    });
-    tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(Accept { reply }))
-            .serve_with_incoming(incoming),
-    );
-    (format!("http://{addr}"), seen)
+    };
+    if matches!(reply, Reply::Stall | Reply::Paused) {
+        tokio::spawn(async move {
+            while let Ok((io, _)) = listener.accept().await {
+                tokio::spawn(h2_stalling(accept(io)));
+            }
+        });
+    } else {
+        let incoming = futures_util::stream::unfold(listener, move |l| {
+            let accept = accept.clone();
+            async move { Some((l.accept().await.map(|(io, _)| accept(io)), l)) }
+        });
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(TraceServiceServer::new(Accept { reply }))
+                .serve_with_incoming(incoming),
+        );
+    }
+    Collector {
+        endpoint,
+        port,
+        seen,
+        conns,
+        reads,
+    }
+}
+
+/// Serve one HTTP/2 connection: read each request whole (granting the
+/// client flow-control credit), answer with response headers only, and
+/// never send the body or the trailers.
+async fn h2_stalling(io: Recorder) {
+    let Ok(mut conn) = h2::server::handshake(io).await else {
+        return;
+    };
+    while let Some(Ok((req, mut respond))) = conn.accept().await {
+        tokio::spawn(async move {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let _stream = respond.send_response(response, false);
+            let mut body = req.into_body();
+            while let Some(Ok(chunk)) = body.data().await {
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            std::future::pending::<()>().await; // keep the stream open
+        });
+    }
+}
+
+/// An HTTP/2 GOAWAY frame (error INTERNAL_ERROR, no stream processed)
+/// carrying `debug` as its debug data.
+fn goaway(debug: &[u8]) -> Vec<u8> {
+    let len = 8 + debug.len();
+    let mut f = vec![
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+        0x7,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    f.extend_from_slice(&0u32.to_be_bytes());
+    f.extend_from_slice(&2u32.to_be_bytes());
+    f.extend_from_slice(debug);
+    f
 }
 
 // ── The environment: every sink on ─────────────────────────────────────
@@ -152,6 +249,9 @@ fn global_log() -> &'static Mutex<Vec<u8>> {
         struct W;
         impl std::io::Write for W {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if child() {
+                    std::io::stdout().write_all(b)?;
+                }
                 global_log().lock().unwrap().extend_from_slice(b);
                 Ok(b.len())
             }
@@ -178,6 +278,7 @@ struct Env {
     rate: RateLimiter,
     logs: Arc<Mutex<Vec<u8>>>,
     otlp: Arc<Mutex<Vec<u8>>>,
+    collector: Collector,
 }
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -211,13 +312,16 @@ impl Env {
     async fn with(name: &str, log_filter: &str, reply: Reply) -> Self {
         global_log();
         let dir = tmpdir(name);
-        let (endpoint, otlp) = collector(reply).await;
-        let cfg = config(&dir, &endpoint);
+        let collector = collector(reply).await;
+        let otlp = Arc::clone(&collector.seen);
+        let cfg = config(&dir, &collector.endpoint);
         let privacy = Arc::new(PrivacyGate::new(cfg.privacy_mode));
         let mut shared = Shared::open(cfg, privacy, None, log_filter.to_string()).unwrap();
         let logs = Arc::new(Mutex::new(Vec::new()));
         let l = Arc::clone(&logs);
-        shared.log_sink = Arc::new(move |b: &[u8]| l.lock().unwrap().extend_from_slice(b));
+        if !child() {
+            shared.log_sink = Arc::new(move |b: &[u8]| l.lock().unwrap().extend_from_slice(b));
+        }
         let shared = Arc::new(shared);
         let floor = AdmissionFloor::default();
         let scope = Scope::start(Arc::clone(&shared), floor.clone()).unwrap();
@@ -229,6 +333,7 @@ impl Env {
             rate: RateLimiter::new(0),
             logs,
             otlp,
+            collector,
         }
     }
 
@@ -242,13 +347,24 @@ impl Env {
         a.finish();
     }
 
+    /// The output file and every file it rotated into (`<name>.<n>`), in
+    /// order: what the agent wrote under that path.
     fn file(&self, name: &str) -> Vec<u8> {
-        std::fs::read(self.dir.join(name)).unwrap_or_default()
+        let mut out = std::fs::read(self.dir.join(name)).unwrap_or_default();
+        for n in 1.. {
+            match std::fs::read(self.dir.join(format!("{name}.{n}"))) {
+                Ok(b) => out.extend_from_slice(&b),
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     /// Every output, by name. `global` is everything logged through the
     /// process-wide subscriber (the agent's stdout outside pipelines), by
-    /// every test: markers are unique per test.
+    /// every test (its markers are unique per test); `socket` every byte the
+    /// pipelines' gated sockets wrote to this test's collector. (Real stdout/stderr: see
+    /// `process_streams_carry_nothing_old_after_applied`.)
     fn outputs(&self) -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("json", self.file("events.jsonl")),
@@ -257,6 +373,7 @@ impl Env {
             ("logs", self.logs.lock().unwrap().clone()),
             ("otlp", self.otlp.lock().unwrap().clone()),
             ("global", global_log().lock().unwrap().clone()),
+            ("socket", test_hooks::tapped(self.collector.port)),
         ]
     }
 
@@ -267,7 +384,12 @@ impl Env {
 
     /// Wait until every output named in `sinks` contains `needle`.
     async fn wait_for(&self, needle: &str, sinks: &[&str]) {
-        for _ in 0..200 {
+        self.wait_for_within(needle, sinks, Duration::from_secs(10))
+            .await
+    }
+
+    async fn wait_for_within(&self, needle: &str, sinks: &[&str], limit: Duration) {
+        for _ in 0..limit.as_millis() / 50 {
             if self
                 .outputs()
                 .iter()
@@ -297,7 +419,16 @@ impl Env {
     /// Nothing written after `marks` holds `needle`.
     /// A marker straddling the mark counts as written after it.
     fn assert_absent_after(&self, marks: &[usize], needle: &str) {
+        self.assert_absent_after_except(marks, needle, &[]);
+    }
+
+    /// As [`assert_absent_after`](Self::assert_absent_after), skipping the
+    /// outputs named in `skip`.
+    fn assert_absent_after_except(&self, marks: &[usize], needle: &str, skip: &[&str]) {
         for ((name, bytes), &at) in self.outputs().iter().zip(marks) {
+            if skip.contains(name) {
+                continue;
+            }
             let from = at.saturating_sub(needle.len().saturating_sub(1));
             let after = &bytes[from.min(bytes.len())..];
             assert!(
@@ -555,64 +686,129 @@ fn in_flight_otlp_export_is_refused_after_applied() {
     });
 }
 
-/// The collector rejects every export, quoting it, and the pipelines log
-/// at every level. What the exporter logs while the SDK's batch thread
-/// polls it goes through the pipeline's gated log only (never the
-/// process-wide log), and after "applied" nothing of the old generation
-/// reaches any output, an export paused on its socket included.
+/// The process-wide log's lines that hold `needle` (up to three).
+fn global_lines_with(needle: &str) -> Vec<String> {
+    String::from_utf8_lossy(&global_log().lock().unwrap())
+        .lines()
+        .filter(|l| l.contains(needle))
+        .take(3)
+        .map(|l| l.chars().take(400).collect())
+        .collect()
+}
+
+/// An export in flight across the change fails after it is applied with a
+/// collector error that quotes captured data (an HTTP/2 GOAWAY whose debug
+/// data carries the marker, which tonic's decoder logs with the failed
+/// stream's status). The pipelines log at every level. The error reaches
+/// only the old pipeline's (revoked) log: never the process-wide log, never
+/// any output. Positive control: the same error on the new pipeline's
+/// export reaches the new pipeline's log.
 #[test]
 fn otlp_errors_log_only_through_the_pipeline() {
     t2("otlp_errors_log_only_through_the_pipeline", 4, async {
-        let env = Env::with("otlp-errors", "trace", Reply::EchoError).await;
-        env.feed(&exchange("echo-before", 18101, 1));
-        env.wait_for("echo-before", &["json", "logs", "otlp"]).await;
-
-        let old = env.scope.gate().await.unwrap();
-        let hook = test_hooks::arm(test_hooks::OTLP_IN_FLIGHT_EXPORT, &old);
-        env.feed(&exchange("echo-inflight", 18102, 1));
-        assert!(
-            hook.wait_reached(WAIT),
-            "no OTLP write reached the pause point"
-        );
+        let env = Env::with("otlp-errors", "trace", Reply::Stall).await;
+        env.feed(&exchange("goaway-old", 18101, 1));
+        // The request is read and answered with headers; the body stalls.
+        env.wait_for("goaway-old", &["otlp"]).await;
         env.scope.narrow(2).await;
         let applied = env.marks();
-        drop(hook);
+        let inject = |debug: &[u8]| {
+            use std::io::Write;
+            let conns = env.collector.conns.lock().unwrap();
+            conns
+                .last()
+                .unwrap()
+                .try_clone()
+                .unwrap()
+                .write_all(&goaway(debug))
+                .unwrap();
+        };
+        inject(b"collector error quoting goaway-old-echo");
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        env.feed(&exchange("echo-after", 18103, 2));
-        env.wait_for("echo-after", &["otlp"]).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        env.assert_absent_after(&applied, "echo-before");
-        env.assert_absent_after(&applied, "echo-inflight");
-        assert!(!contains(&env.otlp.lock().unwrap(), "echo-inflight"));
-        let global = global_log().lock().unwrap().clone();
-        let leaked: Vec<String> = String::from_utf8_lossy(&global)
-            .lines()
-            .filter(|l| l.contains("echo-"))
-            .take(3)
-            .map(|l| l.chars().take(400).collect())
-            .collect();
+        env.feed(&exchange("goaway-new", 18102, 2));
+        env.wait_for("goaway-new", &["otlp"]).await;
+        inject(b"collector error quoting goaway-new-echo");
+        env.wait_for("goaway-new-echo", &["logs"]).await;
+
+        env.assert_absent_after(&applied, "goaway-old");
+        let leaked = global_lines_with("goaway-");
         assert!(
             leaked.is_empty(),
-            "a marker reached the process-wide log: {leaked:#?}"
+            "reached the process-wide log: {leaked:#?}"
         );
-        let bsp = String::from_utf8_lossy(&global)
-            .lines()
-            .filter(|l| l.contains("OpenTelemetry.Traces.BatchProcessor"))
-            .take(3)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let bsp = global_lines_with("OpenTelemetry.Traces.BatchProcessor");
         assert!(
             bsp.is_empty(),
             "the SDK batch thread logged globally: {bsp:?}"
         );
-        // The exporter's own lines did reach the pipeline's (gated) log.
-        let logs = env.logs.lock().unwrap().clone();
-        assert!(
-            contains(&logs, "h2::") || contains(&logs, "tonic::"),
-            "no exporter lines"
-        );
         env.scope.shutdown().await;
     });
+}
+
+/// A collector that sends the response headers and then stalls the body
+/// does not hold the exporter: the export's deadline ends it and the next
+/// batch is exported.
+#[test]
+fn a_stalled_response_body_does_not_hold_the_exporter() {
+    t2(
+        "a_stalled_response_body_does_not_hold_the_exporter",
+        4,
+        async {
+            let env = Env::with("otlp-stall", "info", Reply::Stall).await;
+            env.feed(&exchange("stall-first", 18141, 1));
+            env.wait_for("stall-first", &["otlp"]).await;
+            env.feed(&exchange("stall-second", 18142, 1));
+            env.wait_for_within("stall-second", &["otlp"], Duration::from_secs(20))
+                .await;
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// A full SDK queue and an in-flight export blocked by the collector (it
+/// reads nothing: the request's bytes wait in the agent's HTTP/2 buffers)
+/// across the change. After applied nothing of the old generation leaves
+/// through any socket, any file or any log, even once the collector reads
+/// again and grants the credit the old connection was waiting for.
+#[test]
+fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
+    t2(
+        "a_blocked_export_and_a_full_queue_send_nothing_after_applied",
+        4,
+        async {
+            let env = Env::with("otlp-backlog", "info", Reply::Paused).await;
+            // Past the SDK queue (2048 spans) and many times the 64 KiB a
+            // connection may send unacknowledged.
+            for i in 0..2500u16 {
+                env.feed(&exchange("old-backlog", 20000 + i, 1));
+            }
+            env.wait_for("old-backlog", &["socket"]).await;
+            // The premise: writes are blocked with the batch part-sent, its
+            // remaining bytes retained in the agent's HTTP/2 buffers.
+            let sent = || {
+                String::from_utf8_lossy(&test_hooks::tapped(env.collector.port))
+                    .matches("old-backlog")
+                    .count()
+            };
+            let before = sent();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(sent(), before, "writes are not blocked");
+            assert!(before < 512, "the whole batch was sent ({before} spans)");
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            env.collector.reads.resume();
+            env.feed(&exchange("new-after", 18151, 2));
+            env.wait_for_within("new-after", &["socket"], Duration::from_secs(20))
+                .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // The collector's own copy may show bytes written before
+            // applied that sat in the kernel; `socket` is what left the
+            // agent, and when.
+            env.assert_absent_after_except(&applied, "old-backlog", &["otlp"]);
+            env.scope.shutdown().await;
+        },
+    );
 }
 
 /// A DNS query and its answer, `name` -> `ip`, on the resolver's UDP flow.
@@ -673,6 +869,176 @@ fn dns_answer_inserted_after_applied_names_nothing_new() {
             env.scope.shutdown().await;
         },
     );
+}
+
+/// A worker holds a service name it resolved from the old pipeline's DNS
+/// cache (a local, before the audit entries carrying it are written) across
+/// the change: the name is written nowhere after applied. Positive control:
+/// the same name names the flow's audit entry before the change.
+#[test]
+fn a_hostname_held_by_an_old_worker_is_written_nowhere_after_applied() {
+    t2(
+        "a_hostname_held_by_an_old_worker_is_written_nowhere_after_applied",
+        4,
+        async {
+            let env = Env::new("held-name").await;
+            let other = 0x0A63_0008;
+            env.feed(&dns_exchange("held-name.example", other, 9, 1));
+            env.wait_for("held-name.example", &["json"]).await; // the answer
+            env.feed(&exchange_to(other, "old-control", 18161, 1));
+            env.wait_for(":18161", &["audit"]).await;
+            assert!(
+                contains(&env.file("audit.jsonl"), "held-name.example"),
+                "the audit entry names the server"
+            );
+
+            let old = env.scope.gate().await.unwrap();
+            let hook = test_hooks::arm(test_hooks::WORKER_HOLDING_RESOLVED, &old);
+            env.feed(&exchange_to(other, "old-held", 18162, 1));
+            assert!(hook.wait_reached(WAIT), "worker never resolved the name");
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            drop(hook); // the worker resumes, holding the old name
+
+            env.feed(&exchange_to(other, "new-after", 18163, 2));
+            env.wait_for(":18163", &["audit"]).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            env.assert_absent_after(&applied, "held-name");
+            env.assert_absent_after(&applied, ":18162");
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// An old audit write is torn (the output continues in `audit.jsonl.1`),
+/// then an old worker held across the change resumes: it writes nothing
+/// into the rotated file, while the new pipeline does.
+#[test]
+fn a_torn_old_audit_write_then_a_held_worker_write_nothing_after_applied() {
+    t2(
+        "a_torn_old_audit_write_then_a_held_worker_write_nothing_after_applied",
+        4,
+        async {
+            let env = Env::new("torn").await;
+            let rotated = env.dir.join("audit.jsonl.1");
+            env.shared.audit.as_ref().unwrap().fail_next_write_after(10);
+            env.feed(&exchange("old-torn", 18171, 1));
+            env.wait_for("old-torn", &["json"]).await;
+            for _ in 0..100 {
+                if rotated.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(rotated.exists(), "the torn write did not rotate");
+
+            let old = env.scope.gate().await.unwrap();
+            let hook = test_hooks::arm(test_hooks::WORKER_HOLDING_RESOLVED, &old);
+            env.feed(&exchange("old-held", 18172, 1));
+            assert!(hook.wait_reached(WAIT), "worker never reached the audit");
+            env.scope.narrow(2).await;
+            let applied = env.marks();
+            drop(hook);
+
+            env.feed(&exchange("new-after", 18173, 2));
+            env.wait_for(":18173", &["audit"]).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let continued = std::fs::read(&rotated).unwrap();
+            assert!(contains(&continued, ":18173"), "the new pipeline writes on");
+            assert!(!contains(&env.file("audit.jsonl"), ":18172"));
+            env.assert_absent_after(&applied, "old-");
+            env.assert_absent_after(&applied, ":18171");
+            env.scope.shutdown().await;
+        },
+    );
+}
+
+/// Set in the child process of `process_streams_carry_nothing_old_after_applied`.
+const T2_CHILD: &str = "PANOPTICON_T2_CHILD";
+/// Printed on stdout and stderr by the child once the change is applied.
+const T2_APPLIED: &str = "T2-APPLIED";
+
+fn child() -> bool {
+    std::env::var_os(T2_CHILD).is_some()
+}
+
+/// The agent's real stdout and stderr (file descriptors 1 and 2) carry
+/// nothing of the old generation after applied. A child process (this test
+/// binary, running only `t2_child_process_streams`) runs a narrowing with
+/// the agent's own stdout logging, global and per pipeline, at trace level,
+/// and prints a delimiter on both streams once the change is applied.
+/// Positive control: the old markers are on stdout before the delimiter,
+/// the new one after.
+#[test]
+fn process_streams_carry_nothing_old_after_applied() {
+    if child() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "narrowing_tests::t2_child_process_streams",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(T2_CHILD, "1")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    let split = |s: &str| {
+        let at = s.find(T2_APPLIED).expect("delimiter printed");
+        (s[..at].to_string(), s[at..].to_string())
+    };
+    let (before, after) = split(&stdout);
+    assert!(
+        before.contains("old-before"),
+        "stdout carries the old pipeline"
+    );
+    assert!(
+        after.contains("new-after"),
+        "stdout carries the new pipeline"
+    );
+    for (name, after) in [("stdout", after), ("stderr", split(&stderr).1)] {
+        if let Some(i) = after.find("old-") {
+            let line = after[i.saturating_sub(200)..].lines().next().unwrap_or("");
+            panic!("old marker on {name} after applied: {line}");
+        }
+    }
+}
+
+/// The child half of `process_streams_carry_nothing_old_after_applied`
+/// (returns at once unless run as that child).
+#[test]
+fn t2_child_process_streams() {
+    if !child() {
+        return;
+    }
+    t2("t2_child_process_streams", 4, async {
+        let env = Env::with("streams", "trace", Reply::Accept).await;
+        env.feed(&exchange("old-before", 18181, 1));
+        env.wait_for("old-before", &["json", "otlp"]).await;
+        let old = env.scope.gate().await.unwrap();
+        let hook = test_hooks::arm(test_hooks::WORKER_BEFORE_SINK, &old);
+        env.feed(&exchange("old-held", 18182, 1));
+        assert!(hook.wait_reached(WAIT), "worker never reached the sink");
+        env.scope.narrow(2).await;
+        {
+            use std::io::Write;
+            let line = format!("\n{T2_APPLIED}\n");
+            std::io::stdout().write_all(line.as_bytes()).unwrap();
+            std::io::stderr().write_all(line.as_bytes()).unwrap();
+        }
+        drop(hook);
+        env.feed(&exchange("old-stale", 18183, 1));
+        env.feed(&exchange("new-after", 18184, 2));
+        env.wait_for("new-after", &["json", "otlp"]).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        env.scope.shutdown().await;
+    });
 }
 
 /// Kafka topic names a pipeline learned (Metadata) name nothing the next
@@ -748,9 +1114,9 @@ fn an_unanswered_old_export_sends_nothing_after_applied() {
             let applied = env.marks();
             env.feed(&exchange("new-after", 18133, 2));
             env.wait_for("new-after", &["otlp"]).await;
-            // The old export times out (1 s in tests); the old batch thread
+            // The old export times out (3 s in tests); the old batch thread
             // then exports what it kept queued, into the revoked gate.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             env.assert_absent_after(&applied, "old-");
             env.scope.shutdown().await;
         },
@@ -831,8 +1197,8 @@ fn live_close_records_are_counted_and_reach_no_output() {
         4,
         async {
             let dir = tmpdir("close");
-            let (endpoint, _otlp) = collector(Reply::Accept).await;
-            let mut cfg = config(&dir, &endpoint);
+            let collector = collector(Reply::Accept).await;
+            let mut cfg = config(&dir, &collector.endpoint);
             cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
             let shared = Arc::new(
                 Shared::open(

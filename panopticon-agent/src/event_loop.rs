@@ -1413,6 +1413,7 @@ fn handle_messages(
         {
             use crate::export::audit::{AuditAction, AuditEntry};
             let (service, service_addr) = audit_service(ctx, msg.protocol);
+            crate::test_hooks::pause(crate::test_hooks::WORKER_HOLDING_RESOLVED, ctx.io_gate);
             let entries: Vec<AuditEntry> = report
                 .entities
                 .iter()

@@ -1641,6 +1641,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "fxhash",
+ "h2",
  "hpack-patched",
  "http",
  "http-body-util",
