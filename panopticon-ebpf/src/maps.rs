@@ -74,12 +74,13 @@ pub fn clear_scope_fields(event: *mut DataEvent) {
 // the CPU count (CONFIG_RING_SHARD_MASK) and resizes every shard at load
 // time so the active ones split a fixed total (loader DATA_RING_TOTAL_BYTES).
 //
-// TC packets are copied in at their captured size (emit_scratch_event) and
-// cgroup_skb packets and close records reserved at a size class that holds
-// them (SizedEvent), but TLS events and TC's socket events keep fixed
-// 4,168-byte reserves (see EVENT_SCRATCH), so one connection's TLS burst has
-// a single shard to fill: ~250 records at 1 MiB per shard on a 64-CPU node,
-// where the single 16 MiB ring held ~3,900.
+// TC packets are copied in at their captured size (emit_scratch_event),
+// cgroup_skb packets reserved at a size class that holds them, and close and
+// connect/accept records as the header only (SizedEvent), but TLS events keep
+// fixed 4,168-byte reserves (see EVENT_SCRATCH), so one connection's TLS
+// burst has a single shard to fill: ~250 records at 1 MiB per shard on a
+// 64-CPU node, where the single 16 MiB ring held ~3,900. Every reserved byte
+// is written before submit (zero_u64s): user space maps the whole ring.
 
 /// Size each shard is declared with; the loader overrides it.
 const DATA_RING_DECLARED_BYTES: u32 = 1024 * 1024;
@@ -142,13 +143,22 @@ pub fn shard_submit_flags(shard: u32) -> u64 {
     shard_submit_flags_for::<DataEvent>(shard)
 }
 
+/// Zero `bytes` bytes (a multiple of 8) at the 8-aligned `p`, as 8-byte
+/// stores. Every ring reservation is fully written before submit: ring
+/// memory is not zeroed between records and user space maps all of it.
+#[inline(always)]
+pub unsafe fn zero_u64s(p: *mut u8, bytes: usize) {
+    unsafe { core::ptr::write_bytes(p as *mut u64, 0, bytes / 8) };
+}
+
 /// A DataEvent record cut to its header and `N` payload bytes: the
 /// cgroup_skb and sockops records (sock_capture.rs `emit`, `on_tcp_close`)
 /// are reserved at the smallest such size that holds what they carry. Only
 /// header fields and the first `N` payload bytes may be written through a
-/// `*mut DataEvent` cast of it; user space reads `payload_len` bytes and
-/// ignores the rest (`data_event_record_len`).
-#[repr(C)]
+/// `*mut DataEvent` cast of it, and all of them must be (`zero_u64s`); user
+/// space reads `payload_len` bytes and ignores the rest
+/// (`data_event_record_len`).
+#[repr(C, align(8))]
 pub struct SizedEvent<const N: usize> {
     pub header: [u8; DATA_EVENT_HEADER_LEN],
     pub payload: [u8; N],

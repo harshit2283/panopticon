@@ -464,10 +464,16 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
 
 /// Any transition to TCP_CLOSE (close, `connect(AF_UNSPEC)`): revoke
 /// initialisation for good, then tell user space the socket ended, if it
-/// can hold state for it: only packet records create per-socket state in
-/// user space on this backend, so a socket none was emitted for
-/// (`SockState::emitted`) gets no close record. The record is the header
-/// only (96 bytes, `SizedEvent<0>`).
+/// may hold state for it and the socket is authorised now. Only packet
+/// records create per-socket state in user space on this backend, so a
+/// socket none was emitted for (`SockState::emitted`) gets no close record.
+/// Authorised: unscoped `full`, or initialised with an IN verdict cached for
+/// the current generation (`tls_addr_in_scope`, the test the TLS address
+/// path uses), read before the revocation. The record carries that
+/// generation, so user space applies its admission floor to it as to any
+/// record; a socket narrowed out never sends one (narrowing replaces the
+/// pipeline, which drops its state). The record is the header only
+/// (96 bytes, `SizedEvent<0>`).
 #[inline(always)]
 fn on_tcp_close(ctx: &SockOpsContext) {
     let ops = ctx.ops;
@@ -479,13 +485,24 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     if st.is_null() {
         return;
     }
+    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
+    let g1 = scope_gen();
+    let authorised = rd!(st, emitted) != 0
+        && (is_unscoped_full(scope_mode())
+            || tls_addr_in_scope(
+                cookie,
+                g1,
+                rd!(st, init_cookie),
+                rd!(st, flags),
+                rd!(st, verdict_word),
+                g1,
+            ));
     wr!(st, init_cookie, 0);
     wr!(st, flags, rd!(st, flags) | FLAG_REUSED);
-    if rd!(st, emitted) == 0 {
+    if !authorised {
         return;
     }
 
-    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
     let shard = shard_for(cookie);
     let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
         count_kernel_drop();
@@ -512,9 +529,15 @@ fn on_tcp_close(ctx: &SockOpsContext) {
         (*event).tcp_seq = 0;
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
+        (*event).scope_gen = g1;
         (*event).owner_tgid = rd!(st, owner_tgid);
         (*event).acceptor_tgid = rd!(st, acceptor_tgid);
         (*event).role = role_of(rd!(st, flags));
+    }
+    // A selector changed while the record was built: send nothing.
+    if scope_gen() != g1 {
+        entry.discard(0);
+        return;
     }
     entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
 }
@@ -1120,13 +1143,27 @@ fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()>
         let want = if r.take > N as u32 { N as u32 } else { r.take };
         let opaque = read_volatile(&want);
         let len = (opaque.wrapping_sub(1) & (N as u32 - 1)) + 1;
+        // Every published byte is written: ring memory is not zeroed and
+        // the whole record is mapped into user space, so unwritten slack
+        // would show an earlier record. The load covers [0, len), and
+        // len > N/2 in every class above 64 (the smallest class that holds
+        // `take`), so only [N/2, N) is zeroed before it; the 64-byte class
+        // is zeroed whole. A failed load zeroes [0, N/2) as well.
+        let payload = (&raw mut (*rec).payload) as *mut u8;
+        let lo = if N == 64 { 0 } else { N / 2 };
+        crate::maps::zero_u64s(payload.add(lo), N - lo);
         let ret = bpf_skb_load_bytes(
             ctx.skb.skb as *const c_void,
             pkt.payload_off,
-            (&raw mut (*rec).payload) as *mut c_void,
+            payload as *mut c_void,
             len,
         );
-        (*event).payload_len = if ret == 0 { len } else { 0 };
+        (*event).payload_len = if ret == 0 {
+            len
+        } else {
+            crate::maps::zero_u64s(payload, lo);
+            0
+        };
     }
     entry.submit(shard_submit_flags_for::<SizedEvent<N>>(shard));
     Ok(())

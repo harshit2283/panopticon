@@ -514,11 +514,11 @@ Two bottlenecks were measured:
   per connection is that ring's reserve order, exactly as with one ring.
 - **TC records at captured size.** TC builds the event in the per-CPU
   scratch map and copies the header plus the captured bytes into the ring,
-  instead of reserving a fixed 4,168-byte record. TLS events and TC's
-  connect/accept events keep fixed reserves, because a uprobe can be
-  preempted mid-event and a shared scratch slot would be overwritten. (The
-  `cgroup_skb` backend reserves each packet at a payload size class instead;
-  see its section below.)
+  instead of reserving a fixed 4,168-byte record. TLS events keep
+  fixed reserves, because a uprobe can be preempted mid-event and a shared
+  scratch slot would be overwritten; connect/accept events are the header
+  only. (The `cgroup_skb` backend reserves each packet at a payload size
+  class instead; see its section below.)
 - **One drain thread per shard.** Draining has its own threads (woken by
   edge-triggered epoll or the 2 ms tick), not the tokio main loop. Each
   event is copied once, at header plus `payload_len`, into packed worker
@@ -622,7 +622,7 @@ VM (5.15 verifier included).
 
 **Limits.**
 
-- **TLS bursts.** TLS events and TC's connect/accept events still use fixed 4,168-byte records,
+- **TLS bursts.** TLS events still use fixed 4,168-byte records,
   and one connection's events all go to one shard. A shard holds about 250
   of them on a 64-CPU node (1 MiB per shard), where the single ring held
   about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy
@@ -1103,7 +1103,8 @@ high ends are under connection churn):
   of each new local connection.
 - **Close records.** A TCP socket's close sends a 96-byte close record to
   user space only if a packet record of that socket was emitted (the only
-  sockets user space holds state for). Before compact records (below),
+  sockets user space holds state for) and the socket is in scope when it
+  closes. Before compact records (below),
   every TCP socket close sent a 4,168-byte one, in every mode, in scope or
   not.
 

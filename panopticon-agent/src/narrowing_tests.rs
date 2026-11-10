@@ -1515,6 +1515,60 @@ fn live_close_records_are_counted_and_reach_no_output() {
     );
 }
 
+/// A connection whose close never comes is evicted on the worker's timer,
+/// with no further traffic (the sweep used to run only when a batch
+/// arrived, so a quiet worker kept it).
+#[test]
+fn idle_connections_are_evicted_without_further_traffic() {
+    t2(
+        "idle_connections_are_evicted_without_further_traffic",
+        4,
+        async {
+            let dir = tmpdir("idle");
+            let collector = collector(Reply::Accept).await;
+            let mut cfg = config(&dir, &collector.endpoint);
+            cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
+            cfg.idle_connection_timeout = Duration::from_millis(200);
+            let shared = Arc::new(
+                Shared::open(
+                    cfg,
+                    Arc::new(PrivacyGate::new(PrivacyMode::Full)),
+                    None,
+                    "info".into(),
+                )
+                .unwrap(),
+            );
+            let floor = AdmissionFloor::default();
+            let scope = Scope::start(Arc::clone(&shared), floor.clone()).unwrap();
+            let slot = scope.slot();
+            let mut a = crate::event_loop::Admission::new(&slot, &floor, &shared.stats, 0, 1);
+            for e in exchange("idle-marker", 18071, 0) {
+                a.offer(&e, &RateLimiter::new(0));
+            }
+            a.finish();
+            let active = || shared.stats.active_connections.load(Ordering::Relaxed);
+            for _ in 0..100 {
+                if active() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(active(), 1, "the exchange is tracked");
+            // No more records: only the timer can free it.
+            for _ in 0..100 {
+                if active() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(active(), 0, "evicted without traffic");
+            assert!(shared.stats.evictions_idle.load(Ordering::Relaxed) >= 1);
+            scope.shutdown().await;
+            std::fs::remove_dir_all(&dir).ok();
+        },
+    );
+}
+
 // ── The scope publisher ────────────────────────────────────────────────
 
 /// In-memory `CGROUP_ALLOW` / `CONFIG`, with injected failures.
