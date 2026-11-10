@@ -6,7 +6,11 @@
 /// Per-socket scope state, kept in a `BPF_MAP_TYPE_SK_STORAGE` map created
 /// with `BPF_F_CLONE`, so an accepted child starts with a copy of its
 /// listener's value. Fields marked "reset" are rewritten by the child's own
-/// ESTABLISHED callback before `init_cookie` is published.
+/// ESTABLISHED callback before `init_cookie` is published. The acceptor
+/// fields are written only by the accept hook, on the accepted socket, and
+/// `accept_cookie` names that socket: a passive ESTABLISHED never clears
+/// them (the accept can come first), and a child carrying another socket's
+/// acceptor (a clone) is never initialised.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SockState {
@@ -19,7 +23,7 @@ pub struct SockState {
     pub udp_rcvd: u64,
     /// Creator tgid (`cgroup/sock_create`), or the listener's on a child.
     pub owner_tgid: u32,
-    /// Tgid that `accept()`ed this child. Reset.
+    /// Tgid that `accept()`ed this socket; written after `accept_cookie`.
     pub acceptor_tgid: u32,
     /// `CONFIG_PID_EPOCH` that `pid_bits` were computed under.
     pub pid_epoch: u32,
@@ -28,13 +32,17 @@ pub struct SockState {
     /// Stream origins (ISN + 1), derived at ESTABLISHED. Reset.
     pub rcv_base: u32,
     pub snd_base: u32,
-    /// `OWNER_LISTED` | `ACCEPTOR_LISTED`.
+    /// `OWNER_LISTED` | `ACCEPTOR_LISTED`. `ACCEPTOR_LISTED` only with
+    /// `acceptor_tgid`, both from the accept hook.
     pub pid_bits: u8,
     /// `FLAG_*` bits.
     pub flags: u8,
     /// Our SYN's count in `bytes_acked`: 1 active, 0 passive. Reset.
     pub syn_adj: u8,
     pub _pad: u8,
+    /// Cookie of the socket the accept hook wrote `acceptor_tgid` and
+    /// `ACCEPTOR_LISTED` on; written first. 0 = never accepted.
+    pub accept_cookie: u64,
 }
 
 pub const OWNER_LISTED: u8 = 1 << 0;
@@ -145,6 +153,20 @@ pub fn pid_inputs(s: &SockState, epoch: u32) -> (bool, bool) {
         s.pid_bits & (OWNER_LISTED | ACCEPTOR_LISTED) != 0,
         s.owner_tgid != 0 || s.acceptor_tgid != 0,
     )
+}
+
+/// Whether a verdict may be cached (DESIGN §3.1). An OUT verdict under
+/// `pid_filter` of a server socket not yet accepted (`acceptor_tgid` read
+/// as 0, before the other pid inputs) is not: the accept hook can still add
+/// `ACCEPTOR_LISTED`, and a word cached after the hook reset it would keep
+/// the connection OUT for its life. Every other input is final once the
+/// socket is initialised.
+#[inline(always)]
+pub fn verdict_cacheable(v: u8, mode: u64, flags: u8, acceptor_tgid: u32) -> bool {
+    v == VERDICT_IN
+        || mode & SCOPE_SEL_PID == 0
+        || flags & FLAG_ROLE_SERVER == 0
+        || acceptor_tgid != 0
 }
 
 /// The scope verdict of an initialised socket in restricted `mode`.
@@ -337,10 +359,11 @@ mod tests {
     #[test]
     fn sock_state_layout_is_stable() {
         use core::mem::{align_of, offset_of, size_of};
-        assert_eq!(size_of::<SockState>(), 64);
+        assert_eq!(size_of::<SockState>(), 72);
         assert_eq!(align_of::<SockState>(), 8);
         assert_eq!(offset_of!(SockState, verdict_word) % 8, 0);
         assert_eq!(offset_of!(SockState, pid_bits), 56);
+        assert_eq!(offset_of!(SockState, accept_cookie), 64);
     }
 
     #[test]
@@ -534,6 +557,36 @@ mod tests {
         s.acceptor_tgid = 9;
         s.pid_bits = ACCEPTOR_LISTED;
         assert_eq!(pid_inputs(&s, 7), (true, true));
+    }
+
+    #[test]
+    fn out_before_accept_is_not_cached() {
+        let pid = SCOPE_SEL_PID;
+        let srv = FLAG_ROLE_SERVER;
+        // A server child not yet accepted: OUT may turn IN at accept.
+        assert!(!verdict_cacheable(VERDICT_OUT_NO_OWNER, pid, srv, 0));
+        assert!(!verdict_cacheable(
+            VERDICT_OUT_PID,
+            pid | SCOPE_SEL_CGROUP,
+            srv,
+            0
+        ));
+        assert!(!verdict_cacheable(
+            VERDICT_OUT_SAMPLE,
+            pid | SCOPE_SAMPLE,
+            srv,
+            0
+        ));
+        // Final inputs: accepted, a client, no pid selector, or IN.
+        assert!(verdict_cacheable(VERDICT_OUT_PID, pid, srv, 9));
+        assert!(verdict_cacheable(VERDICT_OUT_PID, pid, FLAG_ROLE_CLIENT, 0));
+        assert!(verdict_cacheable(
+            VERDICT_OUT_CGROUP,
+            SCOPE_SEL_CGROUP,
+            srv,
+            0
+        ));
+        assert!(verdict_cacheable(VERDICT_IN, pid, srv, 0));
     }
 
     #[test]

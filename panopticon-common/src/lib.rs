@@ -277,6 +277,10 @@ unsafe impl aya::Pod for ProcessEvent {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ConnInfo {}
 
+// SAFETY: SockState is #[repr(C)], Copy, integers only.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for scope::SockState {}
+
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 
 impl DataEvent {

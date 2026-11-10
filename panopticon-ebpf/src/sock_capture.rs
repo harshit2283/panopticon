@@ -40,7 +40,7 @@ use panopticon_common::{
         SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict,
         drop_reason, head_take, in_sample, is_initialised, is_unscoped_full, pid_inputs,
         reserved_take, role_of, stream_offset, tls_addr_in_scope, udp_should_reserve, verdict,
-        verdict_word,
+        verdict_cacheable, verdict_word,
     },
 };
 
@@ -82,9 +82,12 @@ pub static SOCK_STATE: SockStateMap = SockStateMap {
 const SK_STORAGE_GET_F_CREATE: u64 = 1;
 
 /// The socket's state, or null. State is created only for sockets created
-/// while this agent runs: by `cgroup/sock_create`, and by PASSIVE_ESTABLISHED
-/// for a child of a listener that predates the agent (§3.1). A socket that
-/// itself predates the agent never gets state and is never initialised (§2.1).
+/// while this agent runs: by `cgroup/sock_create`, and for a child of a
+/// listener without state (one that predates the agent and was not
+/// initialised at arming, §3.1) by its PASSIVE_ESTABLISHED or its accept,
+/// whichever runs first. User space writes state only on pre-agent LISTEN
+/// sockets, before arming (`scope_loader::init_listeners`). A socket that
+/// itself predates the agent is never initialised (§2.1).
 #[inline(always)]
 fn state_of(sk: *mut c_void, create: bool) -> *mut SockState {
     let flags = if create { SK_STORAGE_GET_F_CREATE } else { 0 };
@@ -95,6 +98,19 @@ fn state_of(sk: *mut c_void, create: bool) -> *mut SockState {
             null_mut(),
             flags,
         ) as *mut SockState
+    }
+}
+
+/// The socket's state, created if absent. The accept hook and a passive
+/// ESTABLISHED can race to create a child's state; the loser's create
+/// fails (it exists), so it looks the winner's up.
+#[inline(always)]
+fn state_or_create(sk: *mut c_void) -> *mut SockState {
+    let st = state_of(sk, true);
+    if st.is_null() {
+        state_of(sk, false)
+    } else {
+        st
     }
 }
 
@@ -368,13 +384,31 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
     // (they need the tls ULP, which needs ESTABLISHED), i.e. after this
     // point, when the marker is already live.
     //
-    // A child of a pre-agent listener has nothing to clone: it is a new
-    // socket, so it gets fresh state here. Its owner is unknown (epoch 0
-    // never matches), so pid_filter selects it only from accept() on
-    // (no_owner before, §3.1). An active socket without state predates the
-    // agent and stays uninitialised.
-    let st = state_of(sk as *mut c_void, !active);
+    // A child of a listener without state (pre-agent, not initialised at
+    // arming) has nothing to clone: it is a new socket, so it gets fresh
+    // state here or in its accept, whichever runs first. Its owner is
+    // unknown (epoch 0 never matches), so pid_filter selects it only from
+    // accept() on (no_owner before, §3.1). An active socket without state
+    // predates the agent and stays uninitialised.
+    let st = if active {
+        state_of(sk as *mut c_void, false)
+    } else {
+        state_or_create(sk as *mut c_void)
+    };
     if st.is_null() {
+        return;
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
+    // The accept hook can run before this callback: the child is queued for
+    // accept() before tcp_child_process runs it, and accept does not take
+    // the child's lock. So a passive callback never clears the acceptor; it
+    // writes no field the accept hook writes. Acceptor fields are this
+    // socket's only if `accept_cookie` is its cookie (written before
+    // `acceptor_tgid`, so read after it); otherwise they were cloned from a
+    // listener that was itself once accepted, and the child is never
+    // initialised. An active socket is never returned by accept, so its
+    // acceptor fields (from an earlier accepted life) are cleared.
+    if !active && rd!(st, acceptor_tgid) != 0 && rd!(st, accept_cookie) != cookie {
         return;
     }
     let old_flags = rd!(st, flags);
@@ -412,10 +446,11 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
     }
     let rcv_base = rcv_nxt.wrapping_sub(bytes_received as u32);
     let snd_base = snd_una.wrapping_sub(bytes_acked.wrapping_sub(syn_adj as u64) as u32);
-    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
 
-    wr!(st, acceptor_tgid, 0);
-    wr!(st, pid_bits, rd!(st, pid_bits) & OWNER_LISTED);
+    if active {
+        wr!(st, acceptor_tgid, 0);
+        wr!(st, pid_bits, rd!(st, pid_bits) & OWNER_LISTED);
+    }
     wr!(st, sample, unsafe { bpf_get_prandom_u32() });
     wr!(st, rcv_base, rcv_base);
     wr!(st, snd_base, snd_base);
@@ -495,28 +530,36 @@ pub fn scope_accept2(ctx: FExitContext) -> i32 {
 }
 
 /// Record the acceptor on the returned child. The listener is never
-/// written (no backfill, §3.1). Clearing the verdict after the change makes
-/// the next packet recompute it.
+/// written (no backfill, §3.1). The child may not be established yet (it is
+/// queued for accept() before its PASSIVE_ESTABLISHED callback runs), and a
+/// child of a listener without state may have no state yet: it is created
+/// here then. Write order: `accept_cookie` (claims the fields for this
+/// socket), the bits, `acceptor_tgid` (readers that see it see the bits),
+/// then clear the verdict so the next packet recomputes it. Not before
+/// arming, when PID_FILTER may be incomplete.
 #[inline(always)]
 fn on_accept(child: *mut c_void) {
-    if child.is_null() {
+    if child.is_null() || !armed() {
         return;
     }
-    let st = state_of(child, false);
+    let st = state_or_create(child);
     if st.is_null() {
         return;
     }
     let tgid = current_tgid();
     let epoch = cfg(CONFIG_PID_EPOCH) as u32;
-    // Bits from another epoch mean nothing; never let this write revive them.
+    // Bits from another epoch mean nothing; never let this write revive
+    // them. Only the owner bit is kept: an acceptor bit not written for
+    // this socket is a clone's.
     let mut bits = if rd!(st, pid_epoch) == epoch {
-        rd!(st, pid_bits)
+        rd!(st, pid_bits) & OWNER_LISTED
     } else {
         0
     };
     if pid_listed(tgid) {
         bits |= ACCEPTOR_LISTED;
     }
+    wr!(st, accept_cookie, unsafe { bpf_get_socket_cookie(child) });
     wr!(st, pid_bits, bits);
     wr!(st, pid_epoch, epoch);
     wr!(st, acceptor_tgid, tgid);
@@ -826,7 +869,16 @@ fn scope_verdict(st: *mut SockState, sk: *mut c_void, mode: u64) -> Result<u32, 
         Some(v) => v,
         None => {
             let epoch = cfg(CONFIG_PID_EPOCH) as u32;
-            let (listed, owner_known) = pid_inputs(unsafe { &*st }, epoch);
+            // acceptor_tgid first: the accept hook writes it after the bits.
+            let acceptor_tgid = rd!(st, acceptor_tgid);
+            let inputs = SockState {
+                acceptor_tgid,
+                pid_epoch: rd!(st, pid_epoch),
+                pid_bits: rd!(st, pid_bits),
+                owner_tgid: rd!(st, owner_tgid),
+                ..SockState::default()
+            };
+            let (listed, owner_known) = pid_inputs(&inputs, epoch);
             let cgroup_in = mode & SCOPE_SEL_CGROUP != 0 && sk_cgroup_selected(sk);
             let sampled_in = mode & SCOPE_SAMPLE == 0
                 || in_sample(rd!(st, sample), cfg(CONFIG_SAMPLE_THRESHOLD));
@@ -840,7 +892,9 @@ fn scope_verdict(st: *mut SockState, sk: *mut c_void, mode: u64) -> Result<u32, 
                     drop_reason(v)
                 });
             }
-            wr!(st, verdict_word, verdict_word(g1, v));
+            if verdict_cacheable(v, mode, rd!(st, flags), acceptor_tgid) {
+                wr!(st, verdict_word, verdict_word(g1, v));
+            }
             v
         }
     };

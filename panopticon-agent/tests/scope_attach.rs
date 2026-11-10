@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf, SkStorage};
 use aya::programs::Program;
-use aya::{Ebpf, EbpfLoader, Pod};
+use aya::{Ebpf, EbpfLoader};
 use panopticon_common::scope::*;
 use panopticon_common::*;
 use scope_loader::*;
@@ -41,18 +41,10 @@ const TARGETS: [(&str, &str); 13] = [
     ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
 ];
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RawState([u64; 8]);
-// SAFETY: plain integers.
-unsafe impl Pod for RawState {}
-
 fn state(ebpf: &Ebpf, fd: &impl AsRawFd) -> Option<SockState> {
-    let map: SkStorage<&MapData, RawState> =
+    let map: SkStorage<&MapData, SockState> =
         SkStorage::try_from(ebpf.map("SOCK_STATE").unwrap()).unwrap();
-    let raw = map.get(&fd.as_raw_fd(), 0).ok()?;
-    // SAFETY: SockState is repr(C), 64 bytes of integers.
-    Some(unsafe { std::mem::transmute::<RawState, SockState>(raw) })
+    map.get(&fd.as_raw_fd(), 0).ok()
 }
 
 fn cookie(fd: &impl AsRawFd) -> u64 {
@@ -829,6 +821,7 @@ fn scope_programs_load_attach_and_hold() {
         drops(&ebpf, DROP_OUT_OF_SCOPE) >= oos0 + 2,
         "unlisted: out_of_scope"
     );
+
     {
         let mut pids: HashMap<_, u32, u8> =
             HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
@@ -848,6 +841,117 @@ fn scope_programs_load_attach_and_hold() {
         !ev.iter().any(|e| e.0 == cookie(&c3)),
         "old verdict stays OUT"
     );
+
+    // ── accept() before PASSIVE_ESTABLISHED (§3.1): a child is queued for
+    // accept before its ESTABLISHED callback runs, so a spinning accept can
+    // return it first. Whatever the order, it keeps its listed acceptor.
+    // `listener`: owner unlisted (state cloned); `pre_listener`: no state.
+    for (name, l) in [("cloned", &listener), ("no_state", &pre_listener)] {
+        let addr = l.local_addr().unwrap();
+        l.set_nonblocking(true).unwrap();
+        let (mut first, mut lost, mut total) = (0, 0, 0);
+        for _ in 0..8 {
+            let n = 250;
+            let dial = std::thread::spawn(move || {
+                (0..n)
+                    .map(|_| TcpStream::connect(addr).unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut kids = Vec::new();
+            while kids.len() < n {
+                match l.accept() {
+                    Ok((k, _)) => {
+                        if state(&ebpf, &k).is_none_or(|s| s.init_cookie != cookie(&k)) {
+                            first += 1;
+                        }
+                        kids.push(k);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::hint::spin_loop(),
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+            let clients = dial.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for k in &kids {
+                let ok = state(&ebpf, k).is_some_and(|s| {
+                    s.init_cookie == cookie(k)
+                        && s.acceptor_tgid == me
+                        && s.accept_cookie == cookie(k)
+                        && s.pid_bits & ACCEPTOR_LISTED != 0
+                });
+                lost += !ok as u32;
+            }
+            total += n;
+            drop((kids, clients));
+        }
+        l.set_nonblocking(false).unwrap();
+        println!("ACCEPT_RACE {name} accept_first={first} of {total} lost={lost}");
+        assert_eq!(lost, 0, "{name}: children that lost their acceptor");
+    }
+    let _ = drain(&mut ring);
+
+    // A listener that carries another socket's acceptor (an accepted socket
+    // that reached TCP_CLOSE without REUSED, then listen()): its children
+    // are never initialised.
+    {
+        let l0 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _c0 = TcpStream::connect(l0.local_addr().unwrap()).unwrap();
+        let (s0, _) = l0.accept().unwrap();
+        drop(l0);
+        let unspec = libc::sockaddr {
+            sa_family: libc::AF_UNSPEC as u16,
+            sa_data: [0; 14],
+        };
+        // SAFETY: valid fd and sockaddr.
+        let rc = unsafe {
+            libc::connect(
+                s0.as_raw_fd(),
+                &unspec,
+                std::mem::size_of::<libc::sockaddr>() as u32,
+            )
+        };
+        assert_eq!(rc, 0, "connect(AF_UNSPEC)");
+        let mut st = state(&ebpf, &s0).unwrap();
+        assert_eq!((st.acceptor_tgid, st.accept_cookie), (me, cookie(&s0)));
+        st.flags &= !FLAG_REUSED; // as if STATE_CB had never been set
+        {
+            let mut map: SkStorage<&mut MapData, SockState> =
+                SkStorage::try_from(ebpf.map_mut("SOCK_STATE").unwrap()).unwrap();
+            map.insert(&s0, st, 0).unwrap();
+        }
+        // SAFETY: valid fd.
+        if unsafe { libc::listen(s0.as_raw_fd(), 8) } != 0 {
+            println!("RELISTEN skipped ({})", std::io::Error::last_os_error());
+        } else {
+            // SAFETY: valid fd and out-pointers.
+            let port = unsafe {
+                let mut a: libc::sockaddr_in = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+                libc::getsockname(s0.as_raw_fd(), (&raw mut a).cast(), &mut len);
+                u16::from_be(a.sin_port)
+            };
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"relisten").unwrap();
+            // SAFETY: valid listening fd; the result is a new fd we own.
+            let k = unsafe {
+                use std::os::fd::FromRawFd;
+                let fd = libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+                assert!(fd >= 0, "accept on the re-listened socket");
+                std::os::fd::OwnedFd::from_raw_fd(fd)
+            };
+            let ks = state(&ebpf, &k).expect("clone");
+            assert_ne!(
+                ks.init_cookie,
+                cookie(&k),
+                "foreign acceptor: never initialised"
+            );
+            assert!(
+                !drain(&mut ring).iter().any(|e| e.0 == cookie(&k)),
+                "nothing captured on it"
+            );
+            println!("RELISTEN OK");
+        }
+    }
 
     // ── TLS addresses (restricted): an address belongs to one OpenSSL call
     // and only to an in-scope socket of that call (tls_probes.rs TLS_CALL)
