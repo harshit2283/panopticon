@@ -561,7 +561,7 @@ impl MysqlParser {
                     let mut text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
                     // A parse error (1064) echoes the statement, secret included.
                     if super::mask_credentials_enabled() {
-                        super::mask_sql_secrets_in(&mut text);
+                        super::mask_sql_secrets_in(&mut text, super::SqlDialect::Mysql);
                     }
                     m.payload_text = Some(text);
                 }
@@ -639,7 +639,7 @@ impl MysqlParser {
         if let Some(mut q) = self.query_text.take() {
             // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
             if super::mask_credentials_enabled() {
-                super::mask_sql_secrets_in(&mut q);
+                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Mysql);
             }
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());

@@ -437,7 +437,7 @@ impl PostgresParser {
                         // Error message takes precedence over query text in
                         // payload_text; it may quote the statement.
                         if super::mask_credentials_enabled() {
-                            super::mask_sql_secrets_in(&mut err);
+                            super::mask_sql_secrets_in(&mut err, super::SqlDialect::Postgres);
                         }
                         msg.payload_text = Some(err);
                     }
@@ -475,7 +475,7 @@ impl PostgresParser {
         if let Some(mut q) = self.query_text.take() {
             // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
             if super::mask_credentials_enabled() {
-                super::mask_sql_secrets_in(&mut q);
+                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Postgres);
             }
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());

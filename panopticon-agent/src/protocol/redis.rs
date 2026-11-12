@@ -182,11 +182,9 @@ impl RedisParser {
             }
             "MULTI" => self.transaction = Some(Vec::new()),
             "DISCARD" => self.transaction = None,
-            "EXEC" => {
-                if let Some(queued) = self.transaction.take() {
-                    expect = Expect::Exec(queued);
-                }
-            }
+            // With no MULTI seen (capture started inside the transaction)
+            // nothing lines up, and all of a result array is masked.
+            "EXEC" => expect = Expect::Exec(self.transaction.take().unwrap_or_default()),
             "MONITOR" => expect = Expect::Monitor,
             c if SUBSCRIBE_COMMANDS.contains(&c) => {
                 // (P|S)UNSUBSCRIBE with no channel: one ack per current
@@ -1065,6 +1063,10 @@ mod tests {
         ]);
         assert!(!leaks(&out), "{out:?}");
         assert!(out[4].as_deref().unwrap().ends_with("value"), "{out:?}");
+        // EXEC whose MULTI came before capture started: the queued
+        // commands are unknown, so the whole result is masked.
+        let out = exchange(&[(&["EXEC"], b"*1\r\n$8\r\ns3cretpw\r\n")]);
+        assert_eq!(out, vec![Some("<REDACTED>".to_string())]);
         // A subscription command inside MULTI is only queued.
         let out = exchange(&[
             (&["MULTI"], b"+OK\r\n"),

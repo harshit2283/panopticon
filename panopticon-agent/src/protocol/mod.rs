@@ -139,7 +139,7 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
-pub use secrets::{is_credential_name, mask_secrets, mask_sql_secrets};
+pub use secrets::{SqlDialect, is_credential_name, mask_secrets, mask_sql_secrets};
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
 // while there is one agent per process. Set once at startup by
@@ -163,8 +163,8 @@ pub fn mask_secrets_in(text: &mut String) {
 }
 
 /// [`mask_sql_secrets`] in place.
-pub fn mask_sql_secrets_in(text: &mut String) {
-    replace_masked(text, mask_sql_secrets(text));
+pub fn mask_sql_secrets_in(text: &mut String, dialect: SqlDialect) {
+    replace_masked(text, mask_sql_secrets(text, dialect));
 }
 
 fn replace_masked(text: &mut String, masked: Option<String>) {

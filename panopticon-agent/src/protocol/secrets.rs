@@ -25,13 +25,56 @@
 
 use super::REDACTED_CREDENTIAL;
 
+/// Which SQL comment syntax applies between a keyword and its value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SqlDialect {
+    /// `/* */`, `-- `, `#`.
+    Mysql,
+    /// `/* */`, `--` (`#` is an operator).
+    Postgres,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// SQL text (MySQL, PostgreSQL queries and error messages): comments
-    /// may sit between a keyword and its value.
-    Sql,
+    Sql(SqlDialect),
     /// Any other text (HTTP fields, bodies, Redis payloads).
     Text,
+}
+
+/// One scan: the mode, and the last comment-end search for each delimiter
+/// as (searched from, found at or text length). Clauses are tried at
+/// increasing positions, so a search from inside the last one's range has
+/// the same answer: each byte is searched at most once per delimiter, and
+/// keyword detection inside comments stays linear.
+struct Scan {
+    mode: Mode,
+    block_end: std::cell::Cell<(usize, usize)>,
+    line_end: std::cell::Cell<(usize, usize)>,
+}
+
+impl Scan {
+    fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            block_end: std::cell::Cell::new((usize::MAX, 0)),
+            line_end: std::cell::Cell::new((usize::MAX, 0)),
+        }
+    }
+}
+
+fn find_cached(
+    b: &[u8],
+    from: usize,
+    pat: &[u8],
+    cache: &std::cell::Cell<(usize, usize)>,
+) -> usize {
+    let (f, e) = cache.get();
+    if f <= from && from <= e {
+        return e;
+    }
+    let e = find(b, from, pat).unwrap_or(b.len());
+    cache.set((from, e));
+    e
 }
 
 /// `text` with every login secret replaced by [`REDACTED_CREDENTIAL`], or
@@ -41,8 +84,8 @@ pub fn mask_secrets(text: &str) -> Option<String> {
 }
 
 /// [`mask_secrets`] for SQL text: queries and server error messages.
-pub fn mask_sql_secrets(text: &str) -> Option<String> {
-    mask(text, Mode::Sql)
+pub fn mask_sql_secrets(text: &str, dialect: SqlDialect) -> Option<String> {
+    mask(text, Mode::Sql(dialect))
 }
 
 /// Whether a parameter, field, header-style or config name names a secret.
@@ -150,6 +193,7 @@ fn is_name_byte(c: u8) -> bool {
 
 fn mask(text: &str, mode: Mode) -> Option<String> {
     let b = text.as_bytes();
+    let cx = Scan::new(mode);
     let mut spans = Vec::new();
     let mut i = 0;
     while i < b.len() {
@@ -158,7 +202,7 @@ fn mask(text: &str, mode: Mode) -> Option<String> {
             while j < b.len() && is_name_byte(b[j]) {
                 j += 1;
             }
-            match clause(b, i, j, mode, &mut spans) {
+            match clause(b, i, j, &cx, &mut spans) {
                 Some(next) => i = next,
                 None => i = j,
             }
@@ -194,7 +238,7 @@ fn clause(
     b: &[u8],
     ws: usize,
     we: usize,
-    mode: Mode,
+    cx: &Scan,
     spans: &mut Vec<(usize, usize)>,
 ) -> Option<usize> {
     let class = classify(&b[ws..we]);
@@ -207,39 +251,39 @@ fn clause(
     if ws > 0 && k < n && matches!(b[k], b'"' | b'\'' | b'`') && b[ws - 1] == b[k] {
         k += 1;
     }
-    k = skip_trivia(b, k, mode);
+    k = skip_trivia(b, k, cx);
     let mut explicit = false;
     match class {
         Class::Identified => {
             let (mut w, mut after) = word_at(b, k);
             if eq(w, "with") || eq(w, "via") {
-                k = skip_trivia(b, after, mode);
+                k = skip_trivia(b, after, cx);
                 k = skip_token(b, k);
-                k = skip_trivia(b, k, mode);
+                k = skip_trivia(b, k, cx);
                 (w, after) = word_at(b, k);
             }
             if !(eq(w, "by") || eq(w, "as") || eq(w, "using")) {
                 return None;
             }
-            k = skip_trivia(b, after, mode);
+            k = skip_trivia(b, after, cx);
             let (w, after) = word_at(b, k);
             if eq(w, "password") {
-                k = skip_trivia(b, after, mode);
+                k = skip_trivia(b, after, cx);
             }
             explicit = true;
         }
         Class::Strong => {
             let (w, after) = word_at(b, k);
             if eq(w, "for") {
-                k = skip_trivia(b, after, mode);
+                k = skip_trivia(b, after, cx);
                 k = skip_account(b, k);
-                k = skip_trivia(b, k, mode);
+                k = skip_trivia(b, k, cx);
             }
         }
         _ => {}
     }
     if k < n && matches!(b[k], b'=' | b':') {
-        k = skip_trivia(b, k + 1, mode);
+        k = skip_trivia(b, k + 1, cx);
         explicit = true;
     } else if class == Class::Name {
         return None;
@@ -249,7 +293,7 @@ fn clause(
     // Where a value that cannot be delimited is masked from.
     let fail_from = k;
     if strong && k < n && b[k] == b'(' {
-        k = skip_trivia(b, k + 1, mode);
+        k = skip_trivia(b, k + 1, cx);
         paren = true;
         explicit = true;
     }
@@ -271,7 +315,7 @@ fn clause(
         // Adjacent literals concatenate ('a' 'b', and across a newline in
         // PostgreSQL).
         loop {
-            let t = skip_trivia(b, end, mode);
+            let t = skip_trivia(b, end, cx);
             match value_at(b, t) {
                 Some((e, true)) if t > end => end = e,
                 _ => break,
@@ -279,8 +323,8 @@ fn clause(
         }
     } else if strong {
         // A function call (`CONCAT(…)`) cannot be delimited.
-        let t = if mode == Mode::Sql {
-            skip_trivia(b, end, mode)
+        let t = if cx.mode != Mode::Text {
+            skip_trivia(b, end, cx)
         } else {
             end
         };
@@ -299,7 +343,7 @@ fn clause(
     }
     let mut next = end;
     if paren {
-        let t = skip_trivia(b, end, mode);
+        let t = skip_trivia(b, end, cx);
         if t >= n || b[t] != b')' {
             return fail_closed(spans);
         }
@@ -308,10 +352,10 @@ fn clause(
     spans.push((vs, end));
     if strong {
         // `IDENTIFIED BY 'new' REPLACE 'current'`
-        let t = skip_trivia(b, next, mode);
+        let t = skip_trivia(b, next, cx);
         let (w, after) = word_at(b, t);
         if eq(w, "replace") {
-            let t = skip_trivia(b, after, mode);
+            let t = skip_trivia(b, after, cx);
             if let Some((e, true)) = value_at(b, t) {
                 spans.push((t, e));
                 next = e;
@@ -334,20 +378,23 @@ fn word_at(b: &[u8], k: usize) -> (&[u8], usize) {
     (&b[k..e], e)
 }
 
-/// Whitespace, and in SQL mode `/* … */`, `-- …` and `# …` comments.
-fn skip_trivia(b: &[u8], mut k: usize, mode: Mode) -> usize {
+/// Whitespace, and in SQL mode the dialect's comments.
+fn skip_trivia(b: &[u8], mut k: usize, cx: &Scan) -> usize {
     let n = b.len();
     loop {
         while k < n && b[k].is_ascii_whitespace() {
             k += 1;
         }
-        if mode != Mode::Sql || k >= n {
+        let Mode::Sql(dialect) = cx.mode else {
+            return k;
+        };
+        if k >= n {
             return k;
         }
         if b[k..].starts_with(b"/*") {
-            k = find(b, k + 2, b"*/").map_or(n, |e| e + 2);
-        } else if b[k..].starts_with(b"--") || b[k] == b'#' {
-            k = find(b, k, b"\n").map_or(n, |e| e + 1);
+            k = (find_cached(b, k + 2, b"*/", &cx.block_end) + 2).min(n);
+        } else if b[k..].starts_with(b"--") || (dialect == SqlDialect::Mysql && b[k] == b'#') {
+            k = (find_cached(b, k, b"\n", &cx.line_end) + 1).min(n);
         } else {
             return k;
         }
@@ -499,7 +546,7 @@ mod tests {
     }
 
     fn sql(s: &str) -> String {
-        mask_sql_secrets(s).unwrap_or_else(|| s.to_string())
+        mask_sql_secrets(s, SqlDialect::Mysql).unwrap_or_else(|| s.to_string())
     }
 
     #[test]
@@ -574,7 +621,7 @@ mod tests {
         ] {
             let once = sql(&text(s));
             assert_eq!(mask_secrets(&once), None, "{once}");
-            assert_eq!(mask_sql_secrets(&once), None, "{once}");
+            assert_eq!(mask_sql_secrets(&once, SqlDialect::Mysql), None, "{once}");
         }
     }
 
@@ -614,10 +661,16 @@ mod tests {
             "password=x&".repeat(6000),
             "lorem ipsum ".repeat(6000),
             "'".repeat(64 * 1024),
+            // Unterminated comments and quotes after a keyword.
+            "PASSWORD /* ".repeat(5000),
+            "password -- ".repeat(5000),
+            "password for '".repeat(5000),
+            "IDENTIFIED WITH '".repeat(5000),
         ] {
             let t = std::time::Instant::now();
             let _ = mask_secrets(&body);
-            let _ = mask_sql_secrets(&body);
+            let _ = mask_sql_secrets(&body, SqlDialect::Mysql);
+            let _ = mask_sql_secrets(&body, SqlDialect::Postgres);
             assert!(
                 t.elapsed() < std::time::Duration::from_millis(500),
                 "{:?}",

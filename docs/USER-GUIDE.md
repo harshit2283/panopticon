@@ -434,10 +434,12 @@ inside `EXEC`, and in any reply the value after a credential-named element
 (a hash with a `password` field) and `ACL LIST` lines with a password rule.
 A Redis reply that cannot be matched to its command (capture started with
 replies outstanding, `MONITOR` output, `UNSUBSCRIBE` with no channel) is
-exported without its text. One case stays open: when capture starts while
-pipelined commands are still unanswered, the first replies are matched to
-the first commands captured, so an `ACL GENPASS` sent just before capture
-started can be exported under another command. Also masked: the SQL
+exported without its text, and an `EXEC` whose `MULTI` came before
+capture started has its whole result masked. One case stays open: when
+capture starts while pipelined commands are still unanswered, the first
+replies are matched to the first commands captured, so the reply to an
+`ACL GENPASS` sent just before capture started can be exported under
+another command. Also masked: the SQL
 clauses above (PostgreSQL, MySQL), also in server error messages that
 quote the statement, and the credential headers, parameters and URI
 passwords above, in every copy (HTTP/2 keeps `:path` as a header too).
