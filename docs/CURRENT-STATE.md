@@ -160,8 +160,8 @@ production-hardened compliance platform.
   - ONNX-backed ML inference is optional and throughput-sensitive.
   - In `redacted` mode, header names and values are scanned for every
     protocol, and credentials (credential-named HTTP headers, Redis `AUTH`,
-    SQL password clauses) are masked; `full` masks login secrets too unless
-    `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
+    SQL password clauses) are masked; `full` masks login secrets too, with
+    or without PII detection, unless `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
     TLS, Redis AUTH and Kafka client ids; SQL password clauses and AMQP
     metadata are covered by unit tests only.
 - Service graphing:

@@ -141,7 +141,7 @@ identity_cache_ttl_secs = 300
 
 [otlp]
 enabled = false
-endpoint = "http://127.0.0.1:4317"
+endpoint = "http://127.0.0.1:4317"   # http:// only: cleartext gRPC, https:// refuses to start
 service_name = "panopticon-agent"
 
 [kubernetes]           # pod/service names for endpoints (§5.6)
@@ -322,7 +322,7 @@ One JSON object per completed exchange. A real record (body shortened):
 | `protocol` | `http1`, `http2`, `grpc`, `mysql`, `postgres`, `redis`, `kafka`, `amqp`, `dns` |
 | `timestamp_ns` | Kernel monotonic clock (ns since boot), not wall-clock time |
 | `latency_ns` | Request → response time as observed on this host |
-| `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key |
+| `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key. Each of these and every header name and value is kept to at most 8 KB |
 | `status` | HTTP status, or database error code |
 | `payload_text` | Response body as text, at most `max_body_bytes` (default 4 KB), after redaction |
 | `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most `max_body_bytes`, after redaction |
@@ -399,16 +399,22 @@ exported:
   **request body** (e.g. POST JSON or form data) and the **response body**
   are scanned and redacted;
 - **credentials** are masked in every field whatever the protocol: the value
-  after `PASSWORD`, `IDENTIFIED BY`, `requirepass`, `masterauth` or
-  `password=` / `"password":`, and the arguments of a Redis `AUTH`.
+  after `PASSWORD` (also `*_PASSWORD`, such as `MASTER_PASSWORD` and
+  `SOURCE_PASSWORD`, and `SET PASSWORD FOR user =`), `IDENTIFIED BY`,
+  `IDENTIFIED WITH plugin AS`, `requirepass`, `masterauth` or `password=` /
+  `"password":`, the current password after `REPLACE`, and the arguments of
+  a Redis `AUTH`.
 
-Login secrets are masked in every privacy mode by default, `full` included:
-Redis `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET
-requirepass|masterauth|masteruser` and `ACL SETUSER` password rules; SQL
-`PASSWORD '…'` and `IDENTIFIED BY '…'` clauses (PostgreSQL, MySQL); the
-credential headers and `password=` values above. The raw dump (`full` mode,
-§5.5) always keeps them. The AMQP and Kafka SASL exchanges are never
-exported as events.
+Login secrets are masked in every privacy mode by default, `full` included,
+and with PII detection off (`[pii] enabled = false`): Redis `AUTH`,
+`HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET` and `SENTINEL SET`
+of `requirepass`, `masterauth`, `masteruser`, the TLS key passphrases and
+`auth-pass`, `ACL SETUSER` password rules, and the replies to `CONFIG GET`
+(those parameters' values) and `ACL LIST|GETUSER|GENPASS` (the whole
+reply); the SQL clauses above (PostgreSQL, MySQL), also in server error
+messages that quote the statement; the credential headers and `password=`
+values above. The raw dump (`full` mode, §5.5) always keeps them. The AMQP
+and Kafka SASL exchanges are never exported as events.
 
 To export login secrets too, `full` mode accepts:
 

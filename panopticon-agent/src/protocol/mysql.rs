@@ -550,10 +550,20 @@ impl MysqlParser {
                 if payload.len() >= 3 {
                     m.status = Some(u16::from_le_bytes([payload[1], payload[2]]) as u32);
                 }
-                if payload.len() > 9 && payload[3] == b'#' {
-                    m.payload_text = Some(String::from_utf8_lossy(&payload[9..]).into_owned());
-                } else if payload.len() > 3 {
-                    m.payload_text = Some(String::from_utf8_lossy(&payload[3..]).into_owned());
+                // The message text follows the SQL state (`#` + 5 bytes)
+                // when there is one.
+                let text_at = if payload.len() > 9 && payload[3] == b'#' {
+                    9
+                } else {
+                    3
+                };
+                if payload.len() > text_at {
+                    let mut text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
+                    // A parse error (1064) echoes the statement, secret included.
+                    if super::mask_credentials_enabled() {
+                        super::mask_secrets_in(&mut text);
+                    }
+                    m.payload_text = Some(text);
                 }
                 Some(m)
             }
@@ -1105,6 +1115,35 @@ mod tests {
                 "ALTER USER app IDENTIFIED WITH caching_sha2_password BY <REDACTED>",
             ),
             ("SET PASSWORD = 'my-s3cret'", "SET PASSWORD = <REDACTED>"),
+            (
+                "SET PASSWORD FOR 'app'@'%' = 'my-s3cret'",
+                "SET PASSWORD FOR 'app'@'%' = <REDACTED>",
+            ),
+            (
+                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD='my-s3cret'",
+                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD=<REDACTED>",
+            ),
+            (
+                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = 'my-s3cret'",
+                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = <REDACTED>",
+            ),
+            (
+                "ALTER USER app IDENTIFIED BY 'new-s3cret' REPLACE 'my-s3cret'",
+                "ALTER USER app IDENTIFIED BY <REDACTED> REPLACE <REDACTED>",
+            ),
+            (
+                "SET PASSWORD = 'new-s3cret' REPLACE 'my-s3cret'",
+                "SET PASSWORD = <REDACTED> REPLACE <REDACTED>",
+            ),
+            (
+                "CREATE USER app IDENTIFIED WITH mysql_native_password AS '*0123my-s3cret'",
+                "CREATE USER app IDENTIFIED WITH mysql_native_password AS <REDACTED>",
+            ),
+            // REPLACE elsewhere is SQL, not a secret.
+            (
+                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
+                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
+            ),
         ] {
             let mut p = MysqlParser::new();
             p.state = State::Ready;
@@ -1141,6 +1180,33 @@ mod tests {
                 assert!(m[0].payload_text.as_ref().unwrap().contains("syntax error"));
             }
             other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    /// A server error that echoes the statement (1064) carries its secret:
+    /// the ERR text is masked like the query, with and without a SQL state.
+    #[test]
+    fn test_error_text_is_masked() {
+        let echo = b"You have an error in your SQL syntax; check the manual near 'IDENTIFIED BY 'my-s3cret'' at line 1";
+        for sql_state in [true, false] {
+            let mut p = MysqlParser::new();
+            p.state = State::Ready;
+            let mut cmd = vec![COM_QUERY];
+            cmd.extend_from_slice(b"GRANT ALL ON app.* TO 'app'@'%' IDENTIFIED BY 'my-s3cret'");
+            p.feed(&make_packet(0, &cmd), Direction::Egress, 1000);
+            let mut err = vec![ERR_MARKER];
+            err.extend_from_slice(&1064u16.to_le_bytes());
+            if sql_state {
+                err.extend_from_slice(b"#42000");
+            }
+            err.extend_from_slice(echo);
+            let ParseResult::Messages(m) = p.feed(&make_packet(1, &err), Direction::Ingress, 2000)
+            else {
+                panic!("expected a message");
+            };
+            let text = m[0].payload_text.as_deref().unwrap();
+            assert!(!text.contains("my-s3cret"), "{text}");
+            assert!(text.contains("near 'IDENTIFIED BY <REDACTED>"), "{text}");
         }
     }
 

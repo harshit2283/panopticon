@@ -58,6 +58,58 @@ fn is_credential_header(name: &str) -> bool {
     !READABLE.contains(&name.as_str()) && CREDENTIAL_NAME_PARTS.iter().any(|p| name.contains(p))
 }
 
+/// Mask the credentials that are whole fields: the arguments of an `AUTH`
+/// command and the values of credential-named HTTP headers.
+fn mask_credential_fields(msg: &mut L7Message) {
+    let wipe = |f: &mut String| {
+        f.zeroize();
+        *f = REDACTED_CREDENTIAL.to_string();
+    };
+    if msg
+        .method
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("AUTH"))
+    {
+        [&mut msg.path, &mut msg.request_text]
+            .into_iter()
+            .flatten()
+            .for_each(wipe);
+    }
+    if matches!(
+        msg.protocol,
+        Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
+    ) {
+        msg.headers
+            .iter_mut()
+            .filter(|(name, _)| is_credential_header(name))
+            .for_each(|(_, value)| wipe(value));
+    }
+}
+
+/// Mask login secrets in every string field of `msg` without the PII
+/// engine: what [`PiiEngine::scan_message_with`] masks when
+/// `mask_credentials` is on, for `full` mode with `[pii] enabled = false`.
+pub fn mask_credentials(msg: &mut L7Message) {
+    mask_credential_fields(msg);
+    for field in [
+        &mut msg.method,
+        &mut msg.path,
+        &mut msg.content_type,
+        &mut msg.request_text,
+        &mut msg.payload_text,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        mask_secrets_in(field);
+    }
+    // DNS answers (domain|ip|ttl) feed the DNS cache and carry no secret.
+    for (name, value) in msg.headers.iter_mut().filter(|(n, _)| n != "dns_a_record") {
+        mask_secrets_in(name);
+        mask_secrets_in(value);
+    }
+}
+
 /// Decode `%XX` escapes and `+` (form encoding) for PII scanning.
 /// Invalid escapes are kept verbatim; invalid UTF-8 is replaced lossily.
 fn percent_decode(input: &str) -> String {
@@ -470,16 +522,8 @@ impl PiiEngine {
         // `full` mode unless `[privacy] mask_credentials = false`.
         let mask_creds = redact_enabled || self.config.mask_credentials;
 
-        if mask_creds
-            && msg
-                .method
-                .as_deref()
-                .is_some_and(|m| m.eq_ignore_ascii_case("AUTH"))
-        {
-            for f in [&mut msg.path, &mut msg.request_text].into_iter().flatten() {
-                f.zeroize();
-                *f = REDACTED_CREDENTIAL.to_string();
-            }
+        if mask_creds {
+            mask_credential_fields(msg);
         }
 
         if let Some(path) = msg.path.as_mut() {
@@ -494,10 +538,6 @@ impl PiiEngine {
             self.scan_field(field, false, redact_enabled, &mut found);
         }
 
-        let http = matches!(
-            msg.protocol,
-            Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
-        );
         if redact_enabled {
             msg.headers.retain(|(name, value)| {
                 name != "dns_a_record" || {
@@ -512,12 +552,7 @@ impl PiiEngine {
             if name == "dns_a_record" {
                 continue;
             }
-            if mask_creds && http && is_credential_header(name) {
-                value.zeroize();
-                *value = REDACTED_CREDENTIAL.to_string();
-            } else {
-                self.scan_field(value, false, redact_enabled, &mut found);
-            }
+            self.scan_field(value, false, redact_enabled, &mut found);
             self.scan_field(name, false, redact_enabled, &mut found);
         }
 

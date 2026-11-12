@@ -123,12 +123,15 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
-/// A secret given after a keyword: SQL `PASSWORD '…'` / `IDENTIFIED BY '…'`,
-/// Redis `requirepass` / `masterauth` (CONFIG SET), and `password=…` /
-/// `"password": "…"` in forms and JSON. Group 3 is the value.
+/// A secret given after a keyword: SQL `PASSWORD '…'` (also `*_PASSWORD`,
+/// e.g. MySQL `MASTER_PASSWORD` / `SOURCE_PASSWORD`, and `SET PASSWORD FOR
+/// user = '…'`), `IDENTIFIED BY '…'` / `IDENTIFIED WITH plugin AS '…'`,
+/// each with an optional `REPLACE '<current>'`; Redis `requirepass` /
+/// `masterauth` (CONFIG SET); and `password=…` / `"password": "…"` in forms
+/// and JSON. Group 3 is the value, group 5 the `REPLACE` value.
 static SECRET_CLAUSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)\b(password|passwd|identified(?:\s+with\s+\S+)?\s+by(?:\s+password)?|requirepass|masterauth)\b(["']?\s*(?:[=:(]|\s)\s*)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"|[^\s'",;)&]+)"#,
+        r#"(?i)\b((?:(?:\w+_)?(?:password|passwd)|identified(?:\s+with\s+\S+)?\s+(?:by|as)(?:\s+password)?|requirepass|masterauth)\b(?:\s+for\s+[^\s=]+)?)(["']?\s*(?:[=:(]|\s)\s*)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"|[^\s'",;)&]+)(?:(\s+replace\s+)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"))?"#,
     )
     .expect("SECRET_CLAUSE")
 });
@@ -141,12 +144,16 @@ thread_local! {
 
 /// `text` with every [`SECRET_CLAUSE`] value replaced by
 /// [`REDACTED_CREDENTIAL`], or None when there is none. Shared by the SQL
-/// parsers and `PiiEngine::scan_message_with`.
+/// parsers (queries and error text), `PiiEngine::scan_message_with` and
+/// `pii::mask_credentials` (no PII engine).
 pub fn mask_secrets(text: &str) -> Option<String> {
     SECRET_CLAUSE_LOCAL.with(|re| {
         re.is_match(text).then(|| {
             re.replace_all(text, |c: &regex::Captures<'_>| {
-                format!("{}{}{REDACTED_CREDENTIAL}", &c[1], &c[2])
+                let replace = c.get(4).map_or(String::new(), |r| {
+                    format!("{}{REDACTED_CREDENTIAL}", r.as_str())
+                });
+                format!("{}{}{REDACTED_CREDENTIAL}{replace}", &c[1], &c[2])
             })
             .into_owned()
         })

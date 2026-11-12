@@ -2,9 +2,14 @@ services:
   postgres:
     image: postgres:15
     network_mode: host
+    # Host network so the agent sees the traffic on lo; listen on loopback
+    # only, so nothing else on the network can reach the superuser.
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1"]
     environment:
       POSTGRES_USER: test
-      POSTGRES_PASSWORD: test
+      # Random per run, set by run_tests.sh. Unset, the image refuses to
+      # initialise the database.
+      POSTGRES_PASSWORD: ${E2E_PG_PASSWORD:-}
       POSTGRES_DB: testdb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U test -d testdb"]
