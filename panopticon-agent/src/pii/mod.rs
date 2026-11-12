@@ -893,6 +893,57 @@ mod tests {
         assert_eq!(msg.headers[2].1, "application/json");
     }
 
+    /// Credential-named parameters (percent-encoded names too), JSON
+    /// fields, header-style values and URI passwords are masked with and
+    /// without the engine, in every copy (HTTP/2 keeps `:path` as a header
+    /// too); ordinary values stay readable.
+    #[test]
+    fn test_credential_params_and_uri_passwords_are_masked() {
+        use panopticon_common::Direction;
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http2, Direction::Egress, 1);
+            let path = "/login?%70assword=canary-1&token=canary-2&api_key=canary-3&q=keep";
+            m.path = Some(path.into());
+            m.headers = vec![
+                (":path".into(), path.into()),
+                ("x-note".into(), "Authorization: Bearer canary-6".into()),
+                (
+                    "x-redirect".into(),
+                    "/cb?access_token=canary-7&state=keep".into(),
+                ),
+            ];
+            m.request_text = Some(
+                r#"{"dsn":"postgresql://app:canary-4@db/app","client_secret": "canary-5","note":"don't","keyword":"keep"}"#
+                    .into(),
+            );
+            m.payload_text = Some("redis://:canary-8@cache:6379/0 and pass%77ord=canary-9".into());
+            m
+        };
+        let check = |m: &L7Message, how: &str| {
+            let all = format!(
+                "{:?} {:?} {:?} {:?}",
+                m.path, m.headers, m.request_text, m.payload_text
+            );
+            assert!(!all.contains("canary"), "{how}: {all}");
+            assert!(
+                all.contains("q=keep") && all.contains("state=keep"),
+                "{how}: {all}"
+            );
+            assert!(all.contains(r#"\"note\":\"don't\""#), "{how}: {all}");
+            assert!(all.contains(r#"\"keyword\":\"keep\""#), "{how}: {all}");
+            assert!(all.contains("postgresql://app:"), "{how}: {all}");
+        };
+        let mut m = msg();
+        mask_credentials(&mut m);
+        check(&m, "no engine");
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for redact in [true, false] {
+            let mut m = msg();
+            let _ = engine.scan_message_with(&mut m, redact);
+            check(&m, &format!("engine, redact {redact}"));
+        }
+    }
+
     #[test]
     fn test_protocol_credentials_masked_when_redacting() {
         use panopticon_common::Direction;

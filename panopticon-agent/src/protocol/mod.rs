@@ -17,6 +17,7 @@ pub mod kafka;
 pub mod mysql;
 pub mod postgres;
 pub mod redis;
+mod secrets;
 
 pub use panopticon_common::Direction;
 
@@ -123,42 +124,7 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
-/// A secret given after a keyword: SQL `PASSWORD '…'` (also `*_PASSWORD`,
-/// e.g. MySQL `MASTER_PASSWORD` / `SOURCE_PASSWORD`, and `SET PASSWORD FOR
-/// user = '…'`), `IDENTIFIED BY '…'` / `IDENTIFIED WITH plugin AS '…'`,
-/// each with an optional `REPLACE '<current>'`; Redis `requirepass` /
-/// `masterauth` (CONFIG SET); and `password=…` / `"password": "…"` in forms
-/// and JSON. Group 3 is the value, group 5 the `REPLACE` value.
-static SECRET_CLAUSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
-        r#"(?i)\b((?:(?:\w+_)?(?:password|passwd)|identified(?:\s+with\s+\S+)?\s+(?:by|as)(?:\s+password)?|requirepass|masterauth)\b(?:\s+for\s+[^\s=]+)?)(["']?\s*(?:[=:(]|\s)\s*)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"|[^\s'",;)&]+)(?:(\s+replace\s+)('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.)*"))?"#,
-    )
-    .expect("SECRET_CLAUSE")
-});
-
-thread_local! {
-    // Per-thread clone, so workers don't contend for one match-cache pool
-    // (see `pii::regex_prefilter`'s LOCAL).
-    static SECRET_CLAUSE_LOCAL: regex::Regex = SECRET_CLAUSE.clone();
-}
-
-/// `text` with every [`SECRET_CLAUSE`] value replaced by
-/// [`REDACTED_CREDENTIAL`], or None when there is none. Shared by the SQL
-/// parsers (queries and error text), `PiiEngine::scan_message_with` and
-/// `pii::mask_credentials` (no PII engine).
-pub fn mask_secrets(text: &str) -> Option<String> {
-    SECRET_CLAUSE_LOCAL.with(|re| {
-        re.is_match(text).then(|| {
-            re.replace_all(text, |c: &regex::Captures<'_>| {
-                let replace = c.get(4).map_or(String::new(), |r| {
-                    format!("{}{REDACTED_CREDENTIAL}", r.as_str())
-                });
-                format!("{}{}{REDACTED_CREDENTIAL}{replace}", &c[1], &c[2])
-            })
-            .into_owned()
-        })
-    })
-}
+pub use secrets::{is_credential_name, mask_secrets, mask_sql_secrets};
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
 // while there is one agent per process. Set once at startup by
@@ -178,7 +144,16 @@ pub fn set_mask_credentials(on: bool) {
 
 /// [`mask_secrets`] in place.
 pub fn mask_secrets_in(text: &mut String) {
-    if let Some(masked) = mask_secrets(text) {
+    replace_masked(text, mask_secrets(text));
+}
+
+/// [`mask_sql_secrets`] in place.
+pub fn mask_sql_secrets_in(text: &mut String) {
+    replace_masked(text, mask_sql_secrets(text));
+}
+
+fn replace_masked(text: &mut String, masked: Option<String>) {
+    if let Some(masked) = masked {
         zeroize::Zeroize::zeroize(text);
         *text = masked;
     }
