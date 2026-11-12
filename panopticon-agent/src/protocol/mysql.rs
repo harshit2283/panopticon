@@ -1465,6 +1465,19 @@ mod tests {
         );
     }
 
+    /// An execute of a statement prepared before capture started: its SQL
+    /// is unknown, so its bound values are not exported.
+    #[test]
+    fn test_execute_of_unseen_prepare_exports_no_values() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let execute =
+            hex("17010000000001000000020001018000fe000000117573657230406578616d706c652e636f6d");
+        let msgs = feed_all(&mut p, &[c(0, &execute), s(1, OK)]);
+        assert_eq!(msgs[0].request_text, None, "{msgs:?}");
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("EXECUTE"));
+    }
+
     #[test]
     fn test_prepared_reexecute_reuses_bound_types_classic_layout() {
         let mut p = MysqlParser::new();

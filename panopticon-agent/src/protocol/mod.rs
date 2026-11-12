@@ -257,6 +257,12 @@ pub trait ProtocolParser: Send {
     fn protocol_version(&self) -> Option<&str> {
         None
     }
+
+    /// The parser did not see a direction of the stream from its first
+    /// byte (capture joined an open connection, TLS, or bytes were lost).
+    /// A parser that pairs replies with requests by order must stop
+    /// trusting that pairing.
+    fn joined_late(&mut self) {}
 }
 
 // ── Parser Factory ───────────────────────────────────────────────────────

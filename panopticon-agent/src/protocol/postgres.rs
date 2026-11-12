@@ -834,6 +834,48 @@ mod tests {
         }
     }
 
+    /// A Bind is paired with its statement's SQL only when the Parse was
+    /// seen: not for a statement prepared before capture, and not after
+    /// client bytes were lost (they may have re-Parsed the name with a
+    /// credential statement).
+    #[test]
+    fn test_bind_against_unseen_parse_exports_no_values() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let values = |r: Option<FsmResult>| match r {
+            Some(FsmResult::MessageComplete(m)) => vec![m.request_text],
+            Some(FsmResult::Messages(ms)) => ms.into_iter().map(|m| m.request_text).collect(),
+            _ => vec![],
+        };
+        let mut p = PostgresParser::new();
+        p.feed(
+            &extended_cycle(None, "s1", &["canary-bound"]),
+            Direction::Egress,
+            1,
+        );
+        assert!(matches!(
+            p.feed(&insert_done(), Direction::Ingress, 2),
+            ParseResult::NeedMoreData
+        ));
+
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Postgres);
+        let cycle = extended_cycle(Some(("s1", "SELECT $1")), "s1", &["x"]);
+        m.process_packet(1, Direction::Egress, &cycle, 1);
+        assert_eq!(
+            values(m.process_packet(1, Direction::Ingress, &insert_done(), 2)),
+            vec![Some("x".into())]
+        );
+        // Lost: Close s1, Parse s1 'ALTER ROLE app PASSWORD $1'.
+        m.skip_from(1, (0, 0), Direction::Egress, 60, 3);
+        let cycle = extended_cycle(None, "s1", &["canary-bound"]);
+        m.process_packet(1, Direction::Egress, &cycle, 4);
+        let out = values(m.process_packet(1, Direction::Ingress, &insert_done(), 5));
+        assert!(
+            out.iter().flatten().all(|v| !v.contains("canary")),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn test_long_query_with_multibyte_text_does_not_panic() {
         // 4096 lands inside a 2-byte character: byte slicing panicked.

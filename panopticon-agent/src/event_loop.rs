@@ -19,6 +19,7 @@ use aya::maps::{PerfEventArray, RingBuf};
 use bytes::BytesMut;
 #[cfg(target_os = "linux")]
 use panopticon_common::parse_data_event_bytes;
+use panopticon_common::scope::STREAM_OFF_UNKNOWN;
 use panopticon_common::{
     DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN,
     TCP_FLAG_RST, TLS_KEY_BIT, data_event_record_len, read_data_event_into,
@@ -1306,6 +1307,17 @@ fn feed_event(
     use crate::protocol::fsm::{CreateResult, SegmentVerdict};
 
     let payload = event.payload_bytes();
+    let src = sender_endpoint(event);
+    let seg = tcp_segment(event);
+    // TC: a SYN locates its side's first byte (before the parser exists,
+    // which is created on the first payload); a bare SYN on a tracked key
+    // is a new connection.
+    if let Some(s) = seg.filter(|s| s.syn)
+        && manager.note_syn(cookie, src, s.ack.is_some(), s.seq)
+    {
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+    let mut created = false;
     if !payload.is_empty()
         && !manager.contains(cookie)
         && let Some(proto) = guarded(stats, worker_id, || {
@@ -1316,9 +1328,11 @@ fn feed_event(
         let server = server_endpoint(event, proto, payload);
         match manager.get_or_create_with_server(cookie, proto, server) {
             CreateResult::Created => {
+                created = true;
                 stats.active_connections.fetch_add(1, Ordering::Relaxed);
             }
             CreateResult::CreatedWithEviction(evicted) => {
+                created = true;
                 // Created after evicting the oldest connections at capacity
                 let evicted = evicted as u64;
                 stats
@@ -1336,14 +1350,23 @@ fn feed_event(
         }
     }
 
-    let src = sender_endpoint(event);
-    let (gap, trim) = match tcp_segment(event)
-        .and_then(|seg| manager.admit_segment(cookie, src, event.direction, seg))
-    {
-        Some(SegmentVerdict::Drop) => return None,
-        Some(SegmentVerdict::Accept { gap, trim }) => (gap as usize, trim as usize),
-        None => (0, 0),
-    };
+    match seg {
+        // cgroup_skb: the kernel's stream offset locates the first byte.
+        Some(s) if event.cgroup_id != 0 && event.stream_off != STREAM_OFF_UNKNOWN => {
+            let origin = s.seq.wrapping_sub(event.stream_off as u32);
+            manager.note_origin(cookie, src, event.direction, origin);
+        }
+        Some(_) => {}
+        // TLS plaintext and UDP carry no stream position.
+        None if created => manager.mark_joined_late(cookie),
+        None => {}
+    }
+    let (gap, trim) =
+        match seg.and_then(|seg| manager.admit_segment(cookie, src, event.direction, seg)) {
+            Some(SegmentVerdict::Drop) => return None,
+            Some(SegmentVerdict::Accept { gap, trim }) => (gap as usize, trim as usize),
+            None => (0, 0),
+        };
     // A parser panic closes the connection instead of the worker.
     let panicked = || Some(FsmResult::Error("parser panicked".into()));
     let skip = |n: usize| {
@@ -2077,6 +2100,7 @@ mod tests {
         e.tcp_seq = seq;
         e.tcp_ack = ack;
         e.tcp_flags = flags | panopticon_common::TCP_FLAG_ACK;
+        e.stream_off = STREAM_OFF_UNKNOWN; // TC computes none
         e.payload[..payload.len()].copy_from_slice(payload);
         (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
         e
@@ -2099,6 +2123,156 @@ mod tests {
             }
         }
         (paths, ignored)
+    }
+
+    /// A Redis packet between CLI and SRV's address on port 6379, from the
+    /// client or the server, `ack` set to the peer's next byte.
+    fn redis_pkt(from_client: bool, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> DataEvent {
+        let srv = (SRV.0, 6379);
+        let mut e = tcp_pkt(CLI, seq, ack, flags, payload);
+        let (from, to) = if from_client { (CLI, srv) } else { (srv, CLI) };
+        (e.src_addr, e.src_port, e.dst_addr, e.dst_port) = (from.0, from.1, to.0, to.1);
+        e.direction = if from_client {
+            Direction::Ingress
+        } else {
+            Direction::Egress
+        };
+        e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, 6);
+        e
+    }
+
+    /// Feed events the way worker_task does; (method, reply text) of every
+    /// message completed.
+    fn run_redis(events: &[DataEvent]) -> Vec<(Option<String>, Option<String>)> {
+        let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
+        let mut out = vec![];
+        for e in events {
+            for r in feed_event(&m, e, connection_key(e), &stats, 0, false)
+                .into_iter()
+                .flatten()
+            {
+                match r {
+                    FsmResult::Messages(ms) => {
+                        out.extend(ms.into_iter().map(|m| (m.method, m.payload_text)))
+                    }
+                    FsmResult::MessageComplete(m) => out.push((m.method, m.payload_text)),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Redis replies line up with commands only when the parser saw each
+    /// direction from its first byte: proved by the SYN (TC) or by the
+    /// kernel's stream offset (cgroup_skb). A connection joined mid-pipeline,
+    /// or with bytes lost later, exports no reply text: the reply to an
+    /// `ACL GENPASS` sent before capture started is not exported under the
+    /// first command captured.
+    #[test]
+    fn redis_replies_need_a_stream_seen_from_its_start() {
+        use panopticon_common::TCP_FLAG_SYN;
+        let get = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+        let glen = get.len() as u32;
+        let genpass = b"$14\r\ncanary-genpass\r\n$1\r\nv\r\n";
+        let leaked = |out: &[(Option<String>, Option<String>)]| {
+            out.iter()
+                .any(|(_, t)| t.as_deref().is_some_and(|t| t.contains("canary")))
+        };
+        let syn = |e: DataEvent| {
+            let mut e = e;
+            e.tcp_flags &= !panopticon_common::TCP_FLAG_ACK;
+            e
+        };
+
+        // Joined mid-pipeline (no SYN): GENPASS's reply arrives first.
+        let out = run_redis(&[
+            redis_pkt(true, 1000, 5000, 0, get),
+            redis_pkt(false, 5000, 1000 + glen, 0, genpass),
+        ]);
+        assert!(!out.is_empty(), "the command is still exported");
+        assert!(!leaked(&out), "{out:?}");
+        assert!(out.iter().all(|(_, t)| t.is_none()), "{out:?}");
+
+        // Seen from the handshake: reply text is exported.
+        let handshake = [
+            syn(redis_pkt(true, 999, 0, TCP_FLAG_SYN, b"")),
+            redis_pkt(false, 4999, 1000, TCP_FLAG_SYN, b""),
+        ];
+        let mut evs = handshake.to_vec();
+        evs.push(redis_pkt(true, 1000, 5000, 0, get));
+        evs.push(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"));
+        let out = run_redis(&evs);
+        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
+
+        // Handshake seen, then client bytes lost (the GENPASS command).
+        let mut evs = handshake.to_vec();
+        evs.push(redis_pkt(true, 1000, 5000, 0, get));
+        evs.push(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"));
+        evs.push(redis_pkt(true, 1000 + glen + 40, 5007, 0, get));
+        evs.push(redis_pkt(false, 5007, 1040 + 2 * glen, 0, genpass));
+        let out = run_redis(&evs);
+        assert!(!leaked(&out), "{out:?}");
+
+        // Only the client's SYN seen: the server's stream start is unproven.
+        let mut evs = vec![handshake[0]];
+        evs.push(redis_pkt(true, 1000, 5000, 0, get));
+        evs.push(redis_pkt(false, 5000, 1000 + glen, 0, genpass));
+        assert!(!leaked(&run_redis(&evs)));
+
+        // cgroup_skb: the kernel's stream offset proves each side's start.
+        let with_off = |mut e: DataEvent, off: u64| {
+            e.cgroup_id = 7;
+            e.stream_off = off;
+            e
+        };
+        let out = run_redis(&[
+            with_off(redis_pkt(true, 1000, 5000, 0, get), 0),
+            with_off(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"), 0),
+        ]);
+        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
+        let out = run_redis(&[
+            with_off(redis_pkt(true, 1040, 5000, 0, get), 40),
+            with_off(redis_pkt(false, 5000, 1040 + glen, 0, genpass), 0),
+        ]);
+        assert!(!leaked(&out), "{out:?}");
+        let out = run_redis(&[
+            with_off(redis_pkt(true, 1000, 5000, 0, get), STREAM_OFF_UNKNOWN),
+            with_off(redis_pkt(false, 5000, 1000 + glen, 0, genpass), 0),
+        ]);
+        assert!(!leaked(&out), "{out:?}");
+    }
+
+    /// TLS plaintext carries no stream position: Redis replies over TLS
+    /// are exported without text.
+    #[test]
+    fn redis_over_tls_exports_no_reply_text() {
+        let m = ConnectionFsmManager::new(16);
+        let stats = EventStats::new();
+        let mut out = vec![];
+        for (dir, data) in [
+            (Direction::Egress, &b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..]),
+            (Direction::Ingress, b"$14\r\ncanary-genpass\r\n"),
+        ] {
+            let mut e: DataEvent = unsafe { std::mem::zeroed() };
+            e.event_type = EventType::TlsData;
+            e.direction = dir;
+            e.socket_cookie = 0x7000;
+            e.stream_off = STREAM_OFF_UNKNOWN;
+            e.payload[..data.len()].copy_from_slice(data);
+            (e.payload_len, e.orig_len) = (data.len() as u32, data.len() as u32);
+            for r in feed_event(&m, &e, connection_key(&e), &stats, 0, false)
+                .into_iter()
+                .flatten()
+            {
+                match r {
+                    FsmResult::Messages(ms) => out.extend(ms.into_iter().map(|m| m.payload_text)),
+                    FsmResult::MessageComplete(m) => out.push(m.payload_text),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(out, vec![None]);
     }
 
     #[test]

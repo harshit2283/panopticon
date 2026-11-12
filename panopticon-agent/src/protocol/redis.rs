@@ -35,6 +35,7 @@ enum State {
 /// nothing, `EXEC` answering every command queued since `MULTI`. Protocol
 /// and subscription state come only from the server's replies (`HELLO`'s
 /// reply, acknowledgement counts, `+RESET`). Whatever it cannot prove — a
+/// stream not seen from its first byte ([`ProtocolParser::joined_late`]), a
 /// reply with no pending command, `MONITOR`'s stream, `UNSUBSCRIBE` with
 /// no channel, `CLIENT REPLY OFF|SKIP` (no acknowledgement shows whether
 /// the server took them), a malformed `CLIENT REPLY`, `MULTI`, `EXEC`,
@@ -393,6 +394,12 @@ impl RedisParser {
 }
 
 impl ProtocolParser for RedisParser {
+    /// Replies pair with commands by order only: without the stream's
+    /// start, the first reply may answer a command sent before capture.
+    fn joined_late(&mut self) {
+        self.lose_correspondence();
+    }
+
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
         match direction {
             Direction::Egress => {

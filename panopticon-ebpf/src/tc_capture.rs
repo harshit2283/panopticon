@@ -182,8 +182,8 @@ fn try_tc_capture(ctx: &TcContext, direction: Direction) -> Result<i32, c_long> 
     // drop the connection's parser state at once instead of holding it
     // until the idle timeout (which, under connection churn, filled the
     // connection table). Same ring buffer as the data, so a close is never
-    // seen before the connection's last bytes. SYNs only in head_only mode,
-    // which counts each direction's bytes from them.
+    // seen before the connection's last bytes. SYNs too when the agent asks
+    // (it does): they locate each direction's first byte.
     if payload_len == 0
         && tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST) == 0
         && !(tcp_flags & TCP_FLAG_SYN != 0 && config_flag(CONFIG_TCP_SYN_EVENTS))

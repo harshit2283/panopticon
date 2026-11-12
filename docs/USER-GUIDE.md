@@ -468,11 +468,22 @@ any `CLIENT REPLY` other than `CLIENT REPLY ON`; `MULTI`, `EXEC`,
 `DISCARD` or `RESET` sent with arguments; `CLIENT`, `HELLO`, `MONITOR` or
 a subscription command queued inside `MULTI`; a transaction past 1024
 commands or 64 KiB. An `EXEC` whose
-`MULTI` came before capture started has its whole result masked. One case
-stays open: when capture starts while pipelined commands are still
-unanswered, the first replies are matched to the first commands
-captured, so the reply to an `ACL GENPASS` sent just before capture
-started can be exported under another command.
+`MULTI` came before capture started has its whole result masked.
+
+Replies are paired with commands by order, which is only safe when the
+agent saw both directions of the connection from their first byte. With
+the TC backend that is proved by the connection's SYN and SYN+ACK, with
+`cgroup_skb` by the kernel's stream offset; any bytes lost later (ring
+drops, capture cap) end the proof. Without it no Redis reply text is
+exported for the rest of the connection. That covers every connection
+already open when the agent started (pooled clients, until they
+reconnect), every TLS-captured Redis connection (TLS plaintext carries no
+stream position), and any connection whose SYN events were lost. The
+commands themselves are still exported. A reply that may answer a
+command sent before capture started, such as an `ACL GENPASS`, is
+therefore never exported under the first command captured. SQL bound
+values are exported only for a statement whose prepare was seen on the
+connection, after the last lost client byte.
 
 All of this applies in every privacy mode by default, `full` included,
 and with PII detection off (`[pii] enabled = false`). The raw dump
