@@ -399,16 +399,22 @@ exported:
   **request body** (e.g. POST JSON or form data) and the **response body**
   are scanned and redacted;
 - **credentials** are masked in every field whatever the protocol: the value
-  after `PASSWORD`, `IDENTIFIED BY`, `requirepass`, `masterauth` or
-  `password=` / `"password":`, and the arguments of a Redis `AUTH`.
+  after `PASSWORD` (also `*_PASSWORD`, such as `MASTER_PASSWORD` and
+  `SOURCE_PASSWORD`, and `SET PASSWORD FOR user =`), `IDENTIFIED BY`,
+  `IDENTIFIED WITH plugin AS`, `requirepass`, `masterauth` or `password=` /
+  `"password":`, the current password after `REPLACE`, and the arguments of
+  a Redis `AUTH`.
 
-Login secrets are masked in every privacy mode by default, `full` included:
-Redis `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET
-requirepass|masterauth|masteruser` and `ACL SETUSER` password rules; SQL
-`PASSWORD '…'` and `IDENTIFIED BY '…'` clauses (PostgreSQL, MySQL); the
-credential headers and `password=` values above. The raw dump (`full` mode,
-§5.5) always keeps them. The AMQP and Kafka SASL exchanges are never
-exported as events.
+Login secrets are masked in every privacy mode by default, `full` included,
+and with PII detection off (`[pii] enabled = false`): Redis `AUTH`,
+`HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET` and `SENTINEL SET`
+of `requirepass`, `masterauth`, `masteruser`, the TLS key passphrases and
+`auth-pass`, `ACL SETUSER` password rules, and the replies to `CONFIG GET`
+(those parameters' values) and `ACL LIST|GETUSER|GENPASS` (the whole
+reply); the SQL clauses above (PostgreSQL, MySQL), also in server error
+messages that quote the statement; the credential headers and `password=`
+values above. The raw dump (`full` mode, §5.5) always keeps them. The AMQP
+and Kafka SASL exchanges are never exported as events.
 
 To export login secrets too, `full` mode accepts:
 
