@@ -140,7 +140,7 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
 pub use secrets::{
-    FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
+    STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
     withheld_statement,
 };
 
@@ -149,8 +149,8 @@ pub use secrets::{
 // `set_mask_credentials`; only ever flipped false -> true at runtime.
 static MASK_CREDENTIALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether login secrets (Redis AUTH, SQL PASSWORD clauses, credential
-/// headers, `password=` values) are masked before any sink. `[privacy]
+/// Whether login secrets (Redis AUTH, SQL credential statements, credential
+/// headers, fields with credential context) are protected before any sink. `[privacy]
 /// mask_credentials`, default true; false is only allowed in `full` mode.
 pub fn mask_credentials_enabled() -> bool {
     MASK_CREDENTIALS.load(std::sync::atomic::Ordering::Relaxed)
@@ -199,7 +199,7 @@ pub fn export_error_text(text: String, statement_withheld: bool) -> String {
 }
 
 /// [`protect_text`] in place: credential values masked, or the field
-/// replaced by [`FIELD_WITHHELD`].
+/// replaced by [`secrets::FIELD_WITHHELD`].
 pub fn protect_text_in(text: &mut String) {
     if let Some(out) = protect_text(text) {
         zeroize::Zeroize::zeroize(text);

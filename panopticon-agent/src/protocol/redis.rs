@@ -357,10 +357,8 @@ impl RedisParser {
                 return Some(msg);
             }
             Expect::Monitor => self.lose_correspondence(),
-            Expect::Hello(version) if !matches!(value, RespValue::Error(_)) => {
-                if let Some(v) = version {
-                    self.resp3 = *v == 3;
-                }
+            Expect::Hello(Some(v)) if !matches!(value, RespValue::Error(_)) => {
+                self.resp3 = *v == 3;
             }
             Expect::Reset if !matches!(value, RespValue::Error(_)) => {
                 self.resp3 = false;
