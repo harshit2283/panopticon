@@ -83,6 +83,8 @@ SP=$!
 CONF=$OUT/load.toml
 {
   [[ -n ${TOML:-} ]] && printf '%s\n' "$TOML"
+  # Loopback is dropped by default on cgroup_skb (capture_loopback).
+  [[ ${LOOPBACK:-0} == 1 && ${BACKEND:-} == cgroup_skb ]] && echo "capture_loopback = true"
   case ${SCOPE:-} in
     "") ;;
     server) echo "pid_filter = [$SP]" ;;

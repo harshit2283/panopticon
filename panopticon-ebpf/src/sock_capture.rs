@@ -30,17 +30,17 @@ use aya_ebpf::{
     programs::{FEntryContext, FExitContext, SkBuffContext, SockContext, SockOpsContext},
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_HEAD_BYTES, CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD,
-    CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, DataEvent, Direction, EventType,
-    MAX_PAYLOAD_SIZE, TlsLibrary,
+    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_PID_CREATOR_RULE,
+    CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN,
+    CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary,
     scope::{
-        ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_NO_BASELINE,
-        DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE, FLAG_KTLS, FLAG_REPAIRED,
-        FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY, OWNER_LISTED, SCOPE_HEAD,
-        SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict,
-        drop_reason, head_take, in_sample, is_initialised, is_unscoped_full, pid_inputs,
-        reserved_take, role_of, stream_offset, tls_addr_in_scope, udp_should_reserve, verdict,
-        verdict_cacheable, verdict_word,
+        ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
+        DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE,
+        FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY,
+        OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState,
+        VERDICT_IN, cached_verdict, drop_reason, head_take, in_sample, is_initialised,
+        is_unscoped_full, local_packet, pid_inputs, reserved_take, role_of, stream_offset,
+        tls_addr_in_scope, udp_should_reserve, verdict, verdict_cacheable, verdict_word,
     },
 };
 
@@ -164,6 +164,14 @@ pub(crate) fn armed() -> bool {
 #[inline(always)]
 pub(crate) fn tls_capture_on() -> bool {
     cfg(CONFIG_CAPTURE_ENABLED) != 0 && (is_unscoped_full(scope_mode()) || armed())
+}
+
+/// `capture_loopback` (`CONFIG_CAPTURE_LOOPBACK`, DESIGN §3.7): packets
+/// and close records only. A reader whose result is stamped into an event
+/// reads the generation first.
+#[inline(always)]
+pub(crate) fn capture_loopback() -> bool {
+    cfg(CONFIG_CAPTURE_LOOPBACK) != 0
 }
 
 #[inline(always)]
@@ -489,8 +497,11 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     // Capture on (and armed outside unscoped full): a completed disarm or
     // `capture_enabled = false` leaves generation and verdicts as they were,
     // so the scope check alone would still authorise a close.
+    // Loopback off (§3.7): a socket that ever had a local packet sends no
+    // close (it carries the tuple), by its sticky flag, never its addresses.
     let authorised = rd!(st, emitted) != 0
         && tls_capture_on()
+        && (capture_loopback() || rd!(st, local) == 0)
         && (is_unscoped_full(scope_mode())
             || tls_addr_in_scope(
                 cookie,
@@ -753,7 +764,7 @@ struct Packet {
 
 const ETH_P_IP_BE: u32 = (0x0800u16).to_be() as u32;
 
-/// Order per packet (§3): eligibility, initialisation, (UDP head
+/// Order per packet (§3): eligibility, loopback, initialisation, (UDP head
 /// reservation), verdict, kTLS, head cut, copy and emit.
 #[inline(always)]
 fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
@@ -792,9 +803,35 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     if pkt.payload_len == 0 {
         return Ok(()); // no data; the socket's end comes from STATE_CB
     }
+    // ── loopback (§3.7): a data packet on a node-local path (`lo` in any
+    // namespace: 127/8, the host's or the pod's own address; VRF local
+    // delivery; a device-bound socket on its device; a socket already
+    // marked), which TC on the NIC never saw (IPv6, ::1 included, is not
+    // captured, above). The socket is marked whatever the setting, so
+    // turning capture off later drops it whole and suppresses its close.
+    // The generation is read before the setting: an event carries `g0`
+    // (unscoped) or is dropped if its verdict's generation is not `g0`
+    // (restricted), so a packet that passed this check before a narrowing
+    // is refused at the ring read.
+    let bound = unsafe { (*sk).bound_dev_if };
     let sk = sk as *mut c_void;
-    let mode = scope_mode();
     let st = state_of(sk, false);
+    let g0 = scope_gen();
+    let marked = !st.is_null() && rd!(st, local) != 0;
+    let lo = local_packet(
+        unsafe { (*skb).ifindex },
+        direction == Direction::Ingress,
+        unsafe { (*skb).pkt_type },
+        bound,
+        marked,
+    );
+    if lo && !marked && !st.is_null() {
+        wr!(st, local, 1);
+    }
+    if lo && !capture_loopback() {
+        return drop(DROP_LOOPBACK);
+    }
+    let mode = scope_mode();
 
     // ── initialisation
     let cookie = unsafe { bpf_get_socket_cookie(skb as *mut c_void) };
@@ -819,7 +856,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
                 pkt: &pkt,
                 take: pkt.payload_len,
                 stream_off: off,
-                scope_gen: scope_gen(),
+                scope_gen: g0,
             },
         );
     }
@@ -854,6 +891,11 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Ok(g) => g,
         Err(reason) => return drop(reason),
     };
+    // The loopback setting was read under `g0`; a later generation may
+    // have turned it off.
+    if lo && g != g0 {
+        return drop(DROP_LOOPBACK);
+    }
 
     // ── kTLS: the payload may be plaintext at this hook (§3.5). After the
     // verdict, so an in-scope kTLS socket has its IN verdict cached (its TLS
@@ -932,14 +974,18 @@ fn scope_verdict(st: *mut SockState, sk: *mut c_void, mode: u64) -> Result<u32, 
             let epoch = cfg(CONFIG_PID_EPOCH) as u32;
             // acceptor_tgid first: the accept hook writes it after the bits.
             let acceptor_tgid = rd!(st, acceptor_tgid);
+            let flags = rd!(st, flags);
             let inputs = SockState {
                 acceptor_tgid,
                 pid_epoch: rd!(st, pid_epoch),
                 pid_bits: rd!(st, pid_bits),
                 owner_tgid: rd!(st, owner_tgid),
+                flags,
                 ..SockState::default()
             };
-            let (listed, owner_known) = pid_inputs(&inputs, epoch);
+            // The listener rule, read after g1 like every input (§3.1).
+            let creator = cfg(CONFIG_PID_CREATOR_RULE) != 0;
+            let (listed, owner_known) = pid_inputs(&inputs, epoch, creator);
             let cgroup_in = mode & SCOPE_SEL_CGROUP != 0 && sk_cgroup_selected(sk);
             let sampled_in = mode & SCOPE_SAMPLE == 0
                 || in_sample(rd!(st, sample), cfg(CONFIG_SAMPLE_THRESHOLD));
@@ -953,7 +999,7 @@ fn scope_verdict(st: *mut SockState, sk: *mut c_void, mode: u64) -> Result<u32, 
                     drop_reason(v)
                 });
             }
-            if verdict_cacheable(v, mode, rd!(st, flags), acceptor_tgid) {
+            if verdict_cacheable(v, mode, flags, acceptor_tgid) {
                 wr!(st, verdict_word, verdict_word(g1, v));
             }
             v

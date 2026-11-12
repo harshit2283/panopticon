@@ -1002,7 +1002,8 @@ the default. Raw per-run outputs are kept with the study notes.
 
 The `cgroup_skb` backend attaches to the root of the cgroup v2 hierarchy, so
 it runs at every local socket on the node: both ends of a node-local
-connection, loopback included, which TC on an interface never sees. Scope
+connection, loopback included (with `capture_loopback = true`; dropped
+by default), which TC on an interface never sees. Scope
 (`pid_filter`, `cgroup_filter`, `sampling_mode`) is decided in the kernel per
 socket, and always-on hooks keep the per-socket state: `cgroup/sock_create`,
 `sockops`, fexit `inet_csk_accept`, and the kTLS key-install markers on
@@ -1066,7 +1067,8 @@ clearing each record's unused bytes; the other four kernels were not re-run.
 - **No measurable effect on the application at this rate** on any kernel: the
   client p50 and the server's CPU per request overlap with TC's.
 
-**Loopback (node-local) traffic.** The same load over 127.0.0.1. TC runs no
+**Loopback (node-local) traffic.** The same load over 127.0.0.1, with
+`capture_loopback = true` (`LOOPBACK=1` sets it). TC runs no
 program on it; only the TLS address hooks below run, 0.17-0.25 µs per
 request.
 
@@ -1184,15 +1186,18 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   a listed process's `accept()` returns, and bytes before that are dropped
   (`no_owner`): 44% of requests under connection churn, and 0.5% at 4K
   connections opening at 20K req/s. With the server's listener created after
-  the agent started (`SERVER_LATE=1`), the same cells measured 100%. In the
+  the agent started (`SERVER_LATE=1`), the same cells measured 100% under
+  the creator rule, the only rule then (now `pid_filter_listener =
+  "creator"`); under the default `"acceptor"` every listener has the gap. In the
   runs above a whole keep-alive connection was also lost now and then (1 of
   64 in 6 of 27 runs): the kernel can hand a connection to `accept()` before
   its ESTABLISHED callback runs, and that callback cleared the recorded
   acceptor. That is fixed.
 
 **`pid_filter` recall, listener before and after the agent** (7.0, 32 vCPUs,
-n=3, median [min-max], after the `accept()` ordering fix). `SERVER_LATE=0` is
-the server's listener created before the agent, `SERVER_LATE=1` after:
+n=3, median [min-max], after the `accept()` ordering fix, creator rule, now
+`pid_filter_listener = "creator"`). `SERVER_LATE=0` is the server's listener
+created before the agent, `SERVER_LATE=1` after:
 
 | Cell | TC `pid_filter` | cgroup_skb, `SERVER_LATE=0` | cgroup_skb, `SERVER_LATE=1` | `no_owner` drops (cgroup_skb, `SERVER_LATE=0`) |
 |---|---|---|---|---|
@@ -1210,8 +1215,8 @@ predates it, because it cannot prove which processes can accept on it (a
 socket can be held through io_uring registered files, a queued
 `SCM_RIGHTS` message or a kernel service, none of which `/proc` shows
 completely). For full `pid_filter` recall on cgroup_skb, restart the server
-after the agent, or select by `cgroup_filter` / `pod_filter`, which has no
-such gap.
+after the agent and set `pid_filter_listener = "creator"`, or select by
+`cgroup_filter` / `pod_filter`, which has no such gap.
 
 **Compact records** (7.0, 32 vCPUs, same rig and settings as the sustained
 runs, three interleaved runs of each binary: before = fixed 4,168-byte
@@ -1368,7 +1373,8 @@ sudo NO_AGENT=1 tests/load/run_load.sh 4096 20s 20000
 # The cgroup_skb backend: unscoped, scoped to the server (pid_filter), with
 # every packet out of scope, and over loopback (node-local traffic).
 # SCOPE also takes cgroup, head and sample; SERVER_LATE=1 creates the
-# server's listener after the agent starts.
+# server's listener after the agent starts (add
+# TOML='pid_filter_listener = "creator"' for the recall table above).
 sudo BACKEND=cgroup_skb tests/load/run_load.sh 64 15s 5000
 sudo BACKEND=cgroup_skb SCOPE=server tests/load/run_load.sh 64 15s 5000
 sudo BACKEND=cgroup_skb SCOPE=other tests/load/run_load.sh 64 15s 5000

@@ -126,7 +126,8 @@ for run in $RUNS; do
   esac
   if [[ $BACKEND == cgroup_skb ]]; then
     start_servers
-    capture=$'[capture]\nbackend = "cgroup_skb"\n\n'
+    # The TLS leg runs over 127.0.0.1: capture loopback (off by default).
+    capture=$'capture_loopback = true\n\n[capture]\nbackend = "cgroup_skb"\n\n'
     iface=()
   else
     capture=

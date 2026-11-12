@@ -105,6 +105,8 @@ All keys are optional. Example with the defaults:
 capture_enabled = true
 interfaces = []                     # [] = auto-detect default-route interface(s)
 # pid_filter = [1234, 5678]         # default: unset (every process); see "Capture scope" below
+# capture_loopback = false          # cgroup_skb backend only; see "Capture scope" below
+# pid_filter_listener = "acceptor"  # cgroup_skb backend only: "acceptor" | "creator"
 sampling_mode = "full"              # "full" | "connection_sample" | "head_only"
 # sample_rate = 0.1                 # connection_sample only, and required there
 # head_only_bytes = 4096            # head_only only (default 4096)
@@ -177,22 +179,38 @@ running config is kept.
     captured. The filter does not follow process trees: list them and
     restart the agent.
   - With the `cgroup_skb` backend the decision is made in the kernel, per
-    connection, and differs in two ways:
-    - A listening socket created by a listed process while the agent runs
-      selects every connection accepted on it, whoever accepts it: a worker
-      the listed process forks later, a process that received the socket
-      (`SCM_RIGHTS`, `pidfd_getfd`) or has since exec'd another program, and
-      after the listed process has exited. List only processes whose
-      listening sockets you want captured.
+    connection, and differs as follows. A connection a process accepted is
+    selected by `pid_filter_listener`:
+    - `"acceptor"` (the default): only if a listed process `accept()`ed it.
+      A listening socket of a listed process selects nothing that an
+      unlisted process accepts (a worker it forks later, a process it passes
+      the socket to). The connection is captured from the moment the
+      `accept()` returns; bytes that arrive before that are dropped (no
+      packets are held) and counted in
+      `panopticon_scope_dropped_events_total{reason="out_of_scope"}` (or
+      `"no_owner"`). Measured (docs/BENCHMARKS.md, pre-agent listener,
+      which behaves the same): 56.6% of requests captured with a new
+      connection per request, about 100% with keep-alive connections,
+      which lose only those first bytes.
+      The rule governs packet capture only: TLS plaintext (uprobes) is
+      captured when the calling process is listed, whichever process
+      accepted the socket.
+    - `"creator"`: also if a listed process created the listening socket
+      while the agent ran. Then it selects every connection accepted on it,
+      from the first byte, whoever accepts it: a worker the listed process
+      forks later, a process that received the socket (`SCM_RIGHTS`,
+      `pidfd_getfd`) or has since exec'd another program, and after the
+      listed process has exited. List only processes whose listening
+      sockets you want captured.
     - On a listening socket that existed before the agent started (any
-      server not restarted since the agent was), a connection is captured
-      only from the moment a listed process `accept()`s it; bytes that
-      arrive before that are dropped (no packets are held) and counted in
-      `panopticon_scope_dropped_events_total{reason="no_owner"}`. With a new
-      connection per request that lost nearly half the requests in the
-      measured benchmark (docs/BENCHMARKS.md).
-      For full recall, restart the server after the agent, or select by
-      `cgroup_filter` / `pod_filter`, which has no such gap.
+      server not restarted since the agent was), both rules capture a
+      connection only from the moment a listed process `accept()`s it, with
+      the same drop before that (`no_owner`).
+    For full recall with connection-per-request servers, select by
+    `cgroup_filter` / `pod_filter`, which has no such gap, or set
+    `pid_filter_listener = "creator"` and restart the server after the
+    agent. Connections a listed process opens
+    (clients) are selected by their creator under both rules.
 - `sampling_mode = "connection_sample"` with `sample_rate = r` (required,
   0.0 to 1.0): each connection is captured whole or not at all, decided once
   from a keyed hash of the connection (the key is drawn at agent start, so
@@ -219,16 +237,41 @@ running config is kept.
   that reuses the library object of an earlier one in the same process
   continues that one's count.
 
+- `capture_loopback = false` (the default, `cgroup_skb` backend only):
+  packets that stay on the node through the loopback device are not
+  captured, as on the TC backend, which never sees them. That is
+  `127.0.0.0/8`, and connections to one of the host's own addresses (or,
+  in a pod, the pod's own address), which the kernel also sends over
+  `lo`; IPv6 packets are not captured on either backend. Local traffic
+  inside a VRF is node-local too and dropped. The kernel program cannot
+  tell a VRF device from a NIC, so a socket bound to a network device
+  (`SO_BINDTODEVICE`) is treated as node-local when it uses that device
+  and is dropped whole, remote traffic included; and a socket that once
+  carried node-local traffic stays dropped (an unconnected UDP socket
+  that talked to a local and a remote peer). Set `capture_loopback =
+  true` if you need those. Same-node pod-to-pod and host-to-pod
+  traffic over veth or a bridge is not loopback and is captured. Dropped
+  packets are counted in
+  `panopticon_scope_dropped_events_total{reason="loopback"}`. It covers
+  packets only: TLS plaintext (uprobes) of a loopback connection is
+  captured per `pid_filter` / cgroup selection like any other, as on TC
+  (in a scoped mode without its addresses, while loopback packets are
+  dropped). Set it to `true` to capture app-to-local-database and
+  sidecar packets.
+
 An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
-`head_only_bytes` without `head_only` stop the agent with an error.
+`head_only_bytes` without `head_only` stop the agent with an error, and so
+do `capture_loopback` or `pid_filter_listener` with the TC backend.
 
 `SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3)
 and, with the `cgroup_skb` backend, changes to cgroup selection: a reload may
 change `cgroup_filter` / `pod_filter`, switch from one to the other, or
 combine them, but turning cgroup selection on or off altogether (going from
-neither to either, or back) needs a restart. A reload that narrows the
-selection is reported applied only once nothing captured under the old scope
-can still leave the agent. Restart the agent for anything else. Unknown keys are ignored silently
+neither to either, or back) needs a restart. It may also change
+`capture_loopback` and `pid_filter_listener`. A reload that narrows the
+selection (a cgroup or pod removed, `capture_loopback` turned off,
+`pid_filter_listener` from `"creator"` to `"acceptor"`) is reported applied
+only once nothing captured under the old scope can still leave the agent. Restart the agent for anything else. Unknown keys are ignored silently
 (except inside `[privacy]`, where they are an error), so check spelling.
 
 ### 4.3 Privacy modes

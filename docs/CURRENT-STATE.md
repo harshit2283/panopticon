@@ -64,16 +64,25 @@ production-hardened compliance platform.
   and agent CPU at 64 keep-alive connections, and at 1K uses slightly less agent CPU
   than TC with no kernel ring drops (records are sized to what they carry),
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
-  loopback and both ends of node-local connections, about twice the events
-  and agent CPU. `pid_filter` matches TC's recall only for a server whose
-  listener was created after the agent started. On a listener that predates
+  both ends of node-local connections, about twice the events and agent
+  CPU; node-local packets (127/8, the host's own address, VRF-local
+  traffic, and conservatively any socket bound to a device) only with
+  `capture_loopback = true` (default false, as TC never saw them; TLS
+  plaintext over loopback is scoped by process either way, as on TC). `pid_filter` matches TC's
+  recall only for a server whose listener was created after the agent
+  started, with `pid_filter_listener = "creator"`; under the default
+  `"acceptor"` every listener loses the bytes before `accept()`, like a
+  pre-agent listener. On a listener that predates
   the agent (any server not restarted since), a connection is captured from
   the moment a listed process accepts it, and earlier bytes are dropped:
   56.6% recall with a new connection per request (TC 100%), 100% with
-  keep-alive connections. Restart the server after the agent, or use
-  `cgroup_filter` / `pod_filter`, which has no such gap. A listener created
-  by a listed process selects every connection accepted on it, also by
-  processes not in the list (docs/USER-GUIDE.md).
+  keep-alive connections. Use `cgroup_filter` / `pod_filter`, which has
+  no such gap, or `pid_filter_listener = "creator"` with the server
+  restarted after the agent. Under
+  `"creator"`, a listener created by a listed process selects every
+  connection accepted on it, also by processes not in the list; under
+  `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
+  Both settings change on reload.
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 

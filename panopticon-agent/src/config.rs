@@ -33,6 +33,45 @@ pub enum CaptureBackend {
     CgroupSkb,
 }
 
+/// `pid_filter_listener`: which process of an accepted (server) connection
+/// `pid_filter` selects it by (DESIGN §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListenerRule {
+    /// Only the process that accepted it is listed (the default).
+    #[default]
+    Acceptor,
+    /// Its acceptor, or the process that created its listener while the
+    /// agent ran, is listed.
+    Creator,
+}
+
+/// The scope settings a reload may change in either direction besides the
+/// cgroup selectors (cgroup_skb backend): kernel `CONFIG` values, applied
+/// by the scope publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScopeOptions {
+    /// `capture_loopback` (`CONFIG_CAPTURE_LOOPBACK`).
+    pub capture_loopback: bool,
+    /// `pid_filter_listener = "creator"` (`CONFIG_PID_CREATOR_RULE`).
+    pub creator_rule: bool,
+}
+
+impl ScopeOptions {
+    pub fn of(config: &AgentConfig) -> Self {
+        Self {
+            capture_loopback: config.capture_loopback,
+            creator_rule: config.pid_filter_listener == ListenerRule::Creator,
+        }
+    }
+
+    /// Whether moving to `to` takes scope away (a narrowing, DESIGN §3):
+    /// loopback capture turned off, or the creator rule replaced by the
+    /// acceptor rule. Either can stop a connection that was captured.
+    pub fn narrows_to(self, to: Self) -> bool {
+        (self.capture_loopback && !to.capture_loopback) || (self.creator_rule && !to.creator_rule)
+    }
+}
+
 /// Default `head_only_bytes`.
 pub const DEFAULT_HEAD_ONLY_BYTES: u64 = 4096;
 /// Upper bound for `head_only_bytes`: keeps TCP stream offsets far from
@@ -171,6 +210,13 @@ pub struct AgentConfig {
     /// `[[pod_filter]]`: pods on this node whose pod-level cgroup is
     /// captured (DESIGN §3.2). cgroup_skb backend only. Restart-only for now.
     pub pod_filter: Option<Vec<PodFilter>>,
+    /// `capture_loopback` (default false): capture packets on node-local
+    /// paths (`lo`, VRF; DESIGN §3.7). TLS plaintext is scoped by process regardless.
+    /// cgroup_skb backend only. A reload may change it.
+    pub capture_loopback: bool,
+    /// `pid_filter_listener` (default `"acceptor"`, DESIGN §3.1). cgroup_skb
+    /// backend only. A reload may change it.
+    pub pid_filter_listener: ListenerRule,
     /// `[capture] backend`. Restart-only.
     pub capture_backend: CaptureBackend,
     /// `[capture] cgroup2_path`: the cgroup v2 root the cgroup_skb backend
@@ -283,6 +329,8 @@ impl Default for AgentConfig {
             pid_filter: None,
             cgroup_filter: None,
             pod_filter: None,
+            capture_loopback: false,
+            pid_filter_listener: ListenerRule::Acceptor,
             capture_backend: CaptureBackend::Tc,
             cgroup2_path: "auto".into(),
 
@@ -473,6 +521,8 @@ pub struct AgentConfigFile {
     pub pid_filter: Option<Vec<u32>>,
     pub cgroup_filter: Option<Vec<String>>,
     pub pod_filter: Option<Vec<PodFilterFile>>,
+    pub capture_loopback: Option<bool>,
+    pub pid_filter_listener: Option<String>,
     pub capture: Option<CaptureConfigFile>,
     pub max_events_per_sec: Option<u64>,
     pub max_worker_count: Option<usize>,
@@ -692,6 +742,25 @@ impl AgentConfigFile {
             if let Some(path) = capture.cgroup2_path {
                 base.cgroup2_path = path;
             }
+        }
+        if let Some(v) = self.capture_loopback {
+            base.capture_loopback = v;
+        }
+        match self.pid_filter_listener.as_deref() {
+            None => {}
+            Some("acceptor") => base.pid_filter_listener = ListenerRule::Acceptor,
+            Some("creator") => base.pid_filter_listener = ListenerRule::Creator,
+            Some(other) => anyhow::bail!(
+                "pid_filter_listener = \"{other}\" is not valid; use \"acceptor\" or \"creator\""
+            ),
+        }
+        if (self.capture_loopback.is_some() || self.pid_filter_listener.is_some())
+            && base.capture_backend != CaptureBackend::CgroupSkb
+        {
+            anyhow::bail!(
+                "capture_loopback and pid_filter_listener need [capture] backend = \"cgroup_skb\"; \
+                 they are kernel scope settings of that backend"
+            );
         }
         if let Some(v) = self.max_events_per_sec {
             base.max_events_per_sec = v;
@@ -1535,6 +1604,67 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    #[test]
+    fn scope_options_config() {
+        const CG: &str = "[capture]\nbackend = \"cgroup_skb\"\n";
+        let load = |toml: &str| load_config_from_str(&format!("{toml}{CG}"));
+        // Defaults: loopback dropped, acceptor rule.
+        let d = load("").unwrap();
+        assert_eq!(ScopeOptions::of(&d), ScopeOptions::default());
+        assert_eq!(d.pid_filter_listener, ListenerRule::Acceptor);
+        let c = load("capture_loopback = true\npid_filter_listener = \"creator\"\n").unwrap();
+        let wide = ScopeOptions {
+            capture_loopback: true,
+            creator_rule: true,
+        };
+        assert_eq!(ScopeOptions::of(&c), wide);
+        assert_eq!(
+            load("pid_filter_listener = \"acceptor\"\n")
+                .unwrap()
+                .pid_filter_listener,
+            ListenerRule::Acceptor
+        );
+        let e = load("pid_filter_listener = \"owner\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("acceptor") && e.contains("creator"), "{e}");
+        // Refused with the tc backend, even at their defaults.
+        for toml in [
+            "capture_loopback = false\n",
+            "pid_filter_listener = \"acceptor\"\n",
+        ] {
+            let e = load_config_from_str(toml).unwrap_err().to_string();
+            assert!(e.contains("cgroup_skb"), "{toml}: {e}");
+        }
+        // Both reload; turning either off is a narrowing, on a widening.
+        assert_eq!(check_restart_only(&d, &c), Ok(()));
+        assert!(!ScopeOptions::default().narrows_to(wide));
+        assert!(wide.narrows_to(ScopeOptions::default()));
+        for one in [
+            ScopeOptions {
+                capture_loopback: true,
+                creator_rule: false,
+            },
+            ScopeOptions {
+                capture_loopback: false,
+                creator_rule: true,
+            },
+        ] {
+            assert!(wide.narrows_to(one) && !one.narrows_to(wide));
+            assert!(!one.narrows_to(one));
+        }
+        // One widened and one narrowed: a narrowing.
+        let lo = ScopeOptions {
+            capture_loopback: true,
+            creator_rule: false,
+        };
+        let cr = ScopeOptions {
+            capture_loopback: false,
+            creator_rule: true,
+        };
+        assert!(lo.narrows_to(cr) && cr.narrows_to(lo));
     }
 
     fn privacy(toml: &str) -> anyhow::Result<AgentConfig> {

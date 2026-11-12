@@ -437,12 +437,13 @@ async fn main() -> Result<()> {
             admission_floor,
         );
 
-        // 7b. The scope publisher (cgroup selector only): reloads,
-        //     Kubernetes pod changes and the net_cls watch.
+        // 7b. The scope publisher (cgroup_skb backend): reloads of the
+        //     cgroup selectors and the scope options, Kubernetes pod changes
+        //     and (cgroup selector only) the net_cls watch.
         let cgroup_selector =
             loader::scope_config(&agent_config).0 & panopticon_common::scope::SCOPE_SEL_CGROUP != 0;
-        let (scope_tx, publisher_handle) = match (&cgroup_root, cgroup_selector) {
-            (Some(root), true) => {
+        let (scope_tx, publisher_handle) = match &cgroup_root {
+            Some(root) => {
                 let mut publisher = scope_publisher::Publisher::new(
                     scope_publisher::AyaMaps(Arc::clone(&shared_ebpf)),
                     Arc::clone(&scope),
@@ -451,6 +452,7 @@ async fn main() -> Result<()> {
                     std::env::var("NODE_NAME").ok().filter(|n| !n.is_empty()),
                     agent_config.cgroup_filter.as_deref().unwrap_or_default(),
                     agent_config.pod_filter.as_deref().unwrap_or_default(),
+                    config::ScopeOptions::of(&agent_config),
                 )
                 .context("cannot start the scope publisher")?;
                 // The first reconciliation (pods may have changed since
@@ -464,13 +466,15 @@ async fn main() -> Result<()> {
                 // §3.2: the cgroup selector stops admitting if a v1
                 // net_cls/net_prio hierarchy appears at runtime (refused at
                 // startup already).
-                scope_select::spawn_net_cls_watch(tx.clone());
+                if cgroup_selector {
+                    scope_select::spawn_net_cls_watch(tx.clone());
+                }
                 (
                     Some(tx),
                     Some(tokio::spawn(scope_publisher::run(publisher, rx))),
                 )
             }
-            _ => (None, None),
+            None => (None, None),
         };
         // 8. HTTP server (health, metrics, debug endpoints).
         //    Probes are attached at this point, so the agent is ready; the flag
@@ -576,13 +580,18 @@ async fn main() -> Result<()> {
                                     Ok(())
                                 }
                             });
-                            // cgroup_filter / pod_filter: the scope publisher
+                            // cgroup_filter / pod_filter, capture_loopback,
+                            // pid_filter_listener: the scope publisher
                             // applies the change (a narrowing revokes the
                             // capture pipeline) and replies once applied; it
-                            // rejects selectors that do not resolve.
+                            // rejects selectors that do not resolve. The
+                            // options can only differ on cgroup_skb (they
+                            // are refused on tc), where it runs.
                             let running = config_swap.load_full();
+                            let options = config::ScopeOptions::of(&new_config);
                             let rescope = running.cgroup_filter != new_config.cgroup_filter
-                                || running.pod_filter != new_config.pod_filter;
+                                || running.pod_filter != new_config.pod_filter
+                                || config::ScopeOptions::of(&running) != options;
                             let check = match (check, rescope, &reload_scope_tx) {
                                 (Ok(()), true, Some(tx)) => {
                                     let (reply, applied) = tokio::sync::oneshot::channel();
@@ -590,6 +599,7 @@ async fn main() -> Result<()> {
                                         .send(scope_publisher::ScopeMsg::Reload {
                                             cgroup_filter: new_config.cgroup_filter.clone(),
                                             pod_filter: new_config.pod_filter.clone(),
+                                            options,
                                             reply,
                                         })
                                         .await;

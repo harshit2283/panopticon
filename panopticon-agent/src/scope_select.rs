@@ -16,7 +16,7 @@ use anyhow::Result;
 use anyhow::bail;
 use tracing::warn;
 
-use crate::config::{PodFilter, PodSelect};
+use crate::config::{PodFilter, PodSelect, ScopeOptions};
 use crate::k8s::model::PodRecord;
 
 /// Directory levels below the cgroup2 root searched for pod directories.
@@ -369,6 +369,9 @@ pub trait AllowMap {
     fn insert(&mut self, id: u64) -> Result<()>;
     fn remove(&mut self, id: u64) -> Result<()>;
     fn bump_gen(&mut self) -> Result<()>;
+    /// Write `capture_loopback` and `pid_filter_listener` to `CONFIG`
+    /// (`CONFIG_CAPTURE_LOOPBACK`, `CONFIG_PID_CREATOR_RULE`).
+    fn set_options(&mut self, options: ScopeOptions) -> Result<()>;
     /// The ids in `CGROUP_ALLOW` now.
     fn ids(&mut self) -> Result<BTreeSet<u64>>;
     /// `CONFIG_SCOPE_GEN` now.
@@ -394,21 +397,30 @@ impl AllowDiff {
     }
 }
 
-/// Move `CGROUP_ALLOW` from `current` to `new` in the design's order:
-/// deletes, then inserts, then one `CONFIG_SCOPE_GEN` increment if anything
-/// changed (§3). A failed write still bumps the generation when an earlier
-/// write changed the map, so a delete that went through is never hidden
-/// behind a verdict cached under the old generation; the error is returned.
+/// Move `CGROUP_ALLOW` from `current` to `new`, and write `options` if
+/// given (they changed), in the design's order: deletes, the options, then
+/// inserts, then one `CONFIG_SCOPE_GEN` increment if anything changed (§3).
+/// The bump invalidates every cached verdict, so a changed listener rule
+/// is applied to every socket's next packet. A failed write still bumps the
+/// generation when an earlier write changed the map or an option write was
+/// attempted, so a change that went through is never hidden behind a
+/// verdict cached under the old generation; the error is returned.
 pub fn publish(
     map: &mut dyn AllowMap,
     current: &BTreeSet<u64>,
     new: &BTreeSet<u64>,
+    options: Option<ScopeOptions>,
 ) -> Result<AllowDiff> {
     let mut diff = AllowDiff::default();
+    let mut wrote_options = false;
     let mut write = || -> Result<()> {
         for &id in current.difference(new) {
             map.remove(id)?;
             diff.removed.push(id);
+        }
+        if let Some(o) = options {
+            wrote_options = true;
+            map.set_options(o)?;
         }
         for &id in new.difference(current) {
             map.insert(id)?;
@@ -417,7 +429,7 @@ pub fn publish(
         Ok(())
     };
     let r = write();
-    if !diff.added.is_empty() || !diff.removed.is_empty() {
+    if !diff.added.is_empty() || !diff.removed.is_empty() || wrote_options {
         map.bump_gen()?;
     }
     r.map(|()| diff)
@@ -524,6 +536,14 @@ mod linux {
             Ok(self.config()?.get(&CONFIG_SCOPE_GEN, 0)?)
         }
 
+        fn set_options(&mut self, o: ScopeOptions) -> Result<()> {
+            use panopticon_common::{CONFIG_CAPTURE_LOOPBACK, CONFIG_PID_CREATOR_RULE};
+            let mut cfg = self.config()?;
+            cfg.set(CONFIG_CAPTURE_LOOPBACK, o.capture_loopback as u64, 0)?;
+            cfg.set(CONFIG_PID_CREATOR_RULE, o.creator_rule as u64, 0)?;
+            Ok(())
+        }
+
         /// What the kernel honours (panopticon-ebpf, read at this stage):
         /// `CONFIG_CAPTURE_ENABLED = 0` stops the cgroup_skb packet path
         /// (`sock_capture.rs` `try_skb`, kTLS and UDP included);
@@ -571,7 +591,7 @@ mod linux {
         }
         let mut map = AyaAllow(ebpf);
         let current = map.ids()?;
-        let diff = publish(&mut map, &current, &r.ids)?;
+        let diff = publish(&mut map, &current, &r.ids, None)?;
         info!(
             cgroups = r.ids.len(),
             added = diff.added.len(),
@@ -891,6 +911,13 @@ mod tests {
             self.0.push("gen".into());
             Ok(())
         }
+        fn set_options(&mut self, o: ScopeOptions) -> Result<()> {
+            self.0.push(format!(
+                "opt{}{}",
+                o.capture_loopback as u8, o.creator_rule as u8
+            ));
+            Ok(())
+        }
         fn ids(&mut self) -> Result<BTreeSet<u64>> {
             unimplemented!()
         }
@@ -906,7 +933,7 @@ mod tests {
     fn publish_writes_the_map_then_bumps_once() {
         let s = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
         let mut m = Log::default();
-        let d = publish(&mut m, &s(&[1, 2]), &s(&[2, 3, 4])).unwrap();
+        let d = publish(&mut m, &s(&[1, 2]), &s(&[2, 3, 4]), None).unwrap();
         assert_eq!(m.0, ["-1", "+3", "+4", "gen"]);
         assert_eq!(
             d,
@@ -918,22 +945,36 @@ mod tests {
         assert!(d.is_narrowing());
 
         let mut m = Log::default();
-        let d = publish(&mut m, &s(&[2]), &s(&[2, 3])).unwrap();
+        let d = publish(&mut m, &s(&[2]), &s(&[2, 3]), None).unwrap();
         assert!(!d.is_narrowing());
         assert_eq!(m.0, ["+3", "gen"]);
 
         // No change: no generation bump.
         let mut m = Log::default();
         assert_eq!(
-            publish(&mut m, &s(&[2]), &s(&[2])).unwrap(),
+            publish(&mut m, &s(&[2]), &s(&[2]), None).unwrap(),
             AllowDiff::default()
         );
         assert!(m.0.is_empty());
 
         // A failed write after a delete still bumps, then reports the error.
         let mut m = Log(vec![], Some(4));
-        assert!(publish(&mut m, &s(&[1]), &s(&[3, 4])).is_err());
+        assert!(publish(&mut m, &s(&[1]), &s(&[3, 4]), None).is_err());
         assert_eq!(m.0, ["-1", "+3", "gen"]);
+
+        // Options alone: written, then one bump (the cached verdicts go
+        // stale); with ids, between the deletes and the inserts.
+        let o = ScopeOptions {
+            capture_loopback: true,
+            creator_rule: false,
+        };
+        let mut m = Log::default();
+        let d = publish(&mut m, &s(&[2]), &s(&[2]), Some(o)).unwrap();
+        assert_eq!(d, AllowDiff::default());
+        assert_eq!(m.0, ["opt10", "gen"]);
+        let mut m = Log(vec![], Some(4));
+        assert!(publish(&mut m, &s(&[1]), &s(&[4]), Some(o)).is_err());
+        assert_eq!(m.0, ["-1", "opt10", "gen"]);
     }
 
     #[test]

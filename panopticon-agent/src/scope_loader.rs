@@ -195,7 +195,9 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
         .find(|p| load_program(ebpf, p, Some("inet_csk_accept")).is_ok());
     if accept.is_none() && setup.mode & SCOPE_SEL_PID != 0 {
         warn!(
-            "fexit inet_csk_accept loads in neither variant: pid_filter uses socket creators only"
+            "fexit inet_csk_accept loads in neither variant: pid_filter uses socket creators \
+             only, so it selects no accepted connection under pid_filter_listener = \
+             \"acceptor\" (the default)"
         );
     }
     let exit_tp = match load_program(ebpf, EXIT_TP, None) {

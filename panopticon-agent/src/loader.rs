@@ -14,10 +14,11 @@ use crate::config::{AgentConfig, CaptureBackend, SamplingMode};
 use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
 use crate::scope_loader::{self, ScopeSetup};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
-    CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD,
-    CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS,
-    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, scope,
+    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES,
+    CONFIG_MAX_PAYLOAD, CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON,
+    CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN,
+    CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF, DATA_RING_SHARDS,
+    MAX_PAYLOAD_SIZE, scope,
 };
 
 /// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
@@ -448,6 +449,11 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_HEAD_BYTES, head, 0)?;
     cfg_map.set(CONFIG_SCOPE_GEN, 1, 0)?;
     cfg_map.set(CONFIG_SCOPE_MODE, mode, 0)?;
+    // capture_loopback and pid_filter_listener (cgroup_skb programs only;
+    // the scope publisher changes them at runtime).
+    let opts = crate::config::ScopeOptions::of(config);
+    cfg_map.set(CONFIG_CAPTURE_LOOPBACK, opts.capture_loopback as u64, 0)?;
+    cfg_map.set(CONFIG_PID_CREATOR_RULE, opts.creator_rule as u64, 0)?;
     // Disarmed until scope_loader::arm, the last step of startup. Written
     // explicitly: a pinned CONFIG map keeps an earlier run's value. The mode
     // above is set now, not at arming: capture hooks running with mode 0
