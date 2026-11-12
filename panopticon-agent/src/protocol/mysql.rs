@@ -214,7 +214,7 @@ impl MysqlParser {
                     past_col_eof,
                 } => match self.read_result_set(ts, cols_expected, cols_received, past_col_eof) {
                     RsResult::Done(msg) => {
-                        messages.push(msg);
+                        messages.push(*msg);
                         self.state = State::Ready;
                     }
                     RsResult::Progress(a, b, c) => {
@@ -561,7 +561,7 @@ impl MysqlParser {
                     let mut text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
                     // A parse error (1064) echoes the statement, secret included.
                     if super::mask_credentials_enabled() {
-                        super::mask_secrets_in(&mut text);
+                        super::mask_sql_secrets_in(&mut text, super::SqlDialect::Mysql);
                     }
                     m.payload_text = Some(text);
                 }
@@ -627,7 +627,7 @@ impl MysqlParser {
                 } else {
                     m.status = Some(0);
                 }
-                return RsResult::Done(m);
+                return RsResult::Done(Box::new(m));
             }
         }
     }
@@ -639,7 +639,7 @@ impl MysqlParser {
         if let Some(mut q) = self.query_text.take() {
             // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
             if super::mask_credentials_enabled() {
-                super::mask_secrets_in(&mut q);
+                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Mysql);
             }
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
@@ -665,7 +665,7 @@ impl MysqlParser {
 }
 
 enum RsResult {
-    Done(L7Message),
+    Done(Box<L7Message>),
     Progress(usize, usize, bool),
     Need,
 }
@@ -1100,6 +1100,58 @@ mod tests {
                 assert_eq!(m[0].latency_ns, Some(1000));
             }
             other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    /// The query text a MySQL COM_QUERY exchange exports.
+    fn exported_query(sql: &str) -> String {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let mut cmd = vec![COM_QUERY];
+        cmd.extend_from_slice(sql.as_bytes());
+        p.feed(&make_packet(0, &cmd), Direction::Egress, 1000);
+        let ParseResult::Messages(m) = p.feed(
+            &make_packet(1, &[OK_MARKER, 0, 0, 2, 0]),
+            Direction::Ingress,
+            2000,
+        ) else {
+            panic!("expected a message for {sql}");
+        };
+        m[0].payload_text.clone().unwrap_or_default()
+    }
+
+    /// Credential clauses written with any SQL lexical form: quoted
+    /// accounts, backquoted identifiers, doubled quotes, charset
+    /// introducers, comments, MariaDB VIA ... USING, and expressions (masked
+    /// to the end, since the value cannot be delimited).
+    #[test]
+    fn test_sql_lexical_forms_are_masked() {
+        for sql in [
+            "SET PASSWORD FOR 'app user'@'%' = 'canary-for';",
+            "SET GLOBAL `group_replication_recovery_password` = 'canary-quoted';",
+            "ALTER USER app IDENTIFIED BY \"canary-a\"\"canary-b\";",
+            "ALTER USER app IDENTIFIED BY _utf8mb4'canary-cs'",
+            "ALTER USER app IDENTIFIED BY /* c */ 'canary-comment'",
+            "ALTER USER app IDENTIFIED BY 'canary-a' 'canary-b'",
+            "ALTER USER app IDENTIFIED BY 'can\\'ary-esc'",
+            "CREATE USER app IDENTIFIED VIA ed25519 USING PASSWORD('canary-maria')",
+            "SET PASSWORD = CONCAT('canary-x', 'canary-y')",
+            "SET PASSWORD = ('canary-paren')",
+            "ALTER USER app IDENTIFIED BY 'canary-trunc",
+        ] {
+            let out = exported_query(sql);
+            assert!(!out.contains("canary"), "{sql} -> {out}");
+            assert!(
+                out.contains(crate::protocol::REDACTED_CREDENTIAL),
+                "{sql} -> {out}"
+            );
+        }
+        // A column named password is not a credential clause.
+        for sql in [
+            "SELECT password, email FROM users",
+            "INSERT INTO t (name, password) VALUES ('a', 'b')",
+        ] {
+            assert_eq!(exported_query(sql), sql);
         }
     }
 

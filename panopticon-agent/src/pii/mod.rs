@@ -84,6 +84,10 @@ fn mask_credential_fields(msg: &mut L7Message) {
             .filter(|(name, _)| is_credential_header(name))
             .for_each(|(_, value)| wipe(value));
     }
+    // A DNS name that reads as a credential clause is not a hostname the
+    // cache would accept anyway: drop it rather than exempt it.
+    msg.dns_answers
+        .retain(|a| crate::protocol::mask_secrets(&a.name).is_none());
 }
 
 /// Mask login secrets in every string field of `msg` without the PII
@@ -103,8 +107,7 @@ pub fn mask_credentials(msg: &mut L7Message) {
     {
         mask_secrets_in(field);
     }
-    // DNS answers (domain|ip|ttl) feed the DNS cache and carry no secret.
-    for (name, value) in msg.headers.iter_mut().filter(|(n, _)| n != "dns_a_record") {
+    for (name, value) in msg.headers.iter_mut() {
         mask_secrets_in(name);
         mask_secrets_in(value);
     }
@@ -539,19 +542,10 @@ impl PiiEngine {
         }
 
         if redact_enabled {
-            msg.headers.retain(|(name, value)| {
-                name != "dns_a_record" || {
-                    let domain = value.split('|').next().unwrap_or_default();
-                    self.scan_with(domain, false).is_none()
-                }
-            });
+            msg.dns_answers
+                .retain(|a| self.scan_with(&a.name, false).is_none());
         }
         for (name, value) in msg.headers.iter_mut() {
-            // DNS answers (domain|ip|ttl) feed the DNS cache: an IP-shaped
-            // value there must not be rewritten.
-            if name == "dns_a_record" {
-                continue;
-            }
             self.scan_field(value, false, redact_enabled, &mut found);
             self.scan_field(name, false, redact_enabled, &mut found);
         }
@@ -782,18 +776,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_message_leaves_non_http_headers_alone() {
+    fn test_scan_message_leaves_dns_answers_alone() {
         use panopticon_common::Direction;
-        // DNS answers travel as synthetic headers (domain|ip|ttl) feeding the
-        // DNS cache; IP-shaped values there must not be rewritten.
+        // DNS answers feed the DNS cache; the address must not be rewritten.
         let engine = PiiEngine::new(&PiiConfig::default(), &[]);
         let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, 1);
-        msg.headers = vec![(
-            "dns_a_record".to_string(),
-            "api.internal|167772161|30".to_string(),
-        )];
+        msg.dns_answers = vec![answer("api.internal", 167772161)];
         let _ = engine.scan_message(&mut msg);
-        assert_eq!(msg.headers[0].1, "api.internal|167772161|30");
+        assert_eq!(msg.dns_answers, vec![answer("api.internal", 167772161)]);
     }
 
     /// Codex #4: a DNS name carrying PII must not become a service name
@@ -806,35 +796,34 @@ mod tests {
         let dns = || {
             let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, 1);
             msg.path = Some("123-45-6789.attacker.test".to_string());
-            msg.headers = vec![
-                ("qtype".to_string(), "A".to_string()),
-                (
-                    "dns_a_record".to_string(),
-                    "123-45-6789.attacker.test|167772161|30".to_string(),
-                ),
-                (
-                    "dns_a_record".to_string(),
-                    "api.internal|167772162|30".to_string(),
-                ),
+            msg.headers = vec![("qtype".to_string(), "A".to_string())];
+            msg.dns_answers = vec![
+                answer("123-45-6789.attacker.test", 167772161),
+                answer("api.internal", 167772162),
             ];
             msg
         };
         let mut msg = dns();
         let report = engine.scan_message_with(&mut msg, true).unwrap();
         assert_eq!(report.entities.len(), 1, "the SSN, counted once (path)");
-        let all = format!("{:?} {:?}", msg.path, msg.headers);
+        let all = format!("{:?} {:?}", msg.path, msg.dns_answers);
         assert!(!all.contains("123-45-6789"), "{all}");
         assert_eq!(
-            msg.headers
-                .iter()
-                .filter(|(k, _)| k == "dns_a_record")
-                .count(),
-            1,
+            msg.dns_answers,
+            vec![answer("api.internal", 167772162)],
             "the clean answer stays"
         );
         let mut full = dns();
         engine.scan_message_with(&mut full, false);
-        assert_eq!(full.headers, dns().headers);
+        assert_eq!(full.dns_answers, dns().dns_answers);
+    }
+
+    fn answer(name: &str, ip: u32) -> crate::protocol::DnsAnswer {
+        crate::protocol::DnsAnswer {
+            name: name.into(),
+            ip,
+            ttl_secs: 30,
+        }
     }
 
     #[test]
@@ -891,6 +880,77 @@ mod tests {
         assert_eq!(msg.headers[0].1, REDACTED_CREDENTIAL);
         assert_eq!(msg.headers[1].1, REDACTED_CREDENTIAL);
         assert_eq!(msg.headers[2].1, "application/json");
+    }
+
+    /// Credential-named parameters (percent-encoded names too), JSON
+    /// fields, header-style values and URI passwords are masked with and
+    /// without the engine, in every copy (HTTP/2 keeps `:path` as a header
+    /// too); ordinary values stay readable.
+    #[test]
+    fn test_credential_params_and_uri_passwords_are_masked() {
+        use panopticon_common::Direction;
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http2, Direction::Egress, 1);
+            let path = "/login?%70assword=canary-1&token=canary-2&api_key=canary-3&q=keep";
+            m.path = Some(path.into());
+            m.headers = vec![
+                (":path".into(), path.into()),
+                ("x-note".into(), "Authorization: Bearer canary-6".into()),
+                (
+                    "x-redirect".into(),
+                    "/cb?access_token=canary-7&state=keep".into(),
+                ),
+            ];
+            m.request_text = Some(
+                r#"{"dsn":"postgresql://app:canary-4@db/app","client_secret": "canary-5","note":"don't","keyword":"keep"}"#
+                    .into(),
+            );
+            m.payload_text = Some("redis://:canary-8@cache:6379/0 and pass%77ord=canary-9".into());
+            m
+        };
+        let check = |m: &L7Message, how: &str| {
+            let all = format!(
+                "{:?} {:?} {:?} {:?}",
+                m.path, m.headers, m.request_text, m.payload_text
+            );
+            assert!(!all.contains("canary"), "{how}: {all}");
+            assert!(
+                all.contains("q=keep") && all.contains("state=keep"),
+                "{how}: {all}"
+            );
+            assert!(all.contains(r#"\"note\":\"don't\""#), "{how}: {all}");
+            assert!(all.contains(r#"\"keyword\":\"keep\""#), "{how}: {all}");
+            assert!(all.contains("postgresql://app:"), "{how}: {all}");
+        };
+        let mut m = msg();
+        mask_credentials(&mut m);
+        check(&m, "no engine");
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for redact in [true, false] {
+            let mut m = msg();
+            let _ = engine.scan_message_with(&mut m, redact);
+            check(&m, &format!("engine, redact {redact}"));
+        }
+    }
+
+    /// A wire header that borrows the DNS-answer name gets no exemption.
+    #[test]
+    fn test_wire_header_named_like_dns_metadata_is_masked() {
+        use panopticon_common::Direction;
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.headers = vec![("dns_a_record".into(), "password=canary-dns".into())];
+            m
+        };
+        let mut m = msg();
+        mask_credentials(&mut m);
+        assert_eq!(m.headers[0].1, "password=<REDACTED>");
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for redact in [true, false] {
+            let mut m = msg();
+            let _ = engine.scan_message_with(&mut m, redact);
+            assert_eq!(m.headers[0].1, "password=<REDACTED>", "redact {redact}");
+        }
     }
 
     #[test]

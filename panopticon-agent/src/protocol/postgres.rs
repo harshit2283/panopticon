@@ -437,7 +437,7 @@ impl PostgresParser {
                         // Error message takes precedence over query text in
                         // payload_text; it may quote the statement.
                         if super::mask_credentials_enabled() {
-                            super::mask_secrets_in(&mut err);
+                            super::mask_sql_secrets_in(&mut err, super::SqlDialect::Postgres);
                         }
                         msg.payload_text = Some(err);
                     }
@@ -475,7 +475,7 @@ impl PostgresParser {
         if let Some(mut q) = self.query_text.take() {
             // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
             if super::mask_credentials_enabled() {
-                super::mask_secrets_in(&mut q);
+                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Postgres);
             }
             if let Some(cmd) = q.split_whitespace().next() {
                 msg.method = Some(cmd.to_uppercase());
@@ -878,6 +878,48 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    /// The query text a simple-query exchange exports.
+    fn exported_query(sql: &str) -> String {
+        let mut p = setup_ready_parser();
+        let mut q = sql.as_bytes().to_vec();
+        q.push(0);
+        p.feed(&make_frontend_msg(b'Q', &q), Direction::Egress, 1000);
+        let mut response = make_backend_msg(b'C', b"OK\0");
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
+            panic!("expected a message for {sql}");
+        };
+        msgs[0].payload_text.clone().unwrap_or_default()
+    }
+
+    /// PostgreSQL string forms: escape strings, dollar quotes, comments,
+    /// continuation across a newline, Unicode escapes.
+    #[test]
+    fn test_sql_lexical_forms_are_masked() {
+        for sql in [
+            "CREATE USER app WITH PASSWORD E'canary-escape';",
+            "CREATE USER app WITH PASSWORD E'can\\'ary-escape';",
+            "ALTER ROLE app PASSWORD/*comment*/'canary-comment';",
+            "ALTER ROLE app PASSWORD -- c\n 'canary-line'",
+            "ALTER ROLE app PASSWORD $$canary-dollar$$",
+            "ALTER ROLE app PASSWORD $pw$canary-tag$pw$",
+            "ALTER ROLE app PASSWORD 'canary-a'\n'canary-b'",
+            "ALTER ROLE app PASSWORD U&'canary-u'",
+            "ALTER ROLE app ENCRYPTED PASSWORD 'canary-enc' VALID UNTIL 'infinity'",
+        ] {
+            let out = exported_query(sql);
+            assert!(!out.contains("canary"), "{sql} -> {out}");
+            assert!(
+                out.contains(crate::protocol::REDACTED_CREDENTIAL),
+                "{sql} -> {out}"
+            );
+        }
+        // `#` is an operator in PostgreSQL, not a comment: a later clause on
+        // the same line is still found.
+        let out = exported_query("SELECT 1 # 2; ALTER ROLE app PASSWORD 'canary-hash'");
+        assert!(!out.contains("canary"), "{out}");
     }
 
     #[test]

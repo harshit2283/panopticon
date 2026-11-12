@@ -49,16 +49,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "protocol/mod.rs",
-        "SECRET_CLAUSE",
-        "a compiled regex from a literal",
-    ),
-    (
-        "protocol/mod.rs",
-        "SECRET_CLAUSE_LOCAL",
-        "a per-thread clone of a compiled regex",
-    ),
-    (
-        "protocol/mod.rs",
         "MASK_CREDENTIALS",
         "the [privacy] mask_credentials config flag",
     ),
