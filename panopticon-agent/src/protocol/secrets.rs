@@ -1,526 +1,440 @@
-//! Login-secret masking: one linear scanner shared by every protocol.
+//! Login-secret protection: withhold any field with credential context.
 //!
-//! A *clause* is a credential name followed by its value. Three kinds:
-//! - **strong** keywords, whose value may follow after whitespace alone:
-//!   `PASSWORD` / `PASSWD` / `*_PASSWORD` (also `SET PASSWORD FOR account`),
-//!   `requirepass`, `masterauth`, and `IDENTIFIED [WITH|VIA plugin]
-//!   BY|AS|USING [PASSWORD]`, each with an optional `REPLACE '<current>'`;
-//! - **credential names** ([`is_credential_name`]: `token`, `api_key`,
-//!   `client_secret`, `authorization`, ...), which need an explicit `=` or
-//!   `:` (query and form parameters, JSON fields, `Name: value` text);
-//! - **URI passwords**: `scheme://user:password@host`.
+//! Masking a secret means finding where its value starts and ends, and SQL
+//! dialects, string escapes and encodings keep defeating that. So the rule
+//! is: a field whose *normalised view* shows credential context is withheld
+//! whole, unless every credential in it sits in a structure whose value is
+//! delimited with certainty, in which case only those values are masked.
 //!
-//! Names are percent-decoded before they are classified (`%70assword`).
-//! Values are lexed whole: quoted strings with doubled quotes and backslash
-//! escapes, prefixed strings (`E'…'`, `N'…'`, `U&'…'`, `_utf8mb4'…'`),
-//! dollar quotes (`$tag$…$tag$`), adjacent string literals, and in SQL mode
-//! comments between the name and the value. A strong clause whose value
-//! cannot be delimited (an expression such as `CONCAT(…)` or `(SELECT …)`,
-//! an unterminated string) is masked to the end of the text instead of in
-//! part.
+//! The normalised view (used for detection only, never exported): JSON
+//! escapes decoded (`p`), percent-decoding repeated up to three times
+//! (`%2570` → `p`) with `+` as a space, ASCII case folded, and SQL comment
+//! delimiters (`/*`, `/*!`, `*/`, `--`, `#`) blanked so their content is
+//! read as text. Credential context is:
+//! - a word containing a credential part ([`PARTS`]: `password`, `secret`,
+//!   `token`, `api_key`, ...), ending in `_pass` or `_auth`, or
+//!   `identified` followed by `by`, `with`, `via`, `as` or `using`;
+//! - a short credential name ([`NAMES`]: `auth`, `key`, `session`, `pwd`,
+//!   ...) used as a name, that is followed by `=` or `:`;
+//! - userinfo, `user:password@host`, with or without a scheme (the `:` of
+//!   `scheme://` and of `mailto:` do not count).
 //!
-//! Detection looks at every word, inside strings and comments too: masking
-//! a secret quoted in a comment costs nothing, and skipping comments would
-//! miss a clause after a PostgreSQL `#` operator.
+//! The certain structures, on the raw text: a query or form parameter
+//! (`name=value` at the start of the text or after `?` or `&`), a JSON
+//! member whose value is a string, number, `true`, `false` or `null`, and
+//! the userinfo of a `//` authority. Their names must be plain names (no
+//! `=`, quotes or spaces once decoded). The text with those clauses
+//! removed is checked again; any context left withholds the whole field.
 
 use super::REDACTED_CREDENTIAL;
 
-/// Which SQL comment syntax applies between a keyword and its value.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SqlDialect {
-    /// `/* */`, `-- `, `#`.
-    Mysql,
-    /// `/* */`, `--` (`#` is an operator).
-    Postgres,
+/// What a field with credential context that cannot be masked with
+/// certainty is replaced with. Holds no word that is credential context.
+pub const FIELD_WITHHELD: &str = "<field withheld>";
+
+/// What follows the verb of a SQL statement with credential context.
+pub const STATEMENT_WITHHELD: &str = "<statement withheld>";
+
+/// Parts that make any word credential context.
+const PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
+    "signature",
+    "requirepass",
+    "masterauth",
+    "authorization",
+    "csrf",
+    "xsrf",
+];
+
+/// Short names that are credential context only when used as a name.
+const NAMES: &[&str] = &[
+    "auth",
+    "pwd",
+    "pass",
+    "key",
+    "sig",
+    "session",
+    "sessionid",
+    "session_id",
+    "sid",
+    "cookie",
+    "jwt",
+    "masteruser",
+];
+
+fn strong_word(w: &str) -> bool {
+    PARTS.iter().any(|p| w.contains(p)) || w.ends_with("_pass") || w.ends_with("_auth")
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Sql(SqlDialect),
-    /// Any other text (HTTP fields, bodies, Redis payloads).
-    Text,
-}
-
-/// One scan: the mode, and the last comment-end search for each delimiter
-/// as (searched from, found at or text length). Clauses are tried at
-/// increasing positions, so a search from inside the last one's range has
-/// the same answer: each byte is searched at most once per delimiter, and
-/// keyword detection inside comments stays linear.
-struct Scan {
-    mode: Mode,
-    block_end: std::cell::Cell<(usize, usize)>,
-    line_end: std::cell::Cell<(usize, usize)>,
-}
-
-impl Scan {
-    fn new(mode: Mode) -> Self {
-        Self {
-            mode,
-            block_end: std::cell::Cell::new((usize::MAX, 0)),
-            line_end: std::cell::Cell::new((usize::MAX, 0)),
-        }
-    }
-}
-
-fn find_cached(
-    b: &[u8],
-    from: usize,
-    pat: &[u8],
-    cache: &std::cell::Cell<(usize, usize)>,
-) -> usize {
-    let (f, e) = cache.get();
-    if f <= from && from <= e {
-        return e;
-    }
-    let e = find(b, from, pat).unwrap_or(b.len());
-    cache.set((from, e));
-    e
-}
-
-/// `text` with every login secret replaced by [`REDACTED_CREDENTIAL`], or
-/// None when there is none. For any field of any protocol.
-pub fn mask_secrets(text: &str) -> Option<String> {
-    mask(text, Mode::Text)
-}
-
-/// [`mask_secrets`] for SQL text: queries and server error messages.
-pub fn mask_sql_secrets(text: &str, dialect: SqlDialect) -> Option<String> {
-    mask(text, Mode::Sql(dialect))
-}
-
-/// Whether a parameter, field, header-style or config name names a secret.
-/// Percent-decoded and case-folded, `-` and `.` read as `_`, before the
-/// test. Narrower than the credential-header test: `key` or `auth` inside
-/// a longer name (`keyword`, `author`) is not a secret.
+/// Whether a parameter, field, header or config name names a secret
+/// (any length; percent- and JSON-decoded, case-folded).
 pub fn is_credential_name(name: &str) -> bool {
-    let mut buf = [0u8; MAX_NAME];
-    normalize(name.as_bytes(), &mut buf).is_some_and(|n| credential_name(n) != Class::None)
+    let n = normalize(name);
+    let whole = n.trim().replace(['-', '.'], "_");
+    NAMES.contains(&whole.as_str())
+        || words(&n).any(|(w, _)| strong_word(&w) || NAMES.contains(&w.as_str()))
 }
 
-/// Longest name classified; longer words are not credential names.
-const MAX_NAME: usize = 64;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Class {
-    None,
-    Strong,
-    Identified,
-    Name,
-}
-
-/// `name` percent-decoded, lowercased, `-`/`.` as `_`, into `buf`.
-fn normalize<'b>(name: &[u8], buf: &'b mut [u8; MAX_NAME]) -> Option<&'b str> {
-    let (mut i, mut n) = (0, 0);
-    while i < name.len() {
-        let mut c = name[i];
-        if c == b'%'
-            && let Some(v) = name
-                .get(i + 1..i + 3)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            c = v;
-            i += 2;
+/// Whether `text` shows credential context (see the module docs).
+pub fn has_credential_context(text: &str) -> bool {
+    let n = normalize(text);
+    let b = n.as_bytes();
+    let mut prev_identified = false;
+    for (w, end) in words(&n) {
+        if prev_identified && matches!(w.as_str(), "by" | "with" | "via" | "as" | "using") {
+            return true;
         }
-        i += 1;
-        *buf.get_mut(n)? = match c.to_ascii_lowercase() {
-            b'-' | b'.' => b'_',
-            c => c,
-        };
-        n += 1;
+        prev_identified = w == "identified";
+        if w != "identified" && strong_word(&w) {
+            return true;
+        }
+        if NAMES.contains(&w.as_str()) && used_as_name(b, end) {
+            return true;
+        }
     }
-    std::str::from_utf8(&buf[..n]).ok()
+    has_userinfo(b)
 }
 
-fn credential_name(n: &str) -> Class {
-    const PARTS: &[&str] = &[
-        "password",
-        "passwd",
-        "passphrase",
-        "secret",
-        "token",
-        "apikey",
-        "api_key",
-        "access_key",
-        "private_key",
-        "credential",
-        "signature",
-        "requirepass",
-        "masterauth",
-        "csrf",
-        "xsrf",
-    ];
-    const EXACT: &[&str] = &[
-        "pwd",
-        "pass",
-        "auth",
-        "authorization",
-        "key",
-        "sig",
-        "session",
-        "sessionid",
-        "session_id",
-        "sid",
-        "cookie",
-        "jwt",
-        "masteruser",
-    ];
-    let n = n.trim_start_matches('_');
-    // `t.password` is the column `password` (dots read as `_`).
-    let last = n.rsplit('_').next().unwrap_or(n);
-    if matches!(n, "password" | "passwd" | "requirepass" | "masterauth")
-        || matches!(last, "password" | "passwd")
-    {
-        Class::Strong
-    } else if n == "identified" {
-        Class::Identified
-    } else if EXACT.contains(&n) || n.ends_with("_pass") || PARTS.iter().any(|p| n.contains(p)) {
-        Class::Name
+/// `text` with credential values masked where certain, or the field
+/// withheld; None when it has no credential context or nothing changes.
+pub fn protect_text(text: &str) -> Option<String> {
+    if !has_credential_context(text) {
+        return None;
+    }
+    let (mask, delete) = certain_clauses(text);
+    let residual = remove(text, &delete);
+    let out = if has_credential_context(&residual) {
+        FIELD_WITHHELD.to_string()
     } else {
-        Class::None
-    }
-}
-
-fn classify(word: &[u8]) -> Class {
-    let mut buf = [0u8; MAX_NAME];
-    normalize(word, &mut buf).map_or(Class::None, credential_name)
-}
-
-/// Bytes of a name: letters, digits, `_`, `-`, `.` and `%` (escapes).
-fn is_name_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'%')
-}
-
-fn mask(text: &str, mode: Mode) -> Option<String> {
-    let b = text.as_bytes();
-    let cx = Scan::new(mode);
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if is_name_byte(b[i]) && (i == 0 || !is_name_byte(b[i - 1])) {
-            let mut j = i;
-            while j < b.len() && is_name_byte(b[j]) {
-                j += 1;
-            }
-            match clause(b, i, j, &cx, &mut spans) {
-                Some(next) => i = next,
-                None => i = j,
-            }
-        } else {
-            i += 1;
-        }
-    }
-    uri_passwords(b, &mut spans);
-    // Already masked values need no rewrite (a second pass is a no-op).
-    spans.retain(|&(s, e)| &text[s..e] != REDACTED_CREDENTIAL);
-    if spans.is_empty() {
-        return None;
-    }
-    spans.sort_unstable();
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for (s, e) in spans {
-        if e <= at {
-            continue;
-        }
-        let s = s.max(at);
-        out.push_str(&text[at..s]);
-        out.push_str(REDACTED_CREDENTIAL);
-        at = e;
-    }
-    out.push_str(&text[at..]);
-    Some(out)
-}
-
-/// The clause whose name is `b[ws..we]`, if any: pushes the value span(s)
-/// and returns where scanning resumes.
-fn clause(
-    b: &[u8],
-    ws: usize,
-    we: usize,
-    cx: &Scan,
-    spans: &mut Vec<(usize, usize)>,
-) -> Option<usize> {
-    let class = classify(&b[ws..we]);
-    if class == Class::None {
-        return None;
-    }
-    let n = b.len();
-    let mut k = we;
-    // The closing quote of a quoted name: JSON `"password":`, `` `col` ``.
-    if ws > 0 && k < n && matches!(b[k], b'"' | b'\'' | b'`') && b[ws - 1] == b[k] {
-        k += 1;
-    }
-    k = skip_trivia(b, k, cx);
-    let mut explicit = false;
-    match class {
-        Class::Identified => {
-            let (mut w, mut after) = word_at(b, k);
-            if eq(w, "with") || eq(w, "via") {
-                k = skip_trivia(b, after, cx);
-                k = skip_token(b, k);
-                k = skip_trivia(b, k, cx);
-                (w, after) = word_at(b, k);
-            }
-            if !(eq(w, "by") || eq(w, "as") || eq(w, "using")) {
-                return None;
-            }
-            k = skip_trivia(b, after, cx);
-            let (w, after) = word_at(b, k);
-            if eq(w, "password") {
-                k = skip_trivia(b, after, cx);
-            }
-            explicit = true;
-        }
-        Class::Strong => {
-            let (w, after) = word_at(b, k);
-            if eq(w, "for") {
-                k = skip_trivia(b, after, cx);
-                k = skip_account(b, k);
-                k = skip_trivia(b, k, cx);
-            }
-        }
-        _ => {}
-    }
-    if k < n && matches!(b[k], b'=' | b':') {
-        k = skip_trivia(b, k + 1, cx);
-        explicit = true;
-    } else if class == Class::Name {
-        return None;
-    }
-    let strong = class != Class::Name;
-    let mut paren = false;
-    // Where a value that cannot be delimited is masked from.
-    let fail_from = k;
-    if strong && k < n && b[k] == b'(' {
-        k = skip_trivia(b, k + 1, cx);
-        paren = true;
-        explicit = true;
-    }
-    let vs = k;
-    let fail_closed = |spans: &mut Vec<(usize, usize)>| {
-        spans.push((fail_from, n));
-        Some(n)
+        replace_spans(text, &mask)
     };
-    let Some((mut end, is_str)) = value_at(b, k) else {
-        // `password, email`, `password)`: a column, not a clause; but
-        // `PASSWORD = (…` with no value we can delimit fails closed.
-        return if strong && explicit && k < n && b[k] == b'(' {
-            fail_closed(spans)
-        } else {
-            None
-        };
-    };
-    if is_str {
-        // Adjacent literals concatenate ('a' 'b', and across a newline in
-        // PostgreSQL).
-        loop {
-            let t = skip_trivia(b, end, cx);
-            match value_at(b, t) {
-                Some((e, true)) if t > end => end = e,
-                _ => break,
-            }
-        }
-    } else if strong {
-        // A function call (`CONCAT(…)`) cannot be delimited.
-        let t = if cx.mode != Mode::Text {
-            skip_trivia(b, end, cx)
-        } else {
-            end
-        };
-        if t < n && b[t] == b'(' {
-            return fail_closed(spans);
-        }
-    } else if [&b"bearer"[..], b"basic", b"digest", b"negotiate", b"token"]
-        .iter()
-        .any(|s| b[vs..end].eq_ignore_ascii_case(s))
-        && end + 1 < n
-        && b[end] == b' '
-        && let Some((e, _)) = value_at(b, end + 1)
-    {
-        // `Authorization: Bearer <token>`
-        end = e;
-    }
-    let mut next = end;
-    if paren {
-        let t = skip_trivia(b, end, cx);
-        if t >= n || b[t] != b')' {
-            return fail_closed(spans);
-        }
-        next = t + 1;
-    }
-    spans.push((vs, end));
-    if strong {
-        // `IDENTIFIED BY 'new' REPLACE 'current'`
-        let t = skip_trivia(b, next, cx);
-        let (w, after) = word_at(b, t);
-        if eq(w, "replace") {
-            let t = skip_trivia(b, after, cx);
-            if let Some((e, true)) = value_at(b, t) {
-                spans.push((t, e));
-                next = e;
-            }
-        }
-    }
-    Some(next)
+    (out != text).then_some(out)
 }
 
-fn eq(word: &[u8], kw: &str) -> bool {
-    word.eq_ignore_ascii_case(kw.as_bytes())
-}
-
-/// The name at `k` (possibly empty) and where it ends.
-fn word_at(b: &[u8], k: usize) -> (&[u8], usize) {
-    let mut e = k;
-    while e < b.len() && is_name_byte(b[e]) {
-        e += 1;
-    }
-    (&b[k..e], e)
-}
-
-/// Whitespace, and in SQL mode the dialect's comments.
-fn skip_trivia(b: &[u8], mut k: usize, cx: &Scan) -> usize {
-    let n = b.len();
+/// A SQL statement with credential context, as exported: its verb and
+/// [`STATEMENT_WITHHELD`].
+pub fn withheld_statement(sql: &str) -> String {
+    let mut s = sql.trim_start();
+    // Leading comments.
     loop {
-        while k < n && b[k].is_ascii_whitespace() {
-            k += 1;
-        }
-        let Mode::Sql(dialect) = cx.mode else {
-            return k;
-        };
-        if k >= n {
-            return k;
-        }
-        if b[k..].starts_with(b"/*") {
-            k = (find_cached(b, k + 2, b"*/", &cx.block_end) + 2).min(n);
-        } else if b[k..].starts_with(b"--") || (dialect == SqlDialect::Mysql && b[k] == b'#') {
-            k = (find_cached(b, k, b"\n", &cx.line_end) + 1).min(n);
-        } else {
-            return k;
-        }
-    }
-}
-
-fn find(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
-    b.get(from..)?
-        .windows(pat.len())
-        .position(|w| w == pat)
-        .map(|p| p + from)
-}
-
-/// One token: a quoted string or a name (a plugin name).
-fn skip_token(b: &[u8], k: usize) -> usize {
-    match value_at(b, k) {
-        Some((e, _)) => e,
-        None => k,
-    }
-}
-
-/// A MySQL account: `'app user'@'%'`, `app@localhost`, `` `a`@`b` ``.
-fn skip_account(b: &[u8], mut k: usize) -> usize {
-    while k < b.len() {
-        if matches!(b[k], b'\'' | b'"' | b'`') {
-            k = quoted_end(b, k);
-        } else if is_name_byte(b[k]) || b[k] == b'@' {
-            k += 1;
+        if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.split_once("*/").map_or("", |(_, r)| r).trim_start();
+        } else if s.starts_with("--") || s.starts_with('#') {
+            s = s.split_once('\n').map_or("", |(_, r)| r).trim_start();
         } else {
             break;
         }
     }
-    k
+    let verb: String = s
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .take(32)
+        .collect();
+    if verb.is_empty() {
+        STATEMENT_WITHHELD.to_string()
+    } else {
+        format!("{} {STATEMENT_WITHHELD}", verb.to_ascii_uppercase())
+    }
 }
 
-/// The value at `k`: its end, and whether it is a string literal. None for
-/// punctuation or the end of the text.
-fn value_at(b: &[u8], k: usize) -> Option<(usize, bool)> {
-    let n = b.len();
-    let c = *b.get(k)?;
-    if matches!(c, b'\'' | b'"' | b'`') {
-        return Some((quoted_end(b, k), true));
+// ── Normalised view ─────────────────────────────────────────────────────
+
+fn normalize(text: &str) -> String {
+    let mut s = json_unescape(text);
+    for _ in 0..3 {
+        match percent_decode(&s) {
+            Some(d) => s = d,
+            None => break,
+        }
     }
-    if c == b'$'
-        && let Some(e) = dollar_end(b, k)
-    {
-        return Some((e, true));
+    s.make_ascii_lowercase();
+    for delim in ["/*!", "/*", "*/", "--", "#"] {
+        if s.contains(delim) {
+            s = s.replace(delim, &" ".repeat(delim.len()));
+        }
     }
-    // A prefixed literal: E'…', N'…', X'…', U&'…', _utf8mb4'…'.
-    let mut p = k;
-    while p < n && (b[p].is_ascii_alphanumeric() || matches!(b[p], b'_' | b'&')) {
-        p += 1;
+    s
+}
+
+/// JSON string escapes decoded wherever they appear.
+fn json_unescape(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
     }
-    let prefix = &b[k..p];
-    let literal_prefix = (b.get(p) == Some(&b'\'')
-        && ["e", "n", "b", "x", "u&"]
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let mut code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                if (0xD800..0xDC00).contains(&code) {
+                    // A surrogate pair: 😀.
+                    let mut ahead = chars.clone();
+                    if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                        let low: String = ahead.by_ref().take(4).collect();
+                        if let Ok(l) = u32::from_str_radix(&low, 16)
+                            && (0xDC00..0xE000).contains(&l)
+                        {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (l - 0xDC00);
+                            chars = ahead;
+                        }
+                    }
+                }
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            }
+            Some('b' | 'f' | 'n' | 'r' | 't') => out.push(' '),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// One pass of `%XX` and `+` decoding, or None when there is nothing to
+/// decode.
+fn percent_decode(text: &str) -> Option<String> {
+    if !text.contains(['%', '+']) {
+        return None;
+    }
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                _ => out.push(b'%'),
+            },
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    let decoded = String::from_utf8_lossy(&out).into_owned();
+    (decoded != text).then_some(decoded)
+}
+
+/// The words of a normalised text (`a-z`, digits, `_`; `-` and `.` read
+/// as `_`) and where each ends.
+fn words(n: &str) -> impl Iterator<Item = (String, usize)> + '_ {
+    let b = n.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < b.len() && !is_word(b[i]) {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        let start = i;
+        while i < b.len() && is_word(b[i]) {
+            i += 1;
+        }
+        let w = n[start..i]
+            .replace(['-', '.'], "_")
+            .trim_matches('_')
+            .to_string();
+        Some((w, i))
+    })
+}
+
+/// Whether the word ending at `end` is followed (after spaces and closing
+/// quotes) by `=` or `:`.
+fn used_as_name(b: &[u8], end: usize) -> bool {
+    b[end..]
+        .iter()
+        .find(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'`' | b']'))
+        .is_some_and(|c| matches!(c, b'=' | b':'))
+}
+
+/// `user:password@host` anywhere: a `:` (not that of `scheme://` or
+/// `mailto:`) then `@` and a host character, with no whitespace, quote or
+/// bracket between. One forward pass.
+fn has_userinfo(b: &[u8]) -> bool {
+    let mut colon = false;
+    for i in 0..b.len() {
+        match b[i] {
+            c if c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    b'"' | b'\'' | b'`' | b'<' | b'>' | b'(' | b')' | b',' | b';' | b'&'
+                ) =>
+            {
+                colon = false
+            }
+            b':' => {
+                let scheme = b[i + 1..].starts_with(b"//");
+                let mailto = b[..i].ends_with(b"mailto");
+                colon |= !scheme && !mailto;
+            }
+            b'@' if colon
+                && b.get(i + 1)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'[') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+// ── Certain structures ──────────────────────────────────────────────────
+
+type Spans = Vec<(usize, usize)>;
+
+/// Value spans to mask and clause spans to remove for the residual check.
+fn certain_clauses(text: &str) -> (Spans, Spans) {
+    let b = text.as_bytes();
+    let (mut mask, mut delete) = (Vec::new(), Vec::new());
+    form_params(b, text, &mut mask, &mut delete);
+    json_members(b, text, &mut mask, &mut delete);
+    authorities(b, &mut mask, &mut delete);
+    (mask, delete)
+}
+
+/// A name that, decoded, is a plain identifier.
+fn plain_credential_name(raw: &str) -> bool {
+    let n = normalize(raw);
+    !n.is_empty()
+        && n.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'[' | b']'))
+        && is_credential_name(&n)
+}
+
+/// `name=value` at the start or after `?` / `&`; the value runs to `&` or
+/// the end, without whitespace (a value with a space is not a form value:
+/// `password=correct horse` in prose).
+fn form_params(b: &[u8], text: &str, mask: &mut Spans, delete: &mut Spans) {
+    for p in 0..b.len() {
+        if p > 0 && !matches!(b[p - 1], b'?' | b'&') {
+            continue;
+        }
+        let Some(eq) = b[p..]
             .iter()
-            .any(|s| prefix.eq_ignore_ascii_case(s.as_bytes())))
-        || (prefix.len() > 1 && prefix[0] == b'_' && matches!(b.get(p), Some(b'\'' | b'"')));
-    if literal_prefix {
-        return Some((quoted_end(b, p), true));
+            .position(|&c| matches!(c, b'=' | b'&' | b'#' | b'?' | b'/') || c.is_ascii_whitespace())
+            .map(|o| p + o)
+            .filter(|&e| e > p && b[e] == b'=')
+        else {
+            continue;
+        };
+        if !plain_credential_name(&text[p..eq]) {
+            continue;
+        }
+        let end = b[eq + 1..]
+            .iter()
+            .position(|&c| c == b'&')
+            .map_or(b.len(), |o| eq + 1 + o);
+        if b[eq + 1..end].iter().any(u8::is_ascii_whitespace) {
+            continue;
+        }
+        mask.push((eq + 1, end));
+        delete.push((p, end));
     }
-    let mut e = k;
-    while e < n
-        && !b[e].is_ascii_whitespace()
-        && !matches!(
-            b[e],
-            b',' | b';' | b'(' | b')' | b'&' | b'"' | b'\'' | b'}' | b']' | b'<' | b'>'
-        )
-    {
-        e += 1;
-    }
-    (e > k).then_some((e, false))
 }
 
-/// End of the quoted string at `k` (after its closing quote; the end of the
-/// text when unterminated). Doubled quotes and backslash escapes stay
-/// inside.
-fn quoted_end(b: &[u8], k: usize) -> usize {
-    let q = b[k];
+/// `"name": value` with a string, number or literal value, followed by `,`
+/// or `}`.
+fn json_members(b: &[u8], text: &str, mask: &mut Spans, delete: &mut Spans) {
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let name_end = json_string_end(b, i);
+        let colon = skip_ws(b, name_end);
+        if b.get(colon) != Some(&b':') {
+            i = name_end;
+            continue;
+        }
+        let vs = skip_ws(b, colon + 1);
+        let ve = match b.get(vs) {
+            Some(b'"') => Some(json_string_end(b, vs)),
+            // Masked by an earlier pass.
+            Some(b'<') if b[vs..].starts_with(REDACTED_CREDENTIAL.as_bytes()) => {
+                Some(vs + REDACTED_CREDENTIAL.len())
+            }
+            Some(c) if c.is_ascii_digit() || matches!(c, b'-' | b't' | b'f' | b'n') => {
+                let e = b[vs..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-')))
+                    .map_or(b.len(), |o| vs + o);
+                let lit = &text[vs..e];
+                (matches!(lit, "true" | "false" | "null") || lit.parse::<f64>().is_ok())
+                    .then_some(e)
+            }
+            _ => None,
+        };
+        if let Some(ve) = ve
+            && ve <= b.len()
+            && matches!(b.get(skip_ws(b, ve)), Some(b',' | b'}'))
+            && name_end >= i + 2
+            && plain_credential_name(&text[i + 1..name_end - 1])
+        {
+            // A string keeps its quotes: the JSON stays valid.
+            if b[vs] == b'"' && ve >= vs + 2 && b[ve - 1] == b'"' {
+                mask.push((vs + 1, ve - 1));
+            } else {
+                mask.push((vs, ve));
+            }
+            delete.push((i, ve));
+            i = ve;
+        } else {
+            i = name_end;
+        }
+    }
+}
+
+/// End of the JSON string at `k` (after its closing quote; the end of the
+/// text when unterminated).
+fn json_string_end(b: &[u8], k: usize) -> usize {
     let mut i = k + 1;
     while i < b.len() {
         match b[i] {
             b'\\' => i += 2,
-            c if c == q => {
-                if b.get(i + 1) == Some(&q) {
-                    i += 2;
-                } else {
-                    return i + 1;
-                }
-            }
+            b'"' => return i + 1,
             _ => i += 1,
         }
     }
     b.len()
 }
 
-/// End of a PostgreSQL dollar-quoted string `$tag$…$tag$` at `k`, or None
-/// when `k` does not open one (`$1` is a parameter).
-fn dollar_end(b: &[u8], k: usize) -> Option<usize> {
-    let mut t = k + 1;
-    while t < b.len() && (b[t].is_ascii_alphanumeric() || b[t] == b'_') {
-        t += 1;
+fn skip_ws(b: &[u8], mut k: usize) -> usize {
+    while k < b.len() && b[k].is_ascii_whitespace() {
+        k += 1;
     }
-    if b.get(t) != Some(&b'$') || b.get(k + 1).is_some_and(u8::is_ascii_digit) {
-        return None;
-    }
-    let tag = &b[k..=t];
-    Some(find(b, t + 1, tag).map_or(b.len(), |e| e + tag.len()))
+    k
 }
 
-/// `scheme://user:password@host`: the password, up to the last `@` of the
-/// authority (a password may contain `@`).
-fn uri_passwords(b: &[u8], spans: &mut Vec<(usize, usize)>) {
+/// The userinfo of a `//` authority (scheme optional): the password, after
+/// the first `:` and up to the last `@` before `/`, `?`, `#`, whitespace or
+/// a quote.
+fn authorities(b: &[u8], mask: &mut Spans, delete: &mut Spans) {
     let mut from = 0;
-    while let Some(sep) = find(b, from, b"://") {
-        from = sep + 3;
-        let scheme = b[..sep]
-            .iter()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-'))
-            .count();
-        if scheme == 0 {
-            continue;
-        }
-        let a = sep + 3;
+    while let Some(o) = b[from..].windows(2).position(|w| w == b"//") {
+        let a = from + o + 2;
+        from = a;
         let e = b[a..]
             .iter()
             .position(|&c| {
@@ -530,84 +444,124 @@ fn uri_passwords(b: &[u8], spans: &mut Vec<(usize, usize)>) {
             .map_or(b.len(), |p| a + p);
         if let Some(at) = b[a..e].iter().rposition(|&c| c == b'@').map(|p| a + p)
             && let Some(colon) = b[a..at].iter().position(|&c| c == b':').map(|p| a + p)
-            && colon + 1 < at
         {
-            spans.push((colon + 1, at));
+            mask.push((colon + 1, at));
+            delete.push((a, at + 1));
         }
     }
+}
+
+fn remove(text: &str, spans: &Spans) -> String {
+    let mut spans = spans.clone();
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (s, e) in spans {
+        if e <= at {
+            continue;
+        }
+        out.push_str(&text[at..s.max(at)]);
+        out.push(' ');
+        at = e;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+fn replace_spans(text: &str, spans: &Spans) -> String {
+    let mut spans: Spans = spans
+        .iter()
+        .copied()
+        .filter(|&(s, e)| &text[s..e] != REDACTED_CREDENTIAL)
+        .collect();
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (s, e) in spans {
+        if e <= at {
+            continue;
+        }
+        out.push_str(&text[at..s.max(at)]);
+        out.push_str(REDACTED_CREDENTIAL);
+        at = e;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn text(s: &str) -> String {
-        mask_secrets(s).unwrap_or_else(|| s.to_string())
-    }
-
-    fn sql(s: &str) -> String {
-        mask_sql_secrets(s, SqlDialect::Mysql).unwrap_or_else(|| s.to_string())
+    fn p(s: &str) -> String {
+        protect_text(s).unwrap_or_else(|| s.to_string())
     }
 
     #[test]
-    fn masks_named_values_and_keeps_the_rest() {
+    fn certain_values_are_masked_the_rest_kept() {
         for (input, want) in [
             ("password=x&y=1", "password=<REDACTED>&y=1"),
-            ("?%70assword=x&q=keep", "?%70assword=<REDACTED>&q=keep"),
+            ("/l?%70assword=x&q=keep", "/l?%70assword=<REDACTED>&q=keep"),
+            (
+                "/l?%2570assword=x&q=keep",
+                "/l?%2570assword=<REDACTED>&q=keep",
+            ),
             (
                 r#"{"client_secret": "a\"b", "n": 1}"#,
-                r#"{"client_secret": <REDACTED>, "n": 1}"#,
+                r#"{"client_secret": "<REDACTED>", "n": 1}"#,
             ),
-            ("Authorization: Bearer abc.def", "Authorization: <REDACTED>"),
             (
-                "x-api-key=k1;keyword=shoes",
-                "x-api-key=<REDACTED>;keyword=shoes",
+                r#"{"pin":1,"api_key":12345}"#,
+                r#"{"pin":1,"api_key":<REDACTED>}"#,
             ),
-            ("author=bob&title=x", "author=bob&title=x"),
-            ("requirepass s3cret", "requirepass <REDACTED>"),
+            (
+                "x-api-key=k1&keyword=shoes",
+                "x-api-key=<REDACTED>&keyword=shoes",
+            ),
             (
                 "amqp://guest:p@ss@rabbit:5672/vh",
                 "amqp://guest:<REDACTED>@rabbit:5672/vh",
             ),
-            ("see https://example.com/a@b", "see https://example.com/a@b"),
+            ("//alice:pw@[::1]/db", "//alice:<REDACTED>@[::1]/db"),
         ] {
-            assert_eq!(text(input), want, "{input}");
+            assert_eq!(p(input), want, "{input}");
         }
     }
 
     #[test]
-    fn sql_clauses() {
-        for (input, want) in [
-            (
-                "ALTER USER a IDENTIFIED BY 'x' REPLACE 'y'",
-                "ALTER USER a IDENTIFIED BY <REDACTED> REPLACE <REDACTED>",
-            ),
-            (
-                "CREATE USER a IDENTIFIED WITH 'p' AS '*h'",
-                "CREATE USER a IDENTIFIED WITH 'p' AS <REDACTED>",
-            ),
-            (
-                "CREATE USER a IDENTIFIED WITH auth_socket",
-                "CREATE USER a IDENTIFIED WITH auth_socket",
-            ),
-            (
-                "ALTER ROLE a PASSWORD $1",
-                "ALTER ROLE a PASSWORD <REDACTED>",
-            ),
-            (
-                "SET PASSWORD FOR app@localhost = 'x'",
-                "SET PASSWORD FOR app@localhost = <REDACTED>",
-            ),
-            (
-                "UPDATE t SET password = (SELECT h FROM s)",
-                "UPDATE t SET password = <REDACTED>",
-            ),
-            (
-                "ALTER ROLE a PASSWORD NULL",
-                "ALTER ROLE a PASSWORD <REDACTED>",
-            ),
+    fn uncertain_credential_context_withholds_the_field() {
+        for input in [
+            r#"{"access_tokens":["c1","c2"]}"#,
+            r#"{"password":{"value":"c"}}"#,
+            "/cb?next=alice:canary@db.internal",
+            "Authorization: Bearer abc",
+            "requirepass, s3cret",
+            "pass%77ord=x as text",
+            "dsn=u:pa/ss@h",
+            "a password%3Dc=1",
+            &format!("{}_password: x", "a".repeat(70)),
+            "{\"pass\\u0077ord\": [1]}",
+            "ALTER USER a IDENTIFIED BY /*!80000 'c' */",
+            "key: value",
         ] {
-            assert_eq!(sql(input), want, "{input}");
+            assert_eq!(p(input), FIELD_WITHHELD, "{input}");
+        }
+    }
+
+    #[test]
+    fn plain_text_is_left_alone() {
+        for input in [
+            "see https://medium.com/@user and mailto:alice@example.com",
+            "author=bob&title=x&keyword=shoes",
+            "GET /api/auth/login",
+            "AUTH",
+            "we identified a bug",
+            "Press any key to continue",
+            FIELD_WITHHELD,
+            STATEMENT_WITHHELD,
+            "ALTER <statement withheld>",
+        ] {
+            assert_eq!(protect_text(input), None, "{input}");
         }
     }
 
@@ -615,24 +569,29 @@ mod tests {
     fn a_second_pass_changes_nothing() {
         for s in [
             "password=x&token=y",
-            "ALTER USER a IDENTIFIED BY 'x' REPLACE 'y'",
-            "SET PASSWORD = CONCAT('a', 'b')",
+            r#"{"secret":"x"}"#,
             "postgres://u:p@h/db",
+            "Authorization: Bearer x",
         ] {
-            let once = sql(&text(s));
-            assert_eq!(mask_secrets(&once), None, "{once}");
-            assert_eq!(mask_sql_secrets(&once, SqlDialect::Mysql), None, "{once}");
+            let once = p(s);
+            assert_eq!(protect_text(&once), None, "{once}");
         }
     }
 
     #[test]
-    fn non_ascii_text_is_cut_on_char_boundaries() {
+    fn statements() {
         assert_eq!(
-            text("pässword=é&password=ü€x&ß"),
-            "pässword=é&password=<REDACTED>&ß"
+            withheld_statement("  /* c */ alter user a identified by 'x'"),
+            "ALTER <statement withheld>"
         );
-        assert_eq!(sql("PASSWORD 'é€'"), "PASSWORD <REDACTED>");
-        assert_eq!(text("€ db://ü:é@h"), "€ db://ü:<REDACTED>@h");
+        assert_eq!(withheld_statement("'x'"), STATEMENT_WITHHELD);
+        assert!(has_credential_context(
+            "SET PASSWORD FOR \u{fc}@localhost = 'c'"
+        ));
+        assert!(has_credential_context(
+            "select 1 # 2; alter role a identified by 'c'"
+        ));
+        assert!(!has_credential_context("SELECT name FROM users"));
     }
 
     #[test]
@@ -646,7 +605,15 @@ mod tests {
             "passwords",
             "access_token",
             "sid",
+            "key",
+            "auth",
+            &"a".repeat(80), /* plain */
         ] {
+            if n.starts_with("aaa") {
+                assert!(!is_credential_name(n));
+                assert!(is_credential_name(&format!("{n}_password")));
+                continue;
+            }
             assert!(is_credential_name(n), "{n}");
         }
         for n in ["keyword", "author", "monkey", "maxmemory", "state", "q"] {
@@ -654,26 +621,36 @@ mod tests {
         }
     }
 
-    /// Linear: a 64 KiB body of clauses and a 64 KiB body of words.
+    #[test]
+    fn non_ascii_text_is_cut_on_char_boundaries() {
+        assert_eq!(
+            p("pässword=é&password=ü€x&ß"),
+            "pässword=é&password=<REDACTED>&ß"
+        );
+        assert_eq!(p("€ db://ü:é@h"), "€ db://ü:<REDACTED>@h");
+        assert_eq!(p("\\ud83d\\ude00 token"), FIELD_WITHHELD);
+    }
+
+    /// Linear in the field size, whatever its shape.
     #[test]
     fn scan_time_is_bounded() {
         for body in [
             "password=x&".repeat(6000),
             "lorem ipsum ".repeat(6000),
             "'".repeat(64 * 1024),
-            // Unterminated comments and quotes after a keyword.
-            "PASSWORD /* ".repeat(5000),
-            "password -- ".repeat(5000),
-            "password for '".repeat(5000),
-            "IDENTIFIED WITH '".repeat(5000),
+            "%25".repeat(20_000),
+            "\\u0070".repeat(10_000),
+            "a:b@c ".repeat(10_000),
+            "\"k\":".repeat(15_000),
+            "//".repeat(30_000),
+            "a=".repeat(30_000),
         ] {
             let t = std::time::Instant::now();
-            let _ = mask_secrets(&body);
-            let _ = mask_sql_secrets(&body, SqlDialect::Mysql);
-            let _ = mask_sql_secrets(&body, SqlDialect::Postgres);
+            let _ = protect_text(&body);
             assert!(
                 t.elapsed() < std::time::Duration::from_millis(500),
-                "{:?}",
+                "{:?} {:?}",
+                &body[..8],
                 t.elapsed()
             );
         }

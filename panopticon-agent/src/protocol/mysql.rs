@@ -109,6 +109,8 @@ pub struct MysqlParser {
     skip_defs: VecDeque<DefSkip>,
     /// Bound parameter values of the EXECUTE in flight.
     param_text: Option<String>,
+    /// The last statement built had credential context and was withheld.
+    statement_withheld: bool,
 }
 
 impl MysqlParser {
@@ -128,6 +130,7 @@ impl MysqlParser {
             preparing: None,
             skip_defs: VecDeque::new(),
             param_text: None,
+            statement_withheld: false,
         }
     }
 
@@ -558,12 +561,9 @@ impl MysqlParser {
                     3
                 };
                 if payload.len() > text_at {
-                    let mut text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
                     // A parse error (1064) echoes the statement, secret included.
-                    if super::mask_credentials_enabled() {
-                        super::mask_sql_secrets_in(&mut text, super::SqlDialect::Mysql);
-                    }
-                    m.payload_text = Some(text);
+                    let text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
+                    m.payload_text = Some(super::export_error_text(text, self.statement_withheld));
                 }
                 Some(m)
             }
@@ -634,17 +634,18 @@ impl MysqlParser {
 
     fn build_msg(&mut self, ts: u64) -> L7Message {
         let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, ts);
-        msg.request_text = self.param_text.take();
         msg.method = Some("QUERY".into());
-        if let Some(mut q) = self.query_text.take() {
-            // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
-            if super::mask_credentials_enabled() {
-                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Mysql);
+        let bound = self.param_text.take();
+        self.statement_withheld = false;
+        match self.query_text.take() {
+            Some(q) => {
+                let (verb, shown, bound, withheld) = super::export_statement(q, bound);
+                msg.method = verb.or(msg.method);
+                msg.payload_text = Some(shown);
+                msg.request_text = bound;
+                self.statement_withheld = withheld;
             }
-            if let Some(cmd) = q.split_whitespace().next() {
-                msg.method = Some(cmd.to_uppercase());
-            }
-            msg.payload_text = Some(super::truncate_utf8(&q, 4096).to_string());
+            None => msg.request_text = bound,
         }
         if let Some(t) = self.query_ts.take() {
             msg.latency_ns = Some(ts.saturating_sub(t));
@@ -1120,12 +1121,12 @@ mod tests {
         m[0].payload_text.clone().unwrap_or_default()
     }
 
-    /// Credential clauses written with any SQL lexical form: quoted
-    /// accounts, backquoted identifiers, doubled quotes, charset
-    /// introducers, comments, MariaDB VIA ... USING, and expressions (masked
-    /// to the end, since the value cannot be delimited).
+    /// Every credential statement, whatever SQL form carries the value,
+    /// exports only its verb; so does a statement merely naming a password
+    /// column (the price of not parsing values). Statements without
+    /// credential context are exported as written.
     #[test]
-    fn test_sql_lexical_forms_are_masked() {
+    fn test_credential_statement_forms_export_only_the_verb() {
         for sql in [
             "SET PASSWORD FOR 'app user'@'%' = 'canary-for';",
             "SET GLOBAL `group_replication_recovery_password` = 'canary-quoted';",
@@ -1134,83 +1135,56 @@ mod tests {
             "ALTER USER app IDENTIFIED BY /* c */ 'canary-comment'",
             "ALTER USER app IDENTIFIED BY 'canary-a' 'canary-b'",
             "ALTER USER app IDENTIFIED BY 'can\\'ary-esc'",
+            "ALTER USER app IDENTIFIED WITH caching_sha2_password BY 'canary'",
+            "ALTER USER app IDENTIFIED BY 'canary-new' REPLACE 'canary-old'",
+            "CREATE USER 'app'@'%' IDENTIFIED BY 'canary'",
+            "CREATE USER app IDENTIFIED WITH mysql_native_password AS '*0123canary'",
             "CREATE USER app IDENTIFIED VIA ed25519 USING PASSWORD('canary-maria')",
             "SET PASSWORD = CONCAT('canary-x', 'canary-y')",
             "SET PASSWORD = ('canary-paren')",
             "ALTER USER app IDENTIFIED BY 'canary-trunc",
+            "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD='canary'",
+            "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = 'canary'",
+            "SELECT password, email FROM users",
         ] {
-            let out = exported_query(sql);
-            assert!(!out.contains("canary"), "{sql} -> {out}");
-            assert!(
-                out.contains(crate::protocol::REDACTED_CREDENTIAL),
-                "{sql} -> {out}"
+            let verb = sql.split_whitespace().next().unwrap();
+            assert_eq!(
+                exported_query(sql),
+                format!("{verb} <statement withheld>"),
+                "{sql}"
             );
         }
-        // A column named password is not a credential clause.
         for sql in [
-            "SELECT password, email FROM users",
-            "INSERT INTO t (name, password) VALUES ('a', 'b')",
+            "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
+            "SELECT name, email FROM users WHERE id = 7",
         ] {
             assert_eq!(exported_query(sql), sql);
         }
     }
 
+    /// Statements with credential context export only their verb, whatever
+    /// SQL form hides the value (Codex round 3).
     #[test]
-    fn test_password_clause_is_masked() {
-        for (sql, want) in [
-            (
-                "CREATE USER 'app'@'%' IDENTIFIED BY 'my-s3cret'",
-                "CREATE USER 'app'@'%' IDENTIFIED BY <REDACTED>",
-            ),
-            (
-                "ALTER USER app IDENTIFIED WITH caching_sha2_password BY 'my-s3cret'",
-                "ALTER USER app IDENTIFIED WITH caching_sha2_password BY <REDACTED>",
-            ),
-            ("SET PASSWORD = 'my-s3cret'", "SET PASSWORD = <REDACTED>"),
-            (
-                "SET PASSWORD FOR 'app'@'%' = 'my-s3cret'",
-                "SET PASSWORD FOR 'app'@'%' = <REDACTED>",
-            ),
-            (
-                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD='my-s3cret'",
-                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD=<REDACTED>",
-            ),
-            (
-                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = 'my-s3cret'",
-                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = <REDACTED>",
-            ),
-            (
-                "ALTER USER app IDENTIFIED BY 'new-s3cret' REPLACE 'my-s3cret'",
-                "ALTER USER app IDENTIFIED BY <REDACTED> REPLACE <REDACTED>",
-            ),
-            (
-                "SET PASSWORD = 'new-s3cret' REPLACE 'my-s3cret'",
-                "SET PASSWORD = <REDACTED> REPLACE <REDACTED>",
-            ),
-            (
-                "CREATE USER app IDENTIFIED WITH mysql_native_password AS '*0123my-s3cret'",
-                "CREATE USER app IDENTIFIED WITH mysql_native_password AS <REDACTED>",
-            ),
-            // REPLACE elsewhere is SQL, not a secret.
-            (
-                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
-                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
-            ),
+    fn test_credential_statements_are_withheld() {
+        let mut leaks = Vec::new();
+        for sql in [
+            // NO_BACKSLASH_ESCAPES: the backslash ends nothing.
+            "ALTER USER app IDENTIFIED BY 'new\\' REPLACE 'canary-old'",
+            "ALTER USER app IDENTIFIED BY /*!80000 'canary-exec' */",
+            "SET PASSWORD FOR ü@localhost = 'canary-u'",
+            "SET PASSWORD FOR CURRENT_USER() = 'canary-cu'",
+            "CREATE USER app IDENTIFIED VIA unix_socket OR mysql_native_password USING '*CANARYHASH'",
         ] {
-            let mut p = MysqlParser::new();
-            p.state = State::Ready;
-            let mut cmd = vec![COM_QUERY];
-            cmd.extend_from_slice(sql.as_bytes());
-            p.feed(&make_packet(0, &cmd), Direction::Egress, 1000);
-            let ParseResult::Messages(m) = p.feed(
-                &make_packet(1, &[OK_MARKER, 0, 0, 2, 0]),
-                Direction::Ingress,
-                2000,
-            ) else {
-                panic!("expected a message for {sql}");
-            };
-            assert_eq!(m[0].payload_text.as_deref(), Some(want));
+            let out = exported_query(sql);
+            if out.to_lowercase().contains("canary") {
+                leaks.push(format!("{sql} -> {out}"));
+            }
         }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+        assert_eq!(
+            exported_query("SET PASSWORD = 'canary'"),
+            "SET <statement withheld>"
+        );
     }
 
     #[test]
@@ -1236,15 +1210,27 @@ mod tests {
     }
 
     /// A server error that echoes the statement (1064) carries its secret:
-    /// the ERR text is masked like the query, with and without a SQL state.
+    /// the ERR text is withheld when the statement was, with and without a
+    /// SQL state, and when it shows credential context itself.
     #[test]
-    fn test_error_text_is_masked() {
+    fn test_error_text_is_withheld() {
         let echo = b"You have an error in your SQL syntax; check the manual near 'IDENTIFIED BY 'my-s3cret'' at line 1";
-        for sql_state in [true, false] {
+        for (query, sql_state) in [
+            (
+                &b"GRANT ALL ON app.* TO 'app'@'%' IDENTIFIED BY 'my-s3cret'"[..],
+                true,
+            ),
+            (
+                b"GRANT ALL ON app.* TO 'app'@'%' IDENTIFIED BY 'my-s3cret'",
+                false,
+            ),
+            // A clean query whose error shows credential context.
+            (b"SELECT 1", true),
+        ] {
             let mut p = MysqlParser::new();
             p.state = State::Ready;
             let mut cmd = vec![COM_QUERY];
-            cmd.extend_from_slice(b"GRANT ALL ON app.* TO 'app'@'%' IDENTIFIED BY 'my-s3cret'");
+            cmd.extend_from_slice(query);
             p.feed(&make_packet(0, &cmd), Direction::Egress, 1000);
             let mut err = vec![ERR_MARKER];
             err.extend_from_slice(&1064u16.to_le_bytes());
@@ -1256,9 +1242,8 @@ mod tests {
             else {
                 panic!("expected a message");
             };
-            let text = m[0].payload_text.as_deref().unwrap();
-            assert!(!text.contains("my-s3cret"), "{text}");
-            assert!(text.contains("near 'IDENTIFIED BY <REDACTED>"), "{text}");
+            assert_eq!(m[0].payload_text.as_deref(), Some("<statement withheld>"));
+            assert_eq!(m[0].status, Some(1064));
         }
     }
 
@@ -1450,6 +1435,34 @@ mod tests {
         );
         assert_eq!(msgs[0].request_text.as_deref(), Some("user0@example.com"));
         assert_eq!(msgs[0].status, Some(0));
+    }
+
+    /// A prepared statement with credential context exports no bound value.
+    #[test]
+    fn test_credential_statement_drops_bound_values() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"UPDATE users SET id = ?, password = ?");
+        let execute =
+            hex("17010000000001000000020001018000fe000000117573657230406578616d706c652e636f6d");
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, &prepare),
+                s(1, &prepare_ok(1, 0, 2)),
+                s(2, b"param-def-1"),
+                s(3, b"param-def-2"),
+                s(4, EOF),
+                c(0, &execute),
+                s(1, OK),
+            ],
+        );
+        assert_eq!(msgs[0].request_text, None, "{msgs:?}");
+        assert_eq!(
+            msgs[0].payload_text.as_deref(),
+            Some("UPDATE <statement withheld>")
+        );
     }
 
     #[test]

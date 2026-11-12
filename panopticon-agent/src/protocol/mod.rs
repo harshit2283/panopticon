@@ -139,7 +139,10 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
-pub use secrets::{SqlDialect, is_credential_name, mask_secrets, mask_sql_secrets};
+pub use secrets::{
+    FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
+    withheld_statement,
+};
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
 // while there is one agent per process. Set once at startup by
@@ -157,20 +160,50 @@ pub fn set_mask_credentials(on: bool) {
     MASK_CREDENTIALS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// [`mask_secrets`] in place.
-pub fn mask_secrets_in(text: &mut String) {
-    replace_masked(text, mask_secrets(text));
+/// A SQL statement (query text and its bound values) as a parser exports
+/// it. With credential context and `mask_credentials` on: only its verb as
+/// method and `VERB <statement withheld>` as text, no bound value, and
+/// `true` (its error text is withheld too). The query is wiped.
+pub fn export_statement(
+    mut query: String,
+    bound: Option<String>,
+) -> (Option<String>, String, Option<String>, bool) {
+    if mask_credentials_enabled() && has_credential_context(&query) {
+        let shown = withheld_statement(&query);
+        zeroize::Zeroize::zeroize(&mut query);
+        if let Some(mut b) = bound {
+            zeroize::Zeroize::zeroize(&mut b);
+        }
+        let verb = shown
+            .strip_suffix(STATEMENT_WITHHELD)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        return (verb, shown, None, true);
+    }
+    let verb = query.split_whitespace().next().map(str::to_uppercase);
+    let shown = truncate_utf8(&query, 4096).to_string();
+    (verb, shown, bound, false)
 }
 
-/// [`mask_sql_secrets`] in place.
-pub fn mask_sql_secrets_in(text: &mut String, dialect: SqlDialect) {
-    replace_masked(text, mask_sql_secrets(text, dialect));
+/// A server error message as a SQL parser exports it: withheld when its
+/// statement was, or when it shows credential context itself.
+pub fn export_error_text(text: String, statement_withheld: bool) -> String {
+    if mask_credentials_enabled() && (statement_withheld || has_credential_context(&text)) {
+        let mut text = text;
+        zeroize::Zeroize::zeroize(&mut text);
+        STATEMENT_WITHHELD.to_string()
+    } else {
+        text
+    }
 }
 
-fn replace_masked(text: &mut String, masked: Option<String>) {
-    if let Some(masked) = masked {
+/// [`protect_text`] in place: credential values masked, or the field
+/// replaced by [`FIELD_WITHHELD`].
+pub fn protect_text_in(text: &mut String) {
+    if let Some(out) = protect_text(text) {
         zeroize::Zeroize::zeroize(text);
-        *text = masked;
+        *text = out;
     }
 }
 

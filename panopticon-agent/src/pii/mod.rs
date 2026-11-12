@@ -29,7 +29,7 @@ use self::sampler::{InferenceSampler, template_hash};
 use crate::config::{PiiConfig, PiiMode};
 use crate::protocol::{L7Message, Protocol};
 
-use crate::protocol::{REDACTED_CREDENTIAL, mask_secrets_in};
+use crate::protocol::{REDACTED_CREDENTIAL, protect_text_in};
 
 /// Headers whose values are credentials or session tokens, masked wholesale
 /// when redaction is on: regexes cannot recognise opaque tokens and session
@@ -59,7 +59,10 @@ fn is_credential_header(name: &str) -> bool {
 }
 
 /// Mask the credentials that are whole fields: the arguments of an `AUTH`
-/// command and the values of credential-named HTTP headers.
+/// command and the values of credential-named headers (HTTP header names
+/// by [`is_credential_header`], any protocol's by
+/// [`crate::protocol::is_credential_name`]); drop DNS answers whose name has
+/// credential context.
 fn mask_credential_fields(msg: &mut L7Message) {
     let wipe = |f: &mut String| {
         f.zeroize();
@@ -75,24 +78,24 @@ fn mask_credential_fields(msg: &mut L7Message) {
             .flatten()
             .for_each(wipe);
     }
-    if matches!(
+    let http = matches!(
         msg.protocol,
         Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
-    ) {
-        msg.headers
-            .iter_mut()
-            .filter(|(name, _)| is_credential_header(name))
-            .for_each(|(_, value)| wipe(value));
-    }
-    // A DNS name that reads as a credential clause is not a hostname the
-    // cache would accept anyway: drop it rather than exempt it.
+    );
+    msg.headers
+        .iter_mut()
+        .filter(|(name, _)| {
+            (http && is_credential_header(name)) || crate::protocol::is_credential_name(name)
+        })
+        .for_each(|(_, value)| wipe(value));
     msg.dns_answers
-        .retain(|a| crate::protocol::mask_secrets(&a.name).is_none());
+        .retain(|a| !crate::protocol::has_credential_context(&a.name));
 }
 
-/// Mask login secrets in every string field of `msg` without the PII
-/// engine: what [`PiiEngine::scan_message_with`] masks when
-/// `mask_credentials` is on, for `full` mode with `[pii] enabled = false`.
+/// Protect login secrets in every string field of `msg` without the PII
+/// engine (see [`crate::protocol::protect_text`]): what
+/// [`PiiEngine::scan_message_with`] does when `mask_credentials` is on, for
+/// `full` mode with `[pii] enabled = false`.
 pub fn mask_credentials(msg: &mut L7Message) {
     mask_credential_fields(msg);
     for field in [
@@ -105,11 +108,14 @@ pub fn mask_credentials(msg: &mut L7Message) {
     .into_iter()
     .flatten()
     {
-        mask_secrets_in(field);
+        protect_text_in(field);
     }
     for (name, value) in msg.headers.iter_mut() {
-        mask_secrets_in(name);
-        mask_secrets_in(value);
+        // A wiped credential header keeps its name readable.
+        if value != REDACTED_CREDENTIAL {
+            protect_text_in(name);
+            protect_text_in(value);
+        }
     }
 }
 
@@ -546,6 +552,10 @@ impl PiiEngine {
                 .retain(|a| self.scan_with(&a.name, false).is_none());
         }
         for (name, value) in msg.headers.iter_mut() {
+            // A wiped credential header keeps its name readable.
+            if mask_creds && value == REDACTED_CREDENTIAL {
+                continue;
+            }
             self.scan_field(value, false, redact_enabled, &mut found);
             self.scan_field(name, false, redact_enabled, &mut found);
         }
@@ -575,7 +585,8 @@ impl PiiEngine {
     }
 
     /// Scan one field (percent-decoded first when `decode`); with redaction
-    /// on, replace it by its redacted form and then mask credentials in it.
+    /// on, replace it by its redacted form; then protect credentials in it
+    /// (masked or the field withheld, see [`crate::protocol::protect_text`]).
     /// Entity offsets stay relative to the field as scanned.
     fn scan_field(&self, field: &mut String, decode: bool, redact: bool, found: &mut Found) {
         let decoded = decode.then(|| percent_decode(field));
@@ -589,7 +600,7 @@ impl PiiEngine {
             found.entities.append(&mut report.entities);
         }
         if redact || self.config.mask_credentials {
-            mask_secrets_in(field);
+            protect_text_in(field);
         }
     }
 
@@ -951,6 +962,50 @@ mod tests {
             let _ = engine.scan_message_with(&mut m, redact);
             assert_eq!(m.headers[0].1, "password=<REDACTED>", "redact {redact}");
         }
+    }
+
+    /// Codex round 3: credential context the value masker could not
+    /// delimit. Each field must leave without its secret, with and without
+    /// the engine.
+    #[test]
+    fn test_credential_context_fields_leave_no_secret() {
+        use panopticon_common::Direction;
+        let long = format!("{}_password", "a".repeat(70));
+        let cases: Vec<(&str, String)> = vec![
+            ("json", r#"{"password":"canary-1"}"#.into()),
+            ("long name", format!("{long}=canary-2&q=1")),
+            ("double-encoded", "/x?%2570assword=canary-3".into()),
+            (
+                "array",
+                r#"{"access_tokens":["canary-4a","canary-4b"]}"#.into(),
+            ),
+            ("object", r#"{"password":{"value":"canary-5"}}"#.into()),
+            ("scheme-less authority", "//alice:canary-6@[::1]/db".into()),
+            (
+                "userinfo in a query value",
+                "/cb?next=alice:canary-7@db.internal".into(),
+            ),
+        ];
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut leaks = Vec::new();
+        for (what, text) in &cases {
+            for how in ["no engine", "redact", "full"] {
+                let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+                m.path = Some(text.clone());
+                m.request_text = Some(text.clone());
+                match how {
+                    "no engine" => mask_credentials(&mut m),
+                    h => {
+                        let _ = engine.scan_message_with(&mut m, h == "redact");
+                    }
+                }
+                let all = format!("{:?} {:?}", m.path, m.request_text);
+                if all.contains("canary") {
+                    leaks.push(format!("{what} ({how}): {all}"));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{leaks:#?}");
     }
 
     #[test]
