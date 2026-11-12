@@ -2,18 +2,15 @@
 //!
 //! Attaches to OpenSSL's `SSL_write`/`SSL_read`, their `_ex` variants (what
 //! OpenSSL 1.1.1+ applications such as CPython, curl and nginx call), and Go's
-//! TLS write function. Captures the plaintext buffer contents and emits
-//! TlsData events tagged with the connection object pointer (`SSL*`,
-//! `*tls.Conn`) so user space can tell connections apart.
+//! `crypto/tls.(*Conn).Write` and `(*Conn).Read`. Captures the plaintext
+//! buffer contents and emits TlsData events tagged with the connection
+//! object pointer (`SSL*`, `*tls.Conn`) so user space can tell connections
+//! apart.
 //!
-//! Go TLS reads are not captured. A read's buffer is only filled when the
-//! call returns, and nothing saved at entry can be proven to still belong
-//! to that call at its return: a stack-backed buffer moves when the
-//! goroutine's stack grows, a Read that unwinds (recovered panic, Goexit)
-//! leaves its arguments behind for a later call on a recycled goroutine,
-//! and the entries of abandoned calls are never reclaimed without a sweep
-//! the supported kernels lack. Go writes copy the caller's buffer at entry
-//! and have none of these problems.
+//! Go reads have no uretprobe (the runtime copies goroutine stacks, which
+//! breaks the return-address rewrite): an entry probe saves the arguments
+//! and a probe on each RET instruction of Read emits them (`go_tls_read_ret`,
+//! DESIGN §3.5 "Go TLS reads").
 
 use aya_ebpf::{
     EbpfContext,
@@ -26,10 +23,11 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY,
-    TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH, TlsCall, TlsConnKey,
-    TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_ARGS, PROC_EPOCH, SockTuple, TLS_ACTIVE,
+    TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH,
+    TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
 };
+use panopticon_common::{GoReadArgs, GoReadKey};
 use crate::sock_monitor::read_sock_tuple;
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
@@ -72,8 +70,8 @@ fn mark_active(conn: u64) {
 /// current generation (`sock_capture::sock_addr_checked`). That check needs
 /// the socket's `SOCK_STATE`, and `bpf_sk_storage_get` is offered to
 /// tracing (fentry) programs only, not to tracepoint or kprobe programs.
-/// Go TLS writes are addressless in these modes: they have no return
-/// probe.
+/// Go TLS is addressless in these modes: writes have no return probe, and
+/// a Read belongs to a goroutine, not to the thread the fentry sees.
 #[tracepoint]
 pub fn tls_sock_send_length(ctx: TracePointContext) {
     let _ = try_tls_sock_length(&ctx);
@@ -694,8 +692,6 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 /// - RBX: pointer to byte slice data
 /// - RCX: length of byte slice
 /// - RDI: capacity of byte slice
-///
-/// Go TLS reads are not captured (see the module comment).
 #[uprobe]
 pub fn go_tls_write_entry(ctx: ProbeContext) {
     let _ = try_go_tls_write(&ctx);
@@ -721,6 +717,193 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
         TlsLibrary::GoTls,
         NO_ADDR,
     )
+}
+
+// ── Go TLS: crypto/tls.(*Conn).Read ───────────────────────────────────────
+
+/// Entry of `(*Conn).Read(b []byte) (int, error)` (same registers as Write):
+/// save the call's arguments for the probes on its RET instructions, under
+/// its goroutine and process instance (DESIGN §3.5 "Go TLS reads"). Every
+/// entry replaces or removes the goroutine's entry, so whatever an earlier
+/// Read left (one that unwound without returning) never outlives the next
+/// entry, including an entry while capture is off.
+#[uprobe]
+pub fn go_tls_read_entry(ctx: ProbeContext) {
+    let _ = try_go_tls_read_entry(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    let on = crate::sock_capture::tls_capture_on();
+    // Off: no epoch is created, only an existing entry removed.
+    let key = go_read_key(ctx, on)?;
+    if !on {
+        let _ = GO_READ_ARGS.remove(&key);
+        return Ok(());
+    }
+    match go_read_args(ctx, key.goroutine) {
+        Some(args) if GO_READ_ARGS.insert(&key, &args, 0).is_ok() => mark_active(args.conn),
+        // Nothing to save, a map full or out of memory: no entry at all.
+        _ => {
+            let _ = GO_READ_ARGS.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+/// A RET instruction of `(*Conn).Read` (attached at every one): the byte
+/// count is the first result register, the bytes are in the buffer saved at
+/// this call's entry, at its current address.
+#[uprobe]
+pub fn go_tls_read_ret(ctx: ProbeContext) {
+    let _ = try_go_tls_read_ret(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_read_ret(ctx: &ProbeContext) -> Result<(), ()> {
+    // No epoch: nothing of this process instance is in flight.
+    let key = go_read_key(ctx, false)?;
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let _ = take_active(pid_tgid);
+    if !crate::sock_capture::tls_capture_on() {
+        let _ = GO_READ_ARGS.remove(&key);
+        return Ok(());
+    }
+    let Some(a) = GO_READ_ARGS.get_ptr(&key) else {
+        return Ok(()); // no entry saved for this goroutine
+    };
+    // SAFETY: this goroutine's own entry (maps.rs GO_READ_ARGS), read field
+    // by field before the delete.
+    let (conn, buf, len, depth, stack_rel) =
+        unsafe { ((*a).conn, (*a).buf, (*a).len, (*a).depth, (*a).stack_rel) };
+    let _ = GO_READ_ARGS.remove(&key);
+    // Still the current instance after the reads: no sweep had seen the
+    // epoch dead, so the element was not recycled under them.
+    match PROC_EPOCH.get_ptr(&key.tgid) {
+        Some(e) if unsafe { *e } == key.epoch => {}
+        _ => return Ok(()),
+    }
+    let (_, hi) = go_stack(key.goroutine)?;
+    // Another frame's entry (a nested Read, or one that unwound): its
+    // arguments are not this call's.
+    if hi.wrapping_sub(user_sp(ctx.regs)) != depth {
+        return Ok(());
+    }
+    let n = go_first_result(ctx);
+    if n as i64 <= 0 || n > len {
+        return Ok(());
+    }
+    // A buffer on the goroutine's stack is where a stack copy put it now.
+    let buf = if stack_rel != 0 { hi.wrapping_sub(buf) } else { buf };
+    emit_tls_event(
+        ctx,
+        conn,
+        buf as *const u8,
+        n as usize,
+        Direction::Ingress,
+        TlsLibrary::GoTls,
+        NO_ADDR,
+    )
+}
+
+/// This goroutine's key: the `g` register and the process instance
+/// (`PROC_EPOCH`), created at the first Read entry seen if `create`.
+#[inline(always)]
+fn go_read_key(ctx: &ProbeContext, create: bool) -> Result<GoReadKey, ()> {
+    let goroutine = go_g_register(ctx);
+    if goroutine == 0 {
+        return Err(());
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let epoch = match PROC_EPOCH.get_ptr(&tgid) {
+        Some(e) => unsafe { *e },
+        None if create => {
+            const BPF_NOEXIST: u64 = 1;
+            let now = unsafe { bpf_ktime_get_ns() };
+            if PROC_EPOCH.insert(&tgid, &now, BPF_NOEXIST).is_ok() {
+                now
+            } else {
+                // Another thread got there first, or the map is full.
+                unsafe { *PROC_EPOCH.get_ptr(&tgid).ok_or(())? }
+            }
+        }
+        None => return Err(()),
+    };
+    Ok(GoReadKey {
+        tgid,
+        _pad: 0,
+        goroutine,
+        epoch,
+    })
+}
+
+/// The arguments to save, if the call can be followed to its return. The
+/// buffer is either outside the goroutine's stack (heap, globals and C
+/// memory, which Go never moves), or wholly inside the live part of it,
+/// above SP, where a stack copy (growth or shrink) moves it by exactly as
+/// much as the stack top: it is saved as its distance below the top. Any
+/// other buffer is refused.
+#[inline(always)]
+fn go_read_args(ctx: &ProbeContext, goroutine: u64) -> Option<GoReadArgs> {
+    let (conn, buf, len) = read_go_write_args(ctx).ok()?;
+    let (buf, len) = (buf as u64, len as u64);
+    let (lo, hi) = go_stack(goroutine).ok()?;
+    let sp = user_sp(ctx.regs);
+    if len == 0 || len > u32::MAX as u64 || sp <= lo || sp >= hi {
+        return None; // nothing to fill, or not running on its own stack
+    }
+    let end = buf.checked_add(len)?;
+    let (buf, stack_rel) = if end <= lo || buf >= hi {
+        (buf, 0)
+    } else if buf > sp && end <= hi {
+        (hi - buf, 1)
+    } else {
+        return None;
+    };
+    Some(GoReadArgs {
+        conn,
+        buf,
+        len,
+        depth: hi - sp,
+        stack_rel,
+    })
+}
+
+/// `g.stack` (lo, hi): the first field of `runtime.g`, at offset 0 in every
+/// Go release ("offset known to runtime/cgo"). Read at the entry and again at
+/// the RET, where it is the stack the goroutine runs on now.
+#[inline(always)]
+fn go_stack(goroutine: u64) -> Result<(u64, u64), ()> {
+    let s: [u64; 2] =
+        unsafe { bpf_probe_read_user(goroutine as *const [u64; 2]) }.map_err(|_| ())?;
+    Ok((s[0], s[1]))
+}
+
+/// The current goroutine (`g`), pinned to a register in Go's ABIInternal:
+/// R14 on x86_64, X28 on arm64.
+#[inline(always)]
+#[cfg(bpf_target_arch = "x86_64")]
+fn go_g_register(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).r14 }
+}
+
+#[inline(always)]
+#[cfg(not(bpf_target_arch = "x86_64"))]
+fn go_g_register(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).regs[28] }
+}
+
+/// First integer result at a RET: RAX on x86_64, X0 on arm64.
+#[inline(always)]
+#[cfg(bpf_target_arch = "x86_64")]
+fn go_first_result(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).rax }
+}
+
+#[inline(always)]
+#[cfg(not(bpf_target_arch = "x86_64"))]
+fn go_first_result(ctx: &ProbeContext) -> u64 {
+    unsafe { (*ctx.regs).regs[0] }
 }
 
 #[inline(always)]

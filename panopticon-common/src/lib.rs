@@ -257,6 +257,41 @@ pub struct ProcessEvent {
     pub comm: [u8; MAX_COMM_SIZE],
 }
 
+/// Capacity of `GO_READ_ARGS`: Go `crypto/tls.(*Conn).Read` calls in
+/// flight on the node. A goroutine parked in Read (an idle keep-alive
+/// connection) holds one for as long as it waits.
+pub const GO_READS_IN_FLIGHT: u32 = 65536;
+
+/// `GO_READ_ARGS` key: one Go `(*Conn).Read` call in flight, identified by
+/// its goroutine (`g`) in one process instance (`PROC_EPOCH`), not by
+/// thread: a parked Read can resume on another thread.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GoReadKey {
+    pub tgid: u32,
+    pub _pad: u32,
+    pub goroutine: u64,
+    pub epoch: u64,
+}
+
+/// `GO_READ_ARGS` value: the Read's arguments, saved at its entry for the
+/// probes on its RET instructions (tls_probes.rs `go_tls_read_ret`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GoReadArgs {
+    /// `*tls.Conn`.
+    pub conn: u64,
+    /// The buffer's address; or, with `stack_rel` != 0, its distance below
+    /// the top of the goroutine's stack, which a stack copy preserves.
+    pub buf: u64,
+    /// `len(b)`.
+    pub len: u64,
+    /// Top of the goroutine's stack minus SP at entry: the call's frame,
+    /// equal at its RET instructions wherever the stack has moved.
+    pub depth: u64,
+    pub stack_rel: u64,
+}
+
 /// Connection tracking info stored in CONN_MAP.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -290,6 +325,12 @@ unsafe impl aya::Pod for ConnInfo {}
 // SAFETY: SockState is #[repr(C)], Copy, integers only.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for scope::SockState {}
+
+// SAFETY: #[repr(C)], Copy, integers only, no implicit padding.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoReadKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoReadArgs {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 
@@ -533,6 +574,12 @@ mod tests {
             40,
             "ProcessEvent size changed! This breaks kernel↔userspace ABI."
         );
+    }
+
+    #[test]
+    fn test_go_read_sizes() {
+        assert_eq!(size_of::<GoReadKey>(), 24);
+        assert_eq!(size_of::<GoReadArgs>(), 40);
     }
 
     #[test]

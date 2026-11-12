@@ -95,8 +95,8 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 /// pid_filter maps): their contents are only valid for the run that wrote
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
-/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL): owner-only
-/// maps whose entries belong to this run's probes.
+/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_ARGS,
+/// PROC_EPOCH): owner-only maps whose entries belong to this run's probes.
 const PINNED_MAP_NAMES: [&str; 9] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
@@ -133,6 +133,9 @@ pub struct LoadedPrograms {
     /// cgroup_skb: the cgroup v2 root the programs attach to, against
     /// which the scope publisher resolves selectors.
     pub cgroup_root: Option<std::path::PathBuf>,
+    /// Whether Go TLS reads may be attached: both process tracepoints are,
+    /// which end a process instance's `PROC_EPOCH` (tls_probes.rs).
+    pub go_reads: bool,
 }
 
 /// Shared eBPF state for concurrent access between event loop and scanner.
@@ -142,6 +145,8 @@ pub struct EbpfState {
     /// `(device_id, inode)` pairs of already-attached libraries —
     /// handles symlinks and mount namespace ambiguity.
     pub attached_libs: HashSet<(u64, u64)>,
+    /// [`LoadedPrograms::go_reads`].
+    pub go_reads: bool,
 }
 
 /// Detect kernel capabilities from /proc/version, sysfs and a BPF map probe.
@@ -335,21 +340,26 @@ pub fn load_and_attach(
     }
 
     // ── Tracepoints for process monitoring ────────────────────────────
-    attach_tracepoint(
+    // Before any TLS uprobe: Go read entries are only made once both can
+    // end their process instance.
+    let exec_tp = attach_tracepoint(
         &mut ebpf,
         "sched_process_exec",
         "sched",
         "sched_process_exec",
         &mut links,
     );
-    if !exit_tp_attached {
-        attach_tracepoint(
+    let exit_tp = exit_tp_attached
+        || attach_tracepoint(
             &mut ebpf,
             "sched_process_exit",
             "sched",
             "sched_process_exit",
             &mut links,
         );
+    let go_reads = exec_tp && exit_tp;
+    if !go_reads {
+        warn!("Go TLS reads not captured: the sched_process_exec/exit tracepoints are required");
     }
 
     info!(
@@ -382,6 +392,7 @@ pub fn load_and_attach(
         ebpf,
         _links: links,
         cgroup_root,
+        go_reads,
     })
 }
 
@@ -477,6 +488,7 @@ pub fn attach_tls_uprobes(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
+    go_reads: bool,
 ) -> usize {
     use std::os::fd::AsRawFd;
     let file = match crate::platform::proc_scanner::open_examined(target) {
@@ -490,7 +502,7 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
-    let attached = attach_tls_uprobes_to(ebpf, &pinned, links);
+    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads);
     drop(file); // the uprobes hold the inode now
     if attached > 0 {
         info!(
@@ -519,6 +531,7 @@ fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
+    go_reads: bool,
 ) -> usize {
     let mut attached = 0;
     // Restricted modes emit SSL_write* at return, with that call's own
@@ -633,10 +646,10 @@ fn attach_tls_uprobes_to(
                     if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
                         attached += 1;
                     }
-                    // Go TLS reads are not captured (tls_probes.rs module
-                    // comment): their probes are not attached.
-                    if read.is_some() {
-                        debug!(pid = target.pid, "Go TLS reads not captured; writes only");
+                    if let Some(read) = read
+                        && go_reads
+                    {
+                        attached += attach_go_read(ebpf, path, read, links);
                     }
                 }
                 GoVersion::StackAbi => {
@@ -657,7 +670,37 @@ fn attach_tls_uprobes_to(
 /// Attach TLS uprobes operating on shared `EbpfState` directly.
 /// Caller is responsible for locking the mutex.
 pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) -> usize {
-    attach_tls_uprobes(&mut state.ebpf, target, &mut state.links)
+    let go_reads = state.go_reads;
+    attach_tls_uprobes(&mut state.ebpf, target, &mut state.links, go_reads)
+}
+
+/// Go `(*Conn).Read`: a uprobe on every RET instruction first, then the
+/// entry probe, only if every RET probe attached: a call whose arguments
+/// are saved always has its returns watched (tls_probes.rs
+/// `go_tls_read_ret`). Returns the probes attached.
+fn attach_go_read(
+    ebpf: &mut Ebpf,
+    path: &str,
+    read: &crate::platform::proc_scanner::GoReadProbes,
+    links: &mut Vec<Box<dyn std::any::Any + Send>>,
+) -> usize {
+    let rets = read
+        .ret_offsets
+        .iter()
+        .filter(|&&ret| attach_uprobe(ebpf, "go_tls_read_ret", path, ret, None, links))
+        .count();
+    if rets < read.ret_offsets.len() {
+        warn!(path, "Go TLS reads not captured: a RET probe did not attach");
+        return rets;
+    }
+    rets + usize::from(attach_uprobe(
+        ebpf,
+        "go_tls_read_entry",
+        path,
+        read.entry_offset,
+        None,
+        links,
+    ))
 }
 
 fn attach_uprobe(
@@ -1074,14 +1117,16 @@ fn attach_tracepoint(
     category: &str,
     name: &str,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) {
+) -> bool {
     match try_attach_tracepoint(ebpf, prog_name, category, name) {
         Ok(link) => {
             info!(prog = prog_name, category, name, "tracepoint attached");
             links.push(Box::new(link));
+            true
         }
         Err(e) => {
-            warn!(prog = prog_name, category, name, error = %e, "Failed to attach tracepoint")
+            warn!(prog = prog_name, category, name, error = %e, "Failed to attach tracepoint");
+            false
         }
     }
 }
@@ -1419,6 +1464,8 @@ CapPrm:\t00000000ffffffff
             "PID_EXITED_LOST",
             "TLS_SCRATCH",
             "TLS_CALL",
+            "GO_READ_ARGS",
+            "PROC_EPOCH",
         ] {
             assert!(!pinned_map_names().any(|n| n == m), "{m} is pinned");
         }

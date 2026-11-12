@@ -370,7 +370,12 @@ async fn main() -> Result<()> {
             let mut tls_probes = 0;
             for target in &targets {
                 tls_probes +=
-                    loader::attach_tls_uprobes(&mut programs.ebpf, target, &mut programs._links);
+                    loader::attach_tls_uprobes(
+                        &mut programs.ebpf,
+                        target,
+                        &mut programs._links,
+                        programs.go_reads,
+                    );
                 // Track by inode to handle symlinks/mount namespaces
                 if let Some(file_id) = platform::proc_scanner::get_file_id(&target.library_path) {
                     attached_libs.insert(file_id);
@@ -389,6 +394,7 @@ async fn main() -> Result<()> {
             ebpf: programs.ebpf,
             links: programs._links,
             attached_libs,
+            go_reads: programs.go_reads,
         }));
         let cgroup_root = programs_cgroup_root;
 

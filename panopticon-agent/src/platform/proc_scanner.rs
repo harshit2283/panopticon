@@ -15,6 +15,9 @@ use std::ops::Range;
 use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
 use object::{Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef};
+
+pub use super::go_read::GoReadProbes;
+use super::go_read::{go_read_probes_from, symbol_file_offset};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
@@ -76,23 +79,11 @@ pub enum TlsType {
     },
     GoTls {
         write_offset: u64,
-        /// `crypto/tls.(*Conn).Read` entry and the offset of every return
-        /// instruction in it. Go reads cannot use a uretprobe (the runtime
-        /// moves goroutine stacks, which corrupts the return address), so
-        /// the return value is read with a uprobe on each RET instead.
+        /// `crypto/tls.(*Conn).Read` probe offsets, if found.
         read: Option<GoReadProbes>,
         go_version: GoVersion,
     },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GoReadProbes {
-    pub entry_offset: u64,
-    pub ret_offsets: Vec<u64>,
-}
-
-/// Most return instructions accepted in one function (sanity bound).
-const MAX_GO_RETURNS: usize = 64;
 
 /// Go ABI version — determines how arguments are passed to functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,105 +221,11 @@ fn collect_symbols<'data, Elf: FileHeader, R: ReadRef<'data>>(
     }
 }
 
-/// Convert a symbol's virtual address to a file offset suitable for uprobe attachment.
-///
-/// For shared libraries (.so), subtract the base virtual address of the first
-/// LOAD segment to get the offset relative to the library's load address.
-/// For executables, the address is typically usable directly.
-fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
-    elf: &ElfFile<'data, Elf, R>,
-    sym_addr: u64,
-) -> u64 {
-    // Find the minimum virtual address across all LOAD segments.
-    // This is the base address from which offsets are calculated.
-    use object::read::elf::ProgramHeader;
-
-    let endian = elf.endian();
-    if let Ok(segments) = elf.elf_header().program_headers(endian, elf.data()) {
-        let base_vaddr = segments
-            .iter()
-            .filter(|seg| seg.p_type(endian) == object::elf::PT_LOAD)
-            .map(|seg| seg.p_vaddr(endian).into())
-            .min()
-            .unwrap_or(0u64);
-
-        if base_vaddr > 0 && sym_addr >= base_vaddr {
-            return sym_addr - base_vaddr;
-        }
-    }
-
-    sym_addr
-}
-
 /// Entry and return-instruction offsets of the function `name` in an ELF.
 pub fn go_read_probes(path: &str, name: &str) -> Option<GoReadProbes> {
     with_untrusted_elf(path, |data| go_read_probes_from(data, name)).ok()?
 }
 
-fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Option<GoReadProbes> {
-    let elf = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data).ok()?;
-    let sym = elf
-        .symbols()
-        .find(|s| s.name().ok() == Some(name) && s.size() > 0)?;
-    let (addr, size) = (sym.address(), sym.size());
-    // Read only the function's bytes, not the whole section.
-    let section = elf.sections().find(|s| {
-        s.address() <= addr
-            && addr
-                .checked_add(size)
-                .is_some_and(|e| e <= s.address() + s.size())
-    })?;
-    let (sec_off, sec_len) = section.file_range()?;
-    let rel = addr - section.address();
-    if rel.checked_add(size)? > sec_len {
-        return None;
-    }
-    let code = data.read_bytes_at(sec_off.checked_add(rel)?, size).ok()?;
-    let rets = return_addresses(elf.architecture(), addr, code)?;
-    if rets.is_empty() || rets.len() > MAX_GO_RETURNS {
-        return None;
-    }
-    Some(GoReadProbes {
-        entry_offset: symbol_file_offset(&elf, addr),
-        ret_offsets: rets
-            .into_iter()
-            .map(|a| symbol_file_offset(&elf, a))
-            .collect(),
-    })
-}
-
-/// Virtual addresses of the return instructions in `code` (loaded at
-/// `addr`). Decodes instructions rather than searching for the RET byte,
-/// which also occurs inside other instructions.
-fn return_addresses(arch: object::Architecture, addr: u64, code: &[u8]) -> Option<Vec<u64>> {
-    match arch {
-        object::Architecture::X86_64 => {
-            use iced_x86::{Decoder, DecoderOptions, Mnemonic};
-            let mut decoder = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
-            let mut rets = Vec::new();
-            for insn in &mut decoder {
-                if insn.is_invalid() {
-                    return None; // not code we understand: don't guess
-                }
-                if insn.mnemonic() == Mnemonic::Ret {
-                    rets.push(insn.ip());
-                }
-            }
-            Some(rets)
-        }
-        object::Architecture::Aarch64 => {
-            const RET: u32 = 0xd65f_03c0; // ret (x30)
-            Some(
-                code.chunks_exact(4)
-                    .enumerate()
-                    .filter(|(_, w)| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == RET)
-                    .map(|(i, _)| addr + 4 * i as u64)
-                    .collect(),
-            )
-        }
-        _ => None,
-    }
-}
 
 /// Detect Go version from the `.go.buildinfo` ELF section.
 ///
@@ -683,12 +580,24 @@ pub async fn tls_scanner_task(
         };
         prune_attached_libs(&shared_ebpf, &targets);
         let newly_attached = attach_new_targets(&shared_ebpf, targets);
+        sweep_go_reads(&shared_ebpf);
         if newly_attached > 0 {
             info!(
                 new_libraries = newly_attached,
                 "Background TLS scan: attached uprobes to new libraries"
             );
         }
+    }
+}
+
+/// Go TLS read entries of process instances that ended (go_read.rs `sweep`).
+#[cfg(target_os = "linux")]
+fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>) {
+    let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
+    match super::go_read::sweep(&state.ebpf) {
+        Ok((0, 0)) => {}
+        Ok((entries, epochs)) => debug!(entries, epochs, "Go TLS read entries of ended processes removed"),
+        Err(e) => warn!(error = %format!("{e:#}"), "Go TLS read sweep failed"),
     }
 }
 
@@ -833,29 +742,6 @@ mod tests {
             extract_go_version_string(data),
             Some("go1.19.3".to_string())
         );
-    }
-
-    #[test]
-    fn test_return_addresses_decodes_instructions_x86_64() {
-        let code = [
-            0x48, 0x89, 0xc3, // mov rbx, rax
-            0xb8, 0xc3, 0x00, 0x00, 0x00, // mov eax, 0xc3 (0xc3 byte, not a ret)
-            0xc3, // ret
-            0x48, 0x31, 0xc0, // xor rax, rax
-            0xc3, // ret
-        ];
-        let rets = return_addresses(object::Architecture::X86_64, 0x1000, &code).unwrap();
-        assert_eq!(rets, vec![0x1008, 0x100c]);
-    }
-
-    #[test]
-    fn test_return_addresses_aarch64() {
-        let mut code = Vec::new();
-        for w in [0xd503201fu32, 0xd65f03c0, 0xaa0003e1, 0xd65f03c0] {
-            code.extend(w.to_le_bytes()); // nop, ret, mov x1, x0, ret
-        }
-        let rets = return_addresses(object::Architecture::Aarch64, 0x4000, &code).unwrap();
-        assert_eq!(rets, vec![0x4004, 0x400c]);
     }
 
     /// F14: the attach opens the file the offsets were read from, or
