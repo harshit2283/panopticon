@@ -144,7 +144,8 @@ thread_local! {
 
 /// `text` with every [`SECRET_CLAUSE`] value replaced by
 /// [`REDACTED_CREDENTIAL`], or None when there is none. Shared by the SQL
-/// parsers and `PiiEngine::scan_message_with`.
+/// parsers (queries and error text), `PiiEngine::scan_message_with` and
+/// `pii::mask_credentials` (no PII engine).
 pub fn mask_secrets(text: &str) -> Option<String> {
     SECRET_CLAUSE_LOCAL.with(|re| {
         re.is_match(text).then(|| {
