@@ -47,27 +47,6 @@ fn state(ebpf: &Ebpf, fd: &impl AsRawFd) -> Option<SockState> {
     map.get(&fd.as_raw_fd(), 0).ok()
 }
 
-/// pidfd_getfd exists (5.6+): ENOSYS is the only error with an fd of -1.
-fn pidfd_getfd_exists() -> bool {
-    // SAFETY: plain syscall on invalid fds.
-    unsafe { libc::syscall(438, -1, -1, 0u32) };
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
-}
-
-/// A dup of `fd` in process `pid` (pidfd_open + pidfd_getfd).
-fn fd_of(pid: u32, fd: i32) -> std::os::fd::OwnedFd {
-    use std::os::fd::FromRawFd;
-    // SAFETY: plain syscalls; non-negative results are fds we own.
-    unsafe {
-        let pidfd = libc::syscall(434, pid as libc::pid_t, 0u32);
-        assert!(pidfd >= 0, "pidfd_open {pid}");
-        let got = libc::syscall(438, pidfd as i32, fd, 0u32);
-        libc::close(pidfd as i32);
-        assert!(got >= 0, "pidfd_getfd {pid} {fd}");
-        std::os::fd::OwnedFd::from_raw_fd(got as i32)
-    }
-}
-
 fn cookie(fd: &impl AsRawFd) -> u64 {
     let mut c = 0u64;
     let mut len = 8u32;
@@ -400,31 +379,6 @@ fn scope_programs_load_attach_and_hold() {
         "load failures {failed:?}, allowed {allowed:?}"
     );
 
-    // Pre-agent listeners for arm-time owner initialisation (§3.1), made
-    // before any other process is spawned: `holder` (listed) holds LA alone
-    // and LB together with this process (unlisted at arm).
-    let la = TcpListener::bind("127.0.0.1:0").unwrap();
-    let lb = TcpListener::bind("127.0.0.1:0").unwrap();
-    let la_port = la.local_addr().unwrap().port();
-    let (la_raw, lb_raw) = (la.as_raw_fd(), lb.as_raw_fd());
-    let mut holder = {
-        use std::os::unix::process::CommandExt;
-        let mut c = std::process::Command::new("sleep");
-        c.arg("60");
-        // SAFETY: dup2 only, between fork and exec; dup2 clears CLOEXEC.
-        unsafe {
-            c.pre_exec(move || {
-                if libc::dup2(la_raw, 100) < 0 || libc::dup2(lb_raw, 101) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        c.spawn().unwrap()
-    };
-    drop(la);
-    let holder_pid = holder.id();
-
     // Sockets that predate the attach: a listener and a connected client.
     let pre_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut pre_client = TcpStream::connect(pre_listener.local_addr().unwrap()).unwrap();
@@ -480,10 +434,9 @@ fn scope_programs_load_attach_and_hold() {
         .unwrap();
     let (sel_pid, gone_pid, p_pid) = (sel.id(), gone.id(), p.id());
     let (early_pid, late_pid) = (held_early.id(), held_late.id());
-    let pids = [sel_pid, gone_pid, early_pid, late_pid, p_pid, holder_pid];
+    let pids = [sel_pid, gone_pid, early_pid, late_pid, p_pid];
     let candidates = snapshot_candidates(&pids);
     let pidfd = candidates[0].pidfd.is_some();
-    let candidates_pidfd = pidfd && pidfd_getfd_exists();
     println!("METHOD {}", if pidfd { "pidfd" } else { "start_time" });
     assert!(
         candidates[1].pidfd.is_none() && candidates[1].start.is_none(),
@@ -925,44 +878,6 @@ fn scope_programs_load_attach_and_hold() {
         "unlisted: out_of_scope"
     );
 
-    // ── pre-agent listeners (§3.1): initialised at arm with their owner
-    // iff every holder is listed; a child of one is in scope from its first
-    // byte, before any accept()
-    let getfd = candidates_pidfd;
-    if getfd {
-        let la_fd = fd_of(holder_pid, 100);
-        let ls = state(&ebpf, &la_fd).expect("LA initialised at arm");
-        assert_eq!(
-            (ls.owner_tgid, ls.pid_bits, ls.pid_epoch, ls.init_cookie),
-            (holder_pid, OWNER_LISTED, 77, 0),
-            "LA owner: its only holder"
-        );
-        let lb_fd = fd_of(holder_pid, 101);
-        assert!(
-            state(&ebpf, &lb_fd).is_none(),
-            "LB, also held by an unlisted process: not initialised"
-        );
-    }
-    let no0 = drops(&ebpf, DROP_NO_OWNER);
-    let mut ca = TcpStream::connect(("127.0.0.1", la_port)).unwrap();
-    let mut cb = TcpStream::connect(lb.local_addr().unwrap()).unwrap();
-    ca.write_all(b"preLA").unwrap();
-    cb.write_all(b"preLB").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let ev = drain(&mut ring);
-    let la_in = ev
-        .iter()
-        .any(|e| e.1 == Direction::Ingress && e.3 == b"preLA");
-    println!("LISTENER_INIT pidfd_getfd={getfd} la_captured={la_in}");
-    assert_eq!(la_in, getfd, "LA's child in scope before accept: {ev:?}");
-    assert!(
-        !ev.iter().any(|e| e.3 == b"preLB"),
-        "LB's child not in scope before accept: {ev:?}"
-    );
-    assert!(drops(&ebpf, DROP_NO_OWNER) > no0, "LB's child: no_owner");
-    drop((ca, cb));
-    holder.kill().unwrap();
-    holder.wait().unwrap();
     {
         let mut pids: HashMap<_, u32, u8> =
             HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
@@ -1032,8 +947,12 @@ fn scope_programs_load_attach_and_hold() {
     let _ = drain(&mut ring);
 
     // A listener that carries another socket's acceptor (an accepted socket
-    // that reached TCP_CLOSE without REUSED, then listen()): its children
-    // are never initialised.
+    // that reached TCP_CLOSE without REUSED, then listen()): a listed
+    // acceptor, no listed owner. Its children, accepted by an unlisted
+    // process, are never initialised, and the accept hook leaves the cloned
+    // acceptor untouched (rewriting `accept_cookie` first would let a
+    // concurrent passive ESTABLISHED adopt the cloned ACCEPTOR_LISTED).
+    // Accepts spin so some race their child's ESTABLISHED.
     {
         let l0 = TcpListener::bind("127.0.0.1:0").unwrap();
         let _c0 = TcpStream::connect(l0.local_addr().unwrap()).unwrap();
@@ -1055,6 +974,8 @@ fn scope_programs_load_attach_and_hold() {
         let mut st = state(&ebpf, &s0).unwrap();
         assert_eq!((st.acceptor_tgid, st.accept_cookie), (me, cookie(&s0)));
         st.flags &= !FLAG_REUSED; // as if STATE_CB had never been set
+        st.pid_bits = ACCEPTOR_LISTED; // no listed owner
+        let foreign = st.accept_cookie;
         {
             let mut map: SkStorage<&mut MapData, SockState> =
                 SkStorage::try_from(ebpf.map_mut("SOCK_STATE").unwrap()).unwrap();
@@ -1071,25 +992,68 @@ fn scope_programs_load_attach_and_hold() {
                 libc::getsockname(s0.as_raw_fd(), (&raw mut a).cast(), &mut len);
                 u16::from_be(a.sin_port)
             };
-            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            c.write_all(b"relisten").unwrap();
-            // SAFETY: valid listening fd; the result is a new fd we own.
-            let k = unsafe {
-                use std::os::fd::FromRawFd;
-                let fd = libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
-                assert!(fd >= 0, "accept on the re-listened socket");
-                std::os::fd::OwnedFd::from_raw_fd(fd)
-            };
-            let ks = state(&ebpf, &k).expect("clone");
-            assert_ne!(
-                ks.init_cookie,
-                cookie(&k),
-                "foreign acceptor: never initialised"
-            );
-            assert!(
-                !drain(&mut ring).iter().any(|e| e.0 == cookie(&k)),
-                "nothing captured on it"
-            );
+            {
+                let mut pids: HashMap<_, u32, u8> =
+                    HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+                pids.remove(&me).unwrap(); // the acceptor is unlisted
+            }
+            let dial = std::thread::spawn(move || {
+                (0..64)
+                    .map(|_| {
+                        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                        c.write_all(b"relisten").unwrap();
+                        c
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // SAFETY: valid fd.
+            unsafe { libc::fcntl(s0.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+            let mut kids = Vec::new();
+            while kids.len() < 64 {
+                // SAFETY: valid listening fd; a non-negative result is a new fd we own.
+                let fd = unsafe {
+                    libc::accept(s0.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut())
+                };
+                if fd >= 0 {
+                    // SAFETY: fd is ours.
+                    kids.push(unsafe {
+                        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                    });
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "accept: {e}");
+                    std::hint::spin_loop();
+                }
+            }
+            let clients = dial.join().unwrap();
+            for mut c in &clients {
+                c.write_all(b"after").unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let ev = drain(&mut ring);
+            for k in &kids {
+                let ks = state(&ebpf, k).expect("clone");
+                assert_ne!(
+                    ks.init_cookie,
+                    cookie(k),
+                    "foreign acceptor: never initialised"
+                );
+                assert_eq!(
+                    (ks.accept_cookie, ks.acceptor_tgid, ks.pid_bits),
+                    (foreign, me, ACCEPTOR_LISTED),
+                    "the accept hook left the cloned acceptor untouched"
+                );
+                assert!(
+                    !ev.iter().any(|e| e.0 == cookie(k)),
+                    "nothing captured on it"
+                );
+            }
+            {
+                let mut pids: HashMap<_, u32, u8> =
+                    HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+                pids.insert(me, 1, 0).unwrap();
+            }
+            drop((kids, clients));
             println!("RELISTEN OK");
         }
     }

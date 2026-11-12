@@ -83,11 +83,10 @@ const SK_STORAGE_GET_F_CREATE: u64 = 1;
 
 /// The socket's state, or null. State is created only for sockets created
 /// while this agent runs: by `cgroup/sock_create`, and for a child of a
-/// listener without state (one that predates the agent and was not
-/// initialised at arming, §3.1) by its PASSIVE_ESTABLISHED or its accept,
-/// whichever runs first. User space writes state only on pre-agent LISTEN
-/// sockets, before arming (`scope_loader::init_listeners`). A socket that
-/// itself predates the agent is never initialised (§2.1).
+/// listener without state (one that predates the agent, §3.1) by its
+/// PASSIVE_ESTABLISHED or its accept, whichever runs first. User space never
+/// writes state. A socket that itself predates the agent is never
+/// initialised (§2.1).
 #[inline(always)]
 fn state_of(sk: *mut c_void, create: bool) -> *mut SockState {
     let flags = if create { SK_STORAGE_GET_F_CREATE } else { 0 };
@@ -384,8 +383,8 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
     // (they need the tls ULP, which needs ESTABLISHED), i.e. after this
     // point, when the marker is already live.
     //
-    // A child of a listener without state (pre-agent, not initialised at
-    // arming) has nothing to clone: it is a new socket, so it gets fresh
+    // A child of a listener without state (one that predates the agent)
+    // has nothing to clone: it is a new socket, so it gets fresh
     // state here or in its accept, whichever runs first. Its owner is
     // unknown (epoch 0 never matches), so pid_filter selects it only from
     // accept() on (no_owner before, §3.1). An active socket without state
@@ -541,10 +540,16 @@ pub fn scope_accept2(ctx: FExitContext) -> i32 {
 /// written (no backfill, §3.1). The child may not be established yet (it is
 /// queued for accept() before its PASSIVE_ESTABLISHED callback runs), and a
 /// child of a listener without state may have no state yet: it is created
-/// here then. Write order: `accept_cookie` (claims the fields for this
-/// socket), the bits, `acceptor_tgid` (readers that see it see the bits),
-/// then clear the verdict so the next packet recomputes it. Not before
-/// arming, when PID_FILTER may be incomplete.
+/// here then. A child that already carries another socket's acceptor (a
+/// clone of a listener that was itself once accepted) is left untouched:
+/// rewriting its `accept_cookie` first would let a concurrent passive
+/// ESTABLISHED adopt the cloned acceptor bits and a reader cache IN from
+/// them before the new bits land. Untouched, it is never initialised (the
+/// passive ESTABLISHED refuses it too). Write order otherwise:
+/// `accept_cookie` (claims the fields for this socket), the bits,
+/// `acceptor_tgid` (readers that see it see the bits), then clear the
+/// verdict so the next packet recomputes it. Not before arming, when
+/// PID_FILTER may be incomplete.
 #[inline(always)]
 fn on_accept(child: *mut c_void) {
     if child.is_null() || !armed() {
@@ -552,6 +557,10 @@ fn on_accept(child: *mut c_void) {
     }
     let st = state_or_create(child);
     if st.is_null() {
+        return;
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(child) };
+    if rd!(st, acceptor_tgid) != 0 && rd!(st, accept_cookie) != cookie {
         return;
     }
     let tgid = current_tgid();
@@ -567,7 +576,7 @@ fn on_accept(child: *mut c_void) {
     if pid_listed(tgid) {
         bits |= ACCEPTOR_LISTED;
     }
-    wr!(st, accept_cookie, unsafe { bpf_get_socket_cookie(child) });
+    wr!(st, accept_cookie, cookie);
     wr!(st, pid_bits, bits);
     wr!(st, pid_epoch, epoch);
     wr!(st, acceptor_tgid, tgid);
