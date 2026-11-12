@@ -27,6 +27,10 @@ Checks:
                       recall of the last run's markers >= R
   widened:TAG:R       with DIR/widened.json ({"t", "until"}): recall of TAG's
                       markers sent from t + 1 s (to "until", if set) >= R
+  reads:TAG:R         TLS reads: share of TAG's truth markers in a raw-dump
+                      TLS Ingress event of the client process (the reply it
+                      read) >= R, and the same in one of another process
+                      (the request the server read) >= R
   noaddr:TAG          export events with a TAG marker carry no address
   addr:TAG:R          share of export events with a TAG marker that carry
                       an address >= R
@@ -254,6 +258,22 @@ for c in sys.argv[2:]:
         share = len(got) / max(len(want), 1)
         check(want and share >= float(r), "%s after widening: recall %d/%d (%.1f%%) >= %s"
               % (tag, len(got), len(want), 100 * share, r))
+    elif kind == "reads":
+        tag, r = arg.split(":")
+        want = {t["m"]: t["pid"] for t in truth(tag)}
+        pat = re.compile(rb"B2M-%s-\d+" % re.escape(tag.encode()))
+        views = {"client": set(), "server": set()}
+        for e in raw_events:
+            if e.get("direction") != "Ingress" or e.get("tls_library") in (None, "None"):
+                continue
+            for m in pat.findall(e["data"]):
+                m = m.decode()
+                if m in want:
+                    views["client" if e.get("pid") == want[m] else "server"].add(m)
+        for view, got in sorted(views.items()):
+            share = len(got) / max(len(want), 1)
+            check(want and share >= float(r), "%s %s-view TLS reads %d/%d (%.1f%%) >= %s"
+                  % (tag, view, len(got), len(want), 100 * share, r))
     elif kind in ("noaddr", "addr"):
         tag, _, r = arg.partition(":")
         mark = "B2M-%s-" % tag

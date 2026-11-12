@@ -7,6 +7,7 @@
 #   t2            T-2: narrowing by SIGHUP (cgroup_filter loses b2/a) under
 #                 live traffic, then a widening back
 #   tls_full      T-10: unscoped full, OpenSSL and Go TLS plaintext captured
+#                 (Go and OpenSSL reads checked on their own: reads:TAG)
 #   tls_pid       T-10: pid_filter; unselected process, socket passed either
 #   tls_cgroup    way, PID reused after exit (tls_pid only); TLS addresses
 #                 only when the call's own socket is in scope
@@ -264,7 +265,7 @@ run_tls_full() {
   touch "$d/go"; sleep 14
   stop_pids; sleep 2
   agent_stop "$d"
-  score "$d" recall:OS:0.98 recall:GS:0.98 addr:OS:0.9
+  score "$d" recall:OS:0.98 recall:GS:0.98 reads:OS:0.98 reads:GS:0.98 addr:OS:0.9
 }
 
 # run_tls_scoped DIR pid|cgroup
@@ -297,9 +298,9 @@ run_tls_scoped() {
   touch "$d/go"
   # OSEL's own sockets are in scope: its calls carry their address, also
   # where the library attaches the kTLS ULP without keys (OpenSSL 3.0 does on
-  # every socket BIO). Go writes never carry one (no return probe).
-  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 truth:ON none:ON truth:PS none:PS recall:PR:0.98 noaddr:PR
-                addr:OSEL:0.95 info:GSEL)
+  # every socket BIO). Go TLS never carries one (DESIGN §3.5).
+  local checks=(recall:OSEL:0.98 recall:GSEL:0.98 reads:GSEL:0.98 truth:ON none:ON truth:PS none:PS
+                recall:PR:0.98 noaddr:PR addr:OSEL:0.95 noaddr:GSEL)
   if [[ $how == pid ]]; then
     sleep 1
     kill $dummy; wait $dummy 2>/dev/null

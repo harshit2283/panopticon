@@ -12,6 +12,10 @@
 #[allow(dead_code)]
 mod scope_loader;
 
+#[path = "../src/platform/go_read.rs"]
+#[allow(dead_code)]
+mod go_read;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -75,6 +79,9 @@ fn drops(ebpf: &Ebpf, reason: u32) -> u64 {
         PerCpuArray::try_from(ebpf.map("SCOPE_DROPS").unwrap()).unwrap();
     m.get(&reason, 0).map_or(0, |v| v.iter().sum())
 }
+
+/// One lab test at a time: each attaches node-wide programs.
+static LAB: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The fd the stand-in SSL_write below writes to.
 static TEST_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -419,6 +426,7 @@ fn spawn_with_pid(pid: u32, port: u16, payload: &str) -> bool {
 #[test]
 #[ignore = "needs root on a Linux lab kernel"]
 fn scope_programs_load_attach_and_hold() {
+    let _lab = LAB.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");
 
@@ -2227,4 +2235,257 @@ fn scope_programs_load_attach_and_hold() {
     }
     drop(links);
     println!("RUNTIME OK");
+}
+
+/// Go `crypto/tls` reads (DESIGN §3.5 "Go TLS reads") through the real
+/// probes on a real Go binary, `tests/oracle/scope_go_tls.go` built with
+/// `CGO_ENABLED=0` at `PANOPTICON_GO_TLS` (default
+/// /home/ubuntu/b2/fix/scope_go_tls): reads captured whole, also into a
+/// stack buffer that moved mid-Read; no entries left after goroutine churn;
+/// entries of a process killed mid-Read removed by the sweep; scoped in,
+/// scoped out, narrowed mid-Read, capture off.
+#[test]
+#[ignore = "needs root on a Linux lab kernel and a built Go fixture"]
+fn go_tls_reads() {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    let _lab = LAB.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = std::env::var("PANOPTICON_GO_TLS")
+        .unwrap_or_else(|_| "/home/ubuntu/b2/fix/scope_go_tls".into());
+    // A private copy: uprobes are per file, so other users of the fixture
+    // never reach this test's probes.
+    let bin = std::env::temp_dir().join(format!("goreads-{}", std::process::id()));
+    std::fs::copy(&fixture, &bin).unwrap_or_else(|e| {
+        panic!("Go fixture {fixture}: {e} (CGO_ENABLED=0 go build tests/oracle/scope_go_tls.go)")
+    });
+    let elf = std::fs::read(&bin).unwrap();
+    let probes = go_read::go_read_probes_from(&elf[..], "crypto/tls.(*Conn).Read")
+        .expect("discovery finds (*Conn).Read and its RETs");
+    println!(
+        "GOREAD probes entry={:#x} rets={}",
+        probes.entry_offset,
+        probes.ret_offsets.len()
+    );
+
+    let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
+    let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    set(&mut ebpf, CONFIG_USE_RINGBUF, 1);
+    set(&mut ebpf, CONFIG_RING_SHARD_MASK, 0);
+    set(&mut ebpf, CONFIG_SCOPE_GEN, 1);
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0); // unscoped full
+    let mut ring = RingBuf::try_from(ebpf.take_map("DATA_EVENTS_0").unwrap()).unwrap();
+    let mut links: Vec<Box<dyn std::any::Any>> = Vec::new();
+    for tp in ["sched_process_exec", "sched_process_exit"] {
+        let p: &mut aya::programs::TracePoint = ebpf.program_mut(tp).unwrap().try_into().unwrap();
+        p.load().unwrap();
+        links.push(Box::new(p.attach("sched", tp).unwrap()));
+    }
+    // As the loader does: every RET, then the entry.
+    let path = bin.to_str().unwrap().to_string();
+    for (prog, offsets) in [
+        ("go_tls_read_ret", probes.ret_offsets.clone()),
+        ("go_tls_read_entry", vec![probes.entry_offset]),
+    ] {
+        let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+        p.load().unwrap_or_else(|e| panic!("{prog} loads: {e:#}"));
+        for off in offsets {
+            links.push(Box::new(p.attach(off, path.as_str(), None).unwrap()));
+        }
+    }
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let run = |args: &[&str]| -> Child {
+        Command::new(&bin)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    // Fixture processes still running if an assertion fails.
+    struct Reap(Vec<u32>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for &pid in &self.0 {
+                // SAFETY: kill(2) on a pid; a gone process only fails it.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        }
+    }
+    let mut reap = Reap(Vec::new());
+    let wait_ok = |mut c: Child, what: &str| {
+        assert!(c.wait().unwrap().success(), "{what} failed");
+    };
+    let mut server = run(&["rserver", &addr]);
+    let t0 = Instant::now();
+    while TcpStream::connect(&addr).is_err() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "rserver listens");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let spid = server.id();
+    reap.0.push(spid);
+    // Go reads in the ring: (pid, payload).
+    let reads = |ring: &mut RingBuf<MapData>| -> Vec<(u32, Vec<u8>)> {
+        std::thread::sleep(Duration::from_millis(300));
+        drain_tls(ring)
+            .iter()
+            .filter(|e| e.direction == Direction::Ingress && e.tls_library == TlsLibrary::GoTls)
+            .map(|e| (e.pid, e.payload_bytes().to_vec()))
+            .collect()
+    };
+    let keys = |ebpf: &Ebpf, tgid: Option<u32>| -> usize {
+        let m: HashMap<&MapData, GoReadKey, GoReadArgs> =
+            HashMap::try_from(ebpf.map("GO_READ_ARGS").unwrap()).unwrap();
+        m.keys()
+            .filter_map(Result::ok)
+            .filter(|k| tgid.is_none_or(|t| k.tgid == t))
+            .count()
+    };
+    let has_epoch = |ebpf: &Ebpf, tgid: u32| {
+        let m: HashMap<&MapData, u32, u64> =
+            HashMap::try_from(ebpf.map("PROC_EPOCH").unwrap()).unwrap();
+        m.get(&tgid, 0).is_ok()
+    };
+    let settle = |ebpf: &Ebpf, tgid: Option<u32>, want: usize, what: &str| {
+        let t0 = Instant::now();
+        while keys(ebpf, tgid) != want && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(keys(ebpf, tgid), want, "GO_READ_ARGS entries: {what}");
+    };
+
+    // ── unscoped full: every read whole, from both processes; the server's
+    // buffer is on its goroutine's stack and moves mid-Read
+    let _ = drain(&mut ring);
+    let client = run(&["rclient", &addr, "A", "80"]);
+    let cpid = client.id();
+    wait_ok(client, "rclient A");
+    let got = reads(&mut ring);
+    let mut moved = 0;
+    for i in 0..80 {
+        let m = format!("B2R-A-{i}");
+        assert!(
+            got.iter().any(|(p, b)| *p == spid && b == m.as_bytes()),
+            "server read {m} captured whole"
+        );
+        let reply = got
+            .iter()
+            .find(|(p, b)| *p == cpid && b.starts_with(format!("ECHO {m} m=").as_bytes()))
+            .unwrap_or_else(|| panic!("client read of the reply to {m} captured"));
+        assert_eq!(reply.1.len(), format!("ECHO {m} m=0").len(), "whole reply");
+        moved += usize::from(reply.1.ends_with(b"m=1"));
+    }
+    println!("GOREAD full: 160 reads whole; server buffer moved mid-Read in {moved}/80");
+    assert!(
+        moved > 0,
+        "no Read saw its stack buffer move: the relocation path was not exercised"
+    );
+    settle(&ebpf, None, 0, "after 80 connections' goroutines came and went");
+    assert!(!has_epoch(&ebpf, cpid), "the client's exit ended its instance");
+    assert!(has_epoch(&ebpf, spid));
+    println!("GOREAD churn: 0 entries after 80 connection goroutines");
+
+    // ── a process killed with Reads in flight: its entries outlive it until
+    // the sweep, which removes exactly those
+    let mut hold = run(&["rhold", &addr, "20"]);
+    let hpid = hold.id();
+    reap.0.push(hpid);
+    settle(&ebpf, Some(hpid), 20, "rhold blocked in 20 Reads");
+    hold.kill().unwrap();
+    hold.wait().unwrap();
+    settle(&ebpf, Some(spid), 0, "server Reads ended by EOF");
+    assert!(!has_epoch(&ebpf, hpid), "exit removed the epoch");
+    assert_eq!(keys(&ebpf, Some(hpid)), 20, "entries of the killed process remain");
+    assert_eq!(go_read::sweep(&ebpf).unwrap(), (20, 0));
+    assert_eq!(keys(&ebpf, None), 0, "after the sweep");
+    println!("GOREAD exit: 20 entries left by a killed process, swept to 0");
+
+    // ── pid_filter: the server in scope, the client not
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
+    set(&mut ebpf, CONFIG_SCOPE_ARMED, 1);
+    {
+        let mut pids: HashMap<_, u32, u8> =
+            HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+        pids.insert(spid, 1, 0).unwrap();
+    }
+    let out0 = drops(&ebpf, DROP_TLS_OUT_OF_SCOPE);
+    let client = run(&["rclient", &addr, "C", "20"]);
+    let cpid = client.id();
+    wait_ok(client, "rclient C");
+    let got = reads(&mut ring);
+    for i in 0..20 {
+        let m = format!("B2R-C-{i}");
+        assert!(
+            got.iter().any(|(p, b)| *p == spid && b == m.as_bytes()),
+            "scoped in: {m}"
+        );
+    }
+    assert!(
+        !got.iter().any(|(p, _)| *p == cpid),
+        "scoped out: nothing from the client"
+    );
+    assert!(
+        drops(&ebpf, DROP_TLS_OUT_OF_SCOPE) >= out0 + 20,
+        "client reads counted"
+    );
+    settle(&ebpf, None, 0, "scoped");
+    println!("GOREAD scoped: in-scope reads captured, out-of-scope none");
+
+    // ── narrowed while a Read is parked: what it returns after is dropped
+    let go = std::env::temp_dir().join(format!("goreads-go-{}", std::process::id()));
+    let _ = std::fs::remove_file(&go);
+    let slow = run(&["rslow", &addr, "D", go.to_str().unwrap()]);
+    reap.0.push(slow.id());
+    let t0 = Instant::now();
+    let mut pre = false;
+    while !pre && t0.elapsed() < Duration::from_secs(10) {
+        pre = reads(&mut ring)
+            .iter()
+            .any(|(p, b)| *p == spid && b == b"B2R-D-PRE");
+    }
+    assert!(pre, "control: in scope before the narrowing");
+    settle(&ebpf, Some(spid), 1, "the server parked in its next Read");
+    {
+        let mut pids: HashMap<_, u32, u8> =
+            HashMap::try_from(ebpf.map_mut("PID_FILTER").unwrap()).unwrap();
+        pids.remove(&spid).unwrap();
+    }
+    set(&mut ebpf, CONFIG_SCOPE_GEN, 2);
+    std::fs::write(&go, b"").unwrap();
+    wait_ok(slow, "rslow D");
+    let got = reads(&mut ring);
+    assert!(
+        !got.iter().any(|(_, b)| b.windows(10).any(|w| w == b"B2R-D-POST")),
+        "no read data after the narrowing"
+    );
+    std::fs::remove_file(&go).unwrap();
+    settle(&ebpf, None, 0, "narrowed");
+    println!("GOREAD narrowed: a Read parked across the narrowing emits nothing");
+
+    // ── capture off: nothing emitted, nothing kept
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 0);
+    wait_ok(run(&["rclient", &addr, "E", "10"]), "rclient E");
+    assert!(reads(&mut ring).is_empty(), "capture off");
+    let mut hold = run(&["rhold", &addr, "5"]);
+    reap.0.push(hold.id());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(keys(&ebpf, None), 0, "no entry is made while capture is off");
+    hold.kill().unwrap();
+    hold.wait().unwrap();
+
+    server.kill().unwrap();
+    server.wait().unwrap();
+    assert!(!has_epoch(&ebpf, spid));
+    assert_eq!(go_read::sweep(&ebpf).unwrap().0, 0);
+    assert_eq!(keys(&ebpf, None), 0);
+    drop(links);
+    std::fs::remove_file(&bin).unwrap();
+    println!("GOREAD OK");
 }

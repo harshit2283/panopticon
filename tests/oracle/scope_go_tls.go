@@ -6,6 +6,19 @@
 //
 // Environment: CGROUP (+ CG_ROOT), GO, EVERY, GAP as in scope_traffic.py.
 // Build with symbols (the default) so the agent finds crypto/tls.
+//
+// Go TLS read fixtures for the scope_attach lab test (go_tls_reads):
+//
+//	scope_go_tls rserver ADDR        echo server reading into a stack buffer
+//	scope_go_tls rclient ADDR TAG N  N one-message connections, 8 at a time
+//	scope_go_tls rhold ADDR K        K connections blocked in Read, forever
+//	scope_go_tls rslow ADDR TAG FILE PRE, then POST once FILE exists
+//
+// rserver grows each connection goroutine's stack before every Read into a
+// stack array and runs the GC every millisecond, which shrinks (copies) the
+// stack of a goroutine parked in Read; its reply says whether the buffer
+// moved during that Read (" m=1"). Messages are B2R-TAG-i (rclient) or
+// B2R-TAG-PRE / -POST (rslow); replies are "ECHO <message> m=0|1".
 package main
 
 import (
@@ -25,9 +38,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 )
 
 func env(k, def string) string {
@@ -144,15 +160,143 @@ func client(addr, tag string, n int, out string) {
 	}
 }
 
+// grow uses about n KiB of stack, then returns it.
+//
+//go:noinline
+func grow(n int) byte {
+	var pad [1024]byte
+	pad[n%1024] = byte(n)
+	if n == 0 {
+		return pad[0]
+	}
+	return grow(n-1) + pad[n%1024]
+}
+
+func rserver(addr string) {
+	ln, err := tls.Listen("tcp", addr, &tls.Config{Certificates: []tls.Certificate{cert()}})
+	if err != nil {
+		log.Fatal(err)
+	}
+	go func() {
+		for {
+			runtime.GC()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func(c *tls.Conn) {
+			defer c.Close()
+			for {
+				grow(256)
+				var buf [512]byte // stays on the stack: (*Conn).Read does not keep b
+				for i := range buf {
+					buf[i] = 'x'
+				}
+				before := uintptr(unsafe.Pointer(&buf[0]))
+				n, err := c.Read(buf[:])
+				if err != nil {
+					return
+				}
+				m := 0
+				if uintptr(unsafe.Pointer(&buf[0])) != before {
+					m = 1
+				}
+				msg := string(buf[:n]) // a copy: buf itself must not escape
+				if _, err := fmt.Fprintf(c, "ECHO %s m=%d", msg, m); err != nil {
+					return
+				}
+			}
+		}(c.(*tls.Conn))
+	}
+}
+
+var sink [][]byte // read buffers escape: client reads go to the heap
+
+func exchange(c *tls.Conn, msg string) {
+	if _, err := c.Write([]byte(msg)); err != nil {
+		log.Fatal(err)
+	}
+	buf := make([]byte, 512)
+	sink = append(sink[:0], buf)
+	n, err := c.Read(buf)
+	if err != nil || !strings.HasPrefix(string(buf[:n]), "ECHO "+msg+" m=") {
+		log.Fatalf("%s: %q %v", msg, buf[:n], err)
+	}
+}
+
+func dial(addr string) *tls.Conn {
+	c, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return c
+}
+
+func rclient(addr, tag string, n int) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) { // one goroutine per connection: goroutines churn
+			defer wg.Done()
+			defer func() { <-sem }()
+			c := dial(addr)
+			defer c.Close()
+			time.Sleep(20 * time.Millisecond) // the server parks in Read
+			exchange(c, fmt.Sprintf("B2R-%s-%d", tag, i))
+		}(i)
+	}
+	wg.Wait()
+}
+
+func rhold(addr string, k int) {
+	for i := 0; i < k; i++ {
+		c := dial(addr)
+		go func() {
+			var b [64]byte
+			c.Read(b[:])
+		}()
+	}
+	select {}
+}
+
+func rslow(addr, tag, file string) {
+	c := dial(addr)
+	defer c.Close()
+	exchange(c, "B2R-"+tag+"-PRE")
+	for {
+		if _, err := os.Stat(file); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	exchange(c, "B2R-"+tag+"-POST")
+}
+
 func main() {
 	a := os.Args
 	switch {
+	case len(a) == 3 && a[1] == "rserver":
+		rserver(a[2])
+	case len(a) == 5 && a[1] == "rclient":
+		n, _ := strconv.Atoi(a[4])
+		rclient(a[2], a[3], n)
+	case len(a) == 4 && a[1] == "rhold":
+		k, _ := strconv.Atoi(a[3])
+		rhold(a[2], k)
+	case len(a) == 5 && a[1] == "rslow":
+		rslow(a[2], a[3], a[4])
 	case len(a) == 3 && a[1] == "server":
 		server(a[2])
 	case len(a) == 6 && a[1] == "client":
 		n, _ := strconv.Atoi(a[4])
 		client(a[2], a[3], n, a[5])
 	default:
-		log.Fatal("usage: scope_go_tls server ADDR | client ADDR TAG N OUT")
+		log.Fatal("usage: scope_go_tls server ADDR | client ADDR TAG N OUT | rserver ADDR | rclient ADDR TAG N | rhold ADDR K | rslow ADDR TAG FILE")
 	}
 }
