@@ -2283,12 +2283,12 @@ fn go_tls_reads() {
         p.load().unwrap();
         links.push(Box::new(p.attach("sched", tp).unwrap()));
     }
-    // As the loader does: readRecordOrCCS's RETs, its entry, decrypt's RETs.
+    // As the loader does: every RET probe, then the readRecordOrCCS entry.
     let path = bin.to_str().unwrap().to_string();
     for (prog, offsets) in [
         ("go_tls_rrc_ret", probes.read_record_rets.clone()),
-        ("go_tls_rrc_entry", vec![probes.read_record_entry]),
         ("go_tls_decrypt_ret", probes.decrypt_rets.clone()),
+        ("go_tls_rrc_entry", vec![probes.read_record_entry]),
     ] {
         let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
         p.load().unwrap_or_else(|e| panic!("{prog} loads: {e:#}"));

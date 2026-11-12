@@ -667,11 +667,12 @@ pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) ->
     attach_tls_uprobes(&mut state.ebpf, target, &mut state.links, go_reads)
 }
 
-/// Go TLS reads (go_read.rs): every RET probe of `readRecordOrCCS` first,
-/// then its entry probe only if every RET probe attached, so a saved slot
-/// always has its returns watched; then the `decrypt` RET probes, which
-/// emit only inside a call whose entry was seen (tls_probes.rs
-/// `go_tls_decrypt_ret`). Returns the probes attached.
+/// Go TLS reads (go_read.rs): every RET probe of `readRecordOrCCS` and of
+/// `decrypt` first, then the `readRecordOrCCS` entry probe only if all of
+/// them attached. Without the entry no slot is ever saved and nothing is
+/// emitted, so a binary gets all of its reads or none: a saved slot always
+/// has its returns watched, and no record returns through an unwatched RET
+/// (tls_probes.rs `go_tls_decrypt_ret`). Returns the probes attached.
 fn attach_go_read(
     ebpf: &mut Ebpf,
     path: &str,
@@ -684,29 +685,16 @@ fn attach_go_read(
             .filter(|&&off| attach_uprobe(ebpf, prog, path, off, None, links))
             .count()
     };
-    let rets = attach_all("go_tls_rrc_ret", &read.read_record_rets);
-    if rets < read.read_record_rets.len() {
+    let rets = attach_all("go_tls_rrc_ret", &read.read_record_rets)
+        + attach_all("go_tls_decrypt_ret", &read.decrypt_rets);
+    if rets < read.read_record_rets.len() + read.decrypt_rets.len() {
         warn!(
             path,
-            "Go TLS reads not captured: a readRecordOrCCS RET probe did not attach"
+            "Go TLS reads not captured: a RET probe did not attach"
         );
         return rets;
     }
-    if attach_all("go_tls_rrc_entry", &[read.read_record_entry]) == 0 {
-        warn!(
-            path,
-            "Go TLS reads not captured: the readRecordOrCCS entry probe did not attach"
-        );
-        return rets;
-    }
-    let decrypts = attach_all("go_tls_decrypt_ret", &read.decrypt_rets);
-    if decrypts < read.decrypt_rets.len() {
-        warn!(
-            path,
-            "Go TLS reads incomplete: a decrypt RET probe did not attach"
-        );
-    }
-    rets + 1 + decrypts
+    rets + attach_all("go_tls_rrc_entry", &[read.read_record_entry])
 }
 
 fn attach_uprobe(
