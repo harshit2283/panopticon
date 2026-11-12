@@ -9,7 +9,7 @@ use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
-    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoReadArgs, GoReadKey, MAX_CGROUP_ALLOW,
+    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoReadCall, GoReadKey, MAX_CGROUP_ALLOW,
     MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
     scope::{MAX_VRF_MASTERS, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
@@ -455,30 +455,32 @@ pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
 #[map]
 pub static CONNECTING: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
-/// Go `crypto/tls.(*Conn).Read` calls in flight (tls_probes.rs
-/// `go_tls_read_entry` / `go_tls_read_ret`).
+/// Go `crypto/tls.(*Conn).readRecordOrCCS` calls in flight, by goroutine:
+/// the connection each is reading a record for (tls_probes.rs
+/// `go_tls_rrc_entry`, `go_tls_rrc_ret`, `go_tls_decrypt_ret`). Holds an
+/// identifier and a frame depth, never a buffer address.
 ///
 /// Not LRU (see TLS_SCRATCH). Ownership: in the kernel only the goroutine
-/// of a key inserts, replaces, reads and deletes it (every Read entry
-/// replaces it, every RET consumes it). The one other writer is user
-/// space's sweep (`go_read::sweep`), which deletes only keys whose epoch
-/// is no longer `PROC_EPOCH[tgid]`, an epoch that never comes back. A RET
-/// probe reads its value through a pointer and then checks that its epoch
-/// is still current: if it is, no sweep can yet have seen it dead, so
-/// nothing recycled the element under the read. Not preallocated: memory
+/// of a key inserts, replaces, reads and deletes it. The one other writer is
+/// user space's sweep (`go_read::sweep`), which deletes only keys whose
+/// epoch is no longer `PROC_EPOCH[tgid]`, an epoch that never comes back.
+/// The decrypt probe reads a value through a pointer and then checks that
+/// its epoch is still current: if it is, no sweep can yet have seen it dead,
+/// so nothing recycled the element under the read. Not preallocated: memory
 /// follows the reads in flight. A full map (or a failed allocation) fails
-/// closed: the entry is removed and that call emits nothing.
+/// closed: the slot is removed and that call's record is not emitted.
 #[map]
-pub static GO_READ_ARGS: HashMap<GoReadKey, GoReadArgs> =
+pub static GO_READ_CALLS: HashMap<GoReadKey, GoReadCall> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
 const BPF_F_NO_PREALLOC: u32 = 1;
 
 /// The current instance of each process doing Go TLS reads: boot-time
-/// nanoseconds at the first Read entry seen (`go_tls_read_entry`), removed
-/// when the instance ends: at exec (a new image) and when the thread group
-/// leader exits. Part of every GO_READ_ARGS key, so a later instance (PID
-/// reuse, exec) never matches an earlier one's entries.
+/// nanoseconds at the first `readRecordOrCCS` entry seen
+/// (`go_tls_rrc_entry`), removed when the instance ends: at exec (a new
+/// image) and when the thread group leader exits. Part of every
+/// GO_READ_CALLS key, so a later instance (PID reuse, exec) never matches an
+/// earlier one's slots.
 #[map]
 pub static PROC_EPOCH: HashMap<u32, u64> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 

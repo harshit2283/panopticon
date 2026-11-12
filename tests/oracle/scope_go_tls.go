@@ -14,6 +14,9 @@
 //	scope_go_tls rhold ADDR K        K connections blocked in Read, forever
 //	scope_go_tls rslow ADDR TAG FILE PRE, then POST once FILE exists
 //
+// Their client side speaks TLS 1.3, or TLS 1.2 with TLS12=aead (default
+// suites) or TLS12=cbc (ECDHE-ECDSA AES-128-CBC-SHA).
+//
 // rserver grows each connection goroutine's stack before every Read into a
 // stack array and runs the GC every millisecond, which shrinks (copies) the
 // stack of a goroutine parked in Read; its reply says whether the buffer
@@ -228,10 +231,29 @@ func exchange(c *tls.Conn, msg string) {
 	}
 }
 
+// dial connects with TLS 1.3, or TLS 1.2 when TLS12 is "aead" (the
+// default suites) or "cbc" (AES-CBC with HMAC, decrypted differently).
 func dial(addr string) *tls.Conn {
-	c, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	tls12 := os.Getenv("TLS12")
+	switch tls12 {
+	case "":
+	case "aead":
+		cfg.MaxVersion = tls.VersionTLS12
+	case "cbc":
+		cfg.MaxVersion = tls.VersionTLS12
+		cfg.CipherSuites = []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA}
+	default:
+		log.Fatalf("TLS12=%q: aead or cbc", tls12)
+	}
+	c, err := tls.Dial("tcp", addr, cfg)
 	if err != nil {
 		log.Fatal(err)
+	}
+	st := c.ConnectionState()
+	if tls12 != "" && (st.Version != tls.VersionTLS12 ||
+		(tls12 == "cbc") != (st.CipherSuite == tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA)) {
+		log.Fatalf("TLS12=%s: negotiated %x %x", tls12, st.Version, st.CipherSuite)
 	}
 	return c
 }

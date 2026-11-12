@@ -2,8 +2,8 @@
 
 //! TLS library discovery via /proc scanning and ELF symbol resolution.
 //!
-//! **Cross-platform**: `resolve_elf_symbols`, `detect_go_version`, `parse_go_abi`
-//! work on any OS (testable on macOS with ELF fixtures).
+//! **Cross-platform**: `resolve_elf_symbols`, `go_build_admitted`,
+//! `go_read_probes` work on any OS (testable on macOS with ELF fixtures).
 //!
 //! **Linux-only**: `scan_all_processes`, `scan_pid`, `parse_proc_maps`
 //! read `/proc/*/maps` to find loaded TLS libraries.
@@ -77,21 +77,12 @@ pub enum TlsType {
         ssl_write_ex_offset: Option<u64>,
         ssl_read_ex_offset: Option<u64>,
     },
+    /// Only for a build [`go_build_admitted`] accepts.
     GoTls {
         write_offset: u64,
-        /// `crypto/tls.(*Conn).Read` probe offsets, if found.
+        /// Go TLS read probe offsets (go_read.rs), if found.
         read: Option<GoReadProbes>,
-        go_version: GoVersion,
     },
-}
-
-/// Go ABI version — determines how arguments are passed to functions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GoVersion {
-    /// Go >= 1.17 — register-based ABI (what our eBPF probe expects).
-    RegisterAbi,
-    /// Go < 1.17 — stack-based ABI (skip attachment in v1).
-    StackAbi,
 }
 
 // ── ELF Symbol Resolution (cross-platform) ──────────────────────────────
@@ -121,11 +112,15 @@ const MAX_ELF_FILE_BYTES: u64 = 1 << 30;
 /// before it is allocated; once the budget is spent the parse fails.
 const MAX_ELF_READ_BYTES: u64 = 128 << 20;
 
-/// Least charged per string lookup: about what one `ReadCache` string
-/// entry costs (hash slot, key, boxed bytes). 128 MiB of budget then bounds
-/// a parse to 1M lookups; a large Go binary has a few hundred thousand
-/// symbols.
+/// Charged per string lookup on top of the string itself: about what one
+/// `ReadCache` string entry costs (hash slot, key, boxed bytes), so the
+/// budget bounds the entries too, empty strings included. 128 MiB of budget
+/// then bounds a parse to 1M lookups; a large Go binary has a few hundred
+/// thousand symbols.
 const MIN_STRING_CHARGE: u64 = 128;
+
+/// Longest string `ReadCache` scans for (and keeps) in one lookup.
+const MAX_STRING_SCAN: u64 = 4096;
 
 /// `ReadRef` over a file cache that refuses reads past a cumulative budget.
 #[derive(Clone, Copy)]
@@ -135,9 +130,20 @@ struct BudgetedRead<'a> {
 }
 
 impl BudgetedRead<'_> {
+    /// Spend `n` bytes of the budget. A refusal spends all of it, so every
+    /// later read is refused too and a parse stops instead of carrying on
+    /// with smaller reads.
     fn charge(self, n: u64) -> std::result::Result<(), ()> {
-        self.left.set(self.left.get().checked_sub(n).ok_or(())?);
-        Ok(())
+        match self.left.get().checked_sub(n) {
+            Some(left) if self.left.get() > 0 => {
+                self.left.set(left);
+                Ok(())
+            }
+            _ => {
+                self.left.set(0);
+                Err(())
+            }
+        }
     }
 }
 
@@ -156,12 +162,14 @@ impl<'a> ReadRef<'a> for BudgetedRead<'a> {
         range: Range<u64>,
         delimiter: u8,
     ) -> std::result::Result<&'a [u8], ()> {
-        // ReadCache caps a string scan at 4 KiB and keeps one cache entry
-        // per lookup, even of an empty string: charge what it keeps, at
-        // least MIN_STRING_CHARGE, so the budget bounds the entries too
+        // ReadCache scans up to MAX_STRING_SCAN bytes and keeps one entry
+        // per lookup, even of an empty string. Reserve the most it can keep
+        // before it allocates; keep charged the string plus the entry
         // (security scan F8).
+        self.charge(MAX_STRING_SCAN + MIN_STRING_CHARGE)?;
         let bytes = self.cache.read_bytes_at_until(range, delimiter)?;
-        self.charge((bytes.len() as u64).max(MIN_STRING_CHARGE))?;
+        let unused = MAX_STRING_SCAN.saturating_sub(bytes.len() as u64);
+        self.left.set(self.left.get() + unused);
         Ok(bytes)
     }
 }
@@ -201,15 +209,16 @@ pub fn resolve_elf_symbols_from_bytes<'data, R: ReadRef<'data>>(
     Ok(result)
 }
 
+/// Stops at the first name that cannot be read: a spent read budget fails
+/// every later lookup, and scanning on would only repeat the failure.
 fn collect_symbols<'data, Elf: FileHeader, R: ReadRef<'data>>(
     elf: &ElfFile<'data, Elf, R>,
     wanted: &[&str],
     result: &mut HashMap<String, u64>,
 ) {
     for sym in elf.symbols() {
-        if let Ok(name) = sym.name()
-            && wanted.contains(&name)
-        {
+        let Ok(name) = sym.name() else { return };
+        if wanted.contains(&name) {
             // Use the symbol's address (virtual address / file offset).
             // For uprobes, aya expects the offset within the ELF file,
             // which for non-PIE executables equals the symbol address.
@@ -220,97 +229,131 @@ fn collect_symbols<'data, Elf: FileHeader, R: ReadRef<'data>>(
     }
     // Also check dynamic symbols
     for sym in elf.dynamic_symbols() {
-        if let Ok(name) = sym.name()
-            && wanted.contains(&name)
-            && !result.contains_key(name)
-        {
+        let Ok(name) = sym.name() else { return };
+        if wanted.contains(&name) && !result.contains_key(name) {
             let offset = symbol_file_offset(elf, sym.address());
             result.insert(name.to_string(), offset);
         }
     }
 }
 
-/// Entry and return-instruction offsets of the function `name` in an ELF.
-pub fn go_read_probes(path: &str, name: &str) -> Option<GoReadProbes> {
-    with_untrusted_elf(path, |data| go_read_probes_from(data, name)).ok()?
+/// The Go TLS read probe offsets in an ELF (go_read.rs).
+pub fn go_read_probes(path: &str) -> Option<GoReadProbes> {
+    with_untrusted_elf(path, |data| go_read_probes_from(data)).ok()?
 }
 
-
-/// Detect Go version from the `.go.buildinfo` ELF section.
-///
-/// Returns the Go version string (e.g., `"go1.21.5"`) or `None` if
-/// not a Go binary or the version cannot be determined.
-pub fn detect_go_version(path: &str) -> Option<String> {
-    with_untrusted_elf(path, |data| detect_go_version_from_bytes(data)).ok()?
+/// Whether the Go probes can read a Go binary's functions: Ok(toolchain
+/// version) only when its build is positively one whose internal calling
+/// convention (ABIInternal, the register ABI) they decode, for this
+/// agent's architecture; otherwise why not. Read from the build
+/// information the Go toolchain records (`.go.buildinfo`), never guessed
+/// from a version alone: a missing or unreadable field rejects the binary,
+/// and with it every Go probe, writes included.
+pub fn go_build_admitted(path: &str) -> std::result::Result<String, &'static str> {
+    with_untrusted_elf(path, |data| {
+        let elf = ElfFile::<object::elf::FileHeader64<object::Endianness>, _>::parse(data)
+            .map_err(|_| "not a 64-bit ELF")?;
+        let info = elf
+            .section_by_name(".go.buildinfo")
+            .ok_or("no Go build information")?
+            .data()
+            .map_err(|_| "unreadable Go build information")?;
+        admit_go_build(info, elf.architecture(), HOST_ARCH)
+    })
+    .map_err(|_| "cannot open")?
 }
 
-/// Inner implementation for testability.
-pub fn detect_go_version_from_bytes<'data, R: ReadRef<'data>>(data: R) -> Option<String> {
-    // Try 64-bit first, then 32-bit
-    if let Ok(elf) = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data) {
-        return extract_go_version(&elf);
+#[cfg(target_arch = "x86_64")]
+const HOST_ARCH: object::Architecture = object::Architecture::X86_64;
+#[cfg(target_arch = "aarch64")]
+const HOST_ARCH: object::Architecture = object::Architecture::Aarch64;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const HOST_ARCH: object::Architecture = object::Architecture::Unknown;
+
+/// [`go_build_admitted`] over the contents of `.go.buildinfo`. Admitted:
+/// the format Go 1.18+ writes (64-bit little-endian, strings inline), a
+/// `go1.N` version with N >= 18, `-compiler=gc`, `GOARCH` amd64 or arm64
+/// matching the ELF and the agent, and no `noregabi*` experiment, either in
+/// the `GOEXPERIMENT` setting or baked into the toolchain (the version's
+/// ` X:` suffix). Register ABI is the default on amd64 from Go 1.17 and on
+/// arm64 from 1.18; an experiment is the only way to turn it off.
+fn admit_go_build(
+    info: &[u8],
+    elf_arch: object::Architecture,
+    host_arch: object::Architecture,
+) -> std::result::Result<String, &'static str> {
+    const MAGIC: &[u8] = b"\xff Go buildinf:";
+    if info.len() < 32 || &info[..MAGIC.len()] != MAGIC {
+        return Err("no Go build information header");
     }
-    if let Ok(elf) = ElfFile::<object::elf::FileHeader32<object::Endianness>, R>::parse(data) {
-        return extract_go_version(&elf);
+    // Pointer size 8; flags: inline strings (Go 1.18+), little-endian.
+    if info[14] != 8 || info[15] & 3 != 2 {
+        return Err("Go build information not in the Go 1.18+ 64-bit format");
     }
-    None
+    let mut rest = &info[32..];
+    let version = take_go_string(&mut rest).ok_or("unreadable Go version")?;
+    let mut modinfo = take_go_string(&mut rest).ok_or("unreadable Go build settings")?;
+    // Framed by 16-byte sentinels, as runtime/debug strips them.
+    if modinfo.len() >= 33 && modinfo[modinfo.len() - 17] == b'\n' {
+        modinfo = &modinfo[16..modinfo.len() - 16];
+    } else {
+        return Err("no Go build settings");
+    }
+    let version = std::str::from_utf8(version).map_err(|_| "unreadable Go version")?;
+    let modinfo = std::str::from_utf8(modinfo).map_err(|_| "unreadable Go build settings")?;
+    let minor = version
+        .strip_prefix("go1.")
+        .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|m| m.parse::<u32>().ok())
+        .ok_or("unrecognised Go version")?;
+    if minor < 18 {
+        return Err("Go older than 1.18");
+    }
+    let setting = |key: &str| {
+        modinfo.lines().find_map(|l| {
+            l.strip_prefix("build\t")?
+                .strip_prefix(key)?
+                .strip_prefix('=')
+        })
+    };
+    if setting("-compiler") != Some("gc") {
+        return Err("not built by the gc compiler");
+    }
+    let arch = match setting("GOARCH") {
+        Some("amd64") => object::Architecture::X86_64,
+        Some("arm64") => object::Architecture::Aarch64,
+        _ => return Err("GOARCH not amd64 or arm64"),
+    };
+    if arch != elf_arch || arch != host_arch {
+        return Err("built for another architecture");
+    }
+    if version.contains("noregabi")
+        || setting("GOEXPERIMENT").is_some_and(|e| e.contains("noregabi"))
+    {
+        return Err("register ABI turned off by a GOEXPERIMENT");
+    }
+    Ok(version.to_string())
 }
 
-fn extract_go_version<'data, Elf: FileHeader, R: ReadRef<'data>>(
-    elf: &ElfFile<'data, Elf, R>,
-) -> Option<String> {
-    // Look for .go.buildinfo section
-    let section = elf.section_by_name(".go.buildinfo")?;
-    let section_data = section.data().ok()?;
-
-    // The .go.buildinfo section starts with a 16-byte header (Go 1.18+):
-    //   bytes 0-3:  magic "\xff Go buildinf:"  (14 bytes actually)
-    // For older Go versions, the version string is embedded differently.
-    // We'll search for "go1." pattern in the section data.
-    extract_go_version_string(section_data)
-}
-
-/// Extract Go version string from buildinfo section data.
-/// Searches for "go1.X" pattern in the raw bytes.
-fn extract_go_version_string(data: &[u8]) -> Option<String> {
-    // Search for "go1." in the section data
-    let needle = b"go1.";
-    for i in 0..data.len().saturating_sub(needle.len()) {
-        if &data[i..i + needle.len()] == needle {
-            // Read until non-version character
-            let start = i;
-            let mut end = i + needle.len();
-            while end < data.len() && (data[end].is_ascii_digit() || data[end] == b'.') {
-                end += 1;
-            }
-            if end > start + needle.len()
-                && let Ok(version) = std::str::from_utf8(&data[start..end])
-            {
-                return Some(version.to_string());
-            }
+/// A uvarint-length-prefixed string at the start of `data`, advancing it.
+fn take_go_string<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (mut len, mut shift) = (0u64, 0);
+    loop {
+        let (&b, rest) = data.split_first()?;
+        *data = rest;
+        len |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 56 {
+            return None;
         }
     }
-    None
-}
-
-/// Parse a Go version string into a `GoVersion` enum.
-///
-/// Go >= 1.17 uses register-based ABI (what our eBPF probe expects).
-/// Go < 1.17 uses stack-based ABI (unsupported in v1).
-pub fn parse_go_abi(version_str: &str) -> GoVersion {
-    // Expected format: "go1.XX" or "go1.XX.Y"
-    let version = version_str.strip_prefix("go1.").unwrap_or("");
-    let minor: u32 = version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    if minor >= 17 {
-        GoVersion::RegisterAbi
-    } else {
-        GoVersion::StackAbi
-    }
+    let len = usize::try_from(len).ok().filter(|&l| l <= data.len())?;
+    let (s, rest) = data.split_at(len);
+    *data = rest;
+    Some(s)
 }
 
 // ── /proc Scanning (Linux-only) ─────────────────────────────────────────
@@ -440,19 +483,27 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
     }
 
     // Check for Go binaries
-    if is_go_binary(path)
-        && let Some(version) = detect_go_version(namespace_path)
+    if !is_go_binary(path) {
+        return None;
+    }
+    let version = match go_build_admitted(namespace_path) {
+        Ok(version) => version,
+        Err(reason) => {
+            if reason != "no Go build information" {
+                debug!(path, target = %namespace_path, reason, "Go binary not probed");
+            }
+            return None;
+        }
+    };
     {
-        let go_abi = parse_go_abi(&version);
         if let Ok(syms) = resolve_elf_symbols(namespace_path, &["crypto/tls.(*Conn).Write"])
             && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
         {
-            let read = go_read_probes(namespace_path, "crypto/tls.(*Conn).Read");
+            let read = go_read_probes(namespace_path);
             debug!(path, target = %namespace_path, %version, read = read.is_some(), "Found Go TLS binary");
             return Some(TlsType::GoTls {
                 write_offset: write_off,
                 read,
-                go_version: go_abi,
             });
         }
         debug!(
@@ -599,13 +650,21 @@ pub async fn tls_scanner_task(
     }
 }
 
-/// Go TLS read entries of process instances that ended (go_read.rs `sweep`).
+/// Go TLS read slots of process instances that ended (go_read.rs `Sweep`).
+/// The shared state is locked only to open the map handles: the walk runs
+/// after the lock is released, so scope publication never waits on it.
 #[cfg(target_os = "linux")]
 fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>) {
-    let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
-    match super::go_read::sweep(&state.ebpf) {
+    let opened = {
+        let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
+        super::go_read::Sweep::open(&state.ebpf)
+    };
+    match opened.map(|mut sweep| sweep.run()) {
         Ok((0, 0)) => {}
-        Ok((entries, epochs)) => debug!(entries, epochs, "Go TLS read entries of ended processes removed"),
+        Ok((slots, epochs)) => debug!(
+            slots,
+            epochs, "Go TLS read slots of ended processes removed"
+        ),
         Err(e) => warn!(error = %format!("{e:#}"), "Go TLS read sweep failed"),
     }
 }
@@ -697,60 +756,85 @@ fn attach_new_targets(
 mod tests {
     use super::*;
 
-    // ── parse_go_abi ─────────────────────────────────────────────────
+    // ── admit_go_build ───────────────────────────────────────────────
 
-    #[test]
-    fn test_parse_go_abi_modern() {
-        assert_eq!(parse_go_abi("go1.21.5"), GoVersion::RegisterAbi);
-        assert_eq!(parse_go_abi("go1.17"), GoVersion::RegisterAbi);
-        assert_eq!(parse_go_abi("go1.22.0"), GoVersion::RegisterAbi);
+    /// `.go.buildinfo` as the Go 1.18+ toolchain writes it.
+    fn buildinfo(version: &str, settings: &[&str]) -> Vec<u8> {
+        let mut b = b"\xff Go buildinf:\x08\x02".to_vec();
+        b.resize(32, 0);
+        let mut modinfo = vec![0xaau8; 16];
+        modinfo.extend(b"path\tcommand-line-arguments\n");
+        for s in settings {
+            modinfo.extend(format!("build\t{s}\n").bytes());
+        }
+        modinfo.extend([0xbb; 16]);
+        for s in [version.as_bytes(), &modinfo] {
+            assert!(s.len() < 1 << 14);
+            b.extend([(s.len() as u8 & 0x7f) | 0x80, (s.len() >> 7) as u8]); // uvarint
+            b.extend(s);
+        }
+        b
     }
 
+    const X86: object::Architecture = object::Architecture::X86_64;
+    const ARM: object::Architecture = object::Architecture::Aarch64;
+
     #[test]
-    fn test_parse_go_abi_old() {
-        assert_eq!(parse_go_abi("go1.16"), GoVersion::StackAbi);
-        assert_eq!(parse_go_abi("go1.15.3"), GoVersion::StackAbi);
-        assert_eq!(parse_go_abi("go1.10"), GoVersion::StackAbi);
+    fn test_admit_go_build_register_abi_builds() {
+        let amd = [
+            "-compiler=gc",
+            "CGO_ENABLED=0",
+            "GOARCH=amd64",
+            "GOOS=linux",
+            "GOAMD64=v1",
+        ];
+        let info = buildinfo("go1.21.5", &amd);
+        assert_eq!(admit_go_build(&info, X86, X86), Ok("go1.21.5".into()));
+        let arm = ["-compiler=gc", "GOARCH=arm64", "GOOS=linux"];
+        assert!(admit_go_build(&buildinfo("go1.18", &arm), ARM, ARM).is_ok());
+        let other_exp = ["-compiler=gc", "GOARCH=arm64", "GOEXPERIMENT=loopvar"];
+        assert!(admit_go_build(&buildinfo("go1.22.0", &other_exp), ARM, ARM).is_ok());
     }
 
+    /// Codex HIGH 2: a version alone does not establish the ABI.
     #[test]
-    fn test_parse_go_abi_boundary() {
-        assert_eq!(parse_go_abi("go1.17"), GoVersion::RegisterAbi);
-        assert_eq!(parse_go_abi("go1.16"), GoVersion::StackAbi);
-    }
-
-    #[test]
-    fn test_parse_go_abi_invalid() {
-        // Gracefully handle garbage — defaults to StackAbi (safe: won't attach)
-        assert_eq!(parse_go_abi("garbage"), GoVersion::StackAbi);
-        assert_eq!(parse_go_abi(""), GoVersion::StackAbi);
-    }
-
-    // ── extract_go_version_string ────────────────────────────────────
-
-    #[test]
-    fn test_extract_go_version_string_found() {
-        let data = b"\x00\x00go1.21.5\x00some other data";
-        assert_eq!(
-            extract_go_version_string(data),
-            Some("go1.21.5".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_go_version_string_not_found() {
-        let data = b"\x00\x00no version here\x00";
-        assert_eq!(extract_go_version_string(data), None);
-    }
-
-    #[test]
-    fn test_extract_go_version_string_multiple() {
-        // Should find the first occurrence
-        let data = b"go1.19.3\x00go1.21.0";
-        assert_eq!(
-            extract_go_version_string(data),
-            Some("go1.19.3".to_string())
-        );
+    fn test_admit_go_build_rejects_unestablished_abi() {
+        let arm = |exp: &str| buildinfo("go1.18", &["-compiler=gc", "GOARCH=arm64", exp]);
+        // Go 1.18 arm64 built with the register ABI turned off.
+        assert!(admit_go_build(&arm("GOEXPERIMENT=noregabiargs"), ARM, ARM).is_err());
+        assert!(admit_go_build(&arm("GOEXPERIMENT=fieldtrack,noregabi"), ARM, ARM).is_err());
+        // ... or a toolchain built with it off.
+        let baked = buildinfo("go1.19 X:noregabiargs", &["-compiler=gc", "GOARCH=arm64"]);
+        assert!(admit_go_build(&baked, ARM, ARM).is_err());
+        // Settings missing: nothing is established.
+        assert!(admit_go_build(&buildinfo("go1.21.5", &["GOARCH=amd64"]), X86, X86).is_err());
+        assert!(admit_go_build(&buildinfo("go1.21.5", &["-compiler=gc"]), X86, X86).is_err());
+        assert!(admit_go_build(&buildinfo("go1.21.5", &[]), X86, X86).is_err());
+        let gccgo = buildinfo("go1.21.5", &["-compiler=gccgo", "GOARCH=amd64"]);
+        assert!(admit_go_build(&gccgo, X86, X86).is_err());
+        // Architecture: the build's, the ELF's and the agent's must agree.
+        let amd = buildinfo("go1.21.5", &["-compiler=gc", "GOARCH=amd64"]);
+        assert!(admit_go_build(&amd, ARM, ARM).is_err());
+        assert!(admit_go_build(&amd, X86, ARM).is_err());
+        let i386 = buildinfo("go1.21.5", &["-compiler=gc", "GOARCH=386"]);
+        assert!(admit_go_build(&i386, X86, X86).is_err());
+        // Versions: before 1.18, or not a release.
+        let gc = ["-compiler=gc", "GOARCH=amd64"];
+        assert!(admit_go_build(&buildinfo("go1.17.13", &gc), X86, X86).is_err());
+        assert!(admit_go_build(&buildinfo("devel go1.23-abc", &gc), X86, X86).is_err());
+        // Pre-1.18 format (pointer-referenced strings), 32-bit, truncated.
+        let mut old = amd.clone();
+        old[15] = 0;
+        assert!(admit_go_build(&old, X86, X86).is_err());
+        let mut p32 = amd.clone();
+        p32[14] = 4;
+        assert!(admit_go_build(&p32, X86, X86).is_err());
+        for n in [0, 16, 31, 33, amd.len() - 1] {
+            assert!(
+                admit_go_build(&amd[..n], X86, X86).is_err(),
+                "truncated at {n}"
+            );
+        }
     }
 
     /// F14: the attach opens the file the offsets were read from, or
@@ -770,7 +854,6 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 0x1000,
                 read: None,
-                go_version: GoVersion::RegisterAbi,
             },
             file_key: key,
         };
@@ -809,7 +892,6 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 3,
                 read: None,
-                go_version: GoVersion::RegisterAbi,
             },
             file_key: None,
         };
@@ -855,7 +937,7 @@ mod tests {
         let from_bytes = resolve_elf_symbols_from_bytes(&bytes[..], &wanted).unwrap();
         assert!(!from_file.is_empty());
         assert_eq!(from_file, from_bytes);
-        assert_eq!(detect_go_version(path), None);
+        assert!(go_build_admitted(path).is_err());
     }
 
     /// Write a sparse ELF64 whose SHT_SYMTAB declares `symtab_size` bytes at
@@ -902,8 +984,8 @@ mod tests {
         let huge = write_sparse_elf("huge", 24 << 24); // 384 MiB of symbols
         let p = huge.to_str().unwrap();
         let symbols = resolve_elf_symbols(p, &["SSL_write"]);
-        let go = detect_go_version(p);
-        let probes = go_read_probes(p, "crypto/tls.(*Conn).Read");
+        let go = go_build_admitted(p).ok();
+        let probes = go_read_probes(p);
         std::fs::remove_file(&huge).unwrap();
         assert!(symbols.is_err(), "over-budget symtab must fail the parse");
         assert_eq!(go, None);
@@ -929,6 +1011,39 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(left, MAX_ELF_READ_BYTES - 1000 * MIN_STRING_CHARGE);
         assert!(refused, "an empty lookup past the budget is refused");
+    }
+
+    /// F8: a string lookup reserves the most ReadCache can keep for it
+    /// before the cache is touched, and a refused read spends the budget:
+    /// every later read is refused too.
+    #[test]
+    fn test_string_lookup_reserved_before_the_cache_and_latched() {
+        let path = std::env::temp_dir().join(format!("panopticon-f8r-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let (lookup, after) = with_untrusted_elf(path.to_str().unwrap(), |r| {
+            // Enough for what an empty string keeps, not for the reservation.
+            r.left.set(MIN_STRING_CHARGE + 10);
+            (
+                r.read_bytes_at_until(0..4096, 0).is_ok(),
+                r.read_bytes_at(0, 1).is_ok(),
+            )
+        })
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!lookup, "refused before the cache allocates");
+        assert!(!after, "the refusal is latched");
+    }
+
+    /// F8: the symbol scan stops at the first name it cannot read, instead
+    /// of looking up every remaining name.
+    #[test]
+    fn test_symbol_scan_stops_at_unreadable_name() {
+        use super::super::go_read::tests::{NoStrings, elf_with_functions};
+        let elf = elf_with_functions(&[("a", &[0xc3]), ("b", &[0xc3]), ("SSL_write", &[0xc3])]);
+        let lookups = std::cell::Cell::new(0);
+        let found = resolve_elf_symbols_from_bytes(NoStrings(&elf, &lookups), &["SSL_write"]);
+        assert!(found.unwrap().is_empty());
+        assert_eq!(lookups.get(), 1);
     }
 
     #[test]

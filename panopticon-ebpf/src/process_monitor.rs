@@ -37,7 +37,7 @@ fn try_sched_process_exec(_ctx: &TracePointContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let tgid = pid_tgid as u32;
-    // A new image is a new process instance: Go read entries of the old one
+    // A new image is a new process instance: Go read slots of the old one
     // never match again (maps.rs PROC_EPOCH). First, before anything that
     // can fail.
     let _ = PROC_EPOCH.remove(&pid);

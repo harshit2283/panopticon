@@ -369,13 +369,12 @@ async fn main() -> Result<()> {
             let targets = platform::proc_scanner::scan_all_processes();
             let mut tls_probes = 0;
             for target in &targets {
-                tls_probes +=
-                    loader::attach_tls_uprobes(
-                        &mut programs.ebpf,
-                        target,
-                        &mut programs._links,
-                        programs.go_reads,
-                    );
+                tls_probes += loader::attach_tls_uprobes(
+                    &mut programs.ebpf,
+                    target,
+                    &mut programs._links,
+                    programs.go_reads,
+                );
                 // Track by inode to handle symlinks/mount namespaces
                 if let Some(file_id) = platform::proc_scanner::get_file_id(&target.library_path) {
                     attached_libs.insert(file_id);

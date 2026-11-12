@@ -257,14 +257,14 @@ pub struct ProcessEvent {
     pub comm: [u8; MAX_COMM_SIZE],
 }
 
-/// Capacity of `GO_READ_ARGS`: Go `crypto/tls.(*Conn).Read` calls in
-/// flight on the node. A goroutine parked in Read (an idle keep-alive
-/// connection) holds one for as long as it waits.
+/// Capacity of `GO_READ_CALLS`: Go TLS record reads in flight on the node.
+/// A goroutine parked waiting for a record (an idle keep-alive connection)
+/// holds one for as long as it waits.
 pub const GO_READS_IN_FLIGHT: u32 = 65536;
 
-/// `GO_READ_ARGS` key: one Go `(*Conn).Read` call in flight, identified by
-/// its goroutine (`g`) in one process instance (`PROC_EPOCH`), not by
-/// thread: a parked Read can resume on another thread.
+/// `GO_READ_CALLS` key: one goroutine (`g`) in one process instance
+/// (`PROC_EPOCH`), not a thread: a parked read can resume on another
+/// thread.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GoReadKey {
@@ -274,22 +274,16 @@ pub struct GoReadKey {
     pub epoch: u64,
 }
 
-/// `GO_READ_ARGS` value: the Read's arguments, saved at its entry for the
-/// probes on its RET instructions (tls_probes.rs `go_tls_read_ret`).
+/// `GO_READ_CALLS` value: the `(*Conn).readRecordOrCCS` call a goroutine
+/// is in (tls_probes.rs `go_tls_rrc_entry`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct GoReadArgs {
-    /// `*tls.Conn`.
+pub struct GoReadCall {
+    /// `*tls.Conn`, used only as the connection's identifier.
     pub conn: u64,
-    /// The buffer's address; or, with `stack_rel` != 0, its distance below
-    /// the top of the goroutine's stack, which a stack copy preserves.
-    pub buf: u64,
-    /// `len(b)`.
-    pub len: u64,
-    /// Top of the goroutine's stack minus SP at entry: the call's frame,
-    /// equal at its RET instructions wherever the stack has moved.
+    /// Top of the goroutine's stack minus SP at the entry: the call's frame,
+    /// comparable wherever the stack has moved since.
     pub depth: u64,
-    pub stack_rel: u64,
 }
 
 /// Connection tracking info stored in CONN_MAP.
@@ -330,7 +324,7 @@ unsafe impl aya::Pod for scope::SockState {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GoReadKey {}
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for GoReadArgs {}
+unsafe impl aya::Pod for GoReadCall {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 
@@ -579,7 +573,7 @@ mod tests {
     #[test]
     fn test_go_read_sizes() {
         assert_eq!(size_of::<GoReadKey>(), 24);
-        assert_eq!(size_of::<GoReadArgs>(), 40);
+        assert_eq!(size_of::<GoReadCall>(), 16);
     }
 
     #[test]
