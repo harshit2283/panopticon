@@ -403,6 +403,11 @@ fn scope_programs_load_attach_and_hold() {
     set(&mut ebpf, CONFIG_HEAD_BYTES, 1 << 20);
     set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_HEAD);
     set(&mut ebpf, CONFIG_SCOPE_ARMED, 0);
+    // The checks below run on loopback: capture it (capture_loopback =
+    // true) until the loopback section turns it off. The listener rule
+    // stays the default (acceptor) until its own section.
+    set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+    set(&mut ebpf, CONFIG_PID_CREATOR_RULE, 0);
     let mut ring = RingBuf::try_from(ebpf.take_map("DATA_EVENTS_0").unwrap()).unwrap();
 
     // ── legacy attach path (RHEL 8): an earlier agent's attachments, left
@@ -1281,6 +1286,439 @@ fn scope_programs_load_attach_and_hold() {
     );
     let e = find(b"tls-again").expect("next call emitted");
     assert_eq!(e.src_port as u64, c4_port, "next call has its own address");
+
+    // ── capture_loopback (DESIGN §3.7). Off: a data packet on the loopback
+    // device (127/8, the host's own address) is dropped before its verdict,
+    // so none is cached. Packets only: TLS plaintext stays scoped by process
+    // (a loopback socket's calls are emitted, without an address in
+    // restricted modes, since no IN verdict is cached). Non-loopback traffic
+    // over a veth pair into another netns (same-node pod-to-pod) is
+    // captured. On (a widening): loopback captured again.
+    let bump = |ebpf: &mut Ebpf| {
+        let mut cfg: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").unwrap()).unwrap();
+        let g = cfg.get(&CONFIG_SCOPE_GEN, 0).unwrap();
+        cfg.set(CONFIG_SCOPE_GEN, g + 1, 0).unwrap();
+    };
+    let ip = |args: &str| {
+        std::process::Command::new("ip")
+            .args(args.split(' '))
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let _ = ip("netns del pnlo");
+    let _ = ip("link del pnlo0"); // left by an aborted run
+    assert!(
+        ip("netns add pnlo")
+            && ip("link add pnlo0 type veth peer name pnlo1")
+            && ip("link set pnlo1 netns pnlo")
+            && ip("addr add 10.211.0.1/30 dev pnlo0")
+            && ip("link set pnlo0 up")
+            && ip("-n pnlo addr add 10.211.0.2/30 dev pnlo1")
+            && ip("-n pnlo link set pnlo1 up"),
+        "veth pair into netns pnlo"
+    );
+    let vl = {
+        let ns = File::open("/run/netns/pnlo").unwrap();
+        std::thread::spawn(move || {
+            // SAFETY: setns of this thread only, to a netns fd we hold.
+            assert_eq!(
+                unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) },
+                0
+            );
+            TcpListener::bind("10.211.0.2:0").unwrap()
+        })
+        .join()
+        .unwrap()
+    };
+    // The host's own non-loopback address (the source toward a TEST-NET
+    // address; nothing is sent).
+    let own = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| {
+            u.connect("192.0.2.1:9")?;
+            u.local_addr()
+        })
+        .map(|a| a.ip())
+        .ok()
+        .filter(|a| !a.is_loopback() && !a.is_unspecified());
+    let own_l = own.map(|a| TcpListener::bind((a, 0)).unwrap());
+    println!("LOOPBACK own_address={own:?}");
+    let exchange = |l: &TcpListener, msg: &[u8]| -> (TcpStream, TcpStream) {
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        c.write_all(msg).unwrap();
+        let mut b = vec![0u8; msg.len()];
+        s.read_exact(&mut b).unwrap();
+        (c, s)
+    };
+    let has = |ev: &[(u64, Direction, u64, Vec<u8>)], c: u64, m: &[u8]| {
+        ev.iter().any(|e| e.0 == c && e.3 == m)
+    };
+    let mut pipe = [0i32; 2];
+    // SAFETY: valid out-array.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let _ = drain(&mut ring);
+
+    set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+    bump(&mut ebpf);
+    let lo0 = drops(&ebpf, DROP_LOOPBACK);
+    let (c5, s5) = exchange(&listener, b"lo-off");
+    let own_pair = own_l.as_ref().map(|l| exchange(l, b"own-off"));
+    let (cv, sv) = exchange(&vl, b"veth-off");
+    let ev = drain(&mut ring);
+    for c in [cookie(&c5), cookie(&s5)] {
+        assert!(!ev.iter().any(|e| e.0 == c), "127/8 exported: {ev:?}");
+    }
+    if let Some((oc, os)) = &own_pair {
+        for c in [cookie(oc), cookie(os)] {
+            assert!(!ev.iter().any(|e| e.0 == c), "own address exported: {ev:?}");
+        }
+    }
+    let lo_pkts = drops(&ebpf, DROP_LOOPBACK) - lo0;
+    for f in [&c5, &s5] {
+        assert_eq!(crate::state(&ebpf, f).unwrap().local, 1, "marked local");
+    }
+    assert_eq!(
+        crate::state(&ebpf, &cv).unwrap().local,
+        0,
+        "veth: not local"
+    );
+    assert!(
+        lo_pkts >= if own_pair.is_some() { 4 } else { 2 },
+        "loopback data packets counted: {lo_pkts}"
+    );
+    assert_eq!(
+        crate::state(&ebpf, &c5).unwrap().verdict_word,
+        0,
+        "dropped before the verdict: none cached"
+    );
+    assert!(
+        has(&ev, cookie(&cv), b"veth-off") && has(&ev, cookie(&sv), b"veth-off"),
+        "veth to another netns: both ends captured: {ev:?}"
+    );
+    // TLS, scoped by process only: c4 is loopback (no verdict under this
+    // generation, so emitted without an address); cv is not (its packet
+    // above cached IN: with its address); the pipe has no socket at all.
+    let lo1 = drops(&ebpf, DROP_LOOPBACK);
+    for (fd, m) in [
+        (c4.as_raw_fd(), &b"tls-lo-off"[..]),
+        (cv.as_raw_fd(), b"tls-veth-off"),
+        (pipe[1], b"tls-pipe-off"),
+    ] {
+        TEST_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(write(ssl, m.as_ptr(), m.len() as i32), m.len() as i32);
+    }
+    let tls = drain_tls(&mut ring);
+    let find = |p: &[u8]| tls.iter().find(|e| e.payload_bytes() == p).copied();
+    let e = find(b"tls-lo-off").expect("TLS on a loopback socket emitted");
+    assert_eq!(
+        (e.src_addr, e.dst_addr, e.src_port, e.ip_proto),
+        (0, 0, 0, 0),
+        "no IN verdict while loopback packets are dropped: no address"
+    );
+    assert!(
+        find(b"tls-pipe-off").is_some(),
+        "TLS without an address emitted"
+    );
+    let e = find(b"tls-veth-off").expect("TLS on a veth socket emitted");
+    assert_eq!(
+        (e.src_addr, e.dst_addr, e.src_port),
+        (0x0ad3_0001, 0x0ad3_0002, cv.local_addr().unwrap().port()),
+        "with its own address"
+    );
+    assert_eq!(
+        drops(&ebpf, DROP_LOOPBACK),
+        lo1 + 2,
+        "only c4's two data packets; no TLS event counted loopback"
+    );
+
+    // Unscoped full: the same packet rule.
+    set(&mut ebpf, CONFIG_SCOPE_MODE, 0);
+    let (cf, sf) = exchange(&listener, b"lo-full-off");
+    let (cvf, svf) = exchange(&vl, b"veth-full-off");
+    let ev = drain(&mut ring);
+    assert!(
+        !ev.iter().any(|e| e.0 == cookie(&cf) || e.0 == cookie(&sf)),
+        "unscoped: 127/8 exported: {ev:?}"
+    );
+    assert!(
+        has(&ev, cookie(&cvf), b"veth-full-off") && has(&ev, cookie(&svf), b"veth-full-off"),
+        "unscoped: veth captured: {ev:?}"
+    );
+    // TLS in unscoped full: the address recorded for the connection is a
+    // label only; a loopback one is emitted.
+    let ssl_u = 0x5100u64;
+    let key = [ssl_u as u32, (ssl_u >> 32) as u32, me, 0];
+    let lo_t = [0x7f00_0001u32, 0x7f00_0001, 1 | 2 << 16];
+    {
+        let mut addrs: HashMap<_, [u32; 4], [u32; 3]> =
+            HashMap::try_from(ebpf.map_mut("TLS_CONN_ADDR").unwrap()).unwrap();
+        addrs.insert(key, lo_t, 0).unwrap();
+    }
+    TEST_FD.store(pipe[1], std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(write(ssl_u, b"tls-full-lo".as_ptr(), 11), 11);
+    let tls = drain_tls(&mut ring);
+    let e = tls
+        .iter()
+        .find(|e| e.payload_bytes() == b"tls-full-lo")
+        .expect("unscoped TLS with a loopback address emitted");
+    assert_eq!((e.src_addr, e.dst_addr), (0x7f00_0001, 0x7f00_0001));
+    {
+        let mut addrs: HashMap<_, [u32; 4], [u32; 3]> =
+            HashMap::try_from(ebpf.map_mut("TLS_CONN_ADDR").unwrap()).unwrap();
+        let _ = addrs.remove(&key);
+    }
+    // A loopback socket that emitted while loopback was captured sends no
+    // close record (it carries the tuple) once loopback is off.
+    set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+    let (ca, sa) = exchange(&listener, b"lo-close-on");
+    let control = [cookie(&ca), cookie(&sa)];
+    drop((ca, sa));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        drain_records(&mut ring).iter().any(
+            |(e, _)| e.event_type == EventType::SockClose && control.contains(&e.socket_cookie)
+        ),
+        "control: a close record while loopback is captured"
+    );
+    let (cc, sc) = exchange(&listener, b"lo-close");
+    let closed = [cookie(&cc), cookie(&sc)];
+    set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+    bump(&mut ebpf);
+    drop((cc, sc));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let recs = drain_records(&mut ring);
+    assert!(
+        recs.iter()
+            .any(|(e, _)| e.event_type == EventType::TcPacket && closed.contains(&e.socket_cookie)),
+        "emitted while captured"
+    );
+    assert!(
+        !recs.iter().any(|(e, _)| e.event_type == EventType::SockClose
+            && closed.contains(&e.socket_cookie)),
+        "no close record once loopback is off"
+    );
+    set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
+
+    // VRF local delivery (§3.7): both ends bound to a VRF master, to an
+    // address on a device enslaved to it. Not on `lo`: caught by ingress
+    // PACKET_LOOPBACK and the device-bound rule, and the sockets are marked.
+    let _ = ip("link del pvrf");
+    let _ = ip("link del pvd0");
+    // A kernel without the vrf module (Ubuntu cloud kernels without
+    // modules-extra) skips this case, saying so.
+    if !ip("link add pvrf type vrf table 211") {
+        println!("LOOPBACK VRF SKIP (no vrf device type)");
+    } else {
+        assert!(
+            ip("link set pvrf up")
+                && ip("link add pvd0 type dummy")
+                && ip("link set pvd0 master pvrf")
+                && ip("addr add 10.212.0.1/24 dev pvd0")
+                && ip("link set pvd0 up"),
+            "VRF pvrf with pvd0"
+        );
+        let bound_sock = || {
+            // SAFETY: a new socket, bound to the VRF device by name.
+            unsafe {
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                assert!(fd >= 0);
+                let dev = b"pvrf\0";
+                assert_eq!(
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_BINDTODEVICE,
+                        dev.as_ptr().cast(),
+                        dev.len() as u32,
+                    ),
+                    0,
+                    "SO_BINDTODEVICE pvrf"
+                );
+                fd
+            }
+        };
+        let sin = |port: u16| libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_be_bytes([10, 212, 0, 1]).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let slen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        let vrf_l = {
+            let fd = bound_sock();
+            let a = sin(0);
+            // SAFETY: valid sockaddr_in for our fd; the listener takes the fd.
+            unsafe {
+                assert_eq!(
+                    libc::bind(fd, (&a as *const libc::sockaddr_in).cast(), slen),
+                    0
+                );
+                assert_eq!(libc::listen(fd, 8), 0);
+                <TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd)
+            }
+        };
+        let vrf_x = |msg: &[u8]| -> (TcpStream, TcpStream) {
+            let fd = bound_sock();
+            let a = sin(vrf_l.local_addr().unwrap().port());
+            // SAFETY: valid sockaddr_in for our fd; the stream takes the fd.
+            let mut c = unsafe {
+                assert_eq!(
+                    libc::connect(fd, (&a as *const libc::sockaddr_in).cast(), slen),
+                    0
+                );
+                <TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd)
+            };
+            let (mut s, _) = vrf_l.accept().unwrap();
+            c.write_all(msg).unwrap();
+            let mut b = vec![0u8; msg.len()];
+            s.read_exact(&mut b).unwrap();
+            (c, s)
+        };
+        let lo_v = drops(&ebpf, DROP_LOOPBACK);
+        let (cr, sr) = vrf_x(b"vrf-off");
+        let ev = drain(&mut ring);
+        assert!(
+            !ev.iter().any(|e| e.0 == cookie(&cr) || e.0 == cookie(&sr)),
+            "VRF local exported: {ev:?}"
+        );
+        assert!(
+            drops(&ebpf, DROP_LOOPBACK) >= lo_v + 2,
+            "VRF packets counted"
+        );
+        for f in [&cr, &sr] {
+            assert_eq!(crate::state(&ebpf, f).unwrap().local, 1, "VRF marked local");
+        }
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+        bump(&mut ebpf);
+        let (cr2, sr2) = vrf_x(b"vrf-on");
+        let ev = drain(&mut ring);
+        assert!(
+            has(&ev, cookie(&cr2), b"vrf-on") && has(&ev, cookie(&sr2), b"vrf-on"),
+            "VRF local captured with loopback on: {ev:?}"
+        );
+        drop((cr, sr, cr2, sr2, vrf_l));
+        let _ = ip("link del pvd0");
+        let _ = ip("link del pvrf");
+        println!("LOOPBACK VRF OK");
+    }
+
+    // On again (a widening): loopback captured, TLS on it too.
+    set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+    bump(&mut ebpf);
+    let (c6, s6) = exchange(&listener, b"lo-on");
+    let own_on = own_l.as_ref().map(|l| exchange(l, b"own-on"));
+    let ev = drain(&mut ring);
+    assert!(
+        has(&ev, cookie(&c6), b"lo-on") && has(&ev, cookie(&s6), b"lo-on"),
+        "loopback captured: {ev:?}"
+    );
+    if let Some((oc, _)) = &own_on {
+        assert!(
+            has(&ev, cookie(oc), b"own-on"),
+            "own address captured: {ev:?}"
+        );
+    }
+    c4.write_all(b"p").unwrap(); // recomputes c4's verdict (IN)
+    for (fd, m) in [
+        (c4.as_raw_fd(), &b"tls-lo-on"[..]),
+        (pipe[1], b"tls-pipe-on"),
+    ] {
+        TEST_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(write(ssl, m.as_ptr(), m.len() as i32), m.len() as i32);
+    }
+    let tls = drain_tls(&mut ring);
+    let find = |p: &[u8]| tls.iter().find(|e| e.payload_bytes() == p).copied();
+    let e = find(b"tls-lo-on").expect("TLS on loopback emitted");
+    assert_eq!(
+        (e.src_addr, e.src_port as u64),
+        (0x7f00_0001, c4_port),
+        "with its address"
+    );
+    assert!(
+        find(b"tls-pipe-on").is_some(),
+        "TLS without an address emitted"
+    );
+    // The sections below write through c4, as before this one.
+    TEST_FD.store(c4.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: our pipe fds.
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+    drop((
+        c5, s5, own_pair, cv, sv, cf, sf, cvf, svf, c6, s6, own_on, vl, own_l,
+    ));
+    let _ = ip("netns del pnlo");
+    let _ = ip("link del pnlo0");
+    println!("LOOPBACK OK lo_packets={lo_pkts}");
+
+    // ── pid_filter_listener (§3.1): a listener created by this (listed)
+    // process, its connection accepted by an unlisted one (a forked
+    // child). Creator rule: the accepted socket's bytes are captured.
+    // Switching to the acceptor rule (a narrowing, with its generation
+    // bump) stops them on the live connection; the client end, created by
+    // this process, stays captured under both rules.
+    set(&mut ebpf, CONFIG_PID_CREATOR_RULE, 1);
+    bump(&mut ebpf);
+    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let raddr = rl.local_addr().unwrap();
+    // SAFETY: the child makes only async-signal-safe calls, then _exits.
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        // SAFETY: plain syscalls on fds the child owns.
+        unsafe {
+            let fd = libc::accept(rl.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+            let mut b = [0u8; 64];
+            loop {
+                let n = libc::read(fd, b.as_mut_ptr().cast(), b.len());
+                if n <= 0 {
+                    break;
+                }
+                libc::write(fd, b.as_ptr().cast(), n as usize);
+            }
+            libc::_exit(0);
+        }
+    }
+    assert!(kid > 0, "fork");
+    drop(rl); // only the child accepts
+    let mut rc = TcpStream::connect(raddr).unwrap();
+    let rcc = cookie(&rc);
+    let mut echo = |m: &[u8]| {
+        rc.write_all(m).unwrap();
+        let mut b = vec![0u8; m.len()];
+        rc.read_exact(&mut b).unwrap();
+    };
+    let sides = |ev: &[(u64, Direction, u64, Vec<u8>)], m: &[u8]| {
+        (
+            ev.iter().filter(|e| e.0 == rcc && e.3 == m).count(),
+            ev.iter().filter(|e| e.0 != rcc && e.3 == m).count(),
+        )
+    };
+    echo(b"rule-creator");
+    let ev = drain(&mut ring);
+    assert_eq!(
+        sides(&ev, b"rule-creator"),
+        (2, 2),
+        "creator rule: client and accepted ends: {ev:?}"
+    );
+    set(&mut ebpf, CONFIG_PID_CREATOR_RULE, 0);
+    bump(&mut ebpf);
+    let oos1 = drops(&ebpf, DROP_OUT_OF_SCOPE);
+    echo(b"rule-acceptor");
+    let ev = drain(&mut ring);
+    assert_eq!(
+        sides(&ev, b"rule-acceptor"),
+        (2, 0),
+        "acceptor rule: the unlisted acceptor's end is not captured: {ev:?}"
+    );
+    assert!(drops(&ebpf, DROP_OUT_OF_SCOPE) >= oos1 + 2);
+    drop(rc);
+    let mut st = 0;
+    // SAFETY: our child.
+    assert_eq!(unsafe { libc::waitpid(kid, &mut st, 0) }, kid);
+    println!("LISTENER_RULE OK");
 
     // ── capture off (the user switch, the fatal stop) or not armed: the TLS
     // probes collect nothing. No call slot during the call, no address, no

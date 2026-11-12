@@ -46,6 +46,13 @@ pub struct SockState {
     /// concurrently, unlocked). Sticky; a child may inherit 1 from its
     /// listener (BPF_F_CLONE), which only costs it a close record.
     pub emitted: u8,
+    /// 1 once a data packet of this socket was seen on a local path
+    /// ([`local_packet`]), whatever `capture_loopback` was then. Sticky, a
+    /// plain store like `emitted`: while loopback capture is off, every
+    /// packet of the socket is dropped and its close record suppressed
+    /// (DESIGN §3.7). A child may inherit 1 from its listener (clone), which
+    /// only drops more.
+    pub local: u8,
     /// Cookie of the socket the accept hook wrote `acceptor_tgid` and
     /// `ACCEPTOR_LISTED` on; written first. 0 = never accepted.
     pub accept_cookie: u64,
@@ -111,7 +118,10 @@ pub const DROP_HEAD_INCOHERENT: u32 = 7;
 pub const DROP_TLS_MODE: u32 = 8;
 pub const DROP_TLS_OUT_OF_SCOPE: u32 = 9;
 pub const DROP_KTLS_PAYLOAD: u32 = 10;
-pub const SCOPE_DROP_REASONS: u32 = 11;
+/// `capture_loopback = false`: a data packet on a node-local path
+/// ([`local_packet`]). Packets only: TLS plaintext is scoped by process.
+pub const DROP_LOOPBACK: u32 = 11;
+pub const SCOPE_DROP_REASONS: u32 = 12;
 /// Metric label of each `DROP_*` index.
 pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
     "not_eligible",
@@ -125,7 +135,41 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
     "tls_mode",
     "tls_out_of_scope",
     "ktls_payload",
+    "loopback",
 ];
+
+/// The loopback device's ifindex in every network namespace
+/// (`LOOPBACK_IFINDEX`; `loopback_net_init` registers `lo` first and
+/// checks it got 1). A packet whose device (`__sk_buff.ifindex`) is 1 is
+/// node-local: TC on the node's NIC never saw it.
+pub const LOOPBACK_IFINDEX: u32 = 1;
+
+/// `__sk_buff.pkt_type` of a packet looped back locally: VRF (l3mdev)
+/// local delivery sets it (`vrf_local_xmit`), as does multicast loopback.
+pub const PACKET_LOOPBACK: u32 = 5;
+
+/// Whether a data packet travels a node-local path (DESIGN §3.7), from
+/// what the cgroup hook sees, never from addresses:
+/// * its device is `lo` (`ifindex`, either direction);
+/// * on ingress, it was looped back (`PACKET_LOOPBACK`: VRF-local);
+/// * the socket is bound to a device and the packet's device is that one
+///   (`bound_dev_if`): a VRF socket's local traffic leaves and arrives on
+///   the VRF master. This also matches any `SO_BINDTODEVICE` socket on its
+///   own device, which fails closed (no exact VRF signal at the hook);
+/// * the socket already had a local packet (`SockState::local`).
+#[inline(always)]
+pub fn local_packet(
+    ifindex: u32,
+    ingress: bool,
+    pkt_type: u32,
+    bound_dev_if: u32,
+    sticky: bool,
+) -> bool {
+    ifindex == LOOPBACK_IFINDEX
+        || (ingress && pkt_type == PACKET_LOOPBACK)
+        || (bound_dev_if != 0 && bound_dev_if == ifindex)
+        || sticky
+}
 
 /// `DataEvent::role`.
 pub const ROLE_UNKNOWN: u8 = 0;
@@ -149,14 +193,25 @@ pub fn role_of(flags: u8) -> u8 {
 
 /// `pid_filter` inputs of one socket, judged under the current epoch: a
 /// different epoch means nothing recorded counts (`no_owner`).
+/// `creator` is the listener rule (`pid_filter_listener`,
+/// `CONFIG_PID_CREATOR_RULE`): under the acceptor rule (false) a passive
+/// socket (`FLAG_ROLE_SERVER`) is selected only by `ACCEPTOR_LISTED`; the
+/// `OWNER_LISTED` it cloned from its listener does not count. Under the
+/// creator rule either bit selects it. Other sockets (client, UDP) are
+/// selected by either bit under both rules.
 /// Returns `(listed, owner_known)`.
 #[inline(always)]
-pub fn pid_inputs(s: &SockState, epoch: u32) -> (bool, bool) {
+pub fn pid_inputs(s: &SockState, epoch: u32, creator: bool) -> (bool, bool) {
     if s.pid_epoch != epoch {
         return (false, false);
     }
+    let owner = if creator || s.flags & FLAG_ROLE_SERVER == 0 {
+        OWNER_LISTED
+    } else {
+        0
+    };
     (
-        s.pid_bits & (OWNER_LISTED | ACCEPTOR_LISTED) != 0,
+        s.pid_bits & (owner | ACCEPTOR_LISTED) != 0,
         s.owner_tgid != 0 || s.acceptor_tgid != 0,
     )
 }
@@ -369,6 +424,7 @@ mod tests {
         assert_eq!(align_of::<SockState>(), 8);
         assert_eq!(offset_of!(SockState, verdict_word) % 8, 0);
         assert_eq!(offset_of!(SockState, pid_bits), 56);
+        assert_eq!(offset_of!(SockState, local), 60);
         assert_eq!(offset_of!(SockState, accept_cookie), 64);
     }
 
@@ -554,15 +610,95 @@ mod tests {
             owner_tgid: 42,
             ..Default::default()
         };
-        assert_eq!(pid_inputs(&s, 7), (true, true));
-        assert_eq!(pid_inputs(&s, 8), (false, false)); // other start: no_owner
-        s.pid_bits = 0;
-        assert_eq!(pid_inputs(&s, 7), (false, true));
-        s.owner_tgid = 0;
-        assert_eq!(pid_inputs(&s, 7), (false, false));
-        s.acceptor_tgid = 9;
-        s.pid_bits = ACCEPTOR_LISTED;
-        assert_eq!(pid_inputs(&s, 7), (true, true));
+        for creator in [false, true] {
+            s.pid_bits = OWNER_LISTED;
+            s.owner_tgid = 42;
+            s.acceptor_tgid = 0;
+            assert_eq!(pid_inputs(&s, 7, creator), (true, true));
+            assert_eq!(pid_inputs(&s, 8, creator), (false, false)); // other start: no_owner
+            s.pid_bits = 0;
+            assert_eq!(pid_inputs(&s, 7, creator), (false, true));
+            s.owner_tgid = 0;
+            assert_eq!(pid_inputs(&s, 7, creator), (false, false));
+            s.acceptor_tgid = 9;
+            s.pid_bits = ACCEPTOR_LISTED;
+            assert_eq!(pid_inputs(&s, 7, creator), (true, true));
+        }
+    }
+
+    #[test]
+    fn listener_rule_decides_whether_the_creator_selects_children() {
+        // An accepted child: listener created by a listed process (cloned
+        // OWNER_LISTED), accepted by an unlisted one.
+        let child = SockState {
+            pid_epoch: 7,
+            pid_bits: OWNER_LISTED,
+            owner_tgid: 42,
+            acceptor_tgid: 43,
+            flags: FLAG_ROLE_SERVER | FLAG_BASELINE,
+            ..Default::default()
+        };
+        assert_eq!(pid_inputs(&child, 7, true), (true, true), "creator rule");
+        assert_eq!(pid_inputs(&child, 7, false), (false, true), "acceptor rule");
+        let v = |c| {
+            let (listed, known) = pid_inputs(&child, 7, c);
+            verdict(SCOPE_SEL_PID, listed, known, false, true)
+        };
+        assert_eq!(v(true), VERDICT_IN);
+        assert_eq!(v(false), VERDICT_OUT_PID);
+        // Not yet accepted, acceptor rule: OUT, and not cached (the accept
+        // can still list it).
+        let early = SockState {
+            acceptor_tgid: 0,
+            ..child
+        };
+        assert_eq!(pid_inputs(&early, 7, false), (false, true));
+        assert!(!verdict_cacheable(
+            VERDICT_OUT_PID,
+            SCOPE_SEL_PID,
+            early.flags,
+            0
+        ));
+        // A listed acceptor selects it under both rules.
+        let acc = SockState {
+            pid_bits: OWNER_LISTED | ACCEPTOR_LISTED,
+            ..child
+        };
+        assert_eq!(pid_inputs(&acc, 7, false), (true, true));
+        let acc_only = SockState {
+            pid_bits: ACCEPTOR_LISTED,
+            ..child
+        };
+        assert_eq!(pid_inputs(&acc_only, 7, true), (true, true));
+        // Client and UDP sockets: the creator selects them under both rules.
+        for flags in [FLAG_ROLE_CLIENT | FLAG_BASELINE, FLAG_BASELINE] {
+            let s = SockState {
+                flags,
+                acceptor_tgid: 0,
+                ..child
+            };
+            assert_eq!(pid_inputs(&s, 7, false), (true, true));
+        }
+    }
+
+    #[test]
+    fn loopback_rules() {
+        assert_eq!(SCOPE_DROP_NAMES[DROP_LOOPBACK as usize], "loopback");
+        // lo, either direction, whatever else.
+        assert!(local_packet(1, false, 0, 0, false));
+        assert!(local_packet(1, true, 0, 7, false));
+        // VRF-local ingress: looped back on the VRF master.
+        assert!(local_packet(9, true, PACKET_LOOPBACK, 0, false));
+        // ...but pkt_type is only meaningful on ingress.
+        assert!(!local_packet(9, false, PACKET_LOOPBACK, 0, false));
+        // A device-bound socket (VRF) on its own device, both directions.
+        assert!(local_packet(9, false, 0, 9, false));
+        assert!(local_packet(9, true, 0, 9, false));
+        // Bound elsewhere, or not bound: a veth or NIC packet.
+        assert!(!local_packet(4, false, 0, 9, false));
+        assert!(!local_packet(4, true, 0, 0, false));
+        // Sticky: once local, every packet of the socket.
+        assert!(local_packet(4, false, 0, 0, true));
     }
 
     #[test]

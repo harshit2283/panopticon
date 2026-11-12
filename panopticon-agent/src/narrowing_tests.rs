@@ -1576,6 +1576,7 @@ fn idle_connections_are_evicted_without_further_traffic() {
 struct FakeMaps {
     ids: BTreeSet<u64>,
     generation: u64,
+    options: crate::config::ScopeOptions,
     disarmed: bool,
     fail_publish: bool,
     fail_disarm: bool,
@@ -1601,6 +1602,13 @@ impl crate::scope_select::AllowMap for FakeMaps {
     }
     fn bump_gen(&mut self) -> anyhow::Result<()> {
         self.generation += 1;
+        Ok(())
+    }
+    fn set_options(&mut self, o: crate::config::ScopeOptions) -> anyhow::Result<()> {
+        if self.fail_publish {
+            anyhow::bail!("injected option failure");
+        }
+        self.options = o;
         Ok(())
     }
     fn ids(&mut self) -> anyhow::Result<BTreeSet<u64>> {
@@ -1733,6 +1741,7 @@ mod publisher {
                 Some("n1".into()),
                 cgroup_filter,
                 pods,
+                crate::config::ScopeOptions::default(),
             )
             .unwrap()
         }
@@ -1823,6 +1832,7 @@ mod publisher {
                     let msg = ScopeMsg::Reload {
                         cgroup_filter: Some(paths.iter().map(|s| s.to_string()).collect()),
                         pod_filter: None,
+                        options: Default::default(),
                         reply,
                     };
                     (msg, applied)
@@ -1927,6 +1937,7 @@ mod publisher {
                 .handle(crate::scope_publisher::ScopeMsg::Reload {
                     cgroup_filter: None,
                     pod_filter: Some(vec![app_filter("co")]),
+                    options: Default::default(),
                     reply,
                 })
                 .await
@@ -1949,6 +1960,109 @@ mod publisher {
                 q.env.scope.gate().await.is_none(),
                 "pipeline revoked anyway"
             );
+        });
+    }
+
+    /// `capture_loopback` and `pid_filter_listener` on reload, with or
+    /// without a cgroup selector: turning loopback capture off or the
+    /// creator rule into the acceptor rule is a narrowing (generation
+    /// bumped, floor raised, pipeline revoked before the reply), each with
+    /// the options written before the bump; the reverse is a widening (the
+    /// generation still moves, so verdicts cached OUT recompute); an
+    /// unchanged reload publishes nothing.
+    #[test]
+    fn scope_options_narrow_and_widen_on_reload() {
+        t2("scope_options_narrow_and_widen_on_reload", 4, async {
+            use crate::config::ScopeOptions;
+            use crate::scope_publisher::ScopeMsg;
+            let p = PubEnv::new("options").await;
+            let mut publisher = p.publisher(&[], &[]);
+            let reload = |options: ScopeOptions| {
+                let (reply, applied) = tokio::sync::oneshot::channel();
+                (
+                    ScopeMsg::Reload {
+                        cgroup_filter: None,
+                        pod_filter: None,
+                        options,
+                        reply,
+                    },
+                    applied,
+                )
+            };
+            let state = || {
+                let m = p.maps.0.lock().unwrap();
+                (m.options, m.generation)
+            };
+            let (lo, cr) = (
+                ScopeOptions {
+                    capture_loopback: true,
+                    creator_rule: false,
+                },
+                ScopeOptions {
+                    capture_loopback: false,
+                    creator_rule: true,
+                },
+            );
+            let both = ScopeOptions {
+                capture_loopback: true,
+                creator_rule: true,
+            };
+            let first = p.env.scope.gate().await.unwrap();
+
+            // Widening: both on. Written, generation bumped, no revocation.
+            let (m, a) = reload(both);
+            publisher.handle(m).await.unwrap();
+            assert_eq!(a.await.unwrap(), Ok(()));
+            assert_eq!(state(), (both, 1));
+            assert!(!first.is_revoked());
+            assert_eq!(p.env.floor.get(), 0, "a widening raises no floor");
+
+            // Unchanged: nothing published.
+            let (m, a) = reload(both);
+            publisher.handle(m).await.unwrap();
+            assert_eq!(a.await.unwrap(), Ok(()));
+            assert_eq!(state(), (both, 1));
+            assert!(!first.is_revoked());
+
+            // Each narrowing alone (revoked before the reply, floor at the
+            // new generation), a widening (creator rule on: nothing
+            // revoked), then one that narrows one setting and widens the
+            // other (a narrowing).
+            let mut gate = first;
+            let mut floor = 0;
+            for (to, generation, narrows) in [
+                (lo, 2u64, true),
+                (ScopeOptions::default(), 3, true),
+                (cr, 4, false),
+                (lo, 5, true),
+            ] {
+                let (m, a) = reload(to);
+                publisher.handle(m).await.unwrap();
+                assert_eq!(a.await.unwrap(), Ok(()));
+                assert_eq!(gate.is_revoked(), narrows, "{to:?}: revoked before applied");
+                assert_eq!(state(), (to, generation));
+                if narrows {
+                    floor = generation as u32;
+                }
+                assert_eq!(p.env.floor.get(), floor, "{to:?}");
+                gate = p.env.scope.gate().await.unwrap();
+                assert!(!gate.is_revoked());
+            }
+
+            // A Kubernetes change keeps the options as they are.
+            publisher.pods_changed().await.unwrap();
+            assert_eq!(state(), (lo, 5));
+
+            // A failed option write is a fatal stop.
+            p.maps.0.lock().unwrap().fail_publish = true;
+            let (m, a) = reload(both);
+            publisher.handle(m).await.unwrap();
+            assert!(a.await.unwrap().is_err());
+            assert!(publisher.is_stopped());
+            assert!(gate.is_revoked());
+            assert!(p.maps.0.lock().unwrap().disarmed);
+            assert_eq!(p.maps.0.lock().unwrap().generation, 6, "attempt bumped");
+            p.env.scope.shutdown().await;
         });
     }
 

@@ -62,7 +62,16 @@ pub const CONFIG_SCOPE_MODE: u32 = 12;
 /// scope writers publish no initialisation, so a socket created or
 /// established during startup stays uninitialised for life.
 pub const CONFIG_SCOPE_ARMED: u32 = 13;
-const _: () = assert!(CONFIG_SCOPE_ARMED < CONFIG_ENTRIES);
+/// `capture_loopback`: non-zero captures packets on a node-local path
+/// (`scope::DROP_LOOPBACK`). 0, the default and what an unwritten entry
+/// reads as, drops them (cgroup_skb backend; TC never sees loopback). TLS
+/// plaintext does not read it: it is scoped by process.
+pub const CONFIG_CAPTURE_LOOPBACK: u32 = 14;
+/// `pid_filter_listener = "creator"`: non-zero lets a listener's listed
+/// creator select its accepted children (`scope::pid_inputs`). 0, the
+/// default, selects a passive connection by its acceptor only.
+pub const CONFIG_PID_CREATOR_RULE: u32 = 15;
+const _: () = assert!(CONFIG_PID_CREATOR_RULE < CONFIG_ENTRIES);
 
 /// Bit 63 of a connection key: set for TLS connection keys (user space),
 /// clear for TC flow cookies, so the two key spaces never overlap.
@@ -710,6 +719,8 @@ mod tests {
             CONFIG_HEAD_BYTES,
             CONFIG_SCOPE_MODE,
             CONFIG_SCOPE_ARMED,
+            CONFIG_CAPTURE_LOOPBACK,
+            CONFIG_PID_CREATOR_RULE,
         ];
         for (i, &idx) in scope.iter().enumerate() {
             assert!(idx < CONFIG_ENTRIES);

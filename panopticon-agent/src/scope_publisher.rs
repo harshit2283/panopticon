@@ -1,14 +1,22 @@
 //! The scope publisher (DESIGN §3, narrowing): one serialised task owns
-//! every runtime write to `CGROUP_ALLOW` and `CONFIG_SCOPE_GEN`.
+//! every runtime write to `CGROUP_ALLOW`, `CONFIG_SCOPE_GEN` and the scope
+//! options (`CONFIG_CAPTURE_LOOPBACK`, `CONFIG_PID_CREATOR_RULE`). It runs
+//! on the cgroup_skb backend whether or not a cgroup selector is set.
 //!
 //! Inputs, processed in order: a `SIGHUP` reload that changes
-//! `cgroup_filter` / `pod_filter`, every Kubernetes metadata change (the
-//! pods `pod_filter` selects are re-resolved), and the net_cls watch.
+//! `cgroup_filter` / `pod_filter`, `capture_loopback` or
+//! `pid_filter_listener`, every Kubernetes metadata change (the pods
+//! `pod_filter` selects are re-resolved), and the net_cls watch.
 //!
 //! For each change the target set is resolved and published
 //! ([`crate::scope_select::publish`]):
-//! - widening only: the publication is all (it only adds scope);
-//! - narrowing: the five steps of DESIGN §3 — publish and bump to `g`,
+//! - widening only (cgroups added, `capture_loopback` turned on, the
+//!   acceptor rule replaced by the creator rule): the publication is all
+//!   (it only adds scope; its generation bump makes cached verdicts
+//!   recompute);
+//! - narrowing (a cgroup removed, `capture_loopback` turned off, the
+//!   creator rule replaced by the acceptor rule; a reload that does any of
+//!   these, whatever else it widens): the five steps of DESIGN §3 — publish and bump to `g`,
 //!   raise the admission floor to `g`, build a new pipeline and switch the
 //!   readers to it, revoke the old pipeline's gate, report applied
 //!   ([`Scope::narrow`]); the old pipeline is dropped, never flushed;
@@ -38,7 +46,7 @@ use anyhow::{Result, bail};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
-use crate::config::PodFilter;
+use crate::config::{PodFilter, ScopeOptions};
 use crate::k8s::K8sMetadata;
 use crate::pipeline::Scope;
 use crate::scope_select::{AllowMap, publish, resolve, select_pods};
@@ -49,6 +57,7 @@ pub enum ScopeMsg {
     Reload {
         cgroup_filter: Option<Vec<String>>,
         pod_filter: Option<Vec<PodFilter>>,
+        options: ScopeOptions,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// A v1 net_cls/net_prio hierarchy appeared (DESIGN §3.2): the cgroup
@@ -72,6 +81,8 @@ pub struct Publisher<M> {
     cgroup_ids: BTreeSet<u64>,
     /// What `CGROUP_ALLOW` holds.
     current: BTreeSet<u64>,
+    /// What the scope options in `CONFIG` are.
+    options: ScopeOptions,
     /// Set by the net_cls watch: the target stays empty.
     disabled: Option<String>,
     /// After a fatal stop: nothing more is published.
@@ -83,7 +94,8 @@ pub struct Publisher<M> {
 
 impl<M: ScopeMaps> Publisher<M> {
     /// `root` is the cgroup2 attach root; `cgroup_filter` / `pod_filter`
-    /// are the running config's.
+    /// and `options` are the running config's (the loader wrote `options`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut maps: M,
         scope: Arc<Scope>,
@@ -92,6 +104,7 @@ impl<M: ScopeMaps> Publisher<M> {
         node: Option<String>,
         cgroup_filter: &[String],
         pod_filter: &[PodFilter],
+        options: ScopeOptions,
     ) -> Result<Self> {
         let mut current = BTreeSet::new();
         maps.with(&mut |m| {
@@ -108,6 +121,7 @@ impl<M: ScopeMaps> Publisher<M> {
             node,
             pod_filter: pod_filter.to_vec(),
             current,
+            options,
             disabled: None,
             stopped: false,
         })
@@ -161,6 +175,7 @@ impl<M: ScopeMaps> Publisher<M> {
             ScopeMsg::Reload {
                 cgroup_filter,
                 pod_filter,
+                options,
                 reply,
             } => {
                 if self.stopped {
@@ -184,7 +199,7 @@ impl<M: ScopeMaps> Publisher<M> {
                 let target = self.target(&cgroup_ids, pod_ids);
                 self.cgroup_ids = cgroup_ids;
                 self.pod_filter = pod_filter;
-                let r = self.apply(target, "reload").await;
+                let r = self.apply(target, options, "reload").await;
                 let _ = reply.send(if self.stopped {
                     Err("scope publication failed; capture stopped".into())
                 } else {
@@ -195,7 +210,7 @@ impl<M: ScopeMaps> Publisher<M> {
             ScopeMsg::Disable(why) => {
                 if self.disabled.is_none() {
                     self.disabled = Some(why.clone());
-                    self.apply(BTreeSet::new(), "net_cls").await?;
+                    self.apply(BTreeSet::new(), self.options, "net_cls").await?;
                     error!(
                         reason = %why,
                         "cgroup_filter/pod_filter stopped admitting: the kernel may no longer \
@@ -221,18 +236,26 @@ impl<M: ScopeMaps> Publisher<M> {
             }
         };
         let target = self.target(&self.cgroup_ids, pod_ids);
-        self.apply(target, "kubernetes").await
+        self.apply(target, self.options, "kubernetes").await
     }
 
-    /// Publish `target` and run the change (see the module docs).
-    async fn apply(&mut self, target: BTreeSet<u64>, cause: &'static str) -> Result<()> {
+    /// Publish `target` and `options` and run the change (see the module
+    /// docs).
+    async fn apply(
+        &mut self,
+        target: BTreeSet<u64>,
+        options: ScopeOptions,
+        cause: &'static str,
+    ) -> Result<()> {
         if self.stopped {
             return Ok(());
         }
         let current = self.current.clone();
+        let from = self.options;
+        let changed = (from != options).then_some(options);
         let mut outcome = None;
         let published = self.maps.with(&mut |m| {
-            let diff = publish(m, &current, &target)?;
+            let diff = publish(m, &current, &target, changed)?;
             outcome = Some((diff, m.generation()?));
             Ok(())
         });
@@ -249,7 +272,8 @@ impl<M: ScopeMaps> Publisher<M> {
             (Ok(()), None) => unreachable!("publish ran"),
         };
         self.current = target;
-        if diff.is_narrowing() {
+        self.options = options;
+        if diff.is_narrowing() || from.narrows_to(options) {
             let installed = self.scope.narrow(generation).await;
             // Step 5: report applied.
             info!(
@@ -257,16 +281,20 @@ impl<M: ScopeMaps> Publisher<M> {
                 generation,
                 removed = diff.removed.len(),
                 added = diff.added.len(),
+                capture_loopback = options.capture_loopback,
+                creator_rule = options.creator_rule,
                 pipeline = installed,
-                "Scope narrowed: applied (captured data of the removed cgroups was revoked)"
+                "Scope narrowed: applied (data captured under the wider scope was revoked)"
             );
         } else {
             let installed = self.scope.ensure_installed().await;
-            if !diff.added.is_empty() {
+            if !diff.added.is_empty() || changed.is_some() {
                 info!(
                     cause,
                     generation,
                     added = diff.added.len(),
+                    capture_loopback = options.capture_loopback,
+                    creator_rule = options.creator_rule,
                     pipeline = installed,
                     "Scope widened: applied"
                 );
