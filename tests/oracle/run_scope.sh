@@ -184,7 +184,10 @@ score() { # score DIR checks...
 }
 
 conf() { # conf DIR SCOPE-LINES: backend cgroup_skb, privacy full, plus SCOPE-LINES
-  printf '%s\n\n[privacy]\nmode = "full"\n\n[capture]\nbackend = "cgroup_skb"\n' "$2" >"$1/agent.toml"
+  # These checks were written for the creator rule (a listed server's
+  # listener selects its children from the first byte); scope_lab.py t15
+  # covers both rules.
+  printf '%s\npid_filter_listener = "creator"\n\n[privacy]\nmode = "full"\n\n[capture]\nbackend = "cgroup_skb"\n' "$2" >"$1/agent.toml"
 }
 
 stop_pids() { for p in $PIDS; do kill "$p" 2>/dev/null; done; sleep 0.3; PIDS=""; }

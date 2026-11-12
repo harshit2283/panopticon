@@ -170,8 +170,14 @@ class Agent:
         return os.path.join(self.d, f)
 
     def write(self, scope):
+        # Every test here runs over 127.0.0.1: capture loopback (off by
+        # default). The tests were written for the creator rule; t15 also
+        # runs the acceptor rule (the default).
+        extra = "\ncapture_loopback = true\n"
+        if "pid_filter_listener" not in scope:
+            extra += 'pid_filter_listener = "creator"\n'
         with open(self.cfg, "w") as f:
-            f.write(scope + '\n\n[capture]\nbackend = "cgroup_skb"\n\n[privacy]\nmode = "full"\n')
+            f.write(scope + extra + '\n[capture]\nbackend = "cgroup_skb"\n\n[privacy]\nmode = "full"\n')
 
     def start(self):
         for f in ("agent.jsonl", "audit.jsonl", "raw.pncap"):
@@ -783,11 +789,12 @@ def prefork_clients(port, run, count):
     return out
 
 
-def prefork_case(t, run, mode, listed, port):
-    """One pre-fork run; `listed` is "M" or "A". Checks per DESIGN §3.1."""
+def prefork_case(t, run, mode, listed, port, rule="creator"):
+    """One pre-fork run; `listed` is "M" or "A"; `rule` is
+    pid_filter_listener. Checks per DESIGN §3.1."""
     m = Proc(prefork_master, port, mode)
     pids = m.get()
-    ag = Agent(t, run, "pid_filter = [%d]" % pids[listed]).start()
+    ag = Agent(t, run, 'pid_filter = [%d]\npid_filter_listener = "%s"' % (pids[listed], rule)).start()
     m.go()
     pids.update(m.get())
     time.sleep(0.5)
@@ -802,16 +809,22 @@ def prefork_case(t, run, mode, listed, port):
     m_in, m_out = [], []
     for cid, name in conns:
         marks = ["B1Q1x" + cid, "B1P1x" + cid, "B1Q2x" + cid, "B1P2x" + cid]
-        if listed == "M":
+        if listed == "M" and rule == "acceptor":
+            m_out += marks  # the listed master accepts nothing
+        elif listed == "M":
             m_in += marks
         elif name == "A":
             m_out.append(marks[0])  # before accept() returned
             m_in += marks[1:]
         else:
             m_out += marks
-    check_present(t, ag, m_in, "%s: in-scope bytes" % run)
+    if m_in:
+        check_present(t, ag, m_in, "%s: in-scope bytes" % run)
     check_absent(t, ag, m_out, "%s: out-of-scope bytes" % run)
     evs = ag.tcp(port)
+    if not m_in:
+        t.check(not evs, "%s: no event on the port (%d)" % (run, len(evs)))
+        return ag
     if listed == "M":
         bad = [e for e in evs if e["owner_tgid"] != pids["M"]]
         what = "every event's owner is the listed master"
@@ -832,8 +845,13 @@ def t3(t):
 
 def t15(t):
     """T-15: pre-fork server, master-listed (listener created under the
-    agent) and worker-listed (listener and workers predate the agent)."""
+    agent; creator rule: every child, acceptor rule: none, the workers are
+    unlisted) and worker-listed (listener and workers predate the agent)."""
     prefork_case(t, "master_M", "master", "M", PORT + 150)
+    ag = prefork_case(t, "master_M_acceptor", "master", "M", PORT + 152, "acceptor")
+    if ag:
+        t.check(ag.scope_drop("out_of_scope") > 0,
+                "acceptor rule: the unlisted workers' children counted out_of_scope")
     ag = prefork_case(t, "pre_A", "pre", "A", PORT + 151)
     if ag:
         t.check(ag.scope_drop("no_owner") > 0,
