@@ -439,55 +439,99 @@ exported:
   `password`, `passwd`, `cookie` or `credential` (so `Authorization`,
   `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Vault-Token`, `PRIVATE-TOKEN`,
   `X-Goog-Api-Key`, `X-Hub-Signature-256`, ...). `:authority` and
-  `Sec-WebSocket-Key` stay readable;
+  `Sec-WebSocket-Key` stay readable. A header of any protocol whose name is
+  a credential name (below) is replaced the same way;
 - the **method** (including a gRPC method path), the **content type**, the
   **request body** (e.g. POST JSON or form data) and the **response body**
   are scanned and redacted;
-- **credentials** are masked in every field whatever the protocol:
-  - the value after `PASSWORD`, `PASSWD` or any `*_PASSWORD` name (such as
-    `MASTER_PASSWORD`, `SOURCE_PASSWORD` or a backquoted
-    `` `group_replication_recovery_password` ``), after `SET PASSWORD FOR
-    account =`, `IDENTIFIED BY`, `IDENTIFIED WITH|VIA plugin AS|USING`,
-    `requirepass` and `masterauth`, and the current password after
-    `REPLACE`. The value is read whole whatever its SQL form: quoted with
-    doubled quotes or backslash escapes, `E'…'`, `U&'…'`, `_utf8mb4'…'`,
-    `$$…$$`, adjacent literals, comments before it. When it cannot be
-    delimited (an expression such as `CONCAT(…)`), the rest of the text is
-    masked;
-  - the value of a credential-named parameter or field given with `=` or
-    `:` (query strings, forms, JSON, `Name: value` text): names containing
-    `password`, `passwd`, `passphrase`, `secret`, `token`, `apikey`,
-    `api_key`, `access_key`, `private_key`, `credential`, `signature`,
-    `csrf` or `xsrf`, names ending in `_pass`, and the names `auth`,
-    `authorization`, `key`, `pwd`, `pass`, `sig`, `session`, `sessionid`,
-    `session_id`, `sid`, `cookie`, `jwt` and `masteruser` (case-folded, `-`
-    and `.` read as `_`). Names are percent-decoded first (`%70assword=` is
-    `password=`);
-  - the password of a URI, `scheme://user:password@host`;
-  - the arguments of a Redis `AUTH`.
+- **credentials**: any field with *credential context* is withheld whole,
+  whatever the protocol, unless every credential in it can be masked with
+  certainty (below).
 
-Login secrets are masked in every privacy mode by default, `full` included,
-and with PII detection off (`[pii] enabled = false`): Redis `AUTH`,
-`HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET` and `SENTINEL SET`
-of a credential-named parameter (`requirepass`, `masterauth`,
-`masteruser`, the TLS key passphrases, `auth-pass`), `ACL SETUSER`
-password rules, and in replies: `CONFIG GET` values of those parameters,
-the whole reply of `ACL LIST|GETUSER|GENPASS`, the same results returned
-inside `EXEC`, and in any reply the value after a credential-named element
-(a hash with a `password` field) and `ACL LIST` lines with a password rule.
-A Redis reply that cannot be matched to its command (capture started with
-replies outstanding, `MONITOR` output, `UNSUBSCRIBE` with no channel) is
-exported without its text, and an `EXEC` whose `MULTI` came before
-capture started has its whole result masked. One case stays open: when
-capture starts while pipelined commands are still unanswered, the first
-replies are matched to the first commands captured, so the reply to an
-`ACL GENPASS` sent just before capture started can be exported under
-another command. Also masked: the SQL
-clauses above (PostgreSQL, MySQL), also in server error messages that
-quote the statement, and the credential headers, parameters and URI
-passwords above, in every copy (HTTP/2 keeps `:path` as a header too).
-The raw dump (`full` mode, §5.5) always keeps them. The AMQP and Kafka
-SASL exchanges are never exported as events.
+A field has credential context when, read with JSON escapes decoded
+(`\u0070`), percent-encoding decoded up to three times (`%2570` is `p`)
+with `+` as a space, case folded, and SQL comment markers (`/*`, `/*!`,
+`*/`, `--`, `#`) ignored so a comment's text counts, it contains:
+
+- a word containing `password`, `passwd`, `passphrase`, `secret`, `token`,
+  `apikey`, `api_key`, `access_key`, `private_key`, `credential`,
+  `signature`, `authorization`, `requirepass`, `masterauth`, `csrf` or
+  `xsrf`, or ending in `_pass` or `_auth` (names of any length; `-` and
+  `.` read as `_`), or `IDENTIFIED` followed by `BY`, `WITH`, `VIA`, `AS`
+  or `USING`;
+- one of the names `auth`, `pwd`, `pass`, `key`, `sig`, `session`,
+  `sessionid`, `session_id`, `sid`, `cookie`, `jwt` or `masteruser` used
+  as a name, that is followed by `=` or `:` (so `/api/auth/login`, a Redis
+  `AUTH` command name or "press any key" are not context);
+- userinfo, `user:password@host`, with or without a scheme (the `:` of
+  `scheme://` and `mailto:` do not count).
+
+What is exported then:
+
+- **SQL** (MySQL, PostgreSQL): the statement becomes its verb and
+  `<statement withheld>` (`ALTER <statement withheld>`), its bound
+  parameter values are not exported, and a server error for it (which may
+  quote it) becomes `<statement withheld>`; so does any error message that
+  shows credential context itself.
+- **Any other field** (path, header value, method, content type, bodies,
+  Redis arguments and replies, Kafka and AMQP fields): `<field withheld>`,
+  unless every credential in it is one of these, in which case only the
+  value becomes `<REDACTED>` and the rest stays readable: a query or form
+  parameter (`name=value` at the start or after `?` or `&`, the value
+  running to `&` or the end without a space), a JSON member whose value is
+  a string, number, `true`, `false` or `null`, or the password of a `//`
+  authority (`scheme://user:<REDACTED>@host`). So `/login?password=x&q=1`
+  exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
+  under a credential name, a password in prose or `Authorization: Bearer …`
+  inside a body withholds the field.
+- **DNS answers** whose name has credential context are dropped.
+
+The price is more withheld text than a value-level mask would leave: a
+`SELECT` naming a `password` column, a body that mentions a token or a
+secret in prose, a path such as `/oauth/token`, or a Redis
+`CONFIG GET requirepass` command and its reply is withheld whole.
+
+Redis commands and replies are masked before this rule runs. The
+command's secret is masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`,
+`CONFIG SET` and `SENTINEL SET` of a credential-named parameter, and
+`ACL SETUSER` password rules. The reply is masked for `CONFIG GET` of those
+parameters, the whole of `ACL LIST|GETUSER|GENPASS` and the same results
+inside `EXEC`; in any reply the value after a credential-named element and
+`ACL LIST` lines with a password rule are masked too. The rule above then
+applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
+<REDACTED>` stay readable (`auth` is not used as a name there), while a
+command or reply naming `requirepass`, `masterauth` or another word from
+the first list (`CONFIG SET requirepass …`, `CONFIG GET masterauth`) is
+withheld whole. Protocol and subscription state follow the server's
+replies only. A reply that cannot be matched to its command is exported
+without its text. No reply text is exported for the rest of the
+connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;
+`CLIENT REPLY OFF|SKIP` (never acknowledged, so a refusal cannot be seen);
+any `CLIENT REPLY` other than `CLIENT REPLY ON`; `MULTI`, `EXEC`,
+`DISCARD` or `RESET` sent with arguments; `CLIENT`, `HELLO`, `MONITOR` or
+a subscription command queued inside `MULTI`; a transaction past 1024
+commands or 64 KiB. An `EXEC` whose
+`MULTI` came before capture started has its whole result masked.
+
+Replies are paired with commands by order, which is only safe when the
+agent saw both directions of the connection from their first byte. With
+the TC backend that is proved by the connection's SYN and SYN+ACK, with
+`cgroup_skb` by the kernel's stream offset; any bytes lost later (ring
+drops, capture cap) end the proof. Without it Redis replies are exported
+for the rest of the connection without their text or the command they
+answer (status, timing and sizes only). That covers every connection
+already open when the agent started (pooled clients, until they
+reconnect), every TLS-captured Redis connection (TLS plaintext carries no
+stream position), and any connection whose SYN events were lost. A reply that may answer a
+command sent before capture started, such as an `ACL GENPASS`, is
+therefore never exported under the first command captured. SQL bound
+values are exported only for a statement whose prepare was seen on the
+connection, after the last lost client byte.
+
+All of this applies in every privacy mode by default, `full` included,
+and with PII detection off (`[pii] enabled = false`). The raw dump
+(`full` mode, §5.5) always keeps credentials. The AMQP and Kafka SASL
+exchanges are never exported as events.
 
 To export login secrets too, `full` mode accepts:
 

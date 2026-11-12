@@ -1298,14 +1298,14 @@ fn kafka_topic_names_do_not_outlive_their_pipeline() {
             };
             env.feed(&kafka(
                 41001,
-                metadata_v12_exchange(1, "old-topic.secret", id),
+                metadata_v12_exchange(1, "old-topic.orders", id),
                 1,
             ));
             // The Fetch runs on another connection (and worker): only once
             // the Metadata is parsed does the pipeline know the topic.
             env.wait_for("Metadata", &["json"]).await;
             env.feed(&kafka(41002, fetch_v16_exchange(2, id, "k", "v"), 1));
-            env.wait_for("old-topic.secret", &["json"]).await; // the Fetch, named
+            env.wait_for("old-topic.orders", &["json"]).await; // the Fetch, named
             env.scope.narrow(2).await;
             let applied = env.marks();
             env.feed(&kafka(41003, fetch_v16_exchange(3, id, "k", "v"), 2));

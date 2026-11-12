@@ -51,6 +51,8 @@ pub struct PostgresParser {
     /// Text-format parameter values from the current cycle's Bind message.
     /// Applications send their data here, not in the SQL text.
     bind_params: Option<String>,
+    /// The last statement built had credential context and was withheld.
+    statement_withheld: bool,
 }
 
 /// Max named statements remembered per connection.
@@ -124,6 +126,7 @@ impl PostgresParser {
             resync_server: false,
             prepared: HashMap::new(),
             bind_params: None,
+            statement_withheld: false,
             query_ts: None,
             query_text: None,
             pending_error: None,
@@ -433,13 +436,11 @@ impl PostgresParser {
                     // ReadyForQuery — build message from accumulated query state + any error.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
-                    if let Some(mut err) = self.pending_error.take() {
+                    if let Some(err) = self.pending_error.take() {
                         // Error message takes precedence over query text in
                         // payload_text; it may quote the statement.
-                        if super::mask_credentials_enabled() {
-                            super::mask_sql_secrets_in(&mut err, super::SqlDialect::Postgres);
-                        }
-                        msg.payload_text = Some(err);
+                        msg.payload_text =
+                            Some(super::export_error_text(err, self.statement_withheld));
                     }
                     return Some(msg);
                 }
@@ -472,20 +473,21 @@ impl PostgresParser {
     fn build_msg(&mut self, ts: u64) -> L7Message {
         let mut msg = L7Message::new(Protocol::Postgres, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
-        if let Some(mut q) = self.query_text.take() {
-            // CREATE/ALTER ROLE|USER … PASSWORD '…' / IDENTIFIED BY '…'.
-            if super::mask_credentials_enabled() {
-                super::mask_sql_secrets_in(&mut q, super::SqlDialect::Postgres);
+        let bound = self.bind_params.take();
+        self.statement_withheld = false;
+        match self.query_text.take() {
+            Some(q) => {
+                let (verb, shown, bound, withheld) = super::export_statement(q, bound);
+                msg.method = verb.or(msg.method);
+                msg.payload_text = Some(shown);
+                msg.request_text = bound;
+                self.statement_withheld = withheld;
             }
-            if let Some(cmd) = q.split_whitespace().next() {
-                msg.method = Some(cmd.to_uppercase());
-            }
-            msg.payload_text = Some(super::truncate_utf8(&q, 4096).to_string());
+            None => msg.request_text = bound,
         }
         if let Some(t) = self.query_ts.take() {
             msg.latency_ns = Some(ts.saturating_sub(t));
         }
-        msg.request_text = self.bind_params.take();
         msg
     }
 
@@ -785,6 +787,26 @@ mod tests {
         }
     }
 
+    /// A credential statement exports no bound value (text format).
+    #[test]
+    fn test_credential_statement_drops_bound_values() {
+        let mut p = setup_ready_parser();
+        let sql = "UPDATE users SET password = $1 WHERE id = 1";
+        p.feed(
+            &extended_cycle(Some(("", sql)), "", &["canary-bound"]),
+            Direction::Egress,
+            1000,
+        );
+        let ParseResult::Messages(msgs) = p.feed(&insert_done(), Direction::Ingress, 2000) else {
+            panic!("expected a message");
+        };
+        assert_eq!(msgs[0].request_text, None, "{msgs:?}");
+        assert_eq!(
+            msgs[0].payload_text.as_deref(),
+            Some("UPDATE <statement withheld>")
+        );
+    }
+
     #[test]
     fn test_reused_prepared_statement_is_captured() {
         // ORMs/drivers prepare once, then send only Bind/Execute/Sync.
@@ -810,6 +832,48 @@ mod tests {
             }
             other => panic!("reused statement must produce a message, got {other:?}"),
         }
+    }
+
+    /// A Bind is paired with its statement's SQL only when the Parse was
+    /// seen: not for a statement prepared before capture, and not after
+    /// client bytes were lost (they may have re-Parsed the name with a
+    /// credential statement).
+    #[test]
+    fn test_bind_against_unseen_parse_exports_no_values() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let values = |r: Option<FsmResult>| match r {
+            Some(FsmResult::MessageComplete(m)) => vec![m.request_text],
+            Some(FsmResult::Messages(ms)) => ms.into_iter().map(|m| m.request_text).collect(),
+            _ => vec![],
+        };
+        let mut p = PostgresParser::new();
+        p.feed(
+            &extended_cycle(None, "s1", &["canary-bound"]),
+            Direction::Egress,
+            1,
+        );
+        assert!(matches!(
+            p.feed(&insert_done(), Direction::Ingress, 2),
+            ParseResult::NeedMoreData
+        ));
+
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Postgres);
+        let cycle = extended_cycle(Some(("s1", "SELECT $1")), "s1", &["x"]);
+        m.process_packet(1, Direction::Egress, &cycle, 1);
+        assert_eq!(
+            values(m.process_packet(1, Direction::Ingress, &insert_done(), 2)),
+            vec![Some("x".into())]
+        );
+        // Lost: Close s1, Parse s1 'ALTER ROLE app PASSWORD $1'.
+        m.skip_from(1, (0, 0), Direction::Egress, 60, 3);
+        let cycle = extended_cycle(None, "s1", &["canary-bound"]);
+        m.process_packet(1, Direction::Egress, &cycle, 4);
+        let out = values(m.process_packet(1, Direction::Ingress, &insert_done(), 5));
+        assert!(
+            out.iter().flatten().all(|v| !v.contains("canary")),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -894,10 +958,10 @@ mod tests {
         msgs[0].payload_text.clone().unwrap_or_default()
     }
 
-    /// PostgreSQL string forms: escape strings, dollar quotes, comments,
-    /// continuation across a newline, Unicode escapes.
+    /// PostgreSQL credential statements in any string form export only their
+    /// verb.
     #[test]
-    fn test_sql_lexical_forms_are_masked() {
+    fn test_credential_statement_forms_export_only_the_verb() {
         for sql in [
             "CREATE USER app WITH PASSWORD E'canary-escape';",
             "CREATE USER app WITH PASSWORD E'can\\'ary-escape';",
@@ -908,58 +972,39 @@ mod tests {
             "ALTER ROLE app PASSWORD 'canary-a'\n'canary-b'",
             "ALTER ROLE app PASSWORD U&'canary-u'",
             "ALTER ROLE app ENCRYPTED PASSWORD 'canary-enc' VALID UNTIL 'infinity'",
+            "ALTER ROLE app WITH LOGIN PASSWORD 'canary'",
+            "CREATE SUBSCRIPTION s CONNECTION 'host=db1 user=repl password=canary' PUBLICATION p",
+            "UPDATE cfg SET smtp_password = 'canary'",
+            "SELECT 1 # 2; ALTER ROLE app PASSWORD 'canary-hash'",
         ] {
-            let out = exported_query(sql);
-            assert!(!out.contains("canary"), "{sql} -> {out}");
-            assert!(
-                out.contains(crate::protocol::REDACTED_CREDENTIAL),
-                "{sql} -> {out}"
+            let verb = sql.split_whitespace().next().unwrap();
+            assert_eq!(
+                exported_query(sql),
+                format!("{verb} <statement withheld>"),
+                "{sql}"
             );
         }
-        // `#` is an operator in PostgreSQL, not a comment: a later clause on
-        // the same line is still found.
-        let out = exported_query("SELECT 1 # 2; ALTER ROLE app PASSWORD 'canary-hash'");
-        assert!(!out.contains("canary"), "{out}");
     }
 
+    /// Statements with credential context export only their verb (Codex
+    /// round 3): standard_conforming_strings, nested comments.
     #[test]
-    fn test_password_clause_is_masked() {
-        let mut p = setup_ready_parser();
-        p.feed(
-            &make_frontend_msg(b'Q', b"ALTER ROLE app WITH LOGIN PASSWORD 'pg-s3cret'\0"),
-            Direction::Egress,
-            1000,
-        );
-        let mut response = make_backend_msg(b'C', b"ALTER ROLE\0");
-        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
-        let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
-            panic!("expected a message");
-        };
-        let q = msgs[0].payload_text.as_deref().unwrap();
-        assert_eq!(q, "ALTER ROLE app WITH LOGIN PASSWORD <REDACTED>");
-        assert_eq!(msgs[0].method.as_deref(), Some("ALTER"));
-        // Underscore-prefixed keywords (a column or option named *_password).
-        for (sql, want) in [
-            (
-                "CREATE SUBSCRIPTION s CONNECTION 'host=db1 user=repl password=pg-s3cret' PUBLICATION p",
-                "CREATE SUBSCRIPTION s CONNECTION 'host=db1 user=repl password=<REDACTED>' PUBLICATION p",
-            ),
-            (
-                "UPDATE cfg SET smtp_password = 'pg-s3cret'",
-                "UPDATE cfg SET smtp_password = <REDACTED>",
-            ),
+    fn test_credential_statements_are_withheld() {
+        let mut leaks = Vec::new();
+        for sql in [
+            "ALTER ROLE a PASSWORD 'first\\'; ALTER ROLE b PASSWORD 'canary-second'",
+            "ALTER ROLE a PASSWORD /* x /* nested */ 'canary-in' */ 'canary-out'",
         ] {
-            let mut p = setup_ready_parser();
-            let mut q = sql.as_bytes().to_vec();
-            q.push(0);
-            p.feed(&make_frontend_msg(b'Q', &q), Direction::Egress, 1000);
-            let mut response = make_backend_msg(b'C', b"OK\0");
-            response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
-            let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
-                panic!("expected a message for {sql}");
-            };
-            assert_eq!(msgs[0].payload_text.as_deref(), Some(want));
+            let out = exported_query(sql);
+            if out.to_lowercase().contains("canary") {
+                leaks.push(format!("{sql} -> {out}"));
+            }
         }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+        assert_eq!(
+            exported_query("ALTER ROLE app PASSWORD 'canary'"),
+            "ALTER <statement withheld>"
+        );
     }
 
     #[test]
@@ -1056,24 +1101,27 @@ mod tests {
         }
     }
 
-    /// An error message that quotes the statement has its secret masked,
-    /// like the query it replaces in payload_text.
+    /// An error message is withheld when its statement was, and when it
+    /// shows credential context itself.
     #[test]
-    fn test_error_text_is_masked() {
-        let mut p = setup_ready_parser();
-        p.feed(
-            &make_frontend_msg(b'Q', b"ALTER ROLE app PASSWORD 'pg-s3cret' BAD\0"),
-            Direction::Egress,
-            1000,
-        );
-        let mut response =
-            make_backend_msg(b'E', b"SERROR\0Mnear \"PASSWORD 'pg-s3cret' BAD\"\0\0");
-        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
-        let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
-            panic!("expected a message");
-        };
-        let text = msgs[0].payload_text.as_deref().unwrap();
-        assert_eq!(text, "near \"PASSWORD <REDACTED> BAD\"");
+    fn test_error_text_is_withheld() {
+        for query in [
+            &b"ALTER ROLE app PASSWORD 'pg-s3cret' BAD\0"[..],
+            b"SELECT 1\0",
+        ] {
+            let mut p = setup_ready_parser();
+            p.feed(&make_frontend_msg(b'Q', query), Direction::Egress, 1000);
+            let mut response =
+                make_backend_msg(b'E', b"SERROR\0Mnear \"PASSWORD 'pg-s3cret' BAD\"\0\0");
+            response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+            let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
+                panic!("expected a message");
+            };
+            assert_eq!(
+                msgs[0].payload_text.as_deref(),
+                Some("<statement withheld>")
+            );
+        }
     }
 
     #[test]

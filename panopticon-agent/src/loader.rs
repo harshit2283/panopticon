@@ -429,8 +429,9 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
-    let syn_events = crate::capture_gate::GateConfig::from_config(config).wants_syn();
-    cfg_map.set(CONFIG_TCP_SYN_EVENTS, syn_events as u64, 0)?;
+    // TC delivers SYNs: they locate each side's first byte, which head_only
+    // counts from and which proves a parser saw the stream from its start.
+    cfg_map.set(CONFIG_TCP_SYN_EVENTS, 1, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
     // A fresh random key per agent start: flow cookies are not computable
     // offline. Set before TC is attached (load path), so every cookie of a

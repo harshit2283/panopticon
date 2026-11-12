@@ -146,11 +146,12 @@ production-hardened compliance platform.
     retransmission is then dropped as a duplicate. Forging one needs the
     connection's current sequence numbers (an on-path attacker).
   - Segments are not reordered: one that arrives before an earlier one is
-    taken as a gap, and the earlier one is then ignored. SYNs are not
-    tracked (`sampling_mode = "head_only"` captures them, but only to count
-    each direction's bytes), so a new connection on a 5-tuple whose old state is still held
-    (its FIN or RST not seen) is ignored until that state expires
-    (`idle_connection_timeout`, 30 s).
+    taken as a gap, and the earlier one is then ignored. TC always
+    delivers SYNs: they place each direction's first byte. A bare SYN on a
+    5-tuple whose old state is still held starts a new connection there
+    once a FIN of the old one was seen; without a FIN or RST the old state
+    is kept (a forged SYN cannot reset it) and the new connection is
+    ignored until that state expires (`idle_connection_timeout`, 30 s).
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
@@ -168,11 +169,20 @@ production-hardened compliance platform.
     with no context; see `BENCHMARKS.md` §3.
   - ONNX-backed ML inference is optional and throughput-sensitive.
   - In `redacted` mode, header names and values are scanned for every
-    protocol, and credentials (credential-named HTTP headers and
-    parameters, URI passwords, Redis `AUTH` and credential replies, SQL
-    password clauses) are masked; `full` masks login secrets too, with or
-    without PII detection, unless `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
-    TLS, Redis AUTH and Kafka client ids; SQL password clauses and AMQP
+    protocol. Credentials are protected by withholding: a SQL statement
+    with credential context is exported as its verb and `<statement
+    withheld>`, without bound values; any other field with credential
+    context is exported as `<field withheld>` unless each credential is a
+    form parameter, a scalar JSON member or URI userinfo, whose value is
+    then masked; credential-named headers are masked, and Redis
+    credential commands and replies are masked before the same rule (so
+    `AUTH` stays readable but `CONFIG GET requirepass` is withheld).
+    Redis reply text is exported only on connections seen from their
+    first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
+    not on connections open before the agent started, nor over TLS.
+    `full` does this too, with or without PII detection, unless
+    `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
+    TLS, Redis AUTH and Kafka client ids; withheld SQL statements and AMQP
     metadata are covered by unit tests only.
 - Service graphing:
   - DNS/IP-based identity works. DNS names come only from answers to

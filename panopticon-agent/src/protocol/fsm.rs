@@ -123,6 +123,9 @@ pub trait ProtocolFsm: Send {
     fn skip(&mut self, _direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<FsmResult> {
         None
     }
+
+    /// See [`ProtocolParser::joined_late`].
+    fn joined_late(&mut self) {}
 }
 
 pub struct ProtocolFsmAdapter {
@@ -179,6 +182,10 @@ impl ProtocolFsm for ProtocolFsmAdapter {
                 ParseResult::Messages(msgs) => FsmResult::Messages(msgs),
                 ParseResult::Error(e) => FsmResult::Error(e),
             })
+    }
+
+    fn joined_late(&mut self) {
+        self.parser.joined_late();
     }
 }
 
@@ -306,6 +313,15 @@ impl TcpTracker {
     }
 }
 
+/// Where each side's stream starts (the sequence number of its first byte),
+/// learnt from SYNs before the connection's parser exists.
+#[derive(Debug, Clone, Copy)]
+struct Origin {
+    client: Option<(Endpoint, u32)>,
+    server: Option<(Endpoint, u32)>,
+    at: Instant,
+}
+
 /// Unified entry combining the FSM instance and last-seen timestamp.
 struct ConnectionEntry {
     fsm: Box<dyn ProtocolFsm>,
@@ -335,6 +351,8 @@ impl ConnectionEntry {
 
 pub struct ConnectionFsmManager {
     connections: DashMap<u64, ConnectionEntry>,
+    /// Stream origins of connections whose first payload has not arrived.
+    origins: DashMap<u64, Origin>,
     max_connections: usize,
     /// The pipeline's Kafka topic ID map, given to every Kafka parser.
     topics: super::kafka::KafkaTopics,
@@ -350,6 +368,7 @@ impl ConnectionFsmManager {
     pub fn with_topics(max_connections: usize, topics: super::kafka::KafkaTopics) -> Self {
         Self {
             connections: DashMap::new(),
+            origins: DashMap::new(),
             max_connections,
             topics,
         }
@@ -397,16 +416,25 @@ impl ConnectionFsmManager {
         }
 
         let fsm: Box<dyn ProtocolFsm> = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
-        self.connections.insert(
-            conn_id,
-            ConnectionEntry {
-                fsm,
-                last_seen: Instant::now(),
-                server,
-                fin: [false; 2],
-                tcp: TcpTracker::default(),
-            },
-        );
+        let mut entry = ConnectionEntry {
+            fsm,
+            last_seen: Instant::now(),
+            server,
+            fin: [false; 2],
+            tcp: TcpTracker::default(),
+        };
+        if let Some((_, origin)) = self.origins.remove(&conn_id) {
+            // The SYN+ACK's sender is the server, whatever the payload said.
+            if let Some((ep, _)) = origin.server {
+                entry.server = Some(ep);
+            }
+            if let Some(server) = entry.server {
+                for (ep, seq) in [origin.client, origin.server].into_iter().flatten() {
+                    entry.tcp.next[(ep == server) as usize] = Some(seq);
+                }
+            }
+        }
+        self.connections.insert(conn_id, entry);
 
         if evicted > 0 {
             CreateResult::CreatedWithEviction(evicted)
@@ -494,7 +522,81 @@ impl ConnectionFsmManager {
             Direction::Egress => 0,
             Direction::Ingress => 1,
         };
-        Some(entry.tcp.admit(side, seg))
+        // No origin for this side: its first byte was never located, so
+        // the parser starts somewhere inside the stream.
+        let unplaced = entry.tcp.next[side].is_none();
+        let verdict = entry.tcp.admit(side, seg);
+        if unplaced && verdict != SegmentVerdict::Drop {
+            entry.fsm.joined_late();
+        }
+        Some(verdict)
+    }
+
+    /// A SYN sent by `src` (`ack`: a SYN+ACK, from the server): that side's
+    /// stream starts at `seq + 1`. A bare SYN for a tracked connection that
+    /// sent a FIN starts a new connection on its key: the old one is closed
+    /// (true). Without a FIN it is ignored: one forged SYN must not reset a
+    /// live connection's state.
+    pub fn note_syn(&self, conn_id: u64, src: Endpoint, ack: bool, seq: u32) -> bool {
+        let reused = !ack
+            && self
+                .connections
+                .get(&conn_id)
+                .is_some_and(|e| e.fin[0] || e.fin[1]);
+        let closed = reused && self.close_connection(conn_id);
+        if self.connections.contains_key(&conn_id) {
+            return closed; // a late SYN+ACK: the parser already started
+        }
+        let start = Some((src, seq.wrapping_add(1)));
+        if let Some(mut o) = self.origins.get_mut(&conn_id) {
+            if ack {
+                o.server = start;
+            } else {
+                o.client = start;
+            }
+            o.at = Instant::now();
+        } else if self.origins.len() < self.max_connections {
+            // ponytail: a full table leaves later connections unproven (no
+            // Redis reply text) until evict_idle; evict the oldest if it bites.
+            let (client, server) = if ack { (None, start) } else { (start, None) };
+            self.origins.insert(
+                conn_id,
+                Origin {
+                    client,
+                    server,
+                    at: Instant::now(),
+                },
+            );
+        }
+        closed
+    }
+
+    /// `src`'s stream starts at sequence number `origin` (from the kernel's
+    /// stream offset). Takes effect only before that side's first byte.
+    pub fn note_origin(
+        &self,
+        conn_id: u64,
+        src: Endpoint,
+        capture_direction: Direction,
+        origin: u32,
+    ) {
+        if let Some(mut entry) = self.connections.get_mut(&conn_id) {
+            let side = match entry.direction_of(src, capture_direction) {
+                Direction::Egress => 0,
+                Direction::Ingress => 1,
+            };
+            if entry.tcp.next[side].is_none() {
+                entry.tcp.next[side] = Some(origin);
+            }
+        }
+    }
+
+    /// The connection's parser did not see its stream from the start (see
+    /// [`ProtocolFsm::joined_late`]).
+    pub fn mark_joined_late(&self, conn_id: u64) {
+        if let Some(mut entry) = self.connections.get_mut(&conn_id) {
+            entry.fsm.joined_late();
+        }
     }
 
     /// `n` bytes sent by `src` were not captured. Lets the parser account for
@@ -511,20 +613,22 @@ impl ConnectionFsmManager {
     ) -> Option<FsmResult> {
         let mut entry = self.connections.get_mut(&conn_id)?;
         let direction = entry.direction_of(src, capture_direction);
-        match entry.fsm.skip(direction, n, timestamp_ns) {
-            Some(result) => Some(result),
-            None => {
-                let protocol = entry.fsm.protocol();
-                entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
-                None
-            }
+        let result = entry.fsm.skip(direction, n, timestamp_ns);
+        if result.is_none() {
+            let protocol = entry.fsm.protocol();
+            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
         }
+        // Bytes were lost: whatever the parser does next starts mid-stream.
+        entry.fsm.joined_late();
+        result
     }
 
     /// Record a FIN sent by `src`. Returns true once both sides have sent
     /// one, i.e. the connection is finished and can be closed.
     pub fn note_fin(&self, conn_id: u64, src: Endpoint, capture_direction: Direction) -> bool {
         let Some(mut entry) = self.connections.get_mut(&conn_id) else {
+            // Closing before any payload: its origin is not needed.
+            self.origins.remove(&conn_id);
             return false;
         };
         let side = match entry.direction_of(src, capture_direction) {
@@ -542,6 +646,7 @@ impl ConnectionFsmManager {
 
     /// Close a connection and return whether it existed.
     pub fn close_connection(&self, conn_id: u64) -> bool {
+        self.origins.remove(&conn_id);
         self.connections.remove(&conn_id).is_some()
     }
 
@@ -564,6 +669,7 @@ impl ConnectionFsmManager {
         for conn_id in expired {
             self.connections.remove(&conn_id);
         }
+        self.origins.retain(|_, o| now.duration_since(o.at) <= ttl);
         count
     }
 

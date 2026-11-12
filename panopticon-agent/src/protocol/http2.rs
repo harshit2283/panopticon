@@ -752,6 +752,40 @@ mod tests {
         ));
     }
 
+    /// Joined mid-connection, the HPACK table lacks the earlier insertions:
+    /// a block that refers to them fails to decode and is dropped whole, so
+    /// no value is exported under another header's name.
+    #[test]
+    fn test_late_join_never_decodes_a_value_under_another_name() {
+        let mut ce = hpack::Encoder::new();
+        let first = [
+            (":method", "POST"),
+            (":path", "/a"),
+            ("x-session-note", "canary-secret-value"),
+        ];
+        let before = encode(&mut ce, &first); // sent before capture started
+        let mut p = Http2Parser::new(false);
+        let h = encode(&mut ce, &[(":method", "POST"), (":path", "/b"), first[2]]);
+        // The block refers to the dynamic table instead of repeating it.
+        assert!(h.len() < before.len() - "canary-secret-value".len());
+        let req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &h);
+        p.feed(&req, Direction::Egress, 1);
+        let h = encode(&mut hpack::Encoder::new(), &[(":status", "200")]);
+        let resp = make_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &h);
+        for m in messages(p.feed(&resp, Direction::Ingress, 2)) {
+            // The request block was dropped, not decoded.
+            assert!(m.headers.iter().all(|(n, _)| n != "x-session-note"));
+            for (name, value) in &m.headers {
+                assert!(
+                    !value.contains("canary") || name == "x-session-note",
+                    "{name}: {value}"
+                );
+            }
+            assert!(m.path.as_deref().is_none_or(|p| !p.contains("canary")));
+            assert!(m.method.as_deref().is_none_or(|p| !p.contains("canary")));
+        }
+    }
+
     #[test]
     fn test_bodyless_get_completes_on_response() {
         // GET with END_STREAM on HEADERS (no DATA), 200 + body.

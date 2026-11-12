@@ -79,7 +79,7 @@ pub struct GateConfig {
 impl GateConfig {
     /// For live capture. On the cgroup_skb backend the kernel has made
     /// every scope decision (DESIGN §8): the gate is a pass-through (no pid
-    /// check, holds, sampling or head cut) and TC SYN events stay off.
+    /// check, holds, sampling or head cut).
     pub fn from_config(config: &AgentConfig) -> Self {
         if config.capture_backend == CaptureBackend::CgroupSkb {
             return Self::default();
@@ -105,12 +105,6 @@ impl GateConfig {
                 _ => None,
             },
         }
-    }
-
-    /// Whether TC must also deliver SYN segments (head_only counts TCP
-    /// offsets from them).
-    pub fn wants_syn(&self) -> bool {
-        self.head_bytes.is_some()
     }
 }
 
@@ -621,7 +615,6 @@ mod tests {
         ] {
             let stats = EventStats::new();
             let cg = config(&format!("{rules}[capture]\nbackend = \"cgroup_skb\"\n"));
-            assert!(!cg.wants_syn(), "{rules}");
             let mut g = CaptureGate::new(cg, 1024);
             let mut tls = event(EventType::TlsData, b"GET / HTTP/1.1");
             tls.pid = 101;
@@ -648,7 +641,6 @@ mod tests {
             let mut p = tcp((1, 1000), 5, 0, b"abcdef");
             assert_ne!(tc.admit(&mut p, 1, [None; 2], &stats), Verdict::Process);
         }
-        assert!(config("sampling_mode = \"head_only\"\nhead_only_bytes = 1\n").wants_syn());
     }
 
     fn head(g: &mut CaptureGate, e: &mut DataEvent, key: u64) -> (Verdict, Vec<u8>) {
