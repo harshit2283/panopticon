@@ -124,22 +124,32 @@ production-hardened compliance platform.
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
     without BTF is not validated yet.
-  - Go `crypto/tls` reads and writes (Go 1.17+ register ABI). A read is
-    saved at the entry of `(*Conn).Read` and emitted by a probe on each of
-    its `RET` instructions (no uretprobe: Go moves goroutine stacks), keyed
-    by goroutine and process instance; a buffer on the goroutine's stack is
-    followed when the stack is copied. Validated on kernels 7.0, 6.8, 5.15,
-    RHEL 9 and RHEL 8 (`scope_attach` `go_tls_reads`: reads captured
-    byte-exact, including into stack buffers that moved mid-read; nothing
-    from an out-of-scope process or after a narrowing; no entries left after
-    goroutine churn or process exit) and with the scope oracle
+  - Go `crypto/tls` reads and writes, for binaries whose build information
+    (`.go.buildinfo`) shows the gc toolchain at Go 1.18+, `GOARCH` amd64 or
+    arm64 matching the node, and the register ABI not turned off by a
+    `GOEXPERIMENT`; any other Go binary gets no Go probe at all. Received
+    plaintext is taken per TLS record as `(*halfConn).decrypt` returns it,
+    decrypted in place in the connection's own input buffer, never from the
+    caller's `Read` buffer, whose lifetime a probe cannot establish. The
+    entry of `(*Conn).readRecordOrCCS` names the connection, keyed by
+    goroutine and process instance (no uretprobe: Go moves goroutine stacks,
+    so returns are probed at their `RET` instructions). A record that
+    decrypts as application data but that the connection then refuses (sent
+    before the handshake completed) is still emitted. Validated on kernels
+    7.0, 6.8, 5.15, RHEL 9 and RHEL 8 (`scope_attach` `go_tls_reads`:
+    records captured byte-exact over TLS 1.3 and TLS 1.2 with AEAD and CBC
+    suites, including while the reader's stack moved; nothing from an
+    out-of-scope process, after a narrowing or after capture is switched
+    off; no slots left after goroutine churn or process exit) and with the
+    scope oracle
     (`tests/oracle/run_scope.sh`: 100% of reads from both processes in
-    unscoped `full`, `pid_filter` and `cgroup_filter`); `run_tls.sh` scores
-    100% recall in both views, except the known client-view flake
-    (one exchange in 500 in some runs, docs/BENCHMARKS.md). Reads in flight at once are capped at
-    65,536 node-wide (a goroutine parked in `Read` on an idle keep-alive
-    connection holds one); past that, further reads are not captured until
-    some return; likewise past 8,192 processes doing Go TLS reads at once
+    unscoped `full`, `pid_filter` and `cgroup_filter`, the last not on
+    RHEL 8, where `cgroup_filter` is refused); `run_tls.sh` scores 100%
+    recall in both views, except the known client-view flake (one to three
+    exchanges in 500 in some runs, docs/BENCHMARKS.md). Record reads in flight at once are
+    capped at 65,536 node-wide (a goroutine parked waiting for a record on
+    an idle keep-alive connection holds one); past that, further reads are
+    not captured until some return; likewise past 8,192 processes doing Go TLS reads at once
     (new ones are not captured until some exit). Reads in flight when their process's main thread exits, or
     when it execs, are not captured. Go TLS events carry no socket address
     under a restricted capture scope. Binaries built with `-s` (no symbol
