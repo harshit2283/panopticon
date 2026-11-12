@@ -1393,14 +1393,23 @@ fn handle_messages(
         // audit log, every exporter and the service graph only ever see the
         // sanitized message (path/query, headers and payload).
         let pii_report = scan_with_body_cap(&mut msg, ctx.max_body_bytes, |msg| {
-            ctx.pii_engine
-                .as_ref()
+            match ctx.pii_engine.as_ref() {
                 // Redact unless the mode is full, and in full too if the config
-                // asks for a redacted export ([pii] redact = true).
-                .and_then(|e| {
+                // asks for a redacted export ([pii] redact = true). The engine
+                // masks login secrets itself.
+                Some(e) => {
                     let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
                     e.scan_message_with(msg, redact)
-                })
+                }
+                // No engine ([pii] enabled = false, full mode): login secrets
+                // are still masked unless `mask_credentials = false`.
+                None => {
+                    if crate::protocol::mask_credentials_enabled() {
+                        crate::pii::mask_credentials(msg);
+                    }
+                    None
+                }
+            }
         });
         if let Some(report) = pii_report.as_ref() {
             ctx.stats

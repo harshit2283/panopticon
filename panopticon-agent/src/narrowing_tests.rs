@@ -1471,6 +1471,46 @@ fn replay_with_cgroup_skb_applies_user_space_scope() {
     );
 }
 
+/// `[privacy] mask_credentials` (default on) does not depend on the PII
+/// engine: `full` mode with `[pii] enabled = false` exports no credential
+/// header and no `password=` value.
+#[test]
+fn full_mode_without_pii_engine_masks_login_secrets() {
+    t2(
+        "full_mode_without_pii_engine_masks_login_secrets",
+        2,
+        async {
+            let dir = tmpdir("creds");
+            let mut cfg =
+                replay_config(&dir, "[privacy]\nmode = \"full\"\n[pii]\nenabled = false\n");
+            crate::config::apply_privacy(&mut cfg).unwrap();
+            let shared =
+                Shared::for_replay(cfg, Arc::new(PrivacyGate::new(PrivacyMode::Full))).unwrap();
+            let p = crate::pipeline::Pipeline::build(&shared).unwrap();
+            let req = b"POST /login?password=Q-SECRET-1 HTTP/1.1\r\nHost: shop\r\n\
+                Authorization: Bearer T-SECRET-2\r\nCookie: sid=C-SECRET-3\r\n\
+                Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 26\r\n\r\n\
+                user=bob&password=B-SECRET";
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            p.replay(&tcp_exchange(
+                (CLIENT, 40_001),
+                (SERVER, 18_052),
+                req,
+                resp,
+                0,
+            ))
+            .await;
+            p.shutdown().await;
+            let out = std::fs::read_to_string(dir.join("replay.jsonl")).unwrap();
+            assert!(out.contains("/login"), "positive control: {out}");
+            for secret in ["Q-SECRET-1", "T-SECRET-2", "C-SECRET-3", "B-SECRET"] {
+                assert!(!out.contains(secret), "{secret} exported: {out}");
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        },
+    );
+}
+
 /// Live cgroup_skb close records free state, count as processed and reach
 /// no output.
 #[test]
