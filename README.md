@@ -156,9 +156,11 @@ correctness across every kernel.
 - Do **not** expose `/healthz`, `/readyz`, `/metrics`, or `/debug/state` to
   public or untrusted networks.
 - Prefer loopback or a private management network for observability endpoints.
-- OTLP should stay on trusted internal networks for the current MVP. If the
-  exposure boundary grows, use TLS or mTLS and stronger endpoint
-  authentication.
+- OTLP export is cleartext gRPC: only `http://` endpoints are accepted
+  (`https://` refuses to start) and there is no TLS or authentication
+  option. Keep the collector on the node or a trusted internal network; to
+  cross an untrusted one, send to a collector on the node that forwards
+  over TLS.
 - Treat JSONL export and the PII audit log as sensitive artifacts.
 - `--privacy-mode full` writes decrypted TLS plaintext and unredacted
   personal data to the export and raw dump; enable it only when you need it

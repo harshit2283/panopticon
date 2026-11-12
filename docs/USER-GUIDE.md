@@ -141,7 +141,7 @@ identity_cache_ttl_secs = 300
 
 [otlp]
 enabled = false
-endpoint = "http://127.0.0.1:4317"
+endpoint = "http://127.0.0.1:4317"   # http:// only: cleartext gRPC, https:// refuses to start
 service_name = "panopticon-agent"
 
 [kubernetes]           # pod/service names for endpoints (§5.6)
