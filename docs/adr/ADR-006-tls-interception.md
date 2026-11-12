@@ -44,7 +44,7 @@ Go's calling convention changed in 1.17:
 - **Go < 1.17**: Stack-based ABI (arguments on stack)
 - **Go ≥ 1.17**: Register-based ABI (arguments in registers)
 
-Uprobe attachment must detect Go version and use correct argument extraction. Additionally, uretprobes on Go functions cause crashes due to goroutine stack relocation—Go runtime can move stacks during execution, invalidating return probe addresses.
+Uprobe attachment must detect Go version and use correct argument extraction. Additionally, uretprobes on Go functions cause crashes due to goroutine stack relocation—Go runtime can move stacks during execution, invalidating return probe addresses. Reads therefore use an entry uprobe plus a uprobe on every `RET` instruction of `(*Conn).Read` (found by decoding the function), keyed by goroutine and process instance, with a buffer on the goroutine's stack saved relative to the stack top so a stack copy does not lose it.
 
 ## Decision
 
@@ -56,7 +56,7 @@ We will use **eBPF uprobes** on OpenSSL and Go TLS (register ABI only) with expl
 |---------|------|-------|-------|
 | OpenSSL 1.1.x | ✅ | ✅ | SSL_read/SSL_write |
 | OpenSSL 3.x | ✅ | ✅ | SSL_read/SSL_write |
-| Go ≥ 1.17 | ❌ | ✅ | crypto/tls.(*Conn).Write |
+| Go ≥ 1.17 | ✅ | ✅ | crypto/tls.(*Conn).Read (entry + RET uprobes) / Write |
 | Go < 1.17 | ❌ | ❌ | Stack ABI incompatible |
 | BoringSSL | ❌ | ❌ | Not implemented |
 | GnuTLS | ❌ | ❌ | Not implemented |
@@ -245,7 +245,7 @@ pub fn attach_tls_probes(&mut self, program: &mut TlsProbes) -> Result<()> {
 ### Negative
 
 1. **Limited library coverage**: Only OpenSSL and Go ≥1.17 supported at launch
-2. **No Go TLS Read**: Goroutine stack relocation makes uretprobes unsafe
+2. **No uretprobe for Go TLS Read**: goroutine stack relocation makes uretprobes unsafe; reads need RET-instruction probes and per-goroutine state
 3. **Version detection required**: Go ABI changes require binary analysis
 4. **Process attachment latency**: New processes must be detected and attached
 5. **Container complexity**: Must resolve library paths inside container mount namespaces

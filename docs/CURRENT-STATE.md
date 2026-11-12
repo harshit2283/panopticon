@@ -124,14 +124,26 @@ production-hardened compliance platform.
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
     without BTF is not validated yet.
-  - Go `crypto/tls`: writes only (Go 1.17+ register ABI). Reads are no
-    longer captured: the arguments saved at a read's entry cannot be proven
-    to still belong to that call at its return (a stack-backed buffer moves
-    when the goroutine's stack grows; a read that unwinds without returning
-    leaves them for a later call), and abandoned entries could not be
-    reclaimed on the supported kernels. Earlier read-and-write recall figures
-    no longer apply. Binaries built with `-s` (no symbol table) are not
-    found; arm64 is untested.
+  - Go `crypto/tls` reads and writes (Go 1.17+ register ABI). A read is
+    saved at the entry of `(*Conn).Read` and emitted by a probe on each of
+    its `RET` instructions (no uretprobe: Go moves goroutine stacks), keyed
+    by goroutine and process instance; a buffer on the goroutine's stack is
+    followed when the stack is copied. Validated on kernels 7.0, 6.8, 5.15,
+    RHEL 9 and RHEL 8 (`scope_attach` `go_tls_reads`: reads captured
+    byte-exact, including into stack buffers that moved mid-read; nothing
+    from an out-of-scope process or after a narrowing; no entries left after
+    goroutine churn or process exit) and with the scope oracle
+    (`tests/oracle/run_scope.sh`: 100% of reads from both processes in
+    unscoped `full`, `pid_filter` and `cgroup_filter`); `run_tls.sh` scores
+    100% recall in both views, except the known client-view flake
+    (one exchange in 500 in some runs, docs/BENCHMARKS.md). Reads in flight at once are capped at
+    65,536 node-wide (a goroutine parked in `Read` on an idle keep-alive
+    connection holds one); past that, further reads are not captured until
+    some return; likewise past 8,192 processes doing Go TLS reads at once
+    (new ones are not captured until some exit). Reads in flight when their process's main thread exits, or
+    when it execs, are not captured. Go TLS events carry no socket address
+    under a restricted capture scope. Binaries built with `-s` (no symbol
+    table) are not found; arm64 is untested.
 - TCP stream integrity (TC capture):
   - Each direction's next expected sequence number is tracked
     (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,

@@ -36,7 +36,8 @@ mutable per-release status table.
 ## TLS Constraints
 
 - OpenSSL support exists for targeted `SSL_read` and `SSL_write` attach paths.
-- Go TLS support is limited to write-path capture.
+- Go TLS support covers `crypto/tls` reads and writes for Go 1.17+ binaries
+  with a symbol table; stripped binaries and the stack ABI are not covered.
 - Broad TLS library coverage is not implemented.
 
 ## Identity And Graph Constraints

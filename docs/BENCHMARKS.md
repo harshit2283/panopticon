@@ -69,14 +69,21 @@ under-reported.
 (`go_tls_oracle.go`, HTTP/1.1 over TLS, keep-alive, GETs up to 70 KB and POSTs
 with an email and an SSN). Writes are hooked at `(*Conn).Write`. Reads use
 an entry probe plus a uprobe on every `RET` instruction of `(*Conn).Read`,
-keyed by goroutine, because uretprobes break when Go moves goroutine stacks.
+because uretprobes break when Go moves goroutine stacks. They are keyed by
+goroutine and process instance, and a buffer on the goroutine's stack is
+followed when the stack moves. Go reads were removed for a while
+(writes only) and are back with that design; the rows marked 2026-11-12 are
+its measurements (kernel 7.0, 32 vCPU VM, unscoped `full`).
 
 | Run | Exchanges | Recall (client / server view) | Status / method / size | With socket addresses | Leaks |
 |---|---|---|---|---|---|
 | Before (writes only, PID-scoped probes) | 300 | 0% / 0% | — | — | — |
-| Current, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 99.6% | 0 |
+| Earlier read design, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 99.6% | 0 |
+| 2026-11-12, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
+| 2026-11-12, seed 7 | 500 | 99.8% / **100%** (1 duplicate) | 100% / 100% / 100% | 100% / 100% | 0 |
 | HTTP/2 (`go-h2` stack), before | 300 | 55–65% / 55–65% | — | — | 0 |
-| HTTP/2 (`go-h2` stack), current, seeds 7, 14, 42 | 300–500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), earlier read design, seeds 7, 14, 42 | 300–500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), 2026-11-12, seeds 7, 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
 
 Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
 64 vCPUs) are not always clean. In 2 runs of 10, the client view scores
@@ -84,7 +91,8 @@ Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
 connection are paired with the wrong responses. The server view stays at
 100%, and no events are dropped. The build before the ring sharding
 behaves the same (also 2 of 10), so this is not new. The cause is not
-established yet.
+established yet. The 2026-11-12 seed 7 run shows the same signature (client
+view 99.8%, server view 100%).
 
 HTTP/2 over TLS had two problems of its own:
 
