@@ -192,6 +192,15 @@ fn drain_records(ring: &mut RingBuf<MapData>) -> Vec<(DataEvent, usize)> {
     out
 }
 
+/// Drain ring 0: every record's raw bytes, as published.
+fn drain_raw(ring: &mut RingBuf<MapData>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(item) = ring.next() {
+        out.push(item.to_vec());
+    }
+    out
+}
+
 fn load_any(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     let target = TARGETS.iter().find(|(p, _)| *p == name).map(|(_, f)| *f);
     let is_scope_kind = matches!(
@@ -820,6 +829,52 @@ fn scope_programs_load_attach_and_hold() {
             .collect::<Vec<_>>()
     );
     drop((c3, s3));
+
+    // Every published byte of a record is written: once the ring has wrapped
+    // over records full of 0xAB, small records (a 64-byte class with 5
+    // bytes, a 128-byte class with 100) carry zeros past their payload, as
+    // do close records and every other record seen.
+    let mut c4 = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut s4, _) = listener.accept().unwrap();
+    c4.set_nodelay(true).unwrap();
+    let mut sink = vec![0u8; 1 << 16];
+    let mut checked = 0usize;
+    let mut check = |raw: Vec<Vec<u8>>| {
+        for r in raw {
+            let n = data_event_record_len(&r).expect("valid record");
+            assert!(
+                r[n..].iter().all(|&b| b == 0),
+                "record of {} bytes has nonzero bytes past its payload ({n})",
+                r.len()
+            );
+            checked += 1;
+        }
+    };
+    for round in 0..3 {
+        // ~3 MiB of 0xAB records: the 1 MiB shard wraps at least twice.
+        for _ in 0..800 {
+            c4.write_all(&[0xABu8; 4000]).unwrap();
+            let mut got = 0;
+            while got < 4000 {
+                got += s4.read(&mut sink).unwrap();
+            }
+            check(drain_raw(&mut ring));
+        }
+        for len in [5usize, 100] {
+            for _ in 0..50 {
+                c4.write_all(&vec![round as u8 + 1; len]).unwrap();
+                let mut got = 0;
+                while got < len {
+                    got += s4.read(&mut sink).unwrap();
+                }
+            }
+            check(drain_raw(&mut ring));
+        }
+    }
+    drop((c4, s4));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    check(drain_raw(&mut ring));
+    assert!(checked > 2400, "records checked: {checked}");
 
     // ── head_only, N = 3
     set(&mut ebpf, CONFIG_HEAD_BYTES, 3);

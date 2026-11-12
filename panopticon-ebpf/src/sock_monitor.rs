@@ -26,8 +26,8 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, EventType, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, CONNECTING, DATA_EVENTS_PERF, EVENT_SCRATCH, pid_allowed, shard_for, shard_reserve,
-    shard_submit_flags,
+    CONFIG, CONNECTING, DATA_EVENTS_PERF, EVENT_SCRATCH, SizedEvent, pid_allowed, shard_for,
+    shard_reserve_as, shard_submit_flags_for,
 };
 use crate::tc_capture::tc_connection_cookie;
 
@@ -214,15 +214,16 @@ fn emit_sock_event<C: EbpfContext>(
         // Same shard as the connection's TC packets (same cookie), so this
         // owner event stays ordered before them.
         let shard = shard_for(cookie);
-        let Some(mut entry) = shard_reserve(shard) else {
+        // The header only (payload_len is 0): every reserved byte is
+        // written, so no earlier record's bytes are published with it.
+        let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
             crate::maps::count_kernel_drop();
             return Ok(()); // RingBuf full — drop
         };
 
-        let event = entry.as_mut_ptr();
-        // SAFETY: writing to reserved RingBuf memory. The payload is not
-        // zeroed: payload_len is 0, and the ring's memory only ever holds
-        // other events that user space can already read.
+        let event = entry.as_mut_ptr() as *mut DataEvent;
+        // SAFETY: writing the header fields of reserved RingBuf memory, all
+        // within the record.
         unsafe {
             populate_sock_event(
                 event, event_type, pid, tgid, cookie, src_addr, dst_addr, src_port, dst_port,
@@ -230,7 +231,7 @@ fn emit_sock_event<C: EbpfContext>(
             );
         }
 
-        entry.submit(shard_submit_flags(shard));
+        entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
     } else {
         // PerfEventArray path for kernels < 5.8
         // Use per-CPU scratch map (DataEvent is ~4.2KB, exceeds 512-byte BPF stack limit).

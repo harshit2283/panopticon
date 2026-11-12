@@ -40,7 +40,8 @@ pub struct SockState {
     /// Our SYN's count in `bytes_acked`: 1 active, 0 passive. Reset.
     pub syn_adj: u8,
     /// 1 once a packet record of this socket was emitted (sock_capture.rs
-    /// `mark_emitted`); `on_tcp_close` sends a close record only then.
+    /// `mark_emitted`); `on_tcp_close` sends a close record only then, and
+    /// only while the socket is authorised.
     /// A plain store, never a read-modify-write of `flags` (FLAG_KTLS is set
     /// concurrently, unlocked). Sticky; a child may inherit 1 from its
     /// listener (BPF_F_CLONE), which only costs it a close record.

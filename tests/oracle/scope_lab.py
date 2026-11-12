@@ -66,6 +66,7 @@ LIBC = ctypes.CDLL(None, use_errno=True)
 TCP_REPAIR, TCP_REPAIR_QUEUE, TCP_QUEUE_SEQ = 19, 20, 21
 TCP_SEND_QUEUE = 2
 TCP_FASTOPEN, TCP_INFO, TCP_ULP, SO_COOKIE = 23, 11, 31, 57
+SOL_TLS, TLS_TX = 282, 1
 MSG_FASTOPEN = 0x20000000
 TCPI_OPT_SYN_DATA = 32
 
@@ -1126,10 +1127,19 @@ def t11_actor(p, port_srv, helpers):
             ls = listener(0, "127.0.0.1")
             c = socket.create_connection(ls.getsockname(), 10)
             a, _ = ls.accept()
+            # A kTLS key install (TLS_TX, AES-GCM-128) after the ULP: the
+            # marker is set on entry to any SOL_TLS setsockopt, whatever the
+            # result. A ULP without keys is not marked (DESIGN §3.5).
             try:
                 c.setsockopt(socket.IPPROTO_TCP, TCP_ULP, b"tls")
             except OSError:
-                pass  # the marker is set on entry, whatever the result
+                pass
+            try:
+                c.setsockopt(SOL_TLS, TLS_TX, struct.pack(
+                    "<HH8s16s4s8s", 0x0303, 51, b"\x01" * 8, b"\x02" * 16, b"\x03" * 4,
+                    b"\x00" * 8))
+            except OSError:
+                pass
             c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             for i in range(30):
                 c.sendall(b"k" * 100)
@@ -1214,11 +1224,16 @@ def t11(t):
     pre_a, _ = pre_l.accept()
     pre_c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def owner_listener(p):                         # listed; its listener predates the agent
-        ls = listener(port + 1, "127.0.0.1")
+    # A listener that predates the agent, held by a listed process and by
+    # this (unlisted) one: not every holder is listed, so arming gives it no
+    # owner, and its children are selected only from accept() on (no_owner).
+    # Held by the listed process alone, arming would own it.
+    shared_l = listener(port + 1, "127.0.0.1")
+
+    def owner_listener(p):                         # listed; inherits shared_l
         p.report({"ok": 1})
         p.wait_go()
-        ls.close()
+        shared_l.close()
     s = Proc(owner_listener)
     s.get()
     lrep = listener(port + 2, "127.0.0.1")
@@ -1254,7 +1269,8 @@ def t11(t):
     def run_case(name):
         return lambda: (r.go(name.encode()), r.get())
     case(ag, "head_cut", "a listed process's 8 KiB stream (N = 512)", run_case("head_cut"))
-    case(ag, "ktls_payload", "30 segments after TCP_ULP \"tls\"", run_case("ktls"), 30)
+    case(ag, "ktls_payload", "30 segments after a kTLS key install (TLS_TX)", run_case("ktls"),
+         30)
     case(ag, "tls_mode", "a TLS exchange under head_only",
          lambda: tls_pair(port + 3, cert, b"B1T11TLSMODE"))
     before = ag.drops().get("head_incoherent", 0)
@@ -1267,7 +1283,7 @@ def t11(t):
          lambda: (r.go(b"repair"), time.sleep(3)), 1)
     ag.stop()
     s.go()
-    for x in held + [pre_c, pre_a, pre_l, lrep]:
+    for x in held + [pre_c, pre_a, pre_l, lrep, shared_l]:
         unlisten(x)
     check_absent(t, ag, [b"B1T11TLSMODE"], "TLS plaintext under head_only")
 

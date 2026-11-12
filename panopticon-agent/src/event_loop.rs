@@ -257,11 +257,12 @@ impl AdmissionFloor {
     }
 }
 
-/// Whether `event` is dropped at the ring read under admission `floor`. A
-/// close record carries no generation and reaches no sink (it only frees
-/// state), so it is never stale.
+/// Whether `event` is dropped at the ring read under admission `floor`.
+/// Close records too: the kernel stamps one with the generation its socket
+/// was in scope under, and a stale one would carry a narrowed-out socket's
+/// tuple across (its state went with the replaced pipeline anyway).
 fn below_floor(event: &DataEvent, floor: u32) -> bool {
-    event.event_type != EventType::SockClose && event.scope_gen < floor
+    event.scope_gen < floor
 }
 
 // ── Rate Limiter (global token bucket) ───────────────────────────────────
@@ -1000,7 +1001,16 @@ pub(crate) async fn worker_task(
     let mut owners = OwnerTable::new(ctx.max_connections_tracked);
     let mut gate = CaptureGate::new(ctx.capture_gate.clone(), ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
-    let sweep_interval = Duration::from_secs(5);
+    // Never longer than the idle timeout itself (5 s at most), and on a
+    // timer, not only when a batch arrives: a connection whose close never
+    // came (lost in a full ring, raced by its first packet, or withheld
+    // because the socket left scope) is freed on a quiet worker too.
+    let sweep_interval = ctx
+        .idle_timeout
+        .min(Duration::from_secs(5))
+        .max(Duration::from_millis(10));
+    let mut sweep_timer = tokio::time::interval(sweep_interval);
+    sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     debug!(worker_id, "Worker started");
 
@@ -1008,18 +1018,27 @@ pub(crate) async fn worker_task(
     // copied in; past payload_len it keeps earlier bytes, never read.
     // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
     let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
-    while let Some(batch) = rx.recv().await {
+    loop {
+        let batch = tokio::select! {
+            b = rx.recv() => match b {
+                Some(b) => b,
+                None => break,
+            },
+            // No traffic: run the timed work below with an empty batch.
+            _ = sweep_timer.tick() => EventBatch::default(),
+        };
         for record in batch.records() {
             if !read_data_event_into(record, &mut scratch) {
                 continue;
             }
             let cookie = connection_key(&scratch);
             // Live cgroup_skb: a close record (sockops STATE_CB, the header
-            // only) is sent for every socket the kernel emitted a packet
-            // record for, in scope now or not, with its tuple and owner: it
-            // frees the connection's state and reaches no sink. Counted
-            // processed (it is consumed here). On TC and in replay a close
-            // takes the gated path below, as before.
+            // only) is sent for a socket the kernel emitted a packet record
+            // for and that is in scope when it closes, stamped with that
+            // generation (admitted like any record): it frees the
+            // connection's state and reaches no sink. Counted processed (it
+            // is consumed here). On TC and in replay a close takes the gated
+            // path below, as before.
             if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
                 ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
                 end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
@@ -2313,8 +2332,9 @@ mod tests {
             (EventType::TcPacket, 4, false),
             (EventType::TlsData, 2, true),
             (EventType::TlsData, 3, false),
-            // A close record (generation 0) only frees state: never stale.
-            (EventType::SockClose, 0, false),
+            // Close records carry the generation they were authorised under.
+            (EventType::SockClose, 2, true),
+            (EventType::SockClose, 3, false),
         ] {
             e.event_type = kind;
             e.scope_gen = gen_;
