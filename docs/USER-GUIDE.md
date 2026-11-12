@@ -445,22 +445,29 @@ What is exported then:
 
 The price is more withheld text than a value-level mask would leave: a
 `SELECT` naming a `password` column, a body that mentions a token or a
-secret in prose, or a path such as `/oauth/token` is withheld whole.
+secret in prose, a path such as `/oauth/token`, or a Redis
+`CONFIG GET requirepass` command and its reply is withheld whole.
 
-Redis replies are matched to their commands before this: `AUTH`,
-`HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET` and `SENTINEL SET`
-of a credential-named parameter and `ACL SETUSER` password rules are
-masked in the command; `CONFIG GET` values of those parameters, the whole
-reply of `ACL LIST|GETUSER|GENPASS`, the same results inside `EXEC`, the
-value after a credential-named element of any reply, and `ACL LIST` lines
-with a password rule are masked in the reply. Protocol and subscription
-state follow the server's replies only. A reply that cannot be matched to
-its command is exported without its text, and after `MONITOR`,
-`UNSUBSCRIBE` with no channel, `CLIENT REPLY OFF|SKIP` (never
-acknowledged, so a refusal cannot be seen), a malformed `CLIENT REPLY`,
-`MULTI`, `EXEC`, `DISCARD` or `RESET`, a protocol- or reply-changing
-command queued in `MULTI`, or a transaction past 1024 commands or 64 KiB,
-no reply text is exported for the rest of the connection. An `EXEC` whose
+Redis commands and replies are masked before this rule runs. The
+command's secret is masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`,
+`CONFIG SET` and `SENTINEL SET` of a credential-named parameter, and
+`ACL SETUSER` password rules. The reply is masked for `CONFIG GET` of those
+parameters, the whole of `ACL LIST|GETUSER|GENPASS` and the same results
+inside `EXEC`; in any reply the value after a credential-named element and
+`ACL LIST` lines with a password rule are masked too. The rule above then
+applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
+<REDACTED>` stay readable (`auth` is not used as a name there), while a
+command or reply naming `requirepass`, `masterauth` or another word from
+the first list (`CONFIG SET requirepass …`, `CONFIG GET masterauth`) is
+withheld whole. Protocol and subscription state follow the server's
+replies only. A reply that cannot be matched to its command is exported
+without its text. No reply text is exported for the rest of the
+connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;
+`CLIENT REPLY OFF|SKIP` (never acknowledged, so a refusal cannot be seen);
+any `CLIENT REPLY` other than `CLIENT REPLY ON`; `MULTI`, `EXEC`,
+`DISCARD` or `RESET` sent with arguments; `CLIENT`, `HELLO`, `MONITOR` or
+a subscription command queued inside `MULTI`; a transaction past 1024
+commands or 64 KiB. An `EXEC` whose
 `MULTI` came before capture started has its whole result masked. One case
 stays open: when capture starts while pipelined commands are still
 unanswered, the first replies are matched to the first commands

@@ -164,8 +164,9 @@ production-hardened compliance platform.
     withheld>`, without bound values; any other field with credential
     context is exported as `<field withheld>` unless each credential is a
     form parameter, a scalar JSON member or URI userinfo, whose value is
-    then masked; credential-named headers and Redis credential replies are
-    masked. `full` does this too, with or without PII detection, unless
+    then masked; credential-named headers are masked, and Redis
+    credential commands and replies are masked before the same rule (so
+    `AUTH` stays readable but `CONFIG GET requirepass` is withheld). `full` does this too, with or without PII detection, unless
     `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
     TLS, Redis AUTH and Kafka client ids; withheld SQL statements and AMQP
     metadata are covered by unit tests only.

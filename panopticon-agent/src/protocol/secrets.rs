@@ -548,6 +548,30 @@ mod tests {
         }
     }
 
+    /// Redis text after the parser's own masking (USER-GUIDE 5.3): `AUTH`
+    /// stays readable, a credential parameter's name withholds the field.
+    #[test]
+    fn masked_redis_text() {
+        for text in [
+            "<REDACTED>",
+            "3 AUTH default <REDACTED>",
+            "default, <REDACTED>",
+        ] {
+            assert_eq!(protect_text(text), None, "{text}");
+        }
+        for text in [
+            "requirepass <REDACTED>",
+            "masterauth",
+            "requirepass, <REDACTED>",
+        ] {
+            assert_eq!(
+                protect_text(text).as_deref(),
+                Some(FIELD_WITHHELD),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn plain_text_is_left_alone() {
         for input in [
