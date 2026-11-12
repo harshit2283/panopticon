@@ -100,12 +100,15 @@ impl RedisParser {
                     // Out-of-band push: answers no command, keep the queue.
                     self.server_buf.consume(consumed);
                 }
-                RespParse::Complete(value, consumed) => {
+                RespParse::Complete(mut value, consumed) => {
                     self.server_buf.consume(consumed);
 
                     // Dequeue the oldest pending command (FIFO — correct for pipelining).
                     let mut msg = L7Message::new(Protocol::Redis, Direction::Ingress, timestamp_ns);
                     if let Some((parts, req_ts)) = self.pending_queue.pop_front() {
+                        if super::mask_credentials_enabled() {
+                            mask_reply_credentials(&parts, &mut value);
+                        }
                         msg.method = Some(parts[0].to_uppercase());
                         if parts.len() > 1 {
                             msg.path = Some(parts[1].clone());
@@ -191,7 +194,7 @@ impl ProtocolParser for RedisParser {
 /// before it is queued, so no sink, in any privacy mode, ever sees them (as
 /// the AMQP and Kafka parsers drop their auth exchanges):
 /// `AUTH [user] pw`, `HELLO … AUTH user pw`, `MIGRATE … AUTH pw | AUTH2 user pw`,
-/// `CONFIG SET requirepass|masterauth|masteruser pw` and the password rules
+/// `CONFIG SET` / `SENTINEL SET` of an [`is_secret_config`] parameter and the password rules
 /// (`>pw`, `<pw`, `#hash`, `!hash`) of `ACL SETUSER`.
 fn mask_credentials(parts: &mut [String]) {
     let mask = |s: &mut String| {
@@ -226,10 +229,11 @@ fn mask_credentials(parts: &mut [String]) {
                 i += 1 + n;
             }
         }
-        "CONFIG" if arg_is(parts, 1, &["SET"]) => {
-            let mut i = 2;
+        // CONFIG SET name value ...; SENTINEL SET master name value ...
+        "CONFIG" | "SENTINEL" if arg_is(parts, 1, &["SET"]) => {
+            let mut i = if cmd == "CONFIG" { 2 } else { 3 };
             while i + 1 < parts.len() {
-                if arg_is(parts, i, &["requirepass", "masterauth", "masteruser"]) {
+                if is_secret_config(&parts[i]) {
                     mask(&mut parts[i + 1]);
                 }
                 i += 2;
@@ -241,6 +245,41 @@ fn mask_credentials(parts: &mut [String]) {
             .filter(|r| r.starts_with(['>', '<', '#', '!']))
             .for_each(mask),
         _ => {}
+    }
+}
+
+/// Config parameters whose value is a secret or names its account:
+/// `requirepass`, `masterauth`, `masteruser`, the TLS key passphrases
+/// (`tls-key-file-pass`, `tls-client-key-file-pass`) and Sentinel's
+/// `auth-pass`.
+fn is_secret_config(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "masteruser" || name.contains("pass") || name.contains("auth")
+}
+
+/// Mask the secrets a reply carries, given the command it answers:
+/// `CONFIG GET` values of [`is_secret_config`] parameters (name/value
+/// pairs, RESP2 array or RESP3 map), and the whole reply of `ACL LIST`
+/// (password hashes), `ACL GETUSER` (password hashes) and `ACL GENPASS`
+/// (a fresh password).
+fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
+    let is = |i: usize, name: &str| cmd.get(i).is_some_and(|a| a.eq_ignore_ascii_case(name));
+    let redacted = || RespValue::SimpleString(super::REDACTED_CREDENTIAL.to_string());
+    if is(0, "ACL") && (is(1, "LIST") || is(1, "GETUSER") || is(1, "GENPASS")) {
+        if !matches!(value, RespValue::Error(_)) {
+            *value = redacted();
+        }
+    } else if is(0, "CONFIG")
+        && is(1, "GET")
+        && let RespValue::Array(Some(items)) = value
+    {
+        for pair in items.chunks_mut(2) {
+            if let [name, v] = pair
+                && resp_element_to_string(name).is_some_and(|n| is_secret_config(&n))
+            {
+                *v = redacted();
+            }
+        }
     }
 }
 
@@ -648,6 +687,8 @@ mod tests {
                 "MIGRATE", "h", "6379", "", "0", "5000", "AUTH2", "u", "s3cretpw",
             ],
             &["CONFIG", "SET", "requirepass", "s3cretpw"],
+            &["CONFIG", "SET", "tls-key-file-pass", "s3cretpw"],
+            &["SENTINEL", "SET", "mymaster", "auth-pass", "s3cretpw"],
             &[
                 "CONFIG",
                 "SET",
@@ -680,6 +721,65 @@ mod tests {
             panic!()
         };
         assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
+    }
+
+    /// Replies that carry a secret: `CONFIG GET` values of secret
+    /// parameters, and the hashes or passwords of `ACL LIST|GETUSER|GENPASS`.
+    #[test]
+    fn test_credential_replies_never_leave_the_parser() {
+        let cases: &[(&[&str], &[u8])] = &[
+            (
+                &["CONFIG", "GET", "requirepass"],
+                b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n",
+            ),
+            (
+                &["config", "get", "*"],
+                b"*6\r\n$9\r\nmaxmemory\r\n$3\r\n1gb\r\n$10\r\nmasterauth\r\n$8\r\ns3cretpw\r\n\
+                  $17\r\ntls-key-file-pass\r\n$8\r\ns3cretpw\r\n",
+            ),
+            // RESP3 map reply.
+            (
+                &["CONFIG", "GET", "masterauth"],
+                b"%1\r\n$10\r\nmasterauth\r\n$8\r\ns3cretpw\r\n",
+            ),
+            (
+                &["ACL", "LIST"],
+                b"*1\r\n$33\r\nuser bob on #s3cretpw ~* &* +@all\r\n",
+            ),
+            (
+                &["ACL", "GETUSER", "bob"],
+                b"*4\r\n$5\r\nflags\r\n*1\r\n$2\r\non\r\n$9\r\npasswords\r\n*1\r\n$8\r\ns3cretpw\r\n",
+            ),
+            (&["ACL", "GENPASS"], b"$8\r\ns3cretpw\r\n"),
+        ];
+        for (args, reply) in cases {
+            let mut parser = RedisParser::new();
+            parser.feed(&resp(args), Direction::Egress, 1);
+            let ParseResult::Messages(msgs) = parser.feed(reply, Direction::Ingress, 2) else {
+                panic!("no message for {args:?}");
+            };
+            let text = msgs[0].payload_text.clone().unwrap_or_default();
+            assert!(!text.contains("s3cretpw"), "{args:?} leaked: {text}");
+            assert!(
+                text.contains(crate::protocol::REDACTED_CREDENTIAL),
+                "{text}"
+            );
+        }
+        // Other parameters stay readable.
+        let mut parser = RedisParser::new();
+        parser.feed(&resp(&["CONFIG", "GET", "*"]), Direction::Egress, 1);
+        let ParseResult::Messages(msgs) = parser.feed(cases[1].1, Direction::Ingress, 2) else {
+            panic!()
+        };
+        assert!(
+            msgs[0]
+                .payload_text
+                .as_deref()
+                .unwrap()
+                .starts_with("maxmemory, 1gb, masterauth, <"),
+            "{:?}",
+            msgs[0].payload_text
+        );
     }
 
     #[test]
