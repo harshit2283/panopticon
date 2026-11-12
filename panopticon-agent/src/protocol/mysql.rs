@@ -214,7 +214,7 @@ impl MysqlParser {
                     past_col_eof,
                 } => match self.read_result_set(ts, cols_expected, cols_received, past_col_eof) {
                     RsResult::Done(msg) => {
-                        messages.push(msg);
+                        messages.push(*msg);
                         self.state = State::Ready;
                     }
                     RsResult::Progress(a, b, c) => {
@@ -627,7 +627,7 @@ impl MysqlParser {
                 } else {
                     m.status = Some(0);
                 }
-                return RsResult::Done(m);
+                return RsResult::Done(Box::new(m));
             }
         }
     }
@@ -665,7 +665,7 @@ impl MysqlParser {
 }
 
 enum RsResult {
-    Done(L7Message),
+    Done(Box<L7Message>),
     Progress(usize, usize, bool),
     Need,
 }
