@@ -81,9 +81,23 @@ pub struct L7Message {
     /// Decoded request body (e.g. HTTP POST/PUT payload, form data), when the
     /// protocol has one. Scanned and redacted like `payload_text`.
     pub request_text: Option<String>,
+    /// Wire headers (HTTP, HTTP/2, gRPC metadata, AMQP/Kafka fields).
     pub headers: Vec<(String, String)>,
+    /// DNS A answers, filled only by the DNS parser: kept apart from wire
+    /// headers, which a peer controls.
+    pub dns_answers: Vec<DnsAnswer>,
     pub request_size_bytes: u64,
     pub response_size_bytes: u64,
+}
+
+/// An A record answering a query seen on the same flow: feeds the DNS
+/// cache that names services in the graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DnsAnswer {
+    pub name: String,
+    /// IPv4 address as a host-order integer, like `src_addr`.
+    pub ip: u32,
+    pub ttl_secs: u32,
 }
 
 impl L7Message {
@@ -101,6 +115,7 @@ impl L7Message {
             payload_text: None,
             request_text: None,
             headers: Vec::new(),
+            dns_answers: Vec::new(),
             request_size_bytes: 0,
             response_size_bytes: 0,
         }

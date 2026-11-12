@@ -1576,7 +1576,7 @@ fn strip_payload_strings(msg: &mut crate::protocol::L7Message) {
     msg.content_type = None;
     msg.payload_text = None;
     msg.request_text = None;
-    msg.headers.retain(|(k, _)| k == "dns_a_record");
+    msg.headers.clear();
 }
 
 /// Bytes past `max_body_bytes` that are still scanned, so a value straddling
@@ -2259,14 +2259,21 @@ mod tests {
         msg.request_text = Some("body".into());
         msg.headers = vec![
             ("x-user".into(), "a@b.c".into()),
+            // A wire header borrowing the old DNS-answer name gets no pass.
             ("dns_a_record".into(), "svc.local|167772161|30".into()),
         ];
+        let answers = vec![crate::protocol::DnsAnswer {
+            name: "svc.local".into(),
+            ip: 167772161,
+            ttl_secs: 30,
+        }];
+        msg.dns_answers = answers.clone();
         msg.status = Some(201);
         strip_payload_strings(&mut msg);
         assert!(msg.method.is_none() && msg.path.is_none() && msg.content_type.is_none());
         assert!(msg.payload_text.is_none() && msg.request_text.is_none());
-        assert_eq!(msg.headers.len(), 1);
-        assert_eq!(msg.headers[0].0, "dns_a_record");
+        assert!(msg.headers.is_empty());
+        assert_eq!(msg.dns_answers, answers);
         assert_eq!(msg.status, Some(201));
     }
 

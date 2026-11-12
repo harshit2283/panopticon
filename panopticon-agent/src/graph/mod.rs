@@ -97,8 +97,8 @@ impl GraphBuilder {
         );
     }
 
-    /// Feed the DNS cache from a parsed DNS message: its `dns_a_record`
-    /// headers (`domain|ip_u32|ttl_secs`), which the DNS parser adds only
+    /// Feed the DNS cache from a parsed DNS message: its `dns_answers`,
+    /// which the DNS parser adds only
     /// for answers to a query seen on the same flow, and which the PII scan
     /// removes when a name holds PII. The cache refuses names that are not
     /// plain hostnames and caps the TTL.
@@ -106,19 +106,9 @@ impl GraphBuilder {
         if msg.protocol != Protocol::Dns {
             return;
         }
-        for (key, value) in &msg.headers {
-            if key != "dns_a_record" {
-                continue;
-            }
-            let mut parts = value.splitn(3, '|');
-            if let (Some(domain), Some(Ok(ip)), Some(Ok(ttl))) = (
-                parts.next(),
-                parts.next().map(str::parse::<u32>),
-                parts.next().map(str::parse::<u64>),
-            ) {
-                self.dns_cache
-                    .insert_observed(domain, ip, Duration::from_secs(ttl));
-            }
+        for a in &msg.dns_answers {
+            self.dns_cache
+                .insert_observed(&a.name, a.ip, Duration::from_secs(a.ttl_secs.into()));
         }
     }
 

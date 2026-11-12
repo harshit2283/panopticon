@@ -14,7 +14,7 @@
 //! own question section.
 //!
 //! DNS cache integration uses Option A: resolved records are returned in
-//! `L7Message.headers` as `("dns_a_record", "domain|ip_u32|ttl_secs")` tuples.
+//! `L7Message.dns_answers` (name, IPv4, TTL), kept apart from `headers`.
 //! The event loop extracts these and feeds `DnsCache::insert_observed()`.
 //! Only an answer to a query seen on the same flow (same transaction ID and
 //! question name) carries them: an unsolicited or spoofed response is
@@ -222,6 +222,7 @@ impl DnsParser {
         let mut cname_targets = Vec::new();
         let mut srv_targets = Vec::new();
         let mut headers = Vec::new();
+        let mut answers = Vec::new();
         if let Some(qtype) = qtype {
             headers.push(("qtype".into(), qtype_to_string(qtype).to_string()));
         }
@@ -263,7 +264,11 @@ impl DnsParser {
                     let ip = u32::from_be_bytes([rdata[0], rdata[1], rdata[2], rdata[3]]);
                     resolved_ips.push(std::net::Ipv4Addr::from(ip).to_string());
                     if let Some(domain) = qname.as_deref().filter(|d| matched && !d.is_empty()) {
-                        headers.push(("dns_a_record".into(), format!("{}|{}|{}", domain, ip, ttl)));
+                        answers.push(super::DnsAnswer {
+                            name: domain.to_string(),
+                            ip,
+                            ttl_secs: ttl,
+                        });
                     }
                 }
                 TYPE_AAAA if rdlength == 16 => {
@@ -301,6 +306,7 @@ impl DnsParser {
         msg.status = Some(rcode as u32);
         msg.response_size_bytes = data.len() as u64;
         msg.headers = headers;
+        msg.dns_answers = answers;
         if let Some(p) = pending {
             msg.latency_ns = Some(timestamp_ns.saturating_sub(p.timestamp_ns));
             msg.request_size_bytes = p.size;
@@ -600,14 +606,9 @@ mod tests {
                 assert_eq!(msgs[0].status, Some(0));
                 assert_eq!(msgs[0].latency_ns, Some(1000));
                 assert!(msgs[0].payload_text.as_ref().unwrap().contains("10.0.0.1"));
-                // Check dns_a_record header
-                let a_records: Vec<_> = msgs[0]
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| k == "dns_a_record")
-                    .collect();
-                assert_eq!(a_records.len(), 1);
-                assert!(a_records[0].1.contains("nginx.default.svc.cluster.local"));
+                let a = &msgs[0].dns_answers;
+                assert_eq!(a.len(), 1);
+                assert_eq!(a[0].name, "nginx.default.svc.cluster.local");
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -619,10 +620,9 @@ mod tests {
         };
         assert_eq!(msgs.len(), 1, "the response is still exported");
         msgs[0]
-            .headers
+            .dns_answers
             .iter()
-            .filter(|(k, _)| k == "dns_a_record")
-            .map(|(_, v)| v.clone())
+            .map(|a| format!("{}|{}|{}", a.name, a.ip, a.ttl_secs))
             .collect()
     }
 
@@ -698,13 +698,8 @@ mod tests {
                 assert_eq!(msgs[0].status, Some(0));
                 // Should contain IPv6 address
                 assert!(msgs[0].payload_text.is_some());
-                // No dns_a_record header for AAAA
-                let a_records: Vec<_> = msgs[0]
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| k == "dns_a_record")
-                    .collect();
-                assert!(a_records.is_empty());
+                // No A answer for AAAA
+                assert!(msgs[0].dns_answers.is_empty());
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -843,13 +838,7 @@ mod tests {
                 assert!(text.contains("10.0.0.1"));
                 assert!(text.contains("10.0.0.2"));
                 assert!(text.contains("10.0.0.3"));
-                // Should have 3 dns_a_record headers
-                let a_records: Vec<_> = msgs[0]
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| k == "dns_a_record")
-                    .collect();
-                assert_eq!(a_records.len(), 3);
+                assert_eq!(msgs[0].dns_answers.len(), 3);
             }
             other => panic!("expected Messages, got {other:?}"),
         }

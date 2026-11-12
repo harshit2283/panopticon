@@ -38,6 +38,8 @@ struct JsonEvent<'a> {
     request_body: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     headers: Vec<(&'a str, &'a str)>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    dns_answers: &'a [crate::protocol::DnsAnswer],
     request_size_bytes: u64,
     response_size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,6 +233,7 @@ impl JsonExporter {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect(),
+            dns_answers: &msg.dns_answers,
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
             src_addr: context.and_then(|ctx| ctx.src_addr),
@@ -510,6 +513,7 @@ mod tests {
             payload_text: msg.payload_text.as_deref(),
             request_body: msg.request_text.as_deref(),
             headers: vec![],
+            dns_answers: &[],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
             src_addr: Some(0x0A000001),
@@ -549,6 +553,7 @@ mod tests {
             payload_text: msg.payload_text.as_deref(),
             request_body: msg.request_text.as_deref(),
             headers: vec![],
+            dns_answers: &[],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
             src_addr: None,
@@ -660,6 +665,7 @@ mod tests {
             payload_text: msg.payload_text.as_deref(),
             request_body: msg.request_text.as_deref(),
             headers: vec![],
+            dns_answers: &[],
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
             src_addr: None,
@@ -704,6 +710,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect(),
+            dns_answers: &msg.dns_answers,
             request_size_bytes: msg.request_size_bytes,
             response_size_bytes: msg.response_size_bytes,
             src_addr: None,
