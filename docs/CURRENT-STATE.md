@@ -138,9 +138,11 @@ production-hardened compliance platform.
     connection's current sequence numbers (an on-path attacker).
   - Segments are not reordered: one that arrives before an earlier one is
     taken as a gap, and the earlier one is then ignored. TC always
-    delivers SYNs: they place each direction's first byte, and a bare SYN
-    on a 5-tuple whose old state is still held (its FIN or RST not seen)
-    starts a new connection there.
+    delivers SYNs: they place each direction's first byte. A bare SYN on a
+    5-tuple whose old state is still held starts a new connection there
+    once a FIN of the old one was seen; without a FIN or RST the old state
+    is kept (a forged SYN cannot reset it) and the new connection is
+    ignored until that state expires (`idle_connection_timeout`, 30 s).
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are

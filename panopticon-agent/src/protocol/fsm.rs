@@ -533,10 +533,17 @@ impl ConnectionFsmManager {
     }
 
     /// A SYN sent by `src` (`ack`: a SYN+ACK, from the server): that side's
-    /// stream starts at `seq + 1`. A bare SYN for a tracked connection
-    /// starts a new connection on its key: the old one is closed (true).
+    /// stream starts at `seq + 1`. A bare SYN for a tracked connection that
+    /// sent a FIN starts a new connection on its key: the old one is closed
+    /// (true). Without a FIN it is ignored: one forged SYN must not reset a
+    /// live connection's state.
     pub fn note_syn(&self, conn_id: u64, src: Endpoint, ack: bool, seq: u32) -> bool {
-        let closed = !ack && self.close_connection(conn_id);
+        let reused = !ack
+            && self
+                .connections
+                .get(&conn_id)
+                .is_some_and(|e| e.fin[0] || e.fin[1]);
+        let closed = reused && self.close_connection(conn_id);
         if self.connections.contains_key(&conn_id) {
             return closed; // a late SYN+ACK: the parser already started
         }

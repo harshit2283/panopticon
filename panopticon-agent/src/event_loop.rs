@@ -19,7 +19,6 @@ use aya::maps::{PerfEventArray, RingBuf};
 use bytes::BytesMut;
 #[cfg(target_os = "linux")]
 use panopticon_common::parse_data_event_bytes;
-use panopticon_common::scope::STREAM_OFF_UNKNOWN;
 use panopticon_common::{
     DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TCP_FLAG_FIN,
     TCP_FLAG_RST, TLS_KEY_BIT, data_event_record_len, read_data_event_into,
@@ -1351,10 +1350,11 @@ fn feed_event(
     }
 
     match seg {
-        // cgroup_skb: the kernel's stream offset locates the first byte.
-        Some(s) if event.cgroup_id != 0 && event.stream_off != STREAM_OFF_UNKNOWN => {
-            let origin = s.seq.wrapping_sub(event.stream_off as u32);
-            manager.note_origin(cookie, src, event.direction, origin);
+        // cgroup_skb: a first byte at stream offset 0 is the stream's start.
+        // Any other offset is a late join (and seeding the tracker that far
+        // back would put the segment outside its window).
+        Some(s) if event.cgroup_id != 0 && event.stream_off == 0 => {
+            manager.note_origin(cookie, src, event.direction, s.seq);
         }
         Some(_) => {}
         // TLS plaintext and UDP carry no stream position.
@@ -1791,6 +1791,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::Protocol;
+    use panopticon_common::scope::STREAM_OFF_UNKNOWN;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -2190,7 +2191,10 @@ mod tests {
             redis_pkt(true, 1000, 5000, 0, get),
             redis_pkt(false, 5000, 1000 + glen, 0, genpass),
         ]);
-        assert!(!out.is_empty(), "the command is still exported");
+        assert!(
+            !out.is_empty(),
+            "replies are still exported, as bare events"
+        );
         assert!(!leaked(&out), "{out:?}");
         assert!(out.iter().all(|(_, t)| t.is_none()), "{out:?}");
 
@@ -2235,6 +2239,14 @@ mod tests {
             with_off(redis_pkt(true, 1040, 5000, 0, get), 40),
             with_off(redis_pkt(false, 5000, 1040 + glen, 0, genpass), 0),
         ]);
+        assert!(!leaked(&out), "{out:?}");
+        // Joined far into the stream (beyond the TCP window): still parsed,
+        // replies exported without text or command.
+        let out = run_redis(&[
+            with_off(redis_pkt(true, 1000, 5000, 0, get), 9 << 20),
+            with_off(redis_pkt(false, 5000, 1000 + glen, 0, genpass), 9 << 20),
+        ]);
+        assert_eq!(out.first(), Some(&(None, None)), "{out:?}");
         assert!(!leaked(&out), "{out:?}");
         let out = run_redis(&[
             with_off(redis_pkt(true, 1000, 5000, 0, get), STREAM_OFF_UNKNOWN),

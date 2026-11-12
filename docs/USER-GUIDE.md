@@ -474,12 +474,12 @@ Replies are paired with commands by order, which is only safe when the
 agent saw both directions of the connection from their first byte. With
 the TC backend that is proved by the connection's SYN and SYN+ACK, with
 `cgroup_skb` by the kernel's stream offset; any bytes lost later (ring
-drops, capture cap) end the proof. Without it no Redis reply text is
-exported for the rest of the connection. That covers every connection
+drops, capture cap) end the proof. Without it Redis replies are exported
+for the rest of the connection without their text or the command they
+answer (status, timing and sizes only). That covers every connection
 already open when the agent started (pooled clients, until they
 reconnect), every TLS-captured Redis connection (TLS plaintext carries no
-stream position), and any connection whose SYN events were lost. The
-commands themselves are still exported. A reply that may answer a
+stream position), and any connection whose SYN events were lost. A reply that may answer a
 command sent before capture started, such as an `ACL GENPASS`, is
 therefore never exported under the first command captured. SQL bound
 values are exported only for a statement whose prepare was seen on the

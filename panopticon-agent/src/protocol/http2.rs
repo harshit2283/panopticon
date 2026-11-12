@@ -763,14 +763,18 @@ mod tests {
             (":path", "/a"),
             ("x-session-note", "canary-secret-value"),
         ];
-        encode(&mut ce, &first); // sent before capture started
+        let before = encode(&mut ce, &first); // sent before capture started
         let mut p = Http2Parser::new(false);
         let h = encode(&mut ce, &[(":method", "POST"), (":path", "/b"), first[2]]);
+        // The block refers to the dynamic table instead of repeating it.
+        assert!(h.len() < before.len() - "canary-secret-value".len());
         let req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &h);
         p.feed(&req, Direction::Egress, 1);
         let h = encode(&mut hpack::Encoder::new(), &[(":status", "200")]);
         let resp = make_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 3, &h);
         for m in messages(p.feed(&resp, Direction::Ingress, 2)) {
+            // The request block was dropped, not decoded.
+            assert!(m.headers.iter().all(|(n, _)| n != "x-session-note"));
             for (name, value) in &m.headers {
                 assert!(
                     !value.contains("canary") || name == "x-session-note",
