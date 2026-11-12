@@ -121,6 +121,12 @@ const MAX_ELF_FILE_BYTES: u64 = 1 << 30;
 /// before it is allocated; once the budget is spent the parse fails.
 const MAX_ELF_READ_BYTES: u64 = 128 << 20;
 
+/// Least charged per string lookup: about what one `ReadCache` string
+/// entry costs (hash slot, key, boxed bytes). 128 MiB of budget then bounds
+/// a parse to 1M lookups; a large Go binary has a few hundred thousand
+/// symbols.
+const MIN_STRING_CHARGE: u64 = 128;
+
 /// `ReadRef` over a file cache that refuses reads past a cumulative budget.
 #[derive(Clone, Copy)]
 struct BudgetedRead<'a> {
@@ -150,9 +156,12 @@ impl<'a> ReadRef<'a> for BudgetedRead<'a> {
         range: Range<u64>,
         delimiter: u8,
     ) -> std::result::Result<&'a [u8], ()> {
-        // ReadCache caps a string scan at 4 KiB; charge what it keeps.
+        // ReadCache caps a string scan at 4 KiB and keeps one cache entry
+        // per lookup, even of an empty string: charge what it keeps, at
+        // least MIN_STRING_CHARGE, so the budget bounds the entries too
+        // (security scan F8).
         let bytes = self.cache.read_bytes_at_until(range, delimiter)?;
-        self.charge(bytes.len() as u64)?;
+        self.charge((bytes.len() as u64).max(MIN_STRING_CHARGE))?;
         Ok(bytes)
     }
 }
@@ -899,6 +908,27 @@ mod tests {
         assert!(symbols.is_err(), "over-budget symtab must fail the parse");
         assert_eq!(go, None);
         assert_eq!(probes, None);
+    }
+
+    /// F8: every string lookup is charged at least MIN_STRING_CHARGE, also
+    /// an empty one, so lookups (and ReadCache's entry per lookup) stop
+    /// once the budget is spent.
+    #[test]
+    fn test_empty_string_lookups_charged() {
+        let path = std::env::temp_dir().join(format!("panopticon-f8-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let (left, refused) = with_untrusted_elf(path.to_str().unwrap(), |r| {
+            for off in 0..1000 {
+                r.read_bytes_at_until(off..4096, 0).unwrap();
+            }
+            let left = r.left.get();
+            r.left.set(MIN_STRING_CHARGE - 1);
+            (left, r.read_bytes_at_until(2000..4096, 0).is_err())
+        })
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(left, MAX_ELF_READ_BYTES - 1000 * MIN_STRING_CHARGE);
+        assert!(refused, "an empty lookup past the budget is refused");
     }
 
     #[test]

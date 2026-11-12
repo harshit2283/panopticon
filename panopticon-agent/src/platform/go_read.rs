@@ -19,6 +19,11 @@ pub struct GoReadProbes {
 /// Most return instructions accepted in one function (sanity bound).
 const MAX_GO_RETURNS: usize = 64;
 
+/// Largest function body examined. The real `(*Conn).Read` is a few KiB; a
+/// workload's ELF can declare anything, and decoding is bounded by this,
+/// not by the file's read budget (security scan F4).
+const MAX_GO_FN_BYTES: u64 = 1 << 20;
+
 /// The probe offsets of the function `name` in an ELF, or None when they
 /// cannot all be found: no sized symbol, code outside its section, an
 /// instruction that does not decode, or no (or too many) returns.
@@ -28,6 +33,9 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Opt
         .symbols()
         .find(|s| s.name().ok() == Some(name) && s.size() > 0)?;
     let (addr, size) = (sym.address(), sym.size());
+    if size > MAX_GO_FN_BYTES {
+        return None;
+    }
     // Read only the function's bytes, not the whole section.
     let section = elf.sections().find(|s| {
         s.address() <= addr
@@ -42,7 +50,7 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Opt
     }
     let code = data.read_bytes_at(sec_off.checked_add(rel)?, size).ok()?;
     let rets = return_addresses(elf.architecture(), addr, code)?;
-    if rets.is_empty() || rets.len() > MAX_GO_RETURNS {
+    if rets.is_empty() {
         return None;
     }
     Some(GoReadProbes {
@@ -55,36 +63,41 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R, name: &str) -> Opt
 }
 
 /// Virtual addresses of the return instructions in `code` (loaded at
-/// `addr`). Decodes instructions rather than searching for the RET byte,
-/// which also occurs inside other instructions.
+/// `addr`), or None past `MAX_GO_RETURNS` (refused as soon as one more is
+/// found, so the list never outgrows the bound). Decodes instructions
+/// rather than searching for the RET byte, which also occurs inside other
+/// instructions.
 fn return_addresses(arch: object::Architecture, addr: u64, code: &[u8]) -> Option<Vec<u64>> {
+    let mut rets = Vec::new();
+    let mut push = |ip: u64| {
+        rets.push(ip);
+        rets.len() <= MAX_GO_RETURNS
+    };
     match arch {
         object::Architecture::X86_64 => {
             use iced_x86::{Decoder, DecoderOptions, Mnemonic};
             let mut decoder = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
-            let mut rets = Vec::new();
             for insn in &mut decoder {
                 if insn.is_invalid() {
                     return None; // not code we understand: don't guess
                 }
-                if insn.mnemonic() == Mnemonic::Ret {
-                    rets.push(insn.ip());
+                if insn.mnemonic() == Mnemonic::Ret && !push(insn.ip()) {
+                    return None;
                 }
             }
-            Some(rets)
         }
         object::Architecture::Aarch64 => {
             const RET: u32 = 0xd65f_03c0; // ret (x30)
-            Some(
-                code.chunks_exact(4)
-                    .enumerate()
-                    .filter(|(_, w)| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == RET)
-                    .map(|(i, _)| addr + 4 * i as u64)
-                    .collect(),
-            )
+            for (i, w) in code.chunks_exact(4).enumerate() {
+                if u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == RET && !push(addr + 4 * i as u64)
+                {
+                    return None;
+                }
+            }
         }
-        _ => None,
+        _ => return None,
     }
+    Some(rets)
 }
 
 /// Convert a symbol's virtual address to a file offset suitable for uprobe attachment.
@@ -191,5 +204,82 @@ mod tests {
         }
         let rets = return_addresses(object::Architecture::Aarch64, 0x4000, &code).unwrap();
         assert_eq!(rets, vec![0x4004, 0x400c]);
+    }
+
+    /// F4: past MAX_GO_RETURNS the scan stops and refuses, on both
+    /// architectures; at the bound it is accepted.
+    #[test]
+    fn test_return_addresses_refused_past_the_bound() {
+        let x86 = |n: usize| vec![0xc3u8; n];
+        let arm = |n: usize| 0xd65f_03c0u32.to_le_bytes().repeat(n);
+        for arch in [object::Architecture::X86_64, object::Architecture::Aarch64] {
+            let code = |n| if arch == object::Architecture::X86_64 { x86(n) } else { arm(n) };
+            let ok = return_addresses(arch, 0, &code(MAX_GO_RETURNS)).unwrap();
+            assert_eq!(ok.len(), MAX_GO_RETURNS, "{arch:?}");
+            assert_eq!(return_addresses(arch, 0, &code(MAX_GO_RETURNS + 1)), None);
+            assert_eq!(return_addresses(arch, 0, &code(1 << 20)), None);
+        }
+    }
+
+    /// An x86_64 ELF with one function symbol `name` of `code`, at 0x1000.
+    fn elf_with_function(name: &str, code: &[u8]) -> Vec<u8> {
+        let text = 4096usize;
+        let mut elf = vec![0u8; text + code.len()];
+        elf[text..].copy_from_slice(code);
+        elf[..16].copy_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&4u16.to_le_bytes()); // null, symtab, strtab, text
+        elf[62..64].copy_from_slice(&2u16.to_le_bytes());
+        let strtab = 320;
+        let names = format!("\0{name}\0");
+        elf[strtab..strtab + names.len()].copy_from_slice(names.as_bytes());
+        let symtab = 512;
+        let sym = symtab + 24; // entry 1 (0 is the null symbol)
+        elf[sym..sym + 4].copy_from_slice(&1u32.to_le_bytes()); // st_name
+        elf[sym + 4] = 0x12; // STB_GLOBAL, STT_FUNC
+        elf[sym + 6..sym + 8].copy_from_slice(&3u16.to_le_bytes()); // .text
+        elf[sym + 8..sym + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[sym + 16..sym + 24].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        let mut sh = |i: usize, ty: u32, addr: u64, off: usize, size: usize, link: u32, ent: u64| {
+            let b = 64 + i * 64;
+            elf[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes());
+            elf[b + 16..b + 24].copy_from_slice(&addr.to_le_bytes());
+            elf[b + 24..b + 32].copy_from_slice(&(off as u64).to_le_bytes());
+            elf[b + 32..b + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            elf[b + 40..b + 44].copy_from_slice(&link.to_le_bytes());
+            elf[b + 44..b + 48].copy_from_slice(&1u32.to_le_bytes()); // sh_info
+            elf[b + 56..b + 64].copy_from_slice(&ent.to_le_bytes());
+        };
+        sh(1, object::elf::SHT_SYMTAB, 0, symtab, 48, 2, 24);
+        sh(2, object::elf::SHT_STRTAB, 0, strtab, names.len(), 0, 0);
+        sh(3, object::elf::SHT_PROGBITS, 0x1000, text, code.len(), 0, 0);
+        elf
+    }
+
+    /// Discovery end to end on an ELF, and F4: a function body over
+    /// MAX_GO_FN_BYTES is refused before it is decoded.
+    #[test]
+    fn test_go_read_probes_from_elf_and_size_cap() {
+        let name = "crypto/tls.(*Conn).Read";
+        // push rbp; ret; xor eax, eax; ret
+        let elf = elf_with_function(name, &[0x55, 0xc3, 0x31, 0xc0, 0xc3]);
+        assert_eq!(
+            go_read_probes_from(&elf[..], name),
+            Some(GoReadProbes {
+                entry_offset: 0x1000,
+                ret_offsets: vec![0x1001, 0x1004],
+            })
+        );
+        assert_eq!(go_read_probes_from(&elf[..], "other"), None);
+        let mut big = vec![0x90u8; MAX_GO_FN_BYTES as usize + 1]; // nops
+        big[0] = 0xc3;
+        assert_eq!(go_read_probes_from(&elf_with_function(name, &big)[..], name), None);
+        big.truncate(MAX_GO_FN_BYTES as usize);
+        assert!(go_read_probes_from(&elf_with_function(name, &big)[..], name).is_some());
     }
 }
