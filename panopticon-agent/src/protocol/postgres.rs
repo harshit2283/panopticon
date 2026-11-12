@@ -433,8 +433,12 @@ impl PostgresParser {
                     // ReadyForQuery — build message from accumulated query state + any error.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
-                    if let Some(err) = self.pending_error.take() {
-                        // Error message takes precedence over query text in payload_text.
+                    if let Some(mut err) = self.pending_error.take() {
+                        // Error message takes precedence over query text in
+                        // payload_text; it may quote the statement.
+                        if super::mask_credentials_enabled() {
+                            super::mask_secrets_in(&mut err);
+                        }
                         msg.payload_text = Some(err);
                     }
                     return Some(msg);
@@ -1008,6 +1012,26 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    /// An error message that quotes the statement has its secret masked,
+    /// like the query it replaces in payload_text.
+    #[test]
+    fn test_error_text_is_masked() {
+        let mut p = setup_ready_parser();
+        p.feed(
+            &make_frontend_msg(b'Q', b"ALTER ROLE app PASSWORD 'pg-s3cret' BAD\0"),
+            Direction::Egress,
+            1000,
+        );
+        let mut response =
+            make_backend_msg(b'E', b"SERROR\0Mnear \"PASSWORD 'pg-s3cret' BAD\"\0\0");
+        response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
+            panic!("expected a message");
+        };
+        let text = msgs[0].payload_text.as_deref().unwrap();
+        assert_eq!(text, "near \"PASSWORD <REDACTED> BAD\"");
     }
 
     #[test]
