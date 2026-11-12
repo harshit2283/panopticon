@@ -1583,16 +1583,40 @@ fn strip_payload_strings(msg: &mut crate::protocol::L7Message) {
 /// the cut is detected whole and redacted before the cut drops its tail.
 const SCAN_LOOKAHEAD: usize = 256;
 
+/// Bound on every other string field (path, method, content type, header
+/// names and values), applied as `max_body_bytes` is to bodies: 8 KiB, the
+/// request-line and header-line limit of common HTTP servers.
+const MAX_FIELD_BYTES: usize = 8 * 1024;
+
 /// Bound the bodies to `max` bytes around a PII scan: scan up to
 /// `max + SCAN_LOOKAHEAD`, then cut to `max` and drop a token the cut split,
 /// so no prefix of an undetected value (`123-45-6` of an SSN) is exported.
+/// The other string fields get the same treatment at [`MAX_FIELD_BYTES`].
 fn scan_with_body_cap(
     msg: &mut crate::protocol::L7Message,
     max: usize,
     scan: impl FnOnce(&mut crate::protocol::L7Message) -> Option<crate::pii::PiiReport>,
 ) -> Option<crate::pii::PiiReport> {
     cap_body_text(msg, max.saturating_add(SCAN_LOOKAHEAD));
+    let fields = |msg: &mut crate::protocol::L7Message, f: &mut dyn FnMut(&mut String)| {
+        [&mut msg.method, &mut msg.path, &mut msg.content_type]
+            .into_iter()
+            .flatten()
+            .for_each(&mut *f);
+        msg.headers.iter_mut().for_each(|(name, value)| {
+            f(name);
+            f(value);
+        });
+    };
+    fields(msg, &mut |text| {
+        if text.len() > MAX_FIELD_BYTES + SCAN_LOOKAHEAD {
+            text.truncate(
+                crate::protocol::truncate_utf8(text, MAX_FIELD_BYTES + SCAN_LOOKAHEAD).len(),
+            );
+        }
+    });
     let mut report = scan(msg);
+    fields(msg, &mut |text| cut_partial_token(text, MAX_FIELD_BYTES));
     let redacted = report.as_mut().and_then(|r| r.redacted_text.as_mut());
     for text in [
         msg.payload_text.as_mut(),
@@ -2181,6 +2205,34 @@ mod tests {
         msg.payload_text = Some(format!("{head}ssn 123-45-6789"));
         scan_with_body_cap(&mut msg, 4096, |_| None);
         assert!(msg.payload_text.as_deref().unwrap().ends_with("ssn "));
+    }
+
+    /// Path and header fields are bounded like bodies before the scan: a
+    /// crafted 200 KiB header or path is neither scanned nor exported whole.
+    #[test]
+    fn field_cap_bounds_path_and_headers() {
+        let engine = crate::pii::PiiEngine::new(&crate::config::PiiConfig::default(), &[]);
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        let big = "1.1.1.1 ".repeat(200 * 1024 / 8);
+        msg.path = Some(format!("/{big}"));
+        msg.headers = vec![("x-pad".into(), big.clone()), (big.clone(), "v".into())];
+        // Redaction off (full mode): the cap, not the redaction, bounds them.
+        scan_with_body_cap(&mut msg, 4096, |m| engine.scan_message_with(m, false));
+        let fields = [
+            msg.path.as_deref().unwrap(),
+            &msg.headers[0].1,
+            &msg.headers[1].0,
+        ];
+        for f in fields {
+            assert!(f.len() <= MAX_FIELD_BYTES, "{}", f.len());
+            // Never cut inside a value.
+            assert!(
+                f.ends_with(' ') || f.ends_with("1.1.1.1"),
+                "{}",
+                &f[f.len() - 16..]
+            );
+        }
     }
 
     #[test]

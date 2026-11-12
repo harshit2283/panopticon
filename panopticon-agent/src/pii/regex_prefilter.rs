@@ -10,6 +10,7 @@
 //! Accuracy is measured against `tests/pii/corpus.jsonl` (`pii::accuracy`).
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 
 use regex::{Regex, RegexSet};
 use zeroize::Zeroize;
@@ -133,6 +134,11 @@ impl RegexPrefilter {
         LOCAL.with(|c| Self::scan_with(c, text))
     }
 
+    /// Candidates collected per field; a field with more is reported as one
+    /// finding covering all of it (crafted input packed with PII-shaped
+    /// values, or a body far denser than real traffic).
+    const MAX_CANDIDATES: usize = 4096;
+
     fn scan_with(compiled: &Compiled, text: &str) -> Vec<PiiEntity> {
         let matches = compiled.set.matches(text);
         if !matches.matched_any() {
@@ -145,6 +151,18 @@ impl RegexPrefilter {
             for m in regex.find_iter(text) {
                 if !validate(*category, text, m.start(), m.end()) {
                     continue;
+                }
+                if candidates.len() == Self::MAX_CANDIDATES {
+                    // Not worth examining further: the whole field is one
+                    // finding (the patterns not run yet saw none of it).
+                    return vec![PiiEntity {
+                        category: *category,
+                        source: PiiSource::Regex,
+                        start: 0,
+                        end: text.len(),
+                        confidence: 1.0,
+                        text: text.to_string(),
+                    }];
                 }
                 candidates.push((
                     idx,
@@ -164,31 +182,42 @@ impl RegexPrefilter {
         // priority; drop anything overlapping a kept one.
         candidates.sort_by_key(|(idx, e)| (Reverse(e.end - e.start), *idx, e.start));
         // A dropped candidate still marks secret bytes: widen the kept
-        // findings it overlaps so the mask covers the union (an ApiKey match
-        // that ends inside a JWT must not leave the JWT's tail exposed).
-        let mut kept: Vec<PiiEntity> = Vec::with_capacity(candidates.len());
-        for (_, e) in candidates {
-            let mut overlapped = false;
-            for k in kept
-                .iter_mut()
-                .filter(|k| e.start < k.end && k.start < e.end)
-            {
-                overlapped = true;
-                k.start = k.start.min(e.start);
-                k.end = k.end.max(e.end);
+        // finding it overlaps so the mask covers the union (an ApiKey match
+        // that ends inside a JWT must not leave the JWT's tail exposed); one
+        // that bridges several kept findings merges them into the first
+        // kept. Kept findings stay disjoint, keyed by start, so the
+        // overlapping ones are found by a range lookup, not a scan of all.
+        let mut kept: BTreeMap<usize, (usize, PiiEntity)> = BTreeMap::new();
+        for (rank, (_, e)) in candidates.into_iter().enumerate() {
+            let overlaps: Vec<usize> = kept
+                .range(..e.end)
+                .rev()
+                .take_while(|(_, (_, k))| k.end > e.start)
+                .map(|(&start, _)| start)
+                .collect();
+            if overlaps.is_empty() {
+                kept.insert(e.start, (rank, e));
+                continue;
             }
-            if !overlapped {
-                kept.push(e);
-            }
+            let mut merged: Vec<(usize, PiiEntity)> =
+                overlaps.iter().filter_map(|s| kept.remove(s)).collect();
+            merged.sort_by_key(|(rank, _)| *rank);
+            let (start, end) = merged.iter().fold((e.start, e.end), |(s, en), (_, k)| {
+                (s.min(k.start), en.max(k.end))
+            });
+            let (rank, mut first) = merged.swap_remove(0);
+            (first.start, first.end) = (start, end);
+            kept.insert(start, (rank, first));
         }
-        for k in kept.iter_mut() {
-            if k.text.len() != k.end - k.start {
-                k.text.zeroize();
-                k.text = text[k.start..k.end].to_string();
-            }
-        }
-        kept.sort_by_key(|e| e.start);
-        kept
+        kept.into_values()
+            .map(|(_, mut k)| {
+                if k.text.len() != k.end - k.start {
+                    k.text.zeroize();
+                    k.text = text[k.start..k.end].to_string();
+                }
+                k
+            })
+            .collect()
     }
 }
 
@@ -664,5 +693,28 @@ mod tests {
         // A GSTIN embeds a PAN; a spaced card contains Aadhaar-shaped groups.
         assert_eq!(pf.scan("27ABCPE1234F1ZB").len(), 1);
         assert_eq!(pf.scan("card 4111 1111 1111 1111").len(), 1);
+    }
+
+    /// A field packed with PII-shaped values (a crafted 200 KiB header of
+    /// `1.1.1.1 `) is scanned in near-linear time: the overlap merge must
+    /// not compare every candidate with every kept finding.
+    #[test]
+    fn test_many_candidates_scan_in_bounded_time() {
+        let pf = prefilter();
+        // Under the candidate cap every value is its own finding; over it,
+        // the field is one finding. Either way every value is covered.
+        for (n, findings) in [(4000, 4000), (200 * 1024 / 8, 1)] {
+            let text = "1.1.1.1 ".repeat(n);
+            let t = std::time::Instant::now();
+            let found = pf.scan(&text);
+            let took = t.elapsed();
+            assert_eq!(found.len(), findings);
+            assert!(!crate::pii::redactor::redact(&text, &found).contains("1.1.1.1"));
+            // Quadratic merge: ~1.3 s for the 200 KiB field in a debug build.
+            assert!(
+                took < std::time::Duration::from_millis(500),
+                "{n}: {took:?}"
+            );
+        }
     }
 }

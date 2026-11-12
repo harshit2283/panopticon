@@ -322,7 +322,7 @@ One JSON object per completed exchange. A real record (body shortened):
 | `protocol` | `http1`, `http2`, `grpc`, `mysql`, `postgres`, `redis`, `kafka`, `amqp`, `dns` |
 | `timestamp_ns` | Kernel monotonic clock (ns since boot), not wall-clock time |
 | `latency_ns` | Request → response time as observed on this host |
-| `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key |
+| `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key. Each of these and every header name and value is kept to at most 8 KB |
 | `status` | HTTP status, or database error code |
 | `payload_text` | Response body as text, at most `max_body_bytes` (default 4 KB), after redaction |
 | `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most `max_body_bytes`, after redaction |
