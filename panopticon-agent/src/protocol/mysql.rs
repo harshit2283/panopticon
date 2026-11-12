@@ -1105,6 +1105,35 @@ mod tests {
                 "ALTER USER app IDENTIFIED WITH caching_sha2_password BY <REDACTED>",
             ),
             ("SET PASSWORD = 'my-s3cret'", "SET PASSWORD = <REDACTED>"),
+            (
+                "SET PASSWORD FOR 'app'@'%' = 'my-s3cret'",
+                "SET PASSWORD FOR 'app'@'%' = <REDACTED>",
+            ),
+            (
+                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD='my-s3cret'",
+                "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD=<REDACTED>",
+            ),
+            (
+                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = 'my-s3cret'",
+                "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = <REDACTED>",
+            ),
+            (
+                "ALTER USER app IDENTIFIED BY 'new-s3cret' REPLACE 'my-s3cret'",
+                "ALTER USER app IDENTIFIED BY <REDACTED> REPLACE <REDACTED>",
+            ),
+            (
+                "SET PASSWORD = 'new-s3cret' REPLACE 'my-s3cret'",
+                "SET PASSWORD = <REDACTED> REPLACE <REDACTED>",
+            ),
+            (
+                "CREATE USER app IDENTIFIED WITH mysql_native_password AS '*0123my-s3cret'",
+                "CREATE USER app IDENTIFIED WITH mysql_native_password AS <REDACTED>",
+            ),
+            // REPLACE elsewhere is SQL, not a secret.
+            (
+                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
+                "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
+            ),
         ] {
             let mut p = MysqlParser::new();
             p.state = State::Ready;

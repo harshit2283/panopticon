@@ -892,6 +892,28 @@ mod tests {
         let q = msgs[0].payload_text.as_deref().unwrap();
         assert_eq!(q, "ALTER ROLE app WITH LOGIN PASSWORD <REDACTED>");
         assert_eq!(msgs[0].method.as_deref(), Some("ALTER"));
+        // Underscore-prefixed keywords (a column or option named *_password).
+        for (sql, want) in [
+            (
+                "CREATE SUBSCRIPTION s CONNECTION 'host=db1 user=repl password=pg-s3cret' PUBLICATION p",
+                "CREATE SUBSCRIPTION s CONNECTION 'host=db1 user=repl password=<REDACTED>' PUBLICATION p",
+            ),
+            (
+                "UPDATE cfg SET smtp_password = 'pg-s3cret'",
+                "UPDATE cfg SET smtp_password = <REDACTED>",
+            ),
+        ] {
+            let mut p = setup_ready_parser();
+            let mut q = sql.as_bytes().to_vec();
+            q.push(0);
+            p.feed(&make_frontend_msg(b'Q', &q), Direction::Egress, 1000);
+            let mut response = make_backend_msg(b'C', b"OK\0");
+            response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+            let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
+                panic!("expected a message for {sql}");
+            };
+            assert_eq!(msgs[0].payload_text.as_deref(), Some(want));
+        }
     }
 
     #[test]
