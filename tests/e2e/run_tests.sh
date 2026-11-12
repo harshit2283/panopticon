@@ -25,6 +25,10 @@ compose() {
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+# A fresh PostgreSQL superuser password per run (docker-compose.yaml).
+E2E_PG_PASSWORD="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export E2E_PG_PASSWORD
+
 wait_for_url() {
   local url="$1"
   local attempts="${2:-60}"
@@ -213,7 +217,7 @@ for _ in $(seq 1 3); do
 done
 
 echo "Generating PostgreSQL traffic..."
-PGPASSWORD=test psql -h localhost -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
+PGPASSWORD="${E2E_PG_PASSWORD}" psql -h 127.0.0.1 -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
 
 echo "Generating Redis traffic..."
 redis-cli -h localhost PING || echo "redis-cli not installed, skipping"
