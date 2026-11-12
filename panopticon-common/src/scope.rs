@@ -144,31 +144,21 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
 /// node-local: TC on the node's NIC never saw it.
 pub const LOOPBACK_IFINDEX: u32 = 1;
 
-/// `__sk_buff.pkt_type` of a packet looped back locally: VRF (l3mdev)
-/// local delivery sets it (`vrf_local_xmit`), as does multicast loopback.
-pub const PACKET_LOOPBACK: u32 = 5;
+/// `VRF_MASTERS` capacity: VRF master ifindexes seen on the node.
+pub const MAX_VRF_MASTERS: u32 = 4096;
 
 /// Whether a data packet travels a node-local path (DESIGN §3.7), from
 /// what the cgroup hook sees, never from addresses:
 /// * its device is `lo` (`ifindex`, either direction);
-/// * on ingress, it was looped back (`PACKET_LOOPBACK`: VRF-local);
-/// * the socket is bound to a device and the packet's device is that one
-///   (`bound_dev_if`): a VRF socket's local traffic leaves and arrives on
-///   the VRF master. This also matches any `SO_BINDTODEVICE` socket on its
-///   own device, which fails closed (no exact VRF signal at the hook);
+/// * its device is a VRF master (`vrf`: the ifindex is in `VRF_MASTERS`,
+///   keyed by ifindex alone, so a device with the same ifindex in another
+///   namespace matches too: fails closed). VRF local delivery leaves and
+///   arrives on the master, bound or not; so does a VRF's remote ingress,
+///   which is dropped with it (every VRF socket is treated as local);
 /// * the socket already had a local packet (`SockState::local`).
 #[inline(always)]
-pub fn local_packet(
-    ifindex: u32,
-    ingress: bool,
-    pkt_type: u32,
-    bound_dev_if: u32,
-    sticky: bool,
-) -> bool {
-    ifindex == LOOPBACK_IFINDEX
-        || (ingress && pkt_type == PACKET_LOOPBACK)
-        || (bound_dev_if != 0 && bound_dev_if == ifindex)
-        || sticky
+pub fn local_packet(ifindex: u32, vrf: bool, sticky: bool) -> bool {
+    ifindex == LOOPBACK_IFINDEX || vrf || sticky
 }
 
 /// `DataEvent::role`.
@@ -684,21 +674,13 @@ mod tests {
     #[test]
     fn loopback_rules() {
         assert_eq!(SCOPE_DROP_NAMES[DROP_LOOPBACK as usize], "loopback");
-        // lo, either direction, whatever else.
-        assert!(local_packet(1, false, 0, 0, false));
-        assert!(local_packet(1, true, 0, 7, false));
-        // VRF-local ingress: looped back on the VRF master.
-        assert!(local_packet(9, true, PACKET_LOOPBACK, 0, false));
-        // ...but pkt_type is only meaningful on ingress.
-        assert!(!local_packet(9, false, PACKET_LOOPBACK, 0, false));
-        // A device-bound socket (VRF) on its own device, both directions.
-        assert!(local_packet(9, false, 0, 9, false));
-        assert!(local_packet(9, true, 0, 9, false));
-        // Bound elsewhere, or not bound: a veth or NIC packet.
-        assert!(!local_packet(4, false, 0, 9, false));
-        assert!(!local_packet(4, true, 0, 0, false));
+        assert!(local_packet(1, false, false));
+        // A VRF master, either direction.
+        assert!(local_packet(9, true, false));
+        // A veth or NIC packet.
+        assert!(!local_packet(4, false, false));
         // Sticky: once local, every packet of the socket.
-        assert!(local_packet(4, false, 0, 0, true));
+        assert!(local_packet(4, false, true));
     }
 
     #[test]

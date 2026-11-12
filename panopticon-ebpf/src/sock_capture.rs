@@ -45,8 +45,8 @@ use panopticon_common::{
 };
 
 use crate::maps::{
-    CGROUP_ALLOW, CONFIG, IPV6_DROPS, PID_FILTER, SizedEvent, count_kernel_drop, count_scope_drop,
-    shard_for, shard_reserve_as, shard_submit_flags_for,
+    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, VRF_MASTERS,
+    count_kernel_drop, count_scope_drop, shard_for, shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -557,6 +557,51 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
 }
 
+// ── VRF masters (§3.7) ─────────────────────────────────────────────────────
+
+/// fexit `register_netdevice(dev)`: a new device, in any namespace. A VRF
+/// master is recorded before it can carry a packet (the ifindex is assigned
+/// inside; the link ops are set before, by `rtnl_create_link`). A VRF
+/// cannot change namespace (`NETIF_F_NETNS_LOCAL`), so its ifindex is final.
+#[fexit(function = "register_netdevice")]
+pub fn scope_vrf_register(ctx: FExitContext) -> i32 {
+    on_netdev(ctx.arg(0));
+    0
+}
+
+/// Record `dev`'s ifindex if its link kind is "vrf". Whatever the return
+/// value: a failed registration leaves at worst a stale entry, which
+/// over-drops.
+#[inline(always)]
+fn on_netdev(dev: *const u8) {
+    let (Some(&ifx_off), Some(&ops_off), Some(&kind_off)) =
+        (NETDEV_OFFS.get(0), NETDEV_OFFS.get(1), NETDEV_OFFS.get(2))
+    else {
+        return;
+    };
+    if dev.is_null() || ifx_off == 0 {
+        return;
+    }
+    let read_ptr = |p: *const u8| unsafe { bpf_probe_read_kernel(p as *const *const u8) };
+    let Ok(ops) = read_ptr(unsafe { dev.add(ops_off as usize) }) else {
+        return;
+    };
+    if ops.is_null() {
+        return;
+    }
+    let Ok(kind) = read_ptr(unsafe { ops.add(kind_off as usize) }) else {
+        return;
+    };
+    if kind.is_null() || unsafe { bpf_probe_read_kernel(kind as *const [u8; 4]) } != Ok(*b"vrf\0") {
+        return;
+    }
+    if let Ok(ifindex) = unsafe { bpf_probe_read_kernel(dev.add(ifx_off as usize) as *const u32) }
+        && ifindex != 0
+    {
+        let _ = VRF_MASTERS.insert(&ifindex, &1, 0);
+    }
+}
+
 // ── accept: the acceptor, on the child only ────────────────────────────────
 
 /// `inet_csk_accept(sk, flags, err, kern)` before 6.10 (and RHEL 8): the
@@ -804,27 +849,22 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         return Ok(()); // no data; the socket's end comes from STATE_CB
     }
     // ── loopback (§3.7): a data packet on a node-local path (`lo` in any
-    // namespace: 127/8, the host's or the pod's own address; VRF local
-    // delivery; a device-bound socket on its device; a socket already
-    // marked), which TC on the NIC never saw (IPv6, ::1 included, is not
+    // namespace: 127/8, the host's or the pod's own address; a VRF master,
+    // local delivery included; a socket already marked), which TC on the
+    // NIC never saw (IPv6, ::1 included, is not
     // captured, above). The socket is marked whatever the setting, so
     // turning capture off later drops it whole and suppresses its close.
     // The generation is read before the setting: an event carries `g0`
     // (unscoped) or is dropped if its verdict's generation is not `g0`
     // (restricted), so a packet that passed this check before a narrowing
     // is refused at the ring read.
-    let bound = unsafe { (*sk).bound_dev_if };
     let sk = sk as *mut c_void;
     let st = state_of(sk, false);
     let g0 = scope_gen();
     let marked = !st.is_null() && rd!(st, local) != 0;
-    let lo = local_packet(
-        unsafe { (*skb).ifindex },
-        direction == Direction::Ingress,
-        unsafe { (*skb).pkt_type },
-        bound,
-        marked,
-    );
+    let ifindex = unsafe { (*skb).ifindex };
+    let vrf = unsafe { VRF_MASTERS.get(&ifindex) }.is_some();
+    let lo = local_packet(ifindex, vrf, marked);
     if lo && !marked && !st.is_null() {
         wr!(st, local, 1);
     }

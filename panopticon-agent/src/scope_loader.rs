@@ -164,6 +164,7 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
              sk_storage (BPF_F_CLONE), bpf_tcp_sock and BPF_ADD|BPF_FETCH"
         })?;
     }
+    load_vrf_hooks(ebpf)?;
     let mut writers = true;
     for (p, target) in [(SOCK_CREATE, None), (SOCKOPS, None)] {
         if let Err(e) = load_program(ebpf, p, target) {
@@ -306,6 +307,328 @@ fn lists_symbol(r: impl std::io::BufRead, name: &str) -> bool {
     false
 }
 
+// ── VRF masters (DESIGN §3.7) ──────────────────────────────────────────────
+
+/// fexit `register_netdevice`: records every VRF master created from now on.
+pub const VRF_REGISTER: &str = "scope_vrf_register";
+/// Load the VRF hook (required: without it a VRF created later is captured
+/// as remote traffic while `capture_loopback = false`). A VRF device cannot
+/// change namespace (`NETIF_F_NETNS_LOCAL`), so its ifindex is final at
+/// registration.
+fn load_vrf_hooks(ebpf: &mut Ebpf) -> Result<()> {
+    load_program(ebpf, VRF_REGISTER, Some("register_netdevice")).with_context(|| {
+        "refusing to start: capture.backend = \"cgroup_skb\" needs fexit on \
+         register_netdevice to recognise VRF devices (DESIGN §3.7)"
+    })
+}
+
+/// Write the hook's offsets, attach it, then record every VRF master that
+/// already exists (the scan), all before the capture hooks attach: a VRF
+/// created during the scan is recorded by the hook. Returns the masters
+/// the scan found.
+pub fn start_vrf_watch(ebpf: &mut Ebpf, links: &mut Links) -> Result<Vec<u32>> {
+    let raw = std::fs::read("/sys/kernel/btf/vmlinux").context("kernel BTF")?;
+    let offs = netdev_offsets(&raw).context("net_device offsets from kernel BTF")?;
+    {
+        let mut a: aya::maps::Array<_, u32> =
+            aya::maps::Array::try_from(ebpf.map_mut("NETDEV_OFFS").context("NETDEV_OFFS map")?)?;
+        for (i, o) in offs.into_iter().enumerate() {
+            a.set(i as u32, o, 0)?;
+        }
+    }
+    let prog = ebpf
+        .program_mut(VRF_REGISTER)
+        .context("scope_vrf_register is not in the eBPF object")?;
+    let aya::programs::Program::FExit(prog) = prog else {
+        bail!("scope_vrf_register is not fexit");
+    };
+    links.push(Box::new(
+        prog.attach()
+            .map_err(describe)
+            .context("scope_vrf_register does not attach")?,
+    ));
+    let found = scan_vrf_masters();
+    let mut m: aya::maps::HashMap<_, u32, u8> =
+        aya::maps::HashMap::try_from(ebpf.map_mut("VRF_MASTERS").context("VRF_MASTERS map")?)?;
+    for &i in &found {
+        m.insert(i, 1, 0)
+            .with_context(|| format!("cannot record VRF master ifindex {i}"))?;
+    }
+    info!(masters = ?found, "VRF masters recorded");
+    Ok(found)
+}
+
+/// Every network namespace reachable at startup: bind mounts in
+/// `/run/netns`, every task's namespace, and every open namespace fd. A
+/// namespace held only by a socket or a kernel reference is not reachable
+/// (DESIGN §3.7). Deduplicated by inode.
+fn netns_paths() -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut add = |p: PathBuf| {
+        if let Ok(m) = std::fs::metadata(&p)
+            && seen.insert((m.dev(), m.ino()))
+        {
+            out.push(p);
+        }
+    };
+    let ls = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .map(|r| r.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    for p in ls(Path::new("/run/netns")) {
+        add(p);
+    }
+    for proc_dir in ls(Path::new("/proc")) {
+        if !proc_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        for t in ls(&proc_dir.join("task")) {
+            add(t.join("ns/net"));
+        }
+        for fd in ls(&proc_dir.join("fd")) {
+            if std::fs::read_link(&fd).is_ok_and(|l| l.to_string_lossy().starts_with("net:[")) {
+                add(fd);
+            }
+        }
+    }
+    out
+}
+
+/// VRF masters (ifindex) in every reachable namespace. A namespace that
+/// cannot be entered or dumped is logged, not fatal (DESIGN §3.7 states
+/// the gap).
+fn scan_vrf_masters() -> Vec<u32> {
+    let mut all = Vec::new();
+    for p in netns_paths() {
+        let r = File::open(&p).map_err(anyhow::Error::from).and_then(|f| {
+            std::thread::spawn(move || vrf_masters_in(&f))
+                .join()
+                .map_err(|_| anyhow::anyhow!("scan thread panicked"))?
+        });
+        match r {
+            Ok(v) => all.extend(v),
+            Err(e) => {
+                warn!(netns = %p.display(), error = %format!("{e:#}"), "VRF scan skipped a namespace")
+            }
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// Enter `ns` (this thread only) and dump its links over rtnetlink.
+fn vrf_masters_in(ns: &File) -> Result<Vec<u32>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: setns on this (scan) thread only, with a namespace fd we hold.
+    if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("setns");
+    }
+    // SAFETY: a new socket; owned below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("netlink socket");
+    }
+    // SAFETY: fd is a socket we just opened.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    // nlmsghdr (16) + ifinfomsg (16): RTM_GETLINK dump.
+    let mut req = [0u8; 32];
+    req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    req[4..6].copy_from_slice(&libc::RTM_GETLINK.to_ne_bytes());
+    req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    req[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    // SAFETY: valid buffer for the call.
+    if unsafe { libc::send(sock.as_raw_fd(), req.as_ptr().cast(), req.len(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("RTM_GETLINK");
+    }
+    let mut found = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: valid buffer for the call.
+        let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error()).context("rtnetlink recv");
+        }
+        match parse_links(&buf[..n as usize], &mut found)? {
+            true => return Ok(found),
+            false if n == 0 => bail!("rtnetlink closed mid-dump"),
+            false => {}
+        }
+    }
+}
+
+/// Parse one rtnetlink datagram of an RTM_GETLINK dump, adding the ifindex
+/// of every link whose `IFLA_INFO_KIND` is "vrf". True at `NLMSG_DONE`.
+fn parse_links(mut b: &[u8], found: &mut Vec<u32>) -> Result<bool> {
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_INFO_KIND: u16 = 1;
+    let u16_at = |b: &[u8], i: usize| u16::from_ne_bytes([b[i], b[i + 1]]);
+    let u32_at = |b: &[u8], i: usize| u32::from_ne_bytes(b[i..i + 4].try_into().unwrap());
+    let align = |n: usize| (n + 3) & !3;
+    while b.len() >= 16 {
+        let len = u32_at(b, 0) as usize;
+        if len < 16 || len > b.len() {
+            bail!("malformed rtnetlink message");
+        }
+        let msg = &b[..len];
+        b = &b[align(len).min(b.len())..];
+        match u16_at(msg, 4) as i32 {
+            libc::NLMSG_DONE => return Ok(true),
+            libc::NLMSG_ERROR => bail!("rtnetlink error {}", u32_at(msg, 16) as i32),
+            t if t == libc::RTM_NEWLINK as i32 && msg.len() >= 32 => {
+                let ifindex = u32_at(msg, 20);
+                let mut a = &msg[32..];
+                while a.len() >= 4 {
+                    let alen = u16_at(a, 0) as usize;
+                    if alen < 4 || alen > a.len() {
+                        break;
+                    }
+                    if u16_at(a, 2) & 0x3fff == IFLA_LINKINFO {
+                        let mut n = &a[4..alen];
+                        while n.len() >= 4 {
+                            let nlen = u16_at(n, 0) as usize;
+                            if nlen < 4 || nlen > n.len() {
+                                break;
+                            }
+                            if u16_at(n, 2) & 0x3fff == IFLA_INFO_KIND && &n[4..nlen] == b"vrf\0" {
+                                found.push(ifindex);
+                            }
+                            n = &n[align(nlen).min(n.len())..];
+                        }
+                    }
+                    a = &a[align(alen).min(a.len())..];
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Byte offsets of `net_device.ifindex`, `net_device.rtnl_link_ops` and
+/// `rtnl_link_ops.kind` from raw kernel BTF (aya keeps its type accessors
+/// private). Members of anonymous structs and unions are searched too.
+fn netdev_offsets(raw: &[u8]) -> Result<[u32; 3]> {
+    let btf = RawBtf::parse(raw)?;
+    let nd = btf
+        .struct_by_name("net_device")
+        .context("struct net_device")?;
+    let ops = btf
+        .struct_by_name("rtnl_link_ops")
+        .context("struct rtnl_link_ops")?;
+    let get = |s, m| {
+        btf.member_offset(s, m)
+            .with_context(|| format!("member {m}"))
+    };
+    Ok([
+        get(nd, "ifindex")?,
+        get(nd, "rtnl_link_ops")?,
+        get(ops, "kind")?,
+    ])
+}
+
+/// One BTF type: (kind, name_off, kind_flag, members as (name_off, type,
+/// offset field)).
+type BtfEntry = (u32, u32, bool, Vec<(u32, u32, u32)>);
+
+/// Just enough of the BTF format to find struct member offsets.
+struct RawBtf<'a> {
+    strs: &'a [u8],
+    types: Vec<BtfEntry>,
+}
+
+impl<'a> RawBtf<'a> {
+    fn parse(raw: &'a [u8]) -> Result<Self> {
+        let u32_at = |i: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                raw.get(i..i + 4).context("BTF truncated")?.try_into()?,
+            ))
+        };
+        if raw.len() < 24 || u16::from_le_bytes([raw[0], raw[1]]) != 0xeb9f {
+            bail!("not little-endian BTF");
+        }
+        let hdr = u32_at(4)? as usize;
+        let (toff, tlen) = (hdr + u32_at(8)? as usize, u32_at(12)? as usize);
+        let (soff, slen) = (hdr + u32_at(16)? as usize, u32_at(20)? as usize);
+        let strs = raw.get(soff..soff + slen).context("BTF strings")?;
+        let mut types = vec![(0, 0, false, Vec::new())]; // id 0 is void
+        let mut i = toff;
+        while i < toff + tlen {
+            let (name, info) = (u32_at(i)?, u32_at(i + 4)?);
+            let (kind, vlen, kflag) = (
+                (info >> 24) & 0x1f,
+                (info & 0xffff) as usize,
+                info >> 31 == 1,
+            );
+            i += 12;
+            let mut members = Vec::new();
+            let extra = match kind {
+                1 | 14 | 17 => 4, // INT, VAR, DECL_TAG
+                3 => 12,          // ARRAY
+                4 | 5 => {
+                    for m in 0..vlen {
+                        let j = i + m * 12;
+                        members.push((u32_at(j)?, u32_at(j + 4)?, u32_at(j + 8)?));
+                    }
+                    vlen * 12
+                }
+                6 | 13 => vlen * 8,   // ENUM, FUNC_PROTO
+                15 | 19 => vlen * 12, // DATASEC, ENUM64
+                _ => 0,
+            };
+            i += extra;
+            types.push((kind, name, kflag, members));
+        }
+        Ok(Self { strs, types })
+    }
+
+    fn name(&self, off: u32) -> &[u8] {
+        let s = self.strs.get(off as usize..).unwrap_or_default();
+        &s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]
+    }
+
+    fn struct_by_name(&self, n: &str) -> Option<u32> {
+        self.types
+            .iter()
+            .position(|(k, name, _, m)| {
+                *k == 4 && !m.is_empty() && self.name(*name) == n.as_bytes()
+            })
+            .map(|i| i as u32)
+    }
+
+    /// Byte offset of member `m` in struct/union `id`, through anonymous
+    /// members.
+    fn member_offset(&self, id: u32, m: &str) -> Option<u32> {
+        let (_, _, kflag, members) = self.types.get(id as usize)?;
+        for &(name, ty, off) in members {
+            let bits = if *kflag { off & 0xff_ffff } else { off };
+            if self.name(name) == m.as_bytes() {
+                return Some(bits / 8);
+            }
+            // An anonymous member is a STRUCT or UNION directly.
+            if name == 0
+                && let Some(inner) = self.member_offset(ty, m)
+            {
+                return Some(bits / 8 + inner);
+            }
+        }
+        None
+    }
+}
+
 // ── cgroup v2 root ─────────────────────────────────────────────────────────
 
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
@@ -431,7 +754,8 @@ pub fn attach_program(ebpf: &mut Ebpf, name: &str, cgroup: &File, links: &mut Li
 ///    sched_process_exit, so every candidate exit from here on is recorded
 ///    in PID_EXITED for [`arm`];
 /// 4. the kTLS key-install markers, so no socket installs kTLS keys unmarked;
-/// 5. both capture hooks and fexit accept;
+/// 5. the VRF hooks and the scan of existing VRF masters, then both capture
+///    hooks and fexit accept;
 /// 6. sock_create and sockops.
 ///
 /// Nothing is initialised before [`arm`], so no socket gets state while a
@@ -490,6 +814,8 @@ pub fn attach_disarmed(
     if report.writers {
         order.extend([(SOCK_CREATE, restricted), (SOCKOPS, restricted)]);
     }
+    // VRF masters are known before any capture hook runs (§3.7).
+    start_vrf_watch(ebpf, links).context("refusing to start")?;
     let mut exit_attached = false;
     for (p, required) in order {
         match attach_program(ebpf, p, &cgroup, links) {
@@ -1030,6 +1356,40 @@ pub fn remove_stale_legacy(ebpf: &Ebpf, cgroup: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtnetlink_dump_finds_vrf_links() {
+        // RTM_NEWLINK ifindex 7 with IFLA_LINKINFO { IFLA_INFO_KIND "vrf" },
+        // ifindex 8 kind "veth", then NLMSG_DONE.
+        let link = |ifindex: u32, kind: &[u8]| {
+            let attr = |ty: u16, body: &[u8]| {
+                let mut a = [
+                    &((4 + body.len()) as u16).to_ne_bytes()[..],
+                    &ty.to_ne_bytes(),
+                    body,
+                ]
+                .concat();
+                a.resize(a.len().div_ceil(4) * 4, 0);
+                a
+            };
+            let mut ifi = vec![0u8; 16];
+            ifi[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+            let body = [ifi, attr(18, &attr(1, kind))].concat();
+            let mut h = vec![0u8; 16];
+            h[0..4].copy_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+            h[4..6].copy_from_slice(&libc::RTM_NEWLINK.to_ne_bytes());
+            [h, body].concat()
+        };
+        let mut done = vec![0u8; 20];
+        done[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        done[4..6].copy_from_slice(&(libc::NLMSG_DONE as u16).to_ne_bytes());
+        let mut found = Vec::new();
+        let first = [link(7, b"vrf\0"), link(8, b"veth\0")].concat();
+        assert!(!parse_links(&first, &mut found).unwrap());
+        assert!(parse_links(&done, &mut found).unwrap());
+        assert_eq!(found, vec![7]);
+        assert!(parse_links(&[0u8; 16], &mut found).is_err(), "zero length");
+    }
 
     /// A reader that yields `head`, then fails.
     struct FailsAfter(std::io::Cursor<Vec<u8>>);

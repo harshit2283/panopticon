@@ -25,7 +25,8 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 13] = [
+const TARGETS: [(&str, &str); 14] = [
+    (VRF_REGISTER, "register_netdevice"),
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -222,6 +223,90 @@ fn load_any(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
         Program::KProbe(p) => p.load().map_err(|e| e.to_string()),
         Program::SchedClassifier(p) => p.load().map_err(|e| e.to_string()),
         _ => Err("unhandled type".into()),
+    }
+}
+
+fn ip_cmd(args: &str) -> bool {
+    std::process::Command::new("ip")
+        .args(args.split(' '))
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn ifindex_of(dev: &str) -> u32 {
+    let n = std::ffi::CString::new(dev).unwrap();
+    // SAFETY: a valid C string.
+    let i = unsafe { libc::if_nametoindex(n.as_ptr()) };
+    assert_ne!(i, 0, "{dev} has an ifindex");
+    i
+}
+
+fn vrf_master(ebpf: &Ebpf, ifindex: u32) -> bool {
+    let m: HashMap<&MapData, u32, u8> =
+        HashMap::try_from(ebpf.map("VRF_MASTERS").unwrap()).unwrap();
+    m.get(&ifindex, 0).is_ok()
+}
+
+fn forget_vrf_master(ebpf: &mut Ebpf, ifindex: u32) {
+    let mut m: HashMap<&mut MapData, u32, u8> =
+        HashMap::try_from(ebpf.map_mut("VRF_MASTERS").unwrap()).unwrap();
+    let _ = m.remove(&ifindex);
+}
+
+/// An IPv4 socket of `ty`, bound to `dev` if given.
+fn bound(ty: i32, dev: Option<&str>) -> socket2::Socket {
+    let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::from(ty), None).unwrap();
+    s.bind_device(dev.map(str::as_bytes)).unwrap();
+    s
+}
+
+/// One datagram from `tx` (unbound) to `to`, routed in the VRF whose
+/// master is `ifindex` (IP_PKTINFO `ipi_ifindex`).
+fn send_pktinfo(tx: &UdpSocket, to: std::net::SocketAddr, ifindex: u32, msg: &[u8]) {
+    let std::net::SocketAddr::V4(to) = to else {
+        unreachable!()
+    };
+    let mut dst = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: to.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(*to.ip()).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let info = libc::in_pktinfo {
+        ipi_ifindex: ifindex as i32,
+        ipi_spec_dst: libc::in_addr { s_addr: 0 },
+        ipi_addr: libc::in_addr { s_addr: 0 },
+    };
+    // SAFETY: CMSG_SPACE of a plain struct size.
+    let space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    let mut iov = libc::iovec {
+        iov_base: msg.as_ptr() as *mut _,
+        iov_len: msg.len(),
+    };
+    // SAFETY: all-zero msghdr is valid; fields set below.
+    let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+    mh.msg_name = (&mut dst as *mut libc::sockaddr_in).cast();
+    mh.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+    mh.msg_iov = &mut iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cbuf.as_mut_ptr().cast();
+    mh.msg_controllen = space as _;
+    // SAFETY: the control buffer holds one cmsg of in_pktinfo.
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&mh);
+        (*c).cmsg_level = libc::IPPROTO_IP;
+        (*c).cmsg_type = libc::IP_PKTINFO;
+        (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast(), info);
+        assert_eq!(
+            libc::sendmsg(tx.as_raw_fd(), &mh, 0),
+            msg.len() as isize,
+            "sendmsg IP_PKTINFO"
+        );
     }
 }
 
@@ -465,6 +550,23 @@ fn scope_programs_load_attach_and_hold() {
     }
     let mut q = spawn_sleep_at(p_pid).expect("Q reuses P's pid");
 
+    // A VRF that predates the attach, in another namespace: the startup
+    // scan records it (§3.7).
+    let _ = ip_cmd("netns del pnvrf");
+    let pre_vrf = (ip_cmd("netns add pnvrf")
+        && ip_cmd("-n pnvrf link add pvpre type vrf table 212"))
+    .then(|| {
+        let out = std::process::Command::new("ip")
+            .args(["-n", "pnvrf", "-o", "link", "show", "pvpre"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split(':')
+            .next()
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .expect("pvpre ifindex")
+    });
+
     // ── production attach, disarmed
     let mut links = Vec::new();
     let (_, exit_attached) = attach_disarmed(
@@ -476,6 +578,23 @@ fn scope_programs_load_attach_and_hold() {
     )
     .expect("attach");
     assert!(exit_attached);
+    match pre_vrf {
+        Some(i) => {
+            assert!(vrf_master(&ebpf, i), "startup scan recorded pvpre in pnvrf");
+            // Its ifindex may equal a host device's (no namespace in the key):
+            // forget it so the sections below are not over-dropped.
+            forget_vrf_master(&mut ebpf, i);
+            // A VRF cannot change namespace (NETIF_F_NETNS_LOCAL), so its
+            // ifindex is final at registration: no move hook is needed.
+            assert!(
+                !ip_cmd("-n pnvrf link set pvpre netns 1"),
+                "a VRF moved between namespaces"
+            );
+            let _ = ip_cmd("netns del pnvrf");
+            println!("VRF_SCAN OK ifindex={i}");
+        }
+        None => println!("VRF_SCAN SKIP (no vrf device type)"),
+    }
     for p in pids {
         assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
         assert!(!pid_listed(&ebpf, p), "nothing published before arm");
@@ -1499,9 +1618,16 @@ fn scope_programs_load_attach_and_hold() {
     );
     set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
 
-    // VRF local delivery (§3.7): both ends bound to a VRF master, to an
-    // address on a device enslaved to it. Not on `lo`: caught by ingress
-    // PACKET_LOOPBACK and the device-bound rule, and the sockets are marked.
+    // VRF (§3.7): a VRF master's ifindex, recorded by fexit register_netdevice
+    // when it is created (pre-existing ones by the startup scan, checked at
+    // attach), marks every packet on it local: local delivery leaves and
+    // arrives on the master whether the socket is bound to the master, to a
+    // slave, or not at all. Cases: TCP both ends bound to the master; TCP
+    // with the client bound to the slave; UDP from an unbound sender that
+    // picks the VRF per datagram (IP_PKTINFO), first datagram; UDP to an
+    // unbound receiver (udp_l3mdev_accept = 1). Off: none exported, counted,
+    // every socket marked. On: captured. TCP: no close record once off (UDP
+    // has none).
     let _ = ip("link del pvrf");
     let _ = ip("link del pvd0");
     // A kernel without the vrf module (Ubuntu cloud kernels without
@@ -1517,90 +1643,157 @@ fn scope_programs_load_attach_and_hold() {
                 && ip("link set pvd0 up"),
             "VRF pvrf with pvd0"
         );
-        let bound_sock = || {
-            // SAFETY: a new socket, bound to the VRF device by name.
-            unsafe {
-                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-                assert!(fd >= 0);
-                let dev = b"pvrf\0";
-                assert_eq!(
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_BINDTODEVICE,
-                        dev.as_ptr().cast(),
-                        dev.len() as u32,
-                    ),
-                    0,
-                    "SO_BINDTODEVICE pvrf"
-                );
-                fd
-            }
-        };
-        let sin = |port: u16| libc::sockaddr_in {
-            sin_family: libc::AF_INET as u16,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_be_bytes([10, 212, 0, 1]).to_be(),
-            },
-            sin_zero: [0; 8],
-        };
-        let slen = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        let vrf_ifx = ifindex_of("pvrf");
+        assert!(
+            vrf_master(&ebpf, vrf_ifx),
+            "fexit register_netdevice recorded pvrf"
+        );
+        assert!(
+            !vrf_master(&ebpf, ifindex_of("pvd0")),
+            "a slave is not a master"
+        );
+        let vaddr = |port: u16| std::net::SocketAddr::from(([10, 212, 0, 1], port));
         let vrf_l = {
-            let fd = bound_sock();
-            let a = sin(0);
-            // SAFETY: valid sockaddr_in for our fd; the listener takes the fd.
-            unsafe {
-                assert_eq!(
-                    libc::bind(fd, (&a as *const libc::sockaddr_in).cast(), slen),
-                    0
-                );
-                assert_eq!(libc::listen(fd, 8), 0);
-                <TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd)
-            }
+            let s = bound(libc::SOCK_STREAM, Some("pvrf"));
+            s.bind(&vaddr(0).into()).unwrap();
+            s.listen(8).unwrap();
+            TcpListener::from(s)
         };
-        let vrf_x = |msg: &[u8]| -> (TcpStream, TcpStream) {
-            let fd = bound_sock();
-            let a = sin(vrf_l.local_addr().unwrap().port());
-            // SAFETY: valid sockaddr_in for our fd; the stream takes the fd.
-            let mut c = unsafe {
-                assert_eq!(
-                    libc::connect(fd, (&a as *const libc::sockaddr_in).cast(), slen),
-                    0
-                );
-                <TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd)
-            };
+        let tcp = |dev: &str, msg: &[u8]| -> (TcpStream, TcpStream) {
+            let s = bound(libc::SOCK_STREAM, Some(dev));
+            s.connect(&vrf_l.local_addr().unwrap().into()).unwrap();
+            let mut c = TcpStream::from(s);
             let (mut s, _) = vrf_l.accept().unwrap();
             c.write_all(msg).unwrap();
             let mut b = vec![0u8; msg.len()];
             s.read_exact(&mut b).unwrap();
             (c, s)
         };
+        // UDP: a receiver bound to the master, and an unbound sender that
+        // names the VRF on the datagram (IP_PKTINFO ipi_ifindex).
+        let vrf_u = {
+            let s = bound(libc::SOCK_DGRAM, Some("pvrf"));
+            s.bind(&vaddr(0).into()).unwrap();
+            UdpSocket::from(s)
+        };
+        let pktinfo = |msg: &[u8]| -> UdpSocket {
+            let tx = UdpSocket::bind("0.0.0.0:0").unwrap();
+            send_pktinfo(&tx, vrf_u.local_addr().unwrap(), vrf_ifx, msg);
+            let mut b = [0u8; 64];
+            let (n, _) = vrf_u.recv_from(&mut b).unwrap();
+            assert_eq!(&b[..n], msg);
+            tx
+        };
+        // An unbound receiver: reachable from inside the VRF only with
+        // udp_l3mdev_accept = 1 (restored below).
+        let l3_accept = std::fs::read_to_string("/proc/sys/net/ipv4/udp_l3mdev_accept").unwrap();
+        std::fs::write("/proc/sys/net/ipv4/udp_l3mdev_accept", "1").unwrap();
+        let rx = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let rx_port = rx.local_addr().unwrap().port();
+        let unbound_rx = |msg: &[u8]| -> UdpSocket {
+            let tx = UdpSocket::from(bound(libc::SOCK_DGRAM, Some("pvrf")));
+            tx.send_to(msg, vaddr(rx_port)).unwrap();
+            let mut b = [0u8; 64];
+            let n = rx.recv(&mut b).unwrap();
+            assert_eq!(&b[..n], msg);
+            tx
+        };
+
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+        bump(&mut ebpf);
         let lo_v = drops(&ebpf, DROP_LOOPBACK);
-        let (cr, sr) = vrf_x(b"vrf-off");
+        let _ = drain(&mut ring);
+        let (cm, sm) = tcp("pvrf", b"vrf-master-off");
+        let (cs, ss) = tcp("pvd0", b"vrf-slave-off");
+        let tp = pktinfo(b"vrf-pktinfo-off");
+        let tr = unbound_rx(b"vrf-l3acc-off");
         let ev = drain(&mut ring);
+        let off_cookies = [
+            cookie(&cm),
+            cookie(&sm),
+            cookie(&cs),
+            cookie(&ss),
+            cookie(&tp),
+            cookie(&vrf_u),
+            cookie(&tr),
+            cookie(&rx),
+        ];
         assert!(
-            !ev.iter().any(|e| e.0 == cookie(&cr) || e.0 == cookie(&sr)),
-            "VRF local exported: {ev:?}"
+            !ev.iter().any(|e| off_cookies.contains(&e.0)),
+            "VRF exported with loopback off: {ev:?}"
         );
         assert!(
-            drops(&ebpf, DROP_LOOPBACK) >= lo_v + 2,
-            "VRF packets counted"
+            drops(&ebpf, DROP_LOOPBACK) >= lo_v + 6,
+            "VRF packets counted: {}",
+            drops(&ebpf, DROP_LOOPBACK) - lo_v
         );
-        for f in [&cr, &sr] {
-            assert_eq!(crate::state(&ebpf, f).unwrap().local, 1, "VRF marked local");
+        for (f, what) in [
+            (
+                crate::state(&ebpf, &cm).map(|s| s.local),
+                "TCP master-bound client",
+            ),
+            (
+                crate::state(&ebpf, &sm).map(|s| s.local),
+                "TCP master-bound server",
+            ),
+            (
+                crate::state(&ebpf, &cs).map(|s| s.local),
+                "TCP slave-bound client",
+            ),
+            (
+                crate::state(&ebpf, &ss).map(|s| s.local),
+                "TCP server of the slave-bound client",
+            ),
+            (
+                crate::state(&ebpf, &tp).map(|s| s.local),
+                "UDP IP_PKTINFO sender, first datagram",
+            ),
+            (
+                crate::state(&ebpf, &rx).map(|s| s.local),
+                "UDP unbound receiver",
+            ),
+        ] {
+            assert_eq!(f, Some(1), "{what} marked local");
         }
+
+        // On (a widening): every case captured; TCP pairs for the close
+        // check emit here, then close once loopback is off.
         set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
         bump(&mut ebpf);
-        let (cr2, sr2) = vrf_x(b"vrf-on");
+        let (cm2, sm2) = tcp("pvrf", b"vrf-master-on");
+        let (cs2, ss2) = tcp("pvd0", b"vrf-slave-on");
+        let tp2 = pktinfo(b"vrf-pktinfo-on");
+        let tr2 = unbound_rx(b"vrf-l3acc-on");
         let ev = drain(&mut ring);
+        for (c, m, what) in [
+            (cookie(&cm2), &b"vrf-master-on"[..], "TCP master-bound"),
+            (cookie(&sm2), b"vrf-master-on", "TCP master-bound server"),
+            (cookie(&cs2), b"vrf-slave-on", "TCP slave-bound"),
+            (cookie(&ss2), b"vrf-slave-on", "TCP slave-bound server"),
+            (cookie(&tp2), b"vrf-pktinfo-on", "UDP IP_PKTINFO sender"),
+            (cookie(&rx), b"vrf-l3acc-on", "UDP unbound receiver"),
+        ] {
+            assert!(has(&ev, c, m), "{what} captured with loopback on: {ev:?}");
+        }
+        let closing = [cookie(&cm2), cookie(&sm2), cookie(&cs2), cookie(&ss2)];
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+        bump(&mut ebpf);
+        drop((cm2, sm2, cs2, ss2));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            has(&ev, cookie(&cr2), b"vrf-on") && has(&ev, cookie(&sr2), b"vrf-on"),
-            "VRF local captured with loopback on: {ev:?}"
+            !drain_records(&mut ring)
+                .iter()
+                .any(|(e, _)| e.event_type == EventType::SockClose
+                    && closing.contains(&e.socket_cookie)),
+            "no VRF close record once loopback is off"
         );
-        drop((cr, sr, cr2, sr2, vrf_l));
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+        bump(&mut ebpf);
+        std::fs::write("/proc/sys/net/ipv4/udp_l3mdev_accept", l3_accept.trim()).unwrap();
+        drop((cm, sm, cs, ss, tp, tr, tp2, tr2, rx, vrf_u, vrf_l));
         let _ = ip("link del pvd0");
         let _ = ip("link del pvrf");
+        forget_vrf_master(&mut ebpf, vrf_ifx);
         println!("LOOPBACK VRF OK");
     }
 

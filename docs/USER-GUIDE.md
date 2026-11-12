@@ -242,15 +242,19 @@ running config is kept.
   captured, as on the TC backend, which never sees them. That is
   `127.0.0.0/8`, and connections to one of the host's own addresses (or,
   in a pod, the pod's own address), which the kernel also sends over
-  `lo`; IPv6 packets are not captured on either backend. Local traffic
-  inside a VRF is node-local too and dropped. The kernel program cannot
-  tell a VRF device from a NIC, so a socket bound to a network device
-  (`SO_BINDTODEVICE`) is treated as node-local when it uses that device
-  and is dropped whole, remote traffic included; and a socket that once
-  carried node-local traffic stays dropped (an unconnected UDP socket
-  that talked to a local and a remote peer). Set `capture_loopback =
-  true` if you need those. Same-node pod-to-pod and host-to-pod
-  traffic over veth or a bridge is not loopback and is captured. Dropped
+  `lo`; IPv6 packets are not captured on either backend. Traffic on a
+  VRF device is node-local too and dropped: local delivery inside a VRF
+  travels the VRF device, and so does a VRF's incoming remote traffic,
+  so every socket in a VRF is dropped while this is off. The agent
+  recognises VRF devices when they are created (and scans for existing
+  ones at startup), with fexit hooks that need kernel BTF; without them
+  the `cgroup_skb` backend refuses to start. Traffic on a device in
+  another network namespace that has the same interface index as a VRF
+  device is dropped too, and a socket that once carried node-local
+  traffic stays dropped (an unconnected UDP socket that talked to a
+  local and a remote peer). Set `capture_loopback = true` if you need
+  those. Same-node pod-to-pod and host-to-pod traffic over veth, a
+  bridge, ipvlan, macvlan or tun/tap is not loopback and is captured. Dropped
   packets are counted in
   `panopticon_scope_dropped_events_total{reason="loopback"}`. It covers
   packets only: TLS plaintext (uprobes) of a loopback connection is

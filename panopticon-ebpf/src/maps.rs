@@ -11,7 +11,7 @@ use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
     DATA_RING_SHARDS, DataEvent, MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE,
     MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
-    scope::{SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
+    scope::{MAX_VRF_MASTERS, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
 /// Events lost because a DATA_EVENTS shard was full (user space not keeping
@@ -46,6 +46,21 @@ pub fn count_scope_drop(reason: u32) {
 /// updates it, then bumps CONFIG_SCOPE_GEN.
 #[map]
 pub static CGROUP_ALLOW: HashMap<u64, u8> = HashMap::with_max_entries(MAX_CGROUP_ALLOW, 0);
+
+/// VRF masters by ifindex, in any network namespace (DESIGN §3.7): written
+/// by fexit `register_netdevice` (`scope_vrf_register`) and the loader's
+/// startup scan; read
+/// by the capture hooks. Never removed: a stale entry over-drops (fails
+/// closed).
+#[map]
+pub static VRF_MASTERS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_VRF_MASTERS, 0);
+
+/// Offsets `scope_vrf_register` reads, from the kernel's BTF, written by
+/// the loader before it attaches: 0 `net_device.ifindex`, 1
+/// `net_device.rtnl_link_ops`, 2 `rtnl_link_ops.kind`. Index 0 unset (0)
+/// means unwritten; the hook then records nothing.
+#[map]
+pub static NETDEV_OFFS: Array<u32> = Array::with_max_entries(3, 0);
 
 /// Zero the DataEvent fields only the cgroup_skb backend fills, so other
 /// producers never leak a previous event's values (ring memory and the
