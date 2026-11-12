@@ -486,7 +486,11 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     }
     let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
     let g1 = scope_gen();
+    // Capture on (and armed outside unscoped full): a completed disarm or
+    // `capture_enabled = false` leaves generation and verdicts as they were,
+    // so the scope check alone would still authorise a close.
     let authorised = rd!(st, emitted) != 0
+        && tls_capture_on()
         && (is_unscoped_full(scope_mode())
             || tls_addr_in_scope(
                 cookie,
@@ -533,8 +537,9 @@ fn on_tcp_close(ctx: &SockOpsContext) {
         (*event).acceptor_tgid = rd!(st, acceptor_tgid);
         (*event).role = role_of(rd!(st, flags));
     }
-    // A selector changed while the record was built: send nothing.
-    if scope_gen() != g1 {
+    // A selector changed, or capture stopped, while the record was built:
+    // send nothing.
+    if scope_gen() != g1 || !tls_capture_on() {
         entry.discard(0);
         return;
     }

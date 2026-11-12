@@ -830,6 +830,27 @@ fn scope_programs_load_attach_and_hold() {
     );
     drop((c3, s3));
 
+    // Capture stopped (the fatal disarm clears CAPTURE_ENABLED and leaves
+    // the generation and cached verdicts as they were): a socket that
+    // carried data sends no close record.
+    let mut c5 = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut s5, _) = listener.accept().unwrap();
+    c5.write_all(b"before-stop").unwrap();
+    let _ = s5.read(&mut buf).unwrap();
+    assert_eq!(state(&ebpf, &c5).map(|s| s.emitted), Some(1));
+    let c5_cookie = cookie(&c5);
+    let _ = drain_records(&mut ring);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 0);
+    drop((c5, s5));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let after_stop = drain_records(&mut ring);
+    set(&mut ebpf, CONFIG_CAPTURE_ENABLED, 1);
+    assert!(
+        !after_stop.iter().any(|(e, _)| e.socket_cookie == c5_cookie),
+        "no close record once capture is stopped"
+    );
+    println!("CLOSE_AFTER_STOP OK");
+
     // Every published byte of a record is written: once the ring has wrapped
     // over records full of 0xAB, small records (a 64-byte class with 5
     // bytes, a 128-byte class with 100) carry zeros past their payload, as

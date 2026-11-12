@@ -189,7 +189,8 @@ running config is kept.
       only from the moment a listed process `accept()`s it; bytes that
       arrive before that are dropped (no packets are held) and counted in
       `panopticon_scope_dropped_events_total{reason="no_owner"}`. With a new
-      connection per request that loses most requests (docs/BENCHMARKS.md).
+      connection per request that lost nearly half the requests in the
+      measured benchmark (docs/BENCHMARKS.md).
       For full recall, restart the server after the agent, or select by
       `cgroup_filter` / `pod_filter`, which has no such gap.
 - `sampling_mode = "connection_sample"` with `sample_rate = r` (required,
