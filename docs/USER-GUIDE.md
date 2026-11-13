@@ -561,8 +561,10 @@ What is exported then:
   neither its headers decoded nor its bodies exported, for as long as
   the agent tracks that key: Go TLS (no such hook), a libssl whose
   `SSL_new` the agent cannot find (static or renamed), an object reused
-  through `SSL_clear`, an object created before the agent attached, and
-  a record that was lost (ring or channel full, rate limit).
+  through `SSL_clear`, an object created before the agent attached, an
+  object read or written inside `SSL_new` (a creation callback, so before
+  the agent saw it created), and a record that was lost (ring or channel
+  full, rate limit).
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
