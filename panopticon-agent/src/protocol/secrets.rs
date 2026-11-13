@@ -195,12 +195,14 @@ impl Decision {
 /// unless `builtin` is false, the built-in rules at their level. Their
 /// spans are merged and the field is rewritten once by
 /// [`Decision::apply`], so no rule hides another's match and rule order
-/// does not matter. The field is withheld when a rule says so, when a
-/// match in the decoded view is not also a raw match (it cannot be placed
-/// in the field), or when it has more than [`MAX_SPANS`] spans.
+/// does not matter. The field is withheld when a rule says so, when the
+/// decoded view of what the raw matches leave still matches (it cannot be
+/// placed in the field), or when it has more than [`MAX_SPANS`] spans.
 pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
-    let markers = markers(text);
-    let keep = |&(s, e): &(usize, usize)| !markers.iter().any(|&(ms, me)| ms <= s && e <= me);
+    // A span that already reads exactly `<REDACTED>` would be replaced by
+    // itself: dropped as a no-op. Nothing else in captured text is exempt,
+    // whatever it reads like.
+    let keep = |&(s, e): &(usize, usize)| &text[s..e] != REDACTED_CREDENTIAL;
     let mut spans = Vec::new();
     if let Some(user) = &rules.user {
         match user_spans(user, text) {
@@ -244,23 +246,12 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
     Decision::Mask(spans)
 }
 
-/// Where `text` already holds a protection marker: rules do not match
-/// inside one again.
-fn markers(text: &str) -> Vec<(usize, usize)> {
-    if !text.contains('<') {
-        return Vec::new();
-    }
-    [REDACTED_CREDENTIAL, FIELD_WITHHELD, STATEMENT_WITHHELD]
-        .iter()
-        .flat_map(|m| text.match_indices(m).map(|(i, m)| (i, i + m.len())))
-        .collect()
-}
-
 /// The user's patterns: the spans of their raw matches (empty matches
 /// skipped), or None when the field must be withheld: more than
-/// [`MAX_SPANS`] matches, or a match in the decoded view (escapes,
-/// entities and percent-encoding decoded, not case-folded) that is not
-/// also a raw match of the same pattern.
+/// [`MAX_SPANS`] matches, or, when decoding changes the field, any match
+/// in the decoded view (escapes, entities and percent-encoding decoded,
+/// not case-folded) of what is left once the raw matches are removed. A
+/// decoded match is only accepted when it lies inside a masked raw span.
 fn user_spans(
     (set, each): &(regex::RegexSet, Vec<regex::Regex>),
     text: &str,
@@ -274,13 +265,10 @@ fn user_spans(
             spans.push((m.start(), m.end()));
         }
     }
-    if let Some(decoded) = decode(text) {
-        for i in set.matches(&decoded).iter() {
-            let mut raw: Vec<&str> = each[i].find_iter(text).map(|m| m.as_str()).collect();
-            for m in each[i].find_iter(&decoded).filter(|m| !m.is_empty()) {
-                let k = raw.iter().position(|r| *r == m.as_str())?;
-                raw.swap_remove(k);
-            }
+    if decode(text).is_some() {
+        let residual = remove(text, &merge(spans.clone()));
+        if decode(&residual).is_some_and(|d| set.is_match(&d)) {
+            return None;
         }
     }
     Some(spans)
@@ -983,10 +971,28 @@ mod tests {
         // #1: ten copies of `[A-Z]` once grew `GET` to gigabytes.
         let r = rules(&["[A-Z]"; 10], Builtin::Full);
         assert_eq!(protect_text_with(&r, "GET").as_deref(), Some("<REDACTED>"));
+        // R5 M1: captured text is never exempt, whatever it reads like.
         assert_eq!(
             protect_text_with(&r, "a <REDACTED> b").as_deref(),
-            None,
-            "a marker is not matched again"
+            Some("a <<REDACTED>> b")
+        );
+        let marker = rules(&["REDACTED"], Builtin::Full);
+        assert_eq!(
+            protect_text_with(&marker, "<REDACTED>").as_deref(),
+            Some("<<REDACTED>>")
+        );
+        // R5 H2: the right value at the wrong occurrence. The raw match is
+        // the first one; decoded, only the second (encoded) one matches.
+        let bounded = rules(&[r"acme_[a-z0-9]{8}\b"], Builtin::Full);
+        assert_eq!(
+            protect_text_with(&bounded, "acme_abcd1234%61 acme%5fabcd1234").as_deref(),
+            Some(FIELD_WITHHELD)
+        );
+        // An encoded neighbour that is not a match still masks.
+        let acme = rules(&["acme_[a-z0-9]{8}"], Builtin::Full);
+        assert_eq!(
+            protect_text_with(&acme, "acme_abcd1234 q=a%20b").as_deref(),
+            Some("<REDACTED> q=a%20b")
         );
         let many = "A ".repeat(MAX_SPANS + 1);
         assert_eq!(
