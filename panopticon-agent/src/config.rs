@@ -1117,8 +1117,9 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
     let mode = config.privacy_mode;
     if mode != PrivacyMode::Full && config.pii_redact_setting == Some(false) {
         anyhow::bail!(
-            "[pii] redact = false contradicts [privacy] mode = \"{mode}\", which never \
-             exports PII values. Remove `redact`, or use mode = \"full\" for unredacted export"
+            "[pii] redact = false contradicts [privacy] mode = \"{mode}\", which redacts \
+             the PII values it detects (detection is best effort). Remove `redact`, or use \
+             mode = \"full\" for unredacted export"
         );
     }
     config.pii.redact = mode != PrivacyMode::Full || config.pii_redact_setting == Some(true);
@@ -1755,6 +1756,11 @@ mod tests {
             let toml = format!("[privacy]\nmode = \"{mode}\"\n[pii]\nredact = false\n");
             let err = privacy(&toml).unwrap_err().to_string();
             assert!(err.contains("contradicts") && err.contains(mode), "{err}");
+            // Codex R5 H6: best effort, no absolute promise.
+            assert!(
+                !err.contains("never") && err.contains("best effort"),
+                "{err}"
+            );
         }
     }
 
