@@ -238,7 +238,7 @@ journalctl -u panopticon -f
   forged TCP segments. With `map_pin_path`, remove the old pins before
   upgrading, as above.
 - **The event format changed again** after that: capture-scope fields
-  (4192 bytes), and a `TlsClose` event kind (OpenSSL `SSL_free`). With
+  (4192 bytes), and a `TlsNew` event kind (OpenSSL `SSL_new`). With
   `map_pin_path`, remove the old pins before upgrading, as above.
 - Replay capture files (`PNCAP`) are now format version 4 (0.1.0 wrote
   version 2); older files are rejected.

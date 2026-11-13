@@ -163,9 +163,9 @@ production-hardened compliance platform.
     was not captured, or one whose parser restarted after lost bytes; a
     later client preface on it does not lift this. Over TLS a new
     connection that reuses a closed one's key starts clean only once the
-    agent has seen the old object freed (OpenSSL `SSL_free`); with Go TLS
-    (no such hook), or when that record was lost, it is not decoded
-    either. While credential masking is on its bodies are not exported
+    agent has seen OpenSSL's `SSL_new` return the new object; with Go TLS
+    (no such hook), a static or renamed libssl, `SSL_clear` reuse, or
+    when that record was lost, it is not decoded either. While credential masking is on its bodies are not exported
     either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
@@ -193,8 +193,8 @@ production-hardened compliance platform.
     prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
-    start, over TLS on a reused key only after its old object was
-    freed as above,
+    start, over TLS on a reused key only after `SSL_new` returned
+    the new object as above,
     and bodies whose content type is repeated or over 256 bytes),
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their

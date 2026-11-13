@@ -93,8 +93,8 @@ HTTP/2 over TLS had two problems of its own:
   `SSL*` key. Its preface then landed in the old connection's parser, along
   with its stale HPACK state. A client preface now restarts the parser.
   Since then (credential masking, USER-GUIDE §5.3) a reused key starts
-  clean only after the agent saw the old object freed (OpenSSL
-  `SSL_free`); otherwise the restarted parser stays latched.
+  clean only after the agent saw OpenSSL's `SSL_new` return the new
+  object; otherwise the restarted parser stays latched.
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
@@ -1356,7 +1356,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   lost outside a DATA frame): HPACK state is unknown, so no header,
   including the path, is decoded for the rest of that connection (a later
   client preface on it does not lift this; over TLS a reused key starts
-  clean only after its old object was freed, USER-GUIDE §5.3), and while credential masking
+  clean only after `SSL_new` returned the new object, USER-GUIDE §5.3), and while credential masking
   is on its bodies are not exported (nor are bodies after any lost header
   block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that

@@ -553,19 +553,22 @@ What is exported then:
   of a DATA frame). Only a new connection observed from its start
   exports bodies again. Over TLS a new connection can reuse a closed
   one's key (the library's connection object address). It starts clean
-  only once the agent has seen the library free the old object (OpenSSL
-  `SSL_free`, in every mode); nothing else resets the key (no client
-  preface, wherever it falls). Go TLS has no such hook, and a free whose
-  record was lost (ring or channel full, rate limit) counts as none:
-  then a new connection that reuses the key gets neither its headers
-  decoded nor its bodies exported, for as long as the agent tracks that
-  key.
+  only once the agent has seen the library create the new object at that
+  address (the return of OpenSSL's `SSL_new`, in every mode), which
+  proves the old one was destroyed; nothing else resets the key (no
+  client preface, wherever it falls, nor `SSL_free`, which may drop one
+  reference of several). Otherwise a new connection on the key gets
+  neither its headers decoded nor its bodies exported, for as long as
+  the agent tracks that key: Go TLS (no such hook), a libssl whose
+  `SSL_new` the agent cannot find (static or renamed), an object reused
+  through `SSL_clear`, an object created before the agent attached, and
+  a record that was lost (ring or channel full, rate limit).
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
-  clean only after the agent saw the old object freed, as above.
+  clean only after the agent saw `SSL_new` return it, as above.
 - **DNS answers** whose name has credential context, or matches one of
   your `[credentials]` patterns, are dropped before export and before the
   name can reach the service graph.
