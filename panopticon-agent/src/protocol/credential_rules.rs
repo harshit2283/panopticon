@@ -1,7 +1,7 @@
 //! `[credentials]`: the user's own credential patterns and how much of the
 //! built-in detection runs. Compiled once per (re)load and swapped in
 //! whole: a message is protected with one rule set, the one current when
-//! its fields are scanned.
+//! its scan starts (loaded once, then passed to every field).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -75,8 +75,16 @@ impl CredentialRules {
                 .dfa_size_limit(DFA_SIZE_LIMIT)
                 .build()
                 .map_err(|e| format!("pattern {i} ({p:?}): {e}"))?;
-            if re.is_match("") {
-                return Err(format!("pattern {i} ({p:?}) matches the empty string"));
+            // A pattern that can match without consuming a byte (`x*`,
+            // `\b`, `^`) would place empty matches anywhere.
+            let can_be_empty = regex_syntax::ParserBuilder::new()
+                .build()
+                .parse(p)
+                .map_or(true, |hir| hir.properties().minimum_len() == Some(0));
+            if can_be_empty {
+                return Err(format!(
+                    "pattern {i} ({p:?}) can match an empty span; it must consume at least one byte"
+                ));
             }
             each.push(re);
         }
@@ -102,9 +110,18 @@ pub fn set_credential_rules(rules: CredentialRules) {
     RULES.store(Arc::new(rules));
 }
 
-/// The rules in effect.
-pub(super) fn credential_rules() -> Arc<CredentialRules> {
+/// The rules in effect. A message is scanned under one snapshot, loaded
+/// once when its scan starts.
+pub fn credential_rules() -> Arc<CredentialRules> {
+    #[cfg(test)]
+    LOADS.with(|n| n.set(n.get() + 1));
     RULES.load_full()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`credential_rules`] calls on this thread.
+    pub static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `panopticon_credential_matches_total{source="user"}`: user-pattern
@@ -144,7 +161,10 @@ mod tests {
             (s(&["acme_[a-z"]), "pattern 0"),
             (s(&["ok_[0-9]+", "(unclosed"]), "pattern 1"),
             (s(&[""]), "empty"),
-            (s(&["x*"]), "empty string"),
+            (s(&["x*"]), "empty span"),
+            // Matches nothing in "", but empty spans around "GET".
+            (s(&[r"\b"]), "empty span"),
+            (s(&[r"acme_[a-z]+|^"]), "empty span"),
             (s(&[&"a".repeat(MAX_PATTERN_LEN + 1)]), "bytes"),
             (s(&[r"\w{1000}{1000}"]), "pattern 0"),
             (vec!["k[0-9]".to_string(); MAX_PATTERNS + 1], "patterns"),

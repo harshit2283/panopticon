@@ -184,8 +184,10 @@ production-hardened compliance platform.
     prefix), HTTP/2 headers after a lost HPACK block,
     over-long header names and gRPC/protobuf body text are not exported;
     only known SQL keywords are exported as methods. `[credentials]
-    patterns` adds the user's own formats (masked in every field, counted
-    in `panopticon_credential_matches_total`), and `builtin = "names_only"`
+    patterns` adds the user's own formats (masked in every field, matching
+    DNS answers dropped, counted in `panopticon_credential_matches_total`;
+    every rule sees the field as captured and one rule set covers a whole
+    message), and `builtin = "names_only"`
     skips the free-text scan. `full` does this too, with or without PII
     detection, unless `[privacy] mask_credentials = false`.
   - Credential protection is a hard guarantee only in `metrics_only`

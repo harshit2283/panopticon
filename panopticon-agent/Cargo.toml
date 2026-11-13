@@ -41,6 +41,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 # PII detection
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 fxhash = { workspace = true }
 mimalloc = { workspace = true }
 iced-x86 = { workspace = true }

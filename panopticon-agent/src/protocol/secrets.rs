@@ -151,81 +151,163 @@ fn context(text: &str, sql: bool) -> bool {
 }
 
 /// `text` with credential values masked where certain, or the field
-/// withheld; None when it has no credential context or nothing changes.
-pub fn protect_text(text: &str) -> Option<String> {
+/// withheld, under the rules in effect; None when nothing changes.
+#[cfg(test)]
+fn protect_text(text: &str) -> Option<String> {
     protect_text_with(&super::credential_rules::credential_rules(), text)
 }
 
-/// [`protect_text`] under `rules`: the user's patterns first, then the
-/// built-in rules at their configured level.
-pub(super) fn protect_text_with(rules: &CredentialRules, text: &str) -> Option<String> {
-    let user = rules.user.as_ref().and_then(|u| user_patterns(u, text));
-    if user.as_deref() == Some(FIELD_WITHHELD) {
-        return user;
-    }
-    let current = user.as_deref().unwrap_or(text);
-    let builtin = match rules.builtin {
-        Builtin::Full => builtin_full(current),
-        Builtin::NamesOnly => builtin_names_only(current),
-    };
-    if builtin.is_some() {
-        count_builtin();
-    }
-    builtin.or(user)
+/// `text` protected under `rules` (see [`decide`]); None when nothing
+/// changes.
+pub fn protect_text_with(rules: &CredentialRules, text: &str) -> Option<String> {
+    decide(rules, text, true).apply(text)
 }
 
-/// The user's patterns on the raw text (each match replaced by
-/// `<REDACTED>`), then on its decoded view (escapes, entities and
-/// percent-encoding decoded, not case-folded): a match there cannot be
-/// placed in the raw text, so the field is withheld.
-fn user_patterns((set, each): &(regex::RegexSet, Vec<regex::Regex>), text: &str) -> Option<String> {
-    let mut out: Option<String> = None;
-    if set.is_match(text) {
-        let mut s = text.to_string();
-        for i in set.matches(text).iter() {
-            let n = each[i].find_iter(&s).count();
-            if n > 0 {
-                count_user(n as u64);
-                s = each[i].replace_all(&s, REDACTED_CREDENTIAL).into_owned();
+/// Most spans masked in one field; past it the field is withheld. Each
+/// span is replaced by [`REDACTED_CREDENTIAL`], so this bounds both the
+/// matching work kept and how much a field can grow.
+pub const MAX_SPANS: usize = 1024;
+
+/// What credential protection does to one field.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    Keep,
+    /// Replace these byte spans (sorted, disjoint, not touching) by
+    /// [`REDACTED_CREDENTIAL`].
+    Mask(Vec<(usize, usize)>),
+    /// Replace the field by [`FIELD_WITHHELD`].
+    Withhold,
+}
+
+impl Decision {
+    /// The protected field, or None when it is kept as is.
+    pub fn apply(&self, text: &str) -> Option<String> {
+        match self {
+            Decision::Keep => None,
+            Decision::Withhold => Some(FIELD_WITHHELD.to_string()),
+            Decision::Mask(spans) => Some(replace_spans(text, spans)),
+        }
+    }
+}
+
+/// Decide how to protect `text`. Every rule runs on the original field:
+/// the user's patterns on the raw text and on its decoded view, then,
+/// unless `builtin` is false, the built-in rules at their level. Their
+/// spans are merged and the field is rewritten once by
+/// [`Decision::apply`], so no rule hides another's match and rule order
+/// does not matter. The field is withheld when a rule says so, when a
+/// match in the decoded view is not also a raw match (it cannot be placed
+/// in the field), or when it has more than [`MAX_SPANS`] spans.
+pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
+    let markers = markers(text);
+    let keep = |&(s, e): &(usize, usize)| !markers.iter().any(|&(ms, me)| ms <= s && e <= me);
+    let mut spans = Vec::new();
+    if let Some(user) = &rules.user {
+        match user_spans(user, text) {
+            Some(found) => {
+                let before = spans.len();
+                spans.extend(found.into_iter().filter(keep));
+                count_user((spans.len() - before) as u64);
+            }
+            None => {
+                count_user(1);
+                return Decision::Withhold;
             }
         }
-        out = Some(s);
     }
-    if let Some(decoded) = decode(out.as_deref().unwrap_or(text))
-        && set.is_match(&decoded)
-    {
-        count_user(1);
-        return Some(FIELD_WITHHELD.to_string());
+    if builtin {
+        let found = match rules.builtin {
+            Builtin::Full => builtin_full(text),
+            Builtin::NamesOnly => Some(certain_clauses(text).0),
+        };
+        match found {
+            None => {
+                count_builtin();
+                return Decision::Withhold;
+            }
+            Some(found) => {
+                let before = spans.len();
+                spans.extend(found.into_iter().filter(keep));
+                if spans.len() > before {
+                    count_builtin();
+                }
+            }
+        }
     }
-    out.filter(|s| s != text)
+    if spans.is_empty() {
+        return Decision::Keep;
+    }
+    let spans = merge(spans);
+    if spans.len() > MAX_SPANS {
+        return Decision::Withhold;
+    }
+    Decision::Mask(spans)
 }
 
-/// Every built-in rule: credential values masked where certain, the field
-/// withheld when any context is left.
-fn builtin_full(text: &str) -> Option<String> {
+/// Where `text` already holds a protection marker: rules do not match
+/// inside one again.
+fn markers(text: &str) -> Vec<(usize, usize)> {
+    if !text.contains('<') {
+        return Vec::new();
+    }
+    [REDACTED_CREDENTIAL, FIELD_WITHHELD, STATEMENT_WITHHELD]
+        .iter()
+        .flat_map(|m| text.match_indices(m).map(|(i, m)| (i, i + m.len())))
+        .collect()
+}
+
+/// The user's patterns: the spans of their raw matches (empty matches
+/// skipped), or None when the field must be withheld: more than
+/// [`MAX_SPANS`] matches, or a match in the decoded view (escapes,
+/// entities and percent-encoding decoded, not case-folded) that is not
+/// also a raw match of the same pattern.
+fn user_spans(
+    (set, each): &(regex::RegexSet, Vec<regex::Regex>),
+    text: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::new();
+    for i in set.matches(text).iter() {
+        for m in each[i].find_iter(text).filter(|m| !m.is_empty()) {
+            if spans.len() == MAX_SPANS {
+                return None;
+            }
+            spans.push((m.start(), m.end()));
+        }
+    }
+    if let Some(decoded) = decode(text) {
+        for i in set.matches(&decoded).iter() {
+            let mut raw: Vec<&str> = each[i].find_iter(text).map(|m| m.as_str()).collect();
+            for m in each[i].find_iter(&decoded).filter(|m| !m.is_empty()) {
+                let k = raw.iter().position(|r| *r == m.as_str())?;
+                raw.swap_remove(k);
+            }
+        }
+    }
+    Some(spans)
+}
+
+/// Every built-in rule: the values to mask where certain, or None (the
+/// field withheld) when any context is left.
+fn builtin_full(text: &str) -> Option<Vec<(usize, usize)>> {
     if !has_credential_context(text) {
-        return None;
+        return Some(Vec::new());
     }
     let (mask, delete) = certain_clauses(text);
     let residual = remove(text, &delete);
-    let out = if has_credential_context(&residual) {
-        FIELD_WITHHELD.to_string()
-    } else {
-        replace_spans(text, &mask)
-    };
-    (out != text).then_some(out)
+    (!has_credential_context(&residual)).then_some(mask)
 }
 
-/// `builtin = "names_only"`: only the values of the certain structures
-/// (credential-named form parameters and JSON members, URI userinfo) are
-/// masked; no free-text context is looked for.
-fn builtin_names_only(text: &str) -> Option<String> {
-    let (mask, _) = certain_clauses(text);
-    if mask.is_empty() {
-        return None;
+/// Sorted, with overlapping or touching spans joined.
+fn merge(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
     }
-    let out = replace_spans(text, &mask);
-    (out != text).then_some(out)
+    out
 }
 
 /// A SQL statement with credential context, as exported: its verb and
@@ -503,8 +585,10 @@ fn percent_decode(text: &str) -> Option<String> {
     (decoded != text).then_some(decoded)
 }
 
-/// The words of a normalised text (`a-z`, digits, `_`; leading and
-/// trailing `_` dropped), borrowed, with where each starts and ends.
+/// The words of a normalised text (`a-z`, digits, `_`), borrowed with
+/// leading and trailing `_` dropped for classification, and where the
+/// whole token starts and ends: what precedes and follows a name is read
+/// from the token's own bounds (`pwd_=` is followed by `=`).
 fn words(n: &str) -> impl Iterator<Item = (&str, usize, usize)> + '_ {
     let b = n.as_bytes();
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -517,19 +601,13 @@ fn words(n: &str) -> impl Iterator<Item = (&str, usize, usize)> + '_ {
             if i >= b.len() {
                 return None;
             }
-            let mut start = i;
+            let start = i;
             while i < b.len() && is_word(b[i]) {
                 i += 1;
             }
-            let mut end = i;
-            while start < end && b[start] == b'_' {
-                start += 1;
-            }
-            while end > start && b[end - 1] == b'_' {
-                end -= 1;
-            }
-            if start < end {
-                return Some((&n[start..end], start, end));
+            let word = n[start..i].trim_matches('_');
+            if !word.is_empty() {
+                return Some((word, start, i));
             }
         }
     })
@@ -815,20 +893,13 @@ fn remove(text: &str, spans: &Spans) -> String {
     out
 }
 
-fn replace_spans(text: &str, spans: &Spans) -> String {
-    let mut spans: Spans = spans
-        .iter()
-        .copied()
-        .filter(|&(s, e)| &text[s..e] != REDACTED_CREDENTIAL)
-        .collect();
-    spans.sort_unstable();
-    let mut out = String::with_capacity(text.len());
+/// `text` with each span (sorted, disjoint) replaced by
+/// [`REDACTED_CREDENTIAL`].
+fn replace_spans(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len() + spans.len() * REDACTED_CREDENTIAL.len());
     let mut at = 0;
-    for (s, e) in spans {
-        if e <= at {
-            continue;
-        }
-        out.push_str(&text[at..s.max(at)]);
+    for &(s, e) in spans {
+        out.push_str(&text[at..s]);
         out.push_str(REDACTED_CREDENTIAL);
         at = e;
     }
@@ -864,7 +935,7 @@ mod tests {
     }
 
     /// User patterns: raw matches replaced, a match only in the decoded
-    /// view withholds the field; the built-in rules still run after.
+    /// view withholds the field; the built-in rules apply too.
     #[test]
     fn user_patterns_mask_their_matches() {
         let r = rules(&["acme_[a-z0-9]{8}", "(?i)tok-[0-9]{4}"], Builtin::Full);
@@ -875,7 +946,7 @@ mod tests {
         // `acme` + JSON escape of `_` (backslash built at run time).
         let escaped = format!(r#"{{"k":"acme{}u005fabcd1234"}}"#, char::from(92));
         assert_eq!(p(&escaped), FIELD_WITHHELD);
-        // Built-in rules after the user's.
+        // Built-in rules as well as the user's.
         assert_eq!(
             p("q=acme_abcd1234&password=x"),
             "q=<REDACTED>&password=<REDACTED>"
@@ -901,6 +972,60 @@ mod tests {
                 protect_text_with(&rules(&[], Builtin::Full), prose).as_deref(),
                 None
             );
+        }
+    }
+
+    /// Codex round 5 #1, #3: every rule is matched against the original
+    /// field and the field is rewritten once, so the output is bounded
+    /// and no rule hides another's match.
+    #[test]
+    fn rules_match_the_original_field() {
+        // #1: ten copies of `[A-Z]` once grew `GET` to gigabytes.
+        let r = rules(&["[A-Z]"; 10], Builtin::Full);
+        assert_eq!(protect_text_with(&r, "GET").as_deref(), Some("<REDACTED>"));
+        assert_eq!(
+            protect_text_with(&r, "a <REDACTED> b").as_deref(),
+            None,
+            "a marker is not matched again"
+        );
+        let many = "A ".repeat(MAX_SPANS + 1);
+        assert_eq!(
+            protect_text_with(&r, &many).as_deref(),
+            Some(FIELD_WITHHELD)
+        );
+        // #3: order does not matter; the longer match is masked whole.
+        for order in [["acme_", "acme_[a-z0-9]{8}"], ["acme_[a-z0-9]{8}", "acme_"]] {
+            let r = rules(&order, Builtin::Full);
+            assert_eq!(
+                protect_text_with(&r, "id acme_abcd1234 ok").as_deref(),
+                Some("id <REDACTED> ok"),
+                "{order:?}"
+            );
+        }
+        // #3: a user match does not hide a credential name from the
+        // built-in rules.
+        let r = rules(&["password"], Builtin::Full);
+        let out = protect_text_with(&r, "password=canary").unwrap();
+        assert!(!out.contains("canary"), "{out}");
+        let r = rules(&["password"], Builtin::NamesOnly);
+        let out = protect_text_with(&r, "password=canary").unwrap();
+        assert!(!out.contains("canary"), "{out}");
+    }
+
+    /// Codex round 5 #2: a name with a trailing separator is still used as
+    /// a name (`pwd_=`): the token's own end decides what follows it.
+    #[test]
+    fn trailing_separators_keep_the_name() {
+        for t in [
+            "pwd_=s3cret",
+            r#"{"pwd_":"s3cret"}"#,
+            "pwd-=s3cret",
+            "pwd.=s3cret",
+            "x _pwd_: s3cret",
+        ] {
+            assert!(has_credential_context(t), "{t}");
+            let out = p(t);
+            assert!(!out.contains("s3cret"), "{t} -> {out}");
         }
     }
 

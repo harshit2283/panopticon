@@ -1125,9 +1125,11 @@ pub fn apply_privacy(config: &mut AgentConfig) -> anyhow::Result<()> {
     config.pii.mask_credentials = config.mask_credentials;
     if !config.mask_credentials && config.pii.redact {
         anyhow::bail!(
-            "[privacy] mask_credentials = false exports login secrets, which [privacy] \
-             mode = \"{mode}\"{} never does. It is only allowed with mode = \"full\" \
-             and PII redaction off",
+            "[privacy] mask_credentials = false turns credential masking off, which \
+             [privacy] mode = \"{mode}\"{} requires. Masking is best effort for known \
+             credential forms; only mode = \"metrics_only\" guarantees that no login secret \
+             is exported. Turning it off is only allowed with mode = \"full\" and PII \
+             redaction off",
             if mode == PrivacyMode::Full {
                 " with [pii] redact = true"
             } else {
@@ -1859,9 +1861,21 @@ mod tests {
             apply_privacy(&mut config).map(|()| config.pii.mask_credentials)
         };
         assert_eq!(off(PrivacyMode::Full, None).unwrap(), false);
-        assert!(off(PrivacyMode::Full, Some(true)).is_err());
-        assert!(off(PrivacyMode::Redacted, None).is_err());
-        assert!(off(PrivacyMode::MetricsOnly, None).is_err());
+        // Codex round 5 #9: the refusal promises best effort in `redacted`
+        // and `full`, a guarantee only in `metrics_only`.
+        for (mode, redact) in [
+            (PrivacyMode::Full, Some(true)),
+            (PrivacyMode::Redacted, None),
+            (PrivacyMode::MetricsOnly, None),
+        ] {
+            let err = off(mode, redact).unwrap_err().to_string();
+            assert!(!err.contains("never"), "{err}");
+            assert!(err.contains("best effort"), "{err}");
+            assert!(
+                err.contains("only mode = \"metrics_only\" guarantees"),
+                "{err}"
+            );
+        }
     }
 
     /// `[credentials]` parses; an invalid or oversized pattern, or an
@@ -1897,7 +1911,7 @@ mod tests {
         );
         for (bad, why) in [
             ("[credentials]\npatterns = [\"acme_[a-z\"]\n", "pattern 0"),
-            ("[credentials]\npatterns = [\"x*\"]\n", "empty string"),
+            ("[credentials]\npatterns = [\"x*\"]\n", "empty span"),
             (
                 "[credentials]\npatterns = [\"\\\\w{1000}{1000}\"]\n",
                 "pattern 0",

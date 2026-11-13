@@ -636,9 +636,9 @@ async fn main() -> Result<()> {
                                     "Privacy mode tightened at runtime"
                                 );
                             }
-                            // Validated at load; fields protected from here on
-                            // use the new rules (a message already being
-                            // scanned finishes with the old ones).
+                            // Validated at load; messages whose scan starts from
+                            // here on use the new rules (a message already
+                            // being scanned keeps the snapshot it loaded).
                             match config::credential_rules(&new_config) {
                                 Ok(rules) => protocol::set_credential_rules(rules),
                                 Err(e) => {

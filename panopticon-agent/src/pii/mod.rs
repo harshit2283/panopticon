@@ -29,7 +29,9 @@ use self::sampler::{InferenceSampler, template_hash};
 use crate::config::{PiiConfig, PiiMode};
 use crate::protocol::{L7Message, Protocol};
 
-use crate::protocol::{REDACTED_CREDENTIAL, protect_text_in};
+use crate::protocol::{
+    CredentialRules, Decision, REDACTED_CREDENTIAL, credential_rules, decide, protect_text_in,
+};
 
 /// Headers whose values are credentials or session tokens, masked wholesale
 /// when redaction is on: regexes cannot recognise opaque tokens and session
@@ -62,8 +64,9 @@ fn is_credential_header(name: &str) -> bool {
 /// command and the values of credential-named headers (HTTP header names
 /// by [`is_credential_header`], any protocol's by
 /// [`crate::protocol::is_credential_name`]); drop DNS answers whose name has
-/// credential context.
-fn mask_credential_fields(msg: &mut L7Message) {
+/// credential context or matches one of the user's patterns (before export
+/// and before the name reaches the service graph's DNS cache).
+fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
     let wipe = |f: &mut String| {
         f.zeroize();
         *f = REDACTED_CREDENTIAL.to_string();
@@ -91,17 +94,24 @@ fn mask_credential_fields(msg: &mut L7Message) {
             crate::protocol::count_builtin();
             wipe(value)
         });
-    msg.dns_answers
-        .retain(|a| !crate::protocol::has_credential_context(&a.name));
+    msg.dns_answers.retain(|a| {
+        !crate::protocol::has_credential_context(&a.name)
+            && decide(rules, &a.name, false) == Decision::Keep
+    });
 }
 
 /// Protect known credential forms in every string field of `msg` (best
 /// effort, USER-GUIDE §5.3) without the PII
-/// engine (see [`crate::protocol::protect_text`]): what
+/// engine (see [`crate::protocol::decide`]), under one rule set: what
 /// [`PiiEngine::scan_message_with`] does when `mask_credentials` is on, for
 /// `full` mode with `[pii] enabled = false`.
 pub fn mask_credentials(msg: &mut L7Message) {
-    mask_credential_fields(msg);
+    mask_credentials_with(&credential_rules(), msg);
+}
+
+/// [`mask_credentials`] under one rule set for the whole message.
+fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
+    mask_credential_fields(rules, msg);
     for field in [
         &mut msg.method,
         &mut msg.path,
@@ -112,13 +122,15 @@ pub fn mask_credentials(msg: &mut L7Message) {
     .into_iter()
     .flatten()
     {
-        protect_text_in(field);
+        protect_text_in(rules, field, true);
     }
     for (name, value) in msg.headers.iter_mut() {
-        // A wiped credential header keeps its name readable.
-        if value != REDACTED_CREDENTIAL {
-            protect_text_in(name);
-            protect_text_in(value);
+        // A wiped credential header keeps its name readable; the user's
+        // patterns still apply to it.
+        let wiped = value == REDACTED_CREDENTIAL;
+        protect_text_in(rules, name, !wiped);
+        if !wiped {
+            protect_text_in(rules, value, true);
         }
     }
 }
@@ -530,25 +542,36 @@ impl PiiEngine {
         if !self.config.enabled {
             return None;
         }
-        let mut found = Found::default();
         // Known credential forms are protected whenever values are redacted,
-        // and also in `full` mode unless `[privacy] mask_credentials = false`.
-        let mask_creds = redact_enabled || self.config.mask_credentials;
+        // and also in `full` mode unless `[privacy] mask_credentials = false`,
+        // under one rule set for the whole message.
+        let rules = (redact_enabled || self.config.mask_credentials).then(credential_rules);
+        self.scan_message_under(msg, redact_enabled, rules.as_deref())
+    }
 
-        if mask_creds {
-            mask_credential_fields(msg);
+    /// [`Self::scan_message_with`], credentials protected under `rules`
+    /// (not at all when None).
+    fn scan_message_under(
+        &self,
+        msg: &mut L7Message,
+        redact_enabled: bool,
+        rules: Option<&CredentialRules>,
+    ) -> Option<PiiReport> {
+        let mut found = Found::default();
+        if let Some(rules) = rules {
+            mask_credential_fields(rules, msg);
         }
 
         if let Some(path) = msg.path.as_mut() {
             // Query strings are usually percent-encoded (alice%40example.com),
             // which the regexes would miss: scan the decoded form.
-            self.scan_field(path, true, redact_enabled, &mut found);
+            self.scan_field(path, true, redact_enabled, rules, &mut found);
         }
         for field in [&mut msg.method, &mut msg.content_type]
             .into_iter()
             .flatten()
         {
-            self.scan_field(field, false, redact_enabled, &mut found);
+            self.scan_field(field, false, redact_enabled, rules, &mut found);
         }
 
         if redact_enabled {
@@ -556,22 +579,24 @@ impl PiiEngine {
                 .retain(|a| self.scan_with(&a.name, false).is_none());
         }
         for (name, value) in msg.headers.iter_mut() {
-            // A wiped credential header keeps its name readable.
-            if mask_creds && value == REDACTED_CREDENTIAL {
+            // A wiped credential header keeps its name readable; the user's
+            // patterns still apply to it.
+            if let Some(rules) = rules.filter(|_| value == REDACTED_CREDENTIAL) {
+                protect_text_in(rules, name, false);
                 continue;
             }
-            self.scan_field(value, false, redact_enabled, &mut found);
-            self.scan_field(name, false, redact_enabled, &mut found);
+            self.scan_field(value, false, redact_enabled, rules, &mut found);
+            self.scan_field(name, false, redact_enabled, rules, &mut found);
         }
 
         if let Some(body) = msg.request_text.as_mut() {
-            self.scan_field(body, false, redact_enabled, &mut found);
+            self.scan_field(body, false, redact_enabled, rules, &mut found);
         }
 
         let mut redacted_payload = None;
         if let Some(text) = msg.payload_text.as_mut() {
             let before = found.entities.len();
-            self.scan_field(text, false, redact_enabled, &mut found);
+            self.scan_field(text, false, redact_enabled, rules, &mut found);
             if redact_enabled && found.entities.len() > before {
                 redacted_payload = Some(text.clone());
             }
@@ -588,14 +613,29 @@ impl PiiEngine {
         })
     }
 
-    /// Scan one field (percent-decoded first when `decode`); with redaction
-    /// on, replace it by its redacted form; then protect credentials in it
-    /// (masked or the field withheld, see [`crate::protocol::protect_text`]).
-    /// Entity offsets stay relative to the field as scanned.
-    fn scan_field(&self, field: &mut String, decode: bool, redact: bool, found: &mut Found) {
+    /// Scan one field (percent-decoded first when `decode`) for PII and,
+    /// under `rules`, protect its credentials (masked or the field
+    /// withheld, see [`crate::protocol::decide`]). The credential decision
+    /// and the PII entities are both taken on the original field, before
+    /// either rewrites it (an `<EMAIL>` must not hide a user pattern's
+    /// match, a mask must not hide an entity from the counts). With
+    /// redaction on, PII left outside the masked values is then redacted.
+    /// Entity offsets stay relative to the field as first scanned.
+    fn scan_field(
+        &self,
+        field: &mut String,
+        decode: bool,
+        redact: bool,
+        rules: Option<&CredentialRules>,
+        found: &mut Found,
+    ) {
+        let decision = rules.map_or(Decision::Keep, |r| decide(r, field, true));
+        let protected = decision.apply(field);
         let decoded = decode.then(|| percent_decode(field));
         let text = decoded.as_deref().unwrap_or(field.as_str());
-        if let Some(mut report) = self.scan_with(text, redact) {
+        let report = self.scan_with(text, redact && protected.is_none());
+        drop(decoded);
+        if let Some(mut report) = report {
             found.scanned_bytes += report.scanned_bytes;
             if let Some(redacted) = report.redacted_text.take() {
                 field.zeroize();
@@ -603,8 +643,22 @@ impl PiiEngine {
             }
             found.entities.append(&mut report.entities);
         }
-        if redact || self.config.mask_credentials {
-            protect_text_in(field);
+        let Some(protected) = protected else {
+            return;
+        };
+        field.zeroize();
+        *field = protected;
+        if redact && matches!(decision, Decision::Mask(_)) {
+            let decoded = decode.then(|| percent_decode(field));
+            let text = decoded.as_deref().unwrap_or(field.as_str());
+            let redacted = self
+                .scan_with(text, true)
+                .and_then(|mut r| r.redacted_text.take());
+            drop(decoded);
+            if let Some(redacted) = redacted {
+                field.zeroize();
+                *field = redacted;
+            }
         }
     }
 
@@ -1022,6 +1076,72 @@ mod tests {
         mask_credentials(&mut msg);
         assert!(credential_matches().1 > builtin_after.max(builtin_before));
         set_credential_rules(CredentialRules::default());
+    }
+
+    /// Codex round 5 #4, #5: user patterns see the original field, before
+    /// PII redaction rewrites it; they apply to header names whatever the
+    /// value, and a DNS answer they match is dropped.
+    #[test]
+    fn test_user_patterns_see_the_original_field() {
+        use crate::protocol::{Builtin, CredentialRules, Direction, DnsAnswer};
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let rules = CredentialRules::compile(
+            &s(&[r"alice@example\.com:[A-Za-z0-9]+", "acme[-_][a-z0-9]{8}"]),
+            Builtin::Full,
+        )
+        .unwrap();
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for how in ["no engine", "redact", "full"] {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.request_text = Some("alice@example.com:Z7mQp2vK".into());
+            m.headers = vec![("x-acme-abcd1234".into(), REDACTED_CREDENTIAL.into())];
+            m.dns_answers = vec![DnsAnswer {
+                name: "acme_abcd1234.example.com".into(),
+                ip: 1,
+                ttl_secs: 60,
+            }];
+            match how {
+                "no engine" => mask_credentials_with(&rules, &mut m),
+                h => {
+                    let _ = engine.scan_message_under(&mut m, h == "redact", Some(&rules));
+                }
+            }
+            let dump = format!("{m:?}");
+            for secret in ["Z7mQp2vK", "abcd1234"] {
+                assert!(!dump.contains(secret), "{how}: {dump}");
+            }
+            assert!(m.dns_answers.is_empty(), "{how}");
+        }
+    }
+
+    /// Codex round 5 #6: one message is protected under one rule set,
+    /// loaded once when its scan starts.
+    #[test]
+    fn test_one_rule_set_per_message() {
+        use crate::protocol::CREDENTIAL_RULE_LOADS as LOADS;
+        use crate::protocol::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.method = Some("GET".into());
+            m.path = Some("/beta1234".into());
+            m.content_type = Some("text/plain".into());
+            m.headers = vec![("x-a".into(), "b".into()), ("x-c".into(), "d".into())];
+            m.request_text = Some("alpha1234".into());
+            m.payload_text = Some("alpha1234".into());
+            m
+        };
+        for how in ["no engine", "redact", "full"] {
+            let before = LOADS.with(|n| n.get());
+            let mut m = msg();
+            match how {
+                "no engine" => mask_credentials(&mut m),
+                h => {
+                    let _ = engine.scan_message_with(&mut m, h == "redact");
+                }
+            }
+            assert_eq!(LOADS.with(|n| n.get()) - before, 1, "{how}");
+        }
     }
 
     /// Codex round 3: credential context the value masker could not

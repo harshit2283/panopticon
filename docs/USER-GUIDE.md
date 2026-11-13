@@ -539,7 +539,9 @@ What is exported then:
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection.
-- **DNS answers** whose name has credential context are dropped.
+- **DNS answers** whose name has credential context, or matches one of
+  your `[credentials]` patterns, are dropped before export and before the
+  name can reach the service graph.
 
 The price is more withheld text than a value-level mask would leave: a
 `SELECT` naming a `password` column, a body that mentions a token or a
@@ -587,7 +589,10 @@ captured. SQL bound values are exported only for a statement whose
 prepare the server confirmed on this connection, after the last lost
 client byte: in PostgreSQL a named statement is known from its
 `ParseComplete`, a `Parse` the server rejects does not replace it, and a
-re-`Parse` or `Close` forgets it until confirmed.
+re-`Parse` or `Close` forgets it until confirmed. A `ParseComplete`
+confirms only the `Parse` it answers: a `Parse` whose answer was lost or
+whose cycle was abandoned, or that a `Close` in the same cycle closed, is
+never confirmed by a later one.
 
 #### Your own credential formats: `[credentials]`
 
@@ -606,21 +611,30 @@ builtin = "full"                       # or "names_only"
 
 Patterns use the Rust `regex` syntax (linear time, no backreferences).
 Every text field of every protocol is checked: method, path, content type,
-header names and values, request and response bodies, SQL text and bound
-values, Redis arguments and replies, Kafka and AMQP fields. A match in the
-field as captured is replaced by `<REDACTED>`; a match only in its decoded
-view (escapes, entities and percent-encoding decoded, case kept) cannot be
-placed in the captured text, so the field becomes `<field withheld>`. The
-built-in rules run after yours. Patterns apply whenever credentials are
-protected (`mask_credentials` on, the default), and not to DNS names.
+header names (also when the value was wiped as a credential header) and
+values, request and response bodies, SQL text and bound values, Redis
+arguments and replies, Kafka and AMQP fields; a DNS answer whose name a
+pattern matches is dropped. A match in the field as captured is replaced
+by `<REDACTED>`; a match in its decoded view (escapes, entities and
+percent-encoding decoded, case kept) that is not also a match in the
+captured text cannot be placed there, so the field becomes
+`<field withheld>`. Your patterns and the built-in rules all look at the
+field as captured, before PII redaction rewrites it, and their matches are
+replaced together in one pass: the order of your patterns does not matter,
+no pattern hides another's match or a credential name from the built-in
+rules, and text already reading `<REDACTED>` or `<field withheld>` is not
+matched again. A field with more than 1024 matches is withheld. Patterns
+apply whenever credentials are protected (`mask_credentials` on, the
+default).
 
-Limits: at most 256 patterns, each at most 1024 bytes, none matching the
-empty string, and each and all together within a compiled-size limit. A
-pattern that is invalid or over a limit stops the agent at startup with
-the regex error, and a SIGHUP reload carrying one is refused (the running
-rules stay). A reload that changes `patterns` or `builtin` applies to
-every field protected after it; a message being scanned at that moment
-finishes with the previous rules.
+Limits: at most 256 patterns, each at most 1024 bytes, none able to match
+without consuming a character (`x*`, `\b`, `^`), and each and all
+together within a compiled-size limit. A pattern that is invalid or over
+a limit stops the agent at startup with the regex error, and a SIGHUP
+reload carrying one is refused (the running rules stay). A reload that
+changes `patterns` or `builtin` applies to every message whose scan starts
+after it; each message is protected under one rule set, so a message being
+scanned at that moment finishes with the previous rules.
 
 `builtin = "names_only"` keeps the cheap built-in rules: credential-named
 headers, the certain structures above (credential-named form parameters

@@ -43,6 +43,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 
 # PII detection (Phase 5)
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 fxhash = { version = "0.2", default-features = false }
 mimalloc = { version = "0.1", default-features = false }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }

@@ -1306,21 +1306,23 @@ machine), medians; the PII engine on the same machine, for scale:
 
 | Body | `builtin` | User patterns | Median | Throughput |
 |---|---|---|---|---|
-| clean | `full` | 0 | 12.3 µs | 313 MiB/s |
-| clean | `full` | 256 | 18.7 µs | 205 MiB/s |
-| clean | `names_only` | 0 | 11.9 µs | 323 MiB/s |
-| clean | `names_only` | 256 | 18.2 µs | 211 MiB/s |
-| context | `full` | 0 | 33.1 µs | 116 MiB/s |
-| context | `full` | 256 | 39.4 µs | 97 MiB/s |
-| context | `names_only` | 0 | 14.5 µs | 264 MiB/s |
-| context | `names_only` | 256 | 20.9 µs | 183 MiB/s |
+| clean | `full` | 0 | 13.3 µs | 290 MiB/s |
+| clean | `full` | 256 | 20.8 µs | 185 MiB/s |
+| clean | `names_only` | 0 | 12.1 µs | 319 MiB/s |
+| clean | `names_only` | 256 | 19.4 µs | 198 MiB/s |
+| context | `full` | 0 | 34.1 µs | 113 MiB/s |
+| context | `full` | 256 | 41.6 µs | 93 MiB/s |
+| context | `names_only` | 0 | 14.6 µs | 264 MiB/s |
+| context | `names_only` | 256 | 21.9 µs | 176 MiB/s |
 
 On clean text `full` costs what `names_only` does: one pass looks for any
 credential word and skips the word scan when there is none. With context
 `full` adds the word scan, the structure masking and the re-check of
-what is left (about 2.3× `names_only`). 256 patterns add about 6.5 µs
+what is left (about 2.3× `names_only`). 256 patterns add about 7.5 µs
 per message (one `RegexSet` pass per field, plus the decoded view when a
-field has escapes). Without the single-pass word check and the shortcut
+field has escapes). Every rule runs on the field as captured and the
+matches are replaced in one pass; that change cost 0 to 2 µs per message
+over the previous sequential replacement. Without the single-pass word check and the shortcut
 for plain field names, the same messages took 37.9 µs (clean) and
 77.8 µs (context) with `full` and no patterns.
 
