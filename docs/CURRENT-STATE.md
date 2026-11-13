@@ -120,9 +120,11 @@ production-hardened compliance platform.
     against ground truth: 100% recall from both client and server processes
     (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
     found. A workload's mapped file is first pinned without being opened
-    (`O_PATH`, resolved inside the workload's root where the kernel has
-    `openat2`), and that same file is opened for reading only if it is a
-    regular file; a mapping whose file was deleted is skipped. A FIFO or
+    (`O_PATH`, resolved inside the workload's own root with `openat2`; a
+    kernel without `openat2` gets no workload file opened, and every lab
+    kernel, RHEL 8.10 included, has it), and that same file is opened for
+    reading only if it is a regular file; a mapping whose file was deleted,
+    or whose process root the agent cannot use, is skipped. A FIFO or
     device put at a mapped path is refused without being opened, so it can
     neither hang the agent nor run a driver's open.
   - TLS exchanges carry their socket addresses and join the service graph:
