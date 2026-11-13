@@ -157,10 +157,11 @@ production-hardened compliance platform.
     parsed. MySQL statements prepared before the agent started are
     reported as `EXECUTE` without their SQL. PostgreSQL bound values are
     not exported on a connection the agent joined mid-stream or lost
-    server bytes on.
-  - HTTP/2 headers cannot be decoded when the agent joins a connection that
-    was already open (HPACK state is lost); while credential masking is on
-    its bodies are not exported either.
+    server bytes on, and a simple Query forgets every confirmed statement.
+  - HTTP/2 headers are not decoded on a connection whose start (the client
+    preface) the parser did not see: one already open when the agent
+    started, or one whose parser restarted after lost bytes; while
+    credential masking is on its bodies are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -184,14 +185,16 @@ production-hardened compliance platform.
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
     Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block (and, while masking
-    is on, HTTP/2 bodies on such a connection, e.g. one joined
-    mid-stream, until a new connection is observed from its start, and
-    bodies whose content type is repeated or over 256 bytes),
+    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    whose start the parser did not see (and, while masking is on, HTTP/2
+    bodies on such a connection until a new connection is observed from
+    its start, and bodies whose content type is repeated or over 256
+    bytes),
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their own
-    statement was confirmed with, and not at all on a connection joined
-    mid-stream or after lost server bytes;
+    statement was confirmed with (a simple Query forgets every
+    statement), and not at all on a connection joined mid-stream or after
+    lost server bytes;
     only known SQL keywords are exported as methods. `[credentials]
     patterns` adds the user's own formats (masked in every field, matching
     DNS answers dropped, counted in `panopticon_credential_matches_total`;

@@ -474,8 +474,8 @@ data. Known limits:
 - protobuf without its schema: field numbers, not names, so gRPC and
   protobuf body text is not exported at all while credentials are
   protected, nor is an HTTP/2 body whose content type is unknown (that
-  direction lost a header block, as on a connection the agent joined
-  mid-stream, or the content type is repeated or over 256 bytes);
+  direction lost a header block, the agent did not see the connection
+  start, or the content type is repeated or over 256 bytes);
 - packets forged or injected into a connection by someone who can do so,
   and state from before capture started that the parser cannot see.
 
@@ -540,16 +540,20 @@ What is exported then:
   body).
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
-  direction of a connection that lost a header block (joined mid-stream,
-  a block that failed to decode, was skipped or was over the size limit,
-  a final response block after an informational `1xx` one included), for
-  the rest of that connection; and for a stream whose header block
-  carries more than one content type or one over 256 bytes (only the
-  first 256 bytes of one content type are ever examined). A new
+  direction of a connection that lost a header block (a block that failed
+  to decode, was skipped or was over the size limit, a final response
+  block after an informational `1xx` one included), for the rest of that
+  connection; on both directions of a connection whose start (the client
+  preface) the parser did not see: joined mid-stream, or bytes lost
+  outside a DATA frame, which restarts the parser; and for a stream whose
+  header block carries more than one content type or one over 256 bytes
+  (only the first 256 bytes of one content type are ever examined). A new
   connection observed from its start exports bodies again.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
-  peer's, so no header of it is exported again on that connection.
+  peer's, so no header of it is exported again on that connection; on a
+  connection whose start the parser did not see, no header is decoded at
+  all.
 - **DNS answers** whose name has credential context, or matches one of
   your `[credentials]` patterns, are dropped before export and before the
   name can reach the service graph.
@@ -604,16 +608,18 @@ statement it names (the unnamed one included) was confirmed by its
 withheld; a `Bind` of another statement than the cycle's `Parse`, or of
 one the server rejected, exports no values. A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
-until confirmed. Several `Parse` messages may be sent before one `Sync`
+until confirmed. A simple Query forgets every confirmed statement and
+cancels unanswered `Parse` messages: its SQL may `PREPARE` or
+`DEALLOCATE` any name, and it ends the unnamed statement. Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
 unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
 cancels an unanswered `Parse` of it. If the agent ever cannot match the
 server's answers to the client's messages on a connection (it joined the
 connection mid-stream, server bytes were lost, an answer matches
-nothing), no `Parse` is confirmed for the rest of that connection, so its
-bound values are withheld until a new connection is observed from its
-start.
+nothing), no `Parse` is confirmed for the rest of that connection and no
+bound value is exported on it, not even for a statement confirmed before,
+until a new connection is observed from its start.
 
 #### Your own credential formats: `[credentials]`
 
@@ -644,8 +650,8 @@ field as captured, before PII redaction rewrites it, and their matches are
 replaced together in one pass: the order of your patterns does not matter,
 and no pattern hides another's match or a credential name from the
 built-in rules. Captured text is matched whatever it reads like, a
-literal `<REDACTED>` included. A field with more than 1024 matches is
-withheld. Patterns
+literal `<REDACTED>` included, in a header value as in any field. A
+field with more than 1024 matches is withheld. Patterns
 apply whenever credentials are protected (`mask_credentials` on, the
 default).
 
