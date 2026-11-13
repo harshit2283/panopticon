@@ -482,8 +482,18 @@ impl Http2Parser {
         msg.request_size_bytes = stream.request_size;
         msg.response_size_bytes = stream.response_size;
         msg.latency_ns = stream.request_ts.map(|t| ts.saturating_sub(t));
+        // Protobuf without its schema carries field numbers, not names: a
+        // password field cannot be told from any other string, so its text
+        // is not exported while credentials are protected.
+        let protobuf = self.is_grpc
+            || msg
+                .content_type
+                .as_deref()
+                .is_some_and(|c| c.contains("grpc") || c.contains("protobuf"));
         let text = |body: &[u8]| {
-            if self.is_grpc {
+            if protobuf && super::mask_credentials_enabled() {
+                None
+            } else if self.is_grpc {
                 grpc_text(body)
             } else {
                 body_text(body)
@@ -1067,8 +1077,11 @@ mod tests {
             (msgs[0].path.as_deref(), msgs[0].status),
             (Some("/pkg.Svc/Ok"), Some(0))
         );
-        assert_eq!(msgs[0].request_text.as_deref(), Some("bob@x.y"));
-        assert_eq!(msgs[0].payload_text.as_deref(), None); // "yes" is < 4 chars
+        // Codex round 4: schema-less protobuf text has no field names, so a
+        // password field is indistinguishable from any other string. With
+        // credential masking on (the default) it is not exported.
+        assert_eq!(msgs[0].request_text.as_deref(), None);
+        assert_eq!(msgs[0].payload_text.as_deref(), None);
         assert_eq!(
             (msgs[1].path.as_deref(), msgs[1].status),
             (Some("/pkg.Svc/Missing"), Some(5))
@@ -1258,6 +1271,13 @@ mod tests {
         assert_eq!(ProtocolParser::protocol(&p), Protocol::Http2);
         assert_eq!(p.state_name(), "preface");
         assert_eq!(ProtocolParser::protocol_version(&p), Some("2"));
+    }
+
+    #[test]
+    fn test_grpc_text_extracts_strings() {
+        let mut msg = vec![0u8, 0, 0, 0, 9, 0x0a, 7];
+        msg.extend_from_slice(b"bob@x.y");
+        assert_eq!(grpc_text(&msg).as_deref(), Some("bob@x.y"));
     }
 
     #[test]
