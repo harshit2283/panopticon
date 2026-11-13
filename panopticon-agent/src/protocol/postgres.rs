@@ -6,6 +6,7 @@
 //! StartupMessage has no type byte (length + protocol version instead).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
@@ -49,7 +50,8 @@ pub struct PostgresParser {
     /// what ORMs and drivers do after preparing) be attributed to its query.
     /// A name being re-Parsed or Closed is removed at once: until the server
     /// confirms, its SQL is unknown and a Bind of it exports no values.
-    prepared: HashMap<String, String>,
+    /// The SQL is shared (not copied) with the Parses and Binds below.
+    prepared: HashMap<String, Arc<str>>,
     /// What the server still has to answer, in the order the client sent
     /// it: each Parse (several may come before one Sync) and each Sync or
     /// simple Query, whose answer is a ReadyForQuery. Read from the client
@@ -69,7 +71,8 @@ pub struct PostgresParser {
     /// the SQL the event shows.
     bind_params: Option<(BindSql, String)>,
     /// The SQL of each Bind read from the client but not consumed yet, in
-    /// order.
+    /// order. At most MAX_PENDING: past that, no Bind of the connection
+    /// exports values (`lose_parses`).
     binds: VecDeque<BindSql>,
     /// Id of the next Parse read.
     next_parse: u64,
@@ -135,7 +138,7 @@ enum Pending {
     /// A Parse: its id, name ("" for the unnamed statement) and SQL,
     /// entered into `prepared` by its ParseComplete; the SQL is None when a
     /// later Close of the name or a simple Query cancelled it.
-    Parse(u64, String, Option<String>),
+    Parse(u64, String, Option<Arc<str>>),
     /// A Sync or a simple Query: answered by a ReadyForQuery.
     Sync,
 }
@@ -145,7 +148,7 @@ enum Pending {
 /// SQL of the latest Parse of that name before it, which must then be
 /// confirmed (`awaits`, its id) before the values are exported.
 struct BindSql {
-    sql: Option<String>,
+    sql: Option<Arc<str>>,
     awaits: Option<u64>,
 }
 
@@ -440,7 +443,7 @@ impl PostgresParser {
                     self.prepared.remove(&name);
                     let sql = extract_second_string(payload);
                     self.next_parse += 1;
-                    Pending::Parse(self.next_parse, name, Some(sql))
+                    Pending::Parse(self.next_parse, name, Some(sql.into()))
                 }
                 b'B' => {
                     // The SQL this Bind runs: the latest Parse of its name
@@ -460,7 +463,15 @@ impl PostgresParser {
                             awaits: None,
                         },
                     };
-                    self.binds.push_back(bind);
+                    if self.binds.len() == MAX_PENDING {
+                        // As lose_parses (data still borrows client_buf).
+                        self.parses_lost = true;
+                        self.pending.clear();
+                        self.binds.clear();
+                    }
+                    if !self.parses_lost {
+                        self.binds.push_back(bind);
+                    }
                     continue;
                 }
                 b'S' => Pending::Sync,
@@ -494,6 +505,7 @@ impl PostgresParser {
                 // As lose_parses (data still borrows client_buf).
                 self.parses_lost = true;
                 self.pending.clear();
+                self.binds.clear();
             }
             if !self.parses_lost {
                 self.pending.push_back(entry);
@@ -502,11 +514,12 @@ impl PostgresParser {
         self.scanned = at;
     }
 
-    /// The answers' order is no longer known: no Parse is committed for
-    /// the rest of the connection.
+    /// The answers' order is no longer known: no Parse is committed and no
+    /// bound value exported for the rest of the connection.
     fn lose_parses(&mut self) {
         self.parses_lost = true;
         self.pending.clear();
+        self.binds.clear();
     }
 
     fn handle_ready(&mut self, ts: u64) -> bool {
@@ -539,7 +552,7 @@ impl PostgresParser {
                 let statement = extract_second_string(&payload);
                 let bind = self.bound(&payload);
                 if let Some(query) = self.prepared.get(&statement) {
-                    self.query_text = Some(query.clone());
+                    self.query_text = Some(query.to_string());
                     self.query_ts = Some(ts);
                     self.bind_params = bind;
                     self.state = State::InExtendedQuery;
@@ -676,8 +689,8 @@ impl PostgresParser {
             (!self.parses_lost
                 && bind.awaits.is_none()
                 && bind.sql.is_some()
-                && bind.sql == self.query_text)
-                .then_some(values)
+                && bind.sql.as_deref() == self.query_text.as_deref())
+            .then_some(values)
         });
         self.statement_withheld = false;
         match self.query_text.take() {
@@ -1012,6 +1025,34 @@ mod tests {
             msgs[0].payload_text.as_deref(),
             Some("UPDATE <statement withheld>")
         );
+    }
+
+    /// Codex R8 #2: Binds the server has not answered are retained one
+    /// record each; a client pipelining Binds of a large statement must not
+    /// grow memory without bound (records capped, SQL shared, not copied).
+    #[test]
+    fn test_unanswered_binds_stay_bounded() {
+        let mut p = setup_ready_parser();
+        let sql = format!("SELECT {}", "x".repeat(4096));
+        p.feed(
+            &extended_cycle(Some(("s1", &sql)), "s1", &[]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        // Cycles the server has not answered, then Binds behind them.
+        let mut flood = parse_bind("t", "SELECT 1");
+        flood.extend(parse_bind("u", "SELECT 2"));
+        for _ in 0..2 * MAX_PENDING {
+            flood.extend(make_bind("s1", &[]));
+        }
+        p.feed(&flood, Direction::Egress, 3);
+        assert!(p.binds.len() <= MAX_PENDING, "{} binds", p.binds.len());
+        let copies = p.binds.iter().filter_map(|b| b.sql.as_ref()).count();
+        let shared = p.prepared.get("s1").map_or(0, |s| Arc::strong_count(s) - 1);
+        assert!(copies <= shared, "{copies} SQL copies, {shared} shared");
+        // Past the cap the connection exports no bound values.
+        assert!(p.parses_lost);
     }
 
     #[test]
