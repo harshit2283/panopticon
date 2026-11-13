@@ -295,24 +295,40 @@ impl RedisParser {
             .as_deref()
             .is_some_and(|k| SUBSCRIBE_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(k)));
         let push = matches!(value, RespValue::Push(_));
-        if ack && let Some(count) = subscription_count(&value) {
-            // The server's own count of this connection's subscriptions.
-            self.subscribed = count > 0;
-        }
+        let published = kind
+            .as_deref()
+            .is_some_and(|k| matches!(k, "message" | "pmessage" | "smessage"));
         if let Some(Pending {
+            parts,
             expect: Expect::Subscription(left),
             ..
         }) = self.pending_queue.front_mut()
-            && ack
             && (push || !self.resp3)
         {
-            *left -= 1;
-            if *left > 0 {
-                return None;
+            // Only the pending command's own acknowledgement counts: an
+            // ordinary array of the same shape (a script's result) must not
+            // change subscription state.
+            if kind.as_deref() == Some(parts[0].to_ascii_lowercase().as_str()) {
+                if let Some(count) = subscription_count(&value) {
+                    // The server's own count of this connection's subscriptions.
+                    self.subscribed = count > 0;
+                }
+                *left -= 1;
+                if *left > 0 {
+                    return None;
+                }
+            } else if push || (self.subscribed && published) {
+                return None; // out-of-band, before the acknowledgement
+            } else {
+                // Not what the subscription command gets: ambiguous.
+                self.lose_correspondence();
             }
         } else if push {
             // Out-of-band (published message, invalidation, server-side
             // unsubscribe): answers no command.
+            if ack && let Some(count) = subscription_count(&value) {
+                self.subscribed = count > 0;
+            }
             return None;
         } else if self.subscribed
             && !self.resp3
@@ -1266,6 +1282,21 @@ mod tests {
                     &["GET", "j"],
                 ][..],
                 &b"-ERR syntax error\r\n$8\r\ns3cretpw\r\n$1\r\nv\r\n$1\r\nw\r\n"[..],
+            ),
+            (
+                // Codex round 4: a script's array shaped like an ack.
+                "EVAL returning {'subscribe','x',1}",
+                &[
+                    &["EVAL", "return {'subscribe','x',1}", "0"][..],
+                    &["ACL", "GENPASS"],
+                    &["GET", "k"],
+                ][..],
+                &b"*3\r\n$9\r\nsubscribe\r\n$1\r\nx\r\n:1\r\n$8\r\ns3cretpw\r\n$1\r\nv\r\n"[..],
+            ),
+            (
+                "a reply to SUBSCRIBE that is not its acknowledgement",
+                &[&["SUBSCRIBE", "a"][..], &["ACL", "GENPASS"], &["GET", "k"]][..],
+                &b"*3\r\n$7\r\nmessage\r\n$1\r\na\r\n:1\r\n$8\r\ns3cretpw\r\n$1\r\nv\r\n"[..],
             ),
         ] {
             let mut parser = RedisParser::new();
