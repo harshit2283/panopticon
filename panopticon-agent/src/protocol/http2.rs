@@ -140,6 +140,9 @@ pub struct Http2Parser {
     /// the connection preface when seen; defaults to Egress.
     client_dir: Direction,
     preface_seen: bool,
+    /// The client preface was this parser's first input: it saw the
+    /// connection from its start.
+    from_start: bool,
     streams: HashMap<u32, StreamState>,
     next_seq: u64,
     is_grpc: bool,
@@ -153,6 +156,7 @@ impl Http2Parser {
             server: Side::new(),
             client_dir: Direction::Egress,
             preface_seen: false,
+            from_start: false,
             streams: HashMap::new(),
             next_seq: 0,
             is_grpc,
@@ -707,11 +711,19 @@ impl ProtocolParser for Http2Parser {
             // capture direction says (TLS uprobes report process-relative
             // directions, which are inverted on servers).
             if data.starts_with(HTTP2_PREFACE) {
+                // The connection's first bytes: its start is proved, and
+                // nothing was lost before them.
                 self.client_dir = direction;
                 self.preface_seen = true;
+                self.from_start = true;
+                self.client.headers_lost = false;
+                self.server.headers_lost = false;
                 data = &data[HTTP2_PREFACE.len()..];
             } else if !data.is_empty() {
-                self.preface_seen = true; // joined mid-connection
+                // Joined mid-connection: header blocks and bodies before
+                // these bytes were never seen.
+                self.preface_seen = true;
+                self.joined_late();
             }
         }
         let from_client = self.is_client(direction);
@@ -755,6 +767,19 @@ impl ProtocolParser for Http2Parser {
     fn protocol_version(&self) -> Option<&str> {
         Some("2")
     }
+
+    /// Unless this parser saw the connection start (the client preface as
+    /// its first bytes), its header state is unknown: both sides count as
+    /// having lost a header block, so no header is decoded and bodies are
+    /// withheld while credentials are masked, for the rest of the
+    /// connection. A gap this parser accounted for (inside a DATA frame)
+    /// changes nothing.
+    fn joined_late(&mut self) {
+        if !self.from_start {
+            self.client.headers_lost = true;
+            self.server.headers_lost = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -764,6 +789,55 @@ mod tests {
     thread_local! {
         /// Content-type bytes scanned by `contains` on this thread.
         pub static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Codex R6 N4: bytes lost inside a HEADERS frame replace the parser;
+    /// the replacement (and any parser that did not see the connection
+    /// start with the client preface) treats its headers and bodies as
+    /// unknown for the rest of the connection.
+    #[test]
+    fn test_replacement_parser_keeps_bodies_withheld() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Http2);
+        let mut req = preface();
+        let mut ce = hpack::Encoder::new();
+        let headers = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            1,
+            &encode(&mut ce, &[(":method", "POST"), (":path", "/a")]),
+        );
+        req.extend_from_slice(&headers[..headers.len() - 3]); // cut inside HEADERS
+        m.process_packet(1, Direction::Egress, &req, 1);
+        assert!(m.skip_from(1, (0, 0), Direction::Egress, 3, 2).is_none());
+        // A new stream: static-table headers only, then a body.
+        let mut req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 3, &[0x83, 0x84]);
+        req.extend(make_frame(
+            FRAME_DATA,
+            FLAG_END_STREAM,
+            3,
+            b"\x0a\x0cs7Kf2v9LmQ8z",
+        ));
+        m.process_packet(1, Direction::Egress, &req, 3);
+        let status = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &[0x88],
+        );
+        let out = match m.process_packet(1, Direction::Ingress, &status, 4) {
+            Some(FsmResult::MessageComplete(msg)) => vec![msg],
+            Some(FsmResult::Messages(ms)) => ms,
+            _ => vec![],
+        };
+        let dump = format!("{out:?}");
+        assert!(!dump.contains("s7Kf"), "{dump}");
+        // Same for a parser that joined mid-connection without a gap.
+        let mut p = Http2Parser::new(false);
+        p.feed(&req, Direction::Egress, 1);
+        let out = format!("{:?}", messages(p.feed(&status, Direction::Ingress, 2)));
+        assert!(!out.contains("s7Kf"), "{out}");
     }
 
     /// Codex R5 H1: a 60,000-byte content-type indexed again and again
@@ -1381,8 +1455,7 @@ mod tests {
     /// Joined mid-connection: the client's header block indexes table
     /// entries the agent never saw, so the request's content-type is
     /// unknown and its body (here protobuf that is valid UTF-8) is
-    /// withheld while credentials are masked. The response side, decoded,
-    /// keeps its body.
+    /// withheld while credentials are masked, as is the response's.
     #[test]
     fn test_body_under_undecodable_headers_is_withheld() {
         let mut p = Http2Parser::new(false);
@@ -1407,7 +1480,9 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(super::super::mask_credentials_enabled());
         assert_eq!(out[0].request_text, None, "{:?}", out[0]);
-        assert_eq!(out[0].payload_text.as_deref(), Some("plain reply"));
+        // Joined mid-connection (no preface): the response side's history
+        // is unknown too (R6 N4), so its body is withheld as well.
+        assert_eq!(out[0].payload_text, None);
     }
 
     /// Codex round 5 #8: gRPC is recognised from a content-type the header
