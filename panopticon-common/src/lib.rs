@@ -104,6 +104,20 @@ pub enum EventType {
     TlsNew = 9,
 }
 
+/// `TLS_NEW_CALL` mark of a thread inside `SSL_new`: no TLS read or write
+/// ran yet.
+pub const TLS_NEW_CLEAN: u32 = 0;
+/// A TLS read or write ran on the thread inside `SSL_new` (a creation
+/// callback): data of the new object may precede its return.
+pub const TLS_NEW_IO: u32 = 1;
+
+/// Whether the return of `SSL_new` sends `TlsNew`, from the thread's mark
+/// (None: its entry was not seen). Only a call seen whole, with no TLS read
+/// or write inside it, proves that no data of the new object came before.
+pub const fn tls_new_starts_connection(mark: Option<u32>) -> bool {
+    matches!(mark, Some(TLS_NEW_CLEAN))
+}
+
 impl EventType {
     pub const fn from_u32(v: u32) -> Option<Self> {
         match v {
@@ -655,6 +669,13 @@ mod tests {
         assert_eq!(EventType::UdpSend as u32, 7);
         assert_eq!(EventType::UdpRecv as u32, 8);
         assert_eq!(EventType::TlsNew as u32, 9);
+    }
+
+    #[test]
+    fn tls_new_needs_a_clean_call_seen_whole() {
+        assert!(tls_new_starts_connection(Some(TLS_NEW_CLEAN)));
+        assert!(!tls_new_starts_connection(Some(TLS_NEW_IO)));
+        assert!(!tls_new_starts_connection(None));
     }
 
     #[test]

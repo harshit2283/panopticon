@@ -92,10 +92,14 @@ pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i
     n
 }
 
-/// Stand-in for OpenSSL's `SSL_new(ctx)`: returns the object address.
+/// Stand-in for OpenSSL's `SSL_new(ctx)`: returns the object address,
+/// after writing on it first when `io` is set (a creation callback).
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn panop_test_ssl_new(obj: u64) -> u64 {
+pub extern "C" fn panop_test_ssl_new(obj: u64, io: u64) -> u64 {
+    if std::hint::black_box(io) != 0 {
+        panop_test_ssl_write(obj, b"in-new".as_ptr(), 6);
+    }
     std::hint::black_box(obj)
 }
 
@@ -2093,30 +2097,65 @@ fn scope_programs_load_attach_and_hold() {
         "control: read carries its own address"
     );
     // SSL_new's return sends a header-only TlsNew keyed like the returned
-    // object's data; a NULL return sends nothing.
+    // object's data; a NULL return sends nothing, nor does a call in which
+    // a TLS write ran (a creation callback), nor one whose entry was not
+    // seen.
     {
-        let p: &mut aya::programs::UProbe =
-            ebpf.program_mut("ssl_new_ret").unwrap().try_into().unwrap();
-        let link = p
-            .attach("panop_test_ssl_new", "/proc/self/exe", Some(me))
-            .expect("ssl_new_ret attaches");
-        let new = std::hint::black_box(panop_test_ssl_new as extern "C" fn(u64) -> u64);
-        assert_eq!(new(0), 0);
-        assert_eq!(new(ssl), ssl);
-        let mut seen = Vec::new();
-        while let Some(item) = ring.next() {
-            // SAFETY: all-zero is a valid DataEvent.
-            let mut r: DataEvent = unsafe { std::mem::zeroed() };
-            if read_data_event_into(&item, &mut r) && r.event_type == EventType::TlsNew {
-                seen.push((r.socket_cookie, r.pid, r.payload_len, item.len()));
+        let new = std::hint::black_box(panop_test_ssl_new as extern "C" fn(u64, u64) -> u64);
+        let records = |ring: &mut RingBuf<MapData>| {
+            let mut seen = Vec::new();
+            while let Some(item) = ring.next() {
+                // SAFETY: all-zero is a valid DataEvent.
+                let mut r: DataEvent = unsafe { std::mem::zeroed() };
+                if read_data_event_into(&item, &mut r) {
+                    seen.push((r.event_type, r.socket_cookie, r.payload_len, item.len()));
+                }
+            }
+            seen
+        };
+        let mut links = Vec::new();
+        for prog in ["ssl_new_ret", "ssl_new_entry"] {
+            let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+            let link = p
+                .attach("panop_test_ssl_new", "/proc/self/exe", Some(me))
+                .unwrap_or_else(|e| panic!("{prog} attaches: {e}"));
+            links.push((prog, link));
+            if prog == "ssl_new_ret" {
+                // Return probe only: the entry was not seen.
+                assert_eq!(new(ssl, 0), ssl);
+                assert_eq!(records(&mut ring), vec![], "unseen entry: no TlsNew");
             }
         }
+        let header = panopticon_common::DATA_EVENT_HEADER_LEN;
+        assert_eq!(new(0, 0), 0);
+        assert_eq!(new(ssl, 0), ssl);
         assert_eq!(
-            seen,
-            vec![(ssl, e.pid, 0, panopticon_common::DATA_EVENT_HEADER_LEN)],
+            records(&mut ring),
+            vec![(EventType::TlsNew, ssl, 0, header)],
             "SSL_new: one header-only TlsNew for the returned object"
         );
-        p.detach(link).unwrap();
+        assert_eq!(new(ssl, 1), ssl);
+        let seen = records(&mut ring);
+        assert!(
+            seen.iter()
+                .any(|r| (r.0, r.1, r.2) == (EventType::TlsData, ssl, 6)),
+            "the write inside SSL_new is captured: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.0 == EventType::TlsNew),
+            "I/O inside SSL_new: no TlsNew: {seen:?}"
+        );
+        assert_eq!(new(ssl, 0), ssl);
+        assert_eq!(
+            records(&mut ring),
+            vec![(EventType::TlsNew, ssl, 0, header)],
+            "the mark is cleared at the return"
+        );
+        SLOT_STATE.store(0, SeqCst);
+        for (prog, link) in links {
+            let p: &mut aya::programs::UProbe = ebpf.program_mut(prog).unwrap().try_into().unwrap();
+            p.detach(link).unwrap();
+        }
     }
     println!("TLS_BORN OK");
     for (index, what) in stops {

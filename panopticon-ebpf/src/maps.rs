@@ -438,6 +438,13 @@ pub const TLS_CALL_POISONED: u32 = 2;
 #[map]
 pub static TLS_CALL: HashMap<u64, TlsCall> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
+/// Threads inside `SSL_new` (tls_probes.rs `ssl_new_entry`): pid_tgid ->
+/// `TLS_NEW_CLEAN`, or `TLS_NEW_IO` once a TLS read or write ran inside
+/// the call. Removed at its return. LRU: a thread that dies inside the
+/// call leaves an entry the map reclaims; an evicted entry only withholds.
+#[map]
+pub static TLS_NEW_CALL: LruHashMap<u64, u32> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
+
 /// Addresses of each TLS connection, learned on its first socket I/O.
 /// Unscoped modes only; restricted modes use per-call TLS_CALL slots.
 ///
