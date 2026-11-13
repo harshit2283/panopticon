@@ -261,6 +261,11 @@ pub struct AgentConfig {
     /// `[privacy] mask_credentials` (default true): mask login secrets in
     /// every export. false is only accepted in `full` with PII redaction off.
     pub mask_credentials: bool,
+    /// `[credentials] patterns`: the user's own credential formats (Rust
+    /// `regex` syntax), validated at load: every match is masked.
+    pub credential_patterns: Vec<String>,
+    /// `[credentials] builtin`: `full` (default) or `names_only`.
+    pub credential_builtin: crate::protocol::Builtin,
 
     // ── PII detection ─────────────────────────────
     /// PII detection pipeline configuration.
@@ -349,6 +354,8 @@ impl Default for AgentConfig {
             privacy_mode: PrivacyMode::Redacted,
             pii_redact_setting: None,
             mask_credentials: true,
+            credential_patterns: Vec::new(),
+            credential_builtin: crate::protocol::Builtin::Full,
 
             pii: PiiConfig::default(),
             pii_external_url_allowlist: vec![],
@@ -535,6 +542,7 @@ pub struct AgentConfigFile {
     pub tls_scan_enabled: Option<bool>,
     pub tls_scan_interval_secs: Option<u64>,
     pub privacy: Option<PrivacyConfigFile>,
+    pub credentials: Option<CredentialsConfigFile>,
     pub pii: Option<PiiConfigFile>,
     pub pii_external_url_allowlist: Option<Vec<String>>,
     pub graph: Option<GraphConfigFile>,
@@ -558,6 +566,16 @@ pub struct PrivacyConfigFile {
     pub mode: Option<PrivacyMode>,
     /// Mask login secrets in exports (default true). Only `full` may set false.
     pub mask_credentials: Option<bool>,
+}
+
+/// `[credentials]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CredentialsConfigFile {
+    /// Credential formats to mask wherever they appear (Rust `regex`).
+    pub patterns: Option<Vec<String>>,
+    /// `"full"` (default) or `"names_only"`.
+    pub builtin: Option<String>,
 }
 
 /// TOML-friendly PII config subset.
@@ -822,6 +840,20 @@ impl AgentConfigFile {
                 base.mask_credentials = mask;
             }
         }
+        if let Some(credentials) = self.credentials {
+            if let Some(patterns) = credentials.patterns {
+                base.credential_patterns = patterns;
+            }
+            if let Some(builtin) = credentials.builtin {
+                base.credential_builtin =
+                    crate::protocol::Builtin::parse(&builtin).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[credentials] builtin = \"{builtin}\" is not valid; use \"full\" \
+                             or \"names_only\""
+                        )
+                    })?;
+            }
+        }
         if let Some(pii) = self.pii {
             if pii.redact.is_some() {
                 base.pii_redact_setting = pii.redact;
@@ -950,7 +982,18 @@ pub fn load_config_from_str(content: &str) -> anyhow::Result<AgentConfig> {
     Ok(config)
 }
 
+/// The compiled `[credentials]` rules of `config`; an invalid or oversized
+/// pattern is an error (a reload carrying one is refused).
+pub fn credential_rules(config: &AgentConfig) -> anyhow::Result<crate::protocol::CredentialRules> {
+    crate::protocol::CredentialRules::compile(
+        &config.credential_patterns,
+        config.credential_builtin,
+    )
+    .map_err(|e| anyhow::anyhow!("[credentials] patterns: {e}"))
+}
+
 fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
+    credential_rules(config)?;
     if config.max_worker_count == 0 {
         return Err(anyhow::anyhow!("max_worker_count must be >= 1"));
     }
@@ -1817,6 +1860,41 @@ mod tests {
         assert!(off(PrivacyMode::Full, Some(true)).is_err());
         assert!(off(PrivacyMode::Redacted, None).is_err());
         assert!(off(PrivacyMode::MetricsOnly, None).is_err());
+    }
+
+    /// `[credentials]` parses; an invalid or oversized pattern, or an
+    /// unknown builtin level, refuses the config (a SIGHUP reload of it is
+    /// refused the same way: reload goes through `load_config`).
+    #[test]
+    fn test_credentials_section() {
+        let config = load_config_from_str(
+            "[credentials]\npatterns = [\"(?i)acme_[a-z0-9]{32}\", \"AKIA[0-9A-Z]{16}\"]\n\
+             builtin = \"names_only\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.credential_patterns.len(), 2);
+        assert_eq!(
+            config.credential_builtin,
+            crate::protocol::Builtin::NamesOnly
+        );
+        assert!(credential_rules(&config).is_ok());
+        assert_eq!(
+            load_config_from_str("").unwrap().credential_builtin,
+            crate::protocol::Builtin::Full
+        );
+        for (bad, why) in [
+            ("[credentials]\npatterns = [\"acme_[a-z\"]\n", "pattern 0"),
+            ("[credentials]\npatterns = [\"x*\"]\n", "empty string"),
+            (
+                "[credentials]\npatterns = [\"\\\\w{1000}{1000}\"]\n",
+                "pattern 0",
+            ),
+            ("[credentials]\nbuiltin = \"some\"\n", "names_only"),
+            ("[credentials]\npattern = [\"x\"]\n", "unknown field"),
+        ] {
+            let err = load_config_from_str(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]

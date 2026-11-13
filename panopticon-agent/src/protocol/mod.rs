@@ -7,6 +7,7 @@
 //! Parsers handle Keep-Alive reset internally (no separate reset method).
 
 pub mod amqp;
+mod credential_rules;
 pub mod detect;
 pub mod dns;
 pub mod fsm;
@@ -139,6 +140,11 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
+// Installed by main's (Linux-only) startup and reload.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub use credential_rules::{
+    Builtin, CredentialRules, count_builtin, credential_matches, set_credential_rules,
+};
 pub use secrets::{
     FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
     sql_verb, withheld_statement,
@@ -169,6 +175,7 @@ pub fn export_statement(
     bound: Option<String>,
 ) -> (Option<String>, String, Option<String>, bool) {
     if mask_credentials_enabled() && secrets::has_sql_credential_context(&query) {
+        count_builtin();
         let shown = withheld_statement(&query);
         zeroize::Zeroize::zeroize(&mut query);
         if let Some(mut b) = bound {

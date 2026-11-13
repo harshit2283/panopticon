@@ -262,6 +262,12 @@ async fn main() -> Result<()> {
         // After every override: nothing may contradict the privacy mode.
         config::apply_privacy(&mut agent_config)?;
         protocol::set_mask_credentials(agent_config.mask_credentials);
+        protocol::set_credential_rules(config::credential_rules(&agent_config)?);
+        info!(
+            patterns = agent_config.credential_patterns.len(),
+            builtin = ?agent_config.credential_builtin,
+            "Credential rules"
+        );
         if !agent_config.mask_credentials {
             eprintln!(
                 "panopticon: WARNING: [privacy] mask_credentials = false: login secrets are exported unmasked"
@@ -629,6 +635,15 @@ async fn main() -> Result<()> {
                                     to = %requested,
                                     "Privacy mode tightened at runtime"
                                 );
+                            }
+                            // Validated at load; fields protected from here on
+                            // use the new rules (a message already being
+                            // scanned finishes with the old ones).
+                            match config::credential_rules(&new_config) {
+                                Ok(rules) => protocol::set_credential_rules(rules),
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Credential rules not reloaded")
+                                }
                             }
                             info!(path = %path, "Config reloaded via SIGHUP");
                             config_swap.store(Arc::new(new_config));

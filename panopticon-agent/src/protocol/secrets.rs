@@ -32,6 +32,7 @@
 //! removed is checked again; any context left withholds the whole field.
 
 use super::REDACTED_CREDENTIAL;
+use super::credential_rules::{Builtin, CredentialRules, count_builtin, count_user};
 
 /// What a field with credential context that cannot be masked with
 /// certainty is replaced with. Holds no word that is credential context.
@@ -81,7 +82,31 @@ const NAMES: &[&str] = &[
 ];
 
 fn strong_word(w: &str) -> bool {
-    PARTS.iter().any(|p| w.contains(p)) || w.ends_with("_pass") || w.ends_with("_auth")
+    PARTS.iter().any(|p| p.len() <= w.len() && w.contains(p))
+        || w.ends_with("_pass")
+        || w.ends_with("_auth")
+}
+
+/// Substrings at least one of which every word of [`PARTS`] and [`NAMES`],
+/// the `_pass` / `_auth` endings and `identified` contains: text holding
+/// none of them (lowercase) has no word-based context.
+const HINTS: &[&str] = &[
+    "pass", "pwd", "secret", "token", "key", "auth", "cred", "sig", "sess", "sid", "cookie", "jwt",
+    "csrf", "xsrf", "bearer", "assert", "master", "otp", "pin", "identif",
+];
+
+/// [`HINTS`] as one alternation: a single literal-prefilter pass over the
+/// text instead of one search per hint.
+static HINT_SEARCH: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(&HINTS.join("|")).expect("HINTS are literals"));
+
+fn has_hint(lower: &str) -> bool {
+    HINT_SEARCH.is_match(lower)
+}
+
+/// Characters a decoding step of the normalised view acts on.
+fn may_decode(raw: &str) -> bool {
+    raw.contains(['%', '+', '\\', '&', '\0'])
 }
 
 /// Whether a parameter, field, header or config name names a secret
@@ -106,6 +131,9 @@ pub fn has_sql_credential_context(sql: &str) -> bool {
 fn context(text: &str, sql: bool) -> bool {
     let n = normalize(text);
     let b = n.as_bytes();
+    if !has_hint(&n) {
+        return has_userinfo(b);
+    }
     let mut prev_identified = false;
     for (w, start, end) in words(&n) {
         if prev_identified && matches!(w, "by" | "with" | "via" | "as" | "using") {
@@ -125,6 +153,56 @@ fn context(text: &str, sql: bool) -> bool {
 /// `text` with credential values masked where certain, or the field
 /// withheld; None when it has no credential context or nothing changes.
 pub fn protect_text(text: &str) -> Option<String> {
+    protect_text_with(&super::credential_rules::credential_rules(), text)
+}
+
+/// [`protect_text`] under `rules`: the user's patterns first, then the
+/// built-in rules at their configured level.
+pub(super) fn protect_text_with(rules: &CredentialRules, text: &str) -> Option<String> {
+    let user = rules.user.as_ref().and_then(|u| user_patterns(u, text));
+    if user.as_deref() == Some(FIELD_WITHHELD) {
+        return user;
+    }
+    let current = user.as_deref().unwrap_or(text);
+    let builtin = match rules.builtin {
+        Builtin::Full => builtin_full(current),
+        Builtin::NamesOnly => builtin_names_only(current),
+    };
+    if builtin.is_some() {
+        count_builtin();
+    }
+    builtin.or(user)
+}
+
+/// The user's patterns on the raw text (each match replaced by
+/// `<REDACTED>`), then on its decoded view (escapes, entities and
+/// percent-encoding decoded, not case-folded): a match there cannot be
+/// placed in the raw text, so the field is withheld.
+fn user_patterns((set, each): &(regex::RegexSet, Vec<regex::Regex>), text: &str) -> Option<String> {
+    let mut out: Option<String> = None;
+    if set.is_match(text) {
+        let mut s = text.to_string();
+        for i in set.matches(text).iter() {
+            let n = each[i].find_iter(&s).count();
+            if n > 0 {
+                count_user(n as u64);
+                s = each[i].replace_all(&s, REDACTED_CREDENTIAL).into_owned();
+            }
+        }
+        out = Some(s);
+    }
+    if let Some(decoded) = decode(out.as_deref().unwrap_or(text))
+        && set.is_match(&decoded)
+    {
+        count_user(1);
+        return Some(FIELD_WITHHELD.to_string());
+    }
+    out.filter(|s| s != text)
+}
+
+/// Every built-in rule: credential values masked where certain, the field
+/// withheld when any context is left.
+fn builtin_full(text: &str) -> Option<String> {
     if !has_credential_context(text) {
         return None;
     }
@@ -135,6 +213,18 @@ pub fn protect_text(text: &str) -> Option<String> {
     } else {
         replace_spans(text, &mask)
     };
+    (out != text).then_some(out)
+}
+
+/// `builtin = "names_only"`: only the values of the certain structures
+/// (credential-named form parameters and JSON members, URI userinfo) are
+/// masked; no free-text context is looked for.
+fn builtin_names_only(text: &str) -> Option<String> {
+    let (mask, _) = certain_clauses(text);
+    if mask.is_empty() {
+        return None;
+    }
+    let out = replace_spans(text, &mask);
     (out != text).then_some(out)
 }
 
@@ -250,24 +340,7 @@ pub fn sql_verb(sql: &str) -> Option<&'static str> {
 // ── Normalised view ─────────────────────────────────────────────────────
 
 fn normalize(text: &str) -> String {
-    let mut s = text.to_string();
-    for _ in 0..3 {
-        let mut changed = false;
-        if s.contains('\0') {
-            s.retain(|c| c != '\0');
-            changed = true;
-        }
-        for decode in [json_unescape, html_unescape, percent_decode] {
-            if let Some(d) = decode(&s) {
-                s = d;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    s.retain(|c| c != '\0');
+    let mut s = decode(text).unwrap_or_else(|| text.to_string());
     s.make_ascii_lowercase();
     for delim in ["/*!", "/*", "*/", "--", "#"] {
         if s.contains(delim) {
@@ -276,6 +349,36 @@ fn normalize(text: &str) -> String {
     }
     if s.contains(['-', '.']) {
         s = s.replace(['-', '.'], "_");
+    }
+    s
+}
+
+/// The decoded view: NUL bytes dropped, then up to three rounds of JSON
+/// escapes, HTML references and percent-decoding. None when nothing
+/// changes.
+fn decode(text: &str) -> Option<String> {
+    let mut s: Option<String> = None;
+    for _ in 0..3 {
+        let mut changed = false;
+        let cur = s.as_deref().unwrap_or(text);
+        if cur.contains('\0') {
+            let mut d = cur.to_string();
+            d.retain(|c| c != '\0');
+            s = Some(d);
+            changed = true;
+        }
+        for step in [json_unescape, html_unescape, percent_decode] {
+            if let Some(d) = step(s.as_deref().unwrap_or(text)) {
+                s = Some(d);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if let Some(d) = s.as_mut() {
+        d.retain(|c| c != '\0');
     }
     s
 }
@@ -549,6 +652,16 @@ fn certain_clauses(text: &str) -> (Spans, Spans) {
 
 /// A name that, decoded, is a plain identifier.
 fn plain_credential_name(raw: &str) -> bool {
+    // Most names are plain and hold no hint: answer without normalising.
+    if !may_decode(raw)
+        && !HINTS.iter().any(|h| {
+            raw.as_bytes()
+                .windows(h.len())
+                .any(|w| w.eq_ignore_ascii_case(h.as_bytes()))
+        })
+    {
+        return false;
+    }
     let n = normalize(raw);
     !n.is_empty()
         && n.bytes()
@@ -729,6 +842,52 @@ mod tests {
 
     fn p(s: &str) -> String {
         protect_text(s).unwrap_or_else(|| s.to_string())
+    }
+
+    fn rules(patterns: &[&str], builtin: Builtin) -> CredentialRules {
+        let p: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        CredentialRules::compile(&p, builtin).unwrap()
+    }
+
+    /// User patterns: raw matches replaced, a match only in the decoded
+    /// view withholds the field; the built-in rules still run after.
+    #[test]
+    fn user_patterns_mask_their_matches() {
+        let r = rules(&["acme_[a-z0-9]{8}", "(?i)tok-[0-9]{4}"], Builtin::Full);
+        let p = |t: &str| protect_text_with(&r, t).unwrap_or_else(|| t.to_string());
+        assert_eq!(p("id acme_abcd1234 ok"), "id <REDACTED> ok");
+        assert_eq!(p("a TOK-1234 b tok-9999"), "a <REDACTED> b <REDACTED>");
+        assert_eq!(p("/x?t=acme%5Fabcd1234"), FIELD_WITHHELD);
+        // `acme` + JSON escape of `_` (backslash built at run time).
+        let escaped = format!(r#"{{"k":"acme{}u005fabcd1234"}}"#, char::from(92));
+        assert_eq!(p(&escaped), FIELD_WITHHELD);
+        // Built-in rules after the user's.
+        assert_eq!(
+            p("q=acme_abcd1234&password=x"),
+            "q=<REDACTED>&password=<REDACTED>"
+        );
+        assert_eq!(protect_text_with(&r, "plain text"), None);
+    }
+
+    /// `names_only`: certain structures and their names only; free text
+    /// with credential words is not withheld.
+    #[test]
+    fn names_only_skips_free_text_context() {
+        let r = rules(&[], Builtin::NamesOnly);
+        let p = |t: &str| protect_text_with(&r, t).unwrap_or_else(|| t.to_string());
+        assert_eq!(p("/login?password=x&q=1"), "/login?password=<REDACTED>&q=1");
+        assert_eq!(
+            p(r#"{"api_key":"k","n":1}"#),
+            r#"{"api_key":"<REDACTED>","n":1}"#
+        );
+        assert_eq!(p("postgres://u:pw@db/x"), "postgres://u:<REDACTED>@db/x");
+        for prose in ["your token expired", r#"{"access_tokens":["c1"]}"#] {
+            assert_eq!(p(prose), prose);
+            assert_ne!(
+                protect_text_with(&rules(&[], Builtin::Full), prose).as_deref(),
+                None
+            );
+        }
     }
 
     /// Codex round 4: forms the detector missed.
