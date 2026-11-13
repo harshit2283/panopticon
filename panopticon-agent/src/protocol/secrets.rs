@@ -195,9 +195,10 @@ impl Decision {
 /// unless `builtin` is false, the built-in rules at their level. Their
 /// spans are merged and the field is rewritten once by
 /// [`Decision::apply`], so no rule hides another's match and rule order
-/// does not matter. The field is withheld when a rule says so, when the
-/// decoded view of what the raw matches leave still matches (it cannot be
-/// placed in the field), or when it has more than [`MAX_SPANS`] spans.
+/// does not matter. The field is withheld when a rule says so, when a
+/// match in the decoded view is not the same raw match at the same place
+/// (it cannot be placed in the field), or when it has more than
+/// [`MAX_SPANS`] spans.
 pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
     // A span that already reads exactly `<REDACTED>` would be replaced by
     // itself: dropped as a no-op. Nothing else in captured text is exempt,
@@ -250,8 +251,8 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
 /// skipped), or None when the field must be withheld: more than
 /// [`MAX_SPANS`] matches, or, when decoding changes the field, any match
 /// in the decoded view (escapes, entities and percent-encoding decoded,
-/// not case-folded) of what is left once the raw matches are removed. A
-/// decoded match is only accepted when it lies inside a masked raw span.
+/// not case-folded) that is not a raw match of the same pattern at the
+/// same position with the same text: only then is it certainly masked.
 fn user_spans(
     (set, each): &(regex::RegexSet, Vec<regex::Regex>),
     text: &str,
@@ -265,10 +266,18 @@ fn user_spans(
             spans.push((m.start(), m.end()));
         }
     }
-    if decode(text).is_some() {
-        let residual = remove(text, &merge(spans.clone()));
-        if decode(&residual).is_some_and(|d| set.is_match(&d)) {
-            return None;
+    if let Some(decoded) = decode(text) {
+        for i in set.matches(&decoded).iter() {
+            for m in each[i].find_iter(&decoded).filter(|m| !m.is_empty()) {
+                let raw = text.get(m.start()..m.end());
+                if raw != Some(m.as_str())
+                    || !each[i]
+                        .find_at(text, m.start())
+                        .is_some_and(|r| r.range() == m.range())
+                {
+                    return None;
+                }
+            }
         }
     }
     Some(spans)
@@ -986,6 +995,18 @@ mod tests {
         let bounded = rules(&[r"acme_[a-z0-9]{8}\b"], Builtin::Full);
         assert_eq!(
             protect_text_with(&bounded, "acme_abcd1234%61 acme%5fabcd1234").as_deref(),
+            Some(FIELD_WITHHELD)
+        );
+        // R5 review: a decoded match straddling a raw match and an encoded
+        // tail, and one built across a raw match of another pattern.
+        let prefix = rules(&["acme_[a-z0-9]+"], Builtin::Full);
+        assert_eq!(
+            protect_text_with(&prefix, "acme_abcd%31234").as_deref(),
+            Some(FIELD_WITHHELD)
+        );
+        let across = rules(&["x[a-z0-9]+y", "abc"], Builtin::Full);
+        assert_eq!(
+            protect_text_with(&across, "xabc%31y").as_deref(),
             Some(FIELD_WITHHELD)
         );
         // An encoded neighbour that is not a match still masks.

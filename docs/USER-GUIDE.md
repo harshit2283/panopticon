@@ -637,9 +637,9 @@ values, request and response bodies, SQL text and bound values, Redis
 arguments and replies, Kafka and AMQP fields; a DNS answer whose name a
 pattern matches is dropped. A match in the field as captured is replaced
 by `<REDACTED>`. When the field has escapes, entities or percent-encoding,
-the matches are removed and what is left is decoded (case kept): a match
-there cannot be placed in the captured text, so the field becomes
-`<field withheld>`. Your patterns and the built-in rules all look at the
+its decoded view (case kept) is matched too: a match there that is not
+the same match at the same place in the captured text cannot be placed
+there, so the field becomes `<field withheld>`. Your patterns and the built-in rules all look at the
 field as captured, before PII redaction rewrites it, and their matches are
 replaced together in one pass: the order of your patterns does not matter,
 and no pattern hides another's match or a credential name from the
