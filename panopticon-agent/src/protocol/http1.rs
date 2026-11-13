@@ -51,6 +51,11 @@ pub struct Http1Parser {
     response_headers: Vec<(String, String)>,
     response_status: Option<u32>,
     response_content_type: Option<String>,
+    /// Bytes of the request / response body were lost: what remains may
+    /// hold a credential's value without its name, so the body is not
+    /// exported (sizes are).
+    request_gap: bool,
+    response_gap: bool,
 }
 
 /// Request-line prefixes; anything else at the start of the client buffer is
@@ -127,6 +132,8 @@ impl Http1Parser {
             response_headers: Vec::new(),
             response_status: None,
             response_content_type: None,
+            request_gap: false,
+            response_gap: false,
         }
     }
 
@@ -434,11 +441,12 @@ impl Http1Parser {
             msg.headers = self.response_headers.clone();
         }
 
-        msg.payload_text = body_text(&self.response_body);
+        msg.payload_text = body_text(&self.response_body).filter(|_| !self.response_gap);
         msg.request_text = self
             .pending_request
             .as_ref()
-            .and_then(|req| body_text(&req.body));
+            .and_then(|req| body_text(&req.body))
+            .filter(|_| !self.request_gap);
 
         Some(msg)
     }
@@ -462,6 +470,8 @@ impl Http1Parser {
         self.response_headers.clear();
         self.response_status = None;
         self.response_content_type = None;
+        self.request_gap = false;
+        self.response_gap = false;
     }
 }
 
@@ -510,6 +520,7 @@ impl ProtocolParser for Http1Parser {
             (Direction::Egress, State::ReadingRequestBody { remaining })
                 if n <= remaining && self.client_buf.is_empty() =>
             {
+                self.request_gap = true;
                 self.state = if n == remaining {
                     State::WaitingForResponse
                 } else {
@@ -524,6 +535,7 @@ impl ProtocolParser for Http1Parser {
             (Direction::Ingress, State::ReadingResponseBody { remaining })
                 if n <= remaining && self.server_buf.is_empty() =>
             {
+                self.response_gap = true;
                 self.response_size += n as u64;
                 if n == remaining {
                     let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
@@ -539,6 +551,7 @@ impl ProtocolParser for Http1Parser {
             // Chunk framing is lost: emit what we have (status, headers,
             // partial body), then resync on the next response line.
             (Direction::Ingress, State::ReadingChunkedResponse) => {
+                self.response_gap = true;
                 self.response_size += n as u64;
                 let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
                 self.reset_for_next_transaction();
@@ -580,6 +593,42 @@ fn is_http1_response(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture gap inside a body can remove a credential's name and keep
+    /// its value: a body with a gap is withheld (sizes kept).
+    #[test]
+    fn test_body_with_a_gap_is_withheld() {
+        let body = br#"{"password":"s7Kf2v9LmQ8z","n":1}"#;
+        let mut p = Http1Parser::new();
+        let head = format!(
+            "POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        p.feed(head.as_bytes(), Direction::Egress, 1);
+        assert!(p.skip(Direction::Egress, 13, 2).is_some()); // {"password":"
+        p.feed(&body[13..], Direction::Egress, 3);
+        let tail = r#"{"token_hint":"s7Kf2v9LmQ8z"}"#;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", tail.len());
+        p.feed(head.as_bytes(), Direction::Ingress, 4);
+        assert!(p.skip(Direction::Ingress, 2, 5).is_some());
+        let ParseResult::Messages(m) = p.feed(&tail.as_bytes()[2..], Direction::Ingress, 6) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].request_text, None, "{m:?}");
+        assert_eq!(m[0].payload_text, None, "{m:?}");
+        assert_eq!(m[0].status, Some(200));
+
+        // The next exchange on the connection is exported normally.
+        p.feed(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n", Direction::Egress, 7);
+        let ParseResult::Messages(m) = p.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            Direction::Ingress,
+            8,
+        ) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].payload_text.as_deref(), Some("ok"));
+    }
 
     #[test]
     fn test_simple_get() {
