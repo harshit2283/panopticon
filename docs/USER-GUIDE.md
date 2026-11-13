@@ -243,16 +243,25 @@ running config is kept.
 
 - `capture_loopback = false` (the default, `cgroup_skb` backend only):
   packets that stay on the node through the loopback device are not
-  captured, as on the TC backend, which never sees them. That is
+  captured, as on the TC backend, which never sees them (this is parity
+  for the loopback device only: other same-node traffic, below, is
+  captured, which TC on the node's NIC did not see either). That is
   `127.0.0.0/8`, and connections to one of the host's own addresses (or,
   in a pod, the pod's own address), which the kernel also sends over
-  `lo`; IPv6 packets are not captured on either backend. Traffic on a
-  VRF device is node-local too and dropped: local delivery inside a VRF
-  travels the VRF device, and so does a VRF's incoming remote traffic,
-  so every socket in a VRF is dropped while this is off. The agent
-  recognises VRF devices when they are created (and scans for existing
-  ones at startup), with fexit hooks that need kernel BTF; without them
-  the `cgroup_skb` backend refuses to start. Traffic on a device in
+  `lo`; IPv6 packets are not captured on either backend. Packets on a
+  VRF device are node-local too and dropped: local delivery inside a VRF
+  travels the VRF device, and so does a VRF's incoming remote traffic.
+  A socket is dropped from its first packet seen on a VRF device on; a
+  one-way sender whose packets all leave through a VRF's member
+  interface to a remote peer is captured. The agent recognises VRF
+  devices when they are created and deleted, and scans every reachable
+  network namespace for existing ones at startup, with fexit/fentry
+  hooks that need kernel BTF; without them, or if the scan cannot
+  complete, the `cgroup_skb` backend refuses to start. If a VRF device
+  ever cannot be recorded (see
+  `panopticon_vrf_hook_events_total{event="read_failed"|"map_full"}`),
+  every packet is dropped while this is off, counted under
+  `reason="vrf_unknown"`; restart the agent. Traffic on a device in
   another network namespace that has the same interface index as a VRF
   device is dropped too, and a socket that once carried node-local
   traffic stays dropped (an unconnected UDP socket that talked to a

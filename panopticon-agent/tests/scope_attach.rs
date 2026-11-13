@@ -25,8 +25,9 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 14] = [
+const TARGETS: [(&str, &str); 15] = [
     (VRF_REGISTER, "register_netdevice"),
+    (VRF_UNREGISTER, "unregister_netdevice_queue"),
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -241,9 +242,16 @@ fn ifindex_of(dev: &str) -> u32 {
     i
 }
 
-fn vrf_master(ebpf: &Ebpf, ifindex: u32) -> bool {
+/// Recorded by the startup scan (`VRF_MASTERS`).
+fn vrf_scanned(ebpf: &Ebpf, ifindex: u32) -> bool {
     let m: HashMap<&MapData, u32, u8> =
         HashMap::try_from(ebpf.map("VRF_MASTERS").unwrap()).unwrap();
+    m.get(&ifindex, 0).is_ok()
+}
+
+/// Counted live by the hooks (`VRF_LIVE`).
+fn vrf_live(ebpf: &Ebpf, ifindex: u32) -> bool {
+    let m: HashMap<&MapData, u32, u32> = HashMap::try_from(ebpf.map("VRF_LIVE").unwrap()).unwrap();
     m.get(&ifindex, 0).is_ok()
 }
 
@@ -251,6 +259,11 @@ fn forget_vrf_master(ebpf: &mut Ebpf, ifindex: u32) {
     let mut m: HashMap<&mut MapData, u32, u8> =
         HashMap::try_from(ebpf.map_mut("VRF_MASTERS").unwrap()).unwrap();
     let _ = m.remove(&ifindex);
+}
+
+fn vrf_failed_latch(ebpf: &Ebpf) -> u32 {
+    let a: Array<&MapData, u32> = Array::try_from(ebpf.map("VRF_FAILED").unwrap()).unwrap();
+    a.get(&0, 0).unwrap()
 }
 
 /// An IPv4 socket of `ty`, bound to `dev` if given.
@@ -580,7 +593,10 @@ fn scope_programs_load_attach_and_hold() {
     assert!(exit_attached);
     match pre_vrf {
         Some(i) => {
-            assert!(vrf_master(&ebpf, i), "startup scan recorded pvpre in pnvrf");
+            assert!(
+                vrf_scanned(&ebpf, i),
+                "startup scan recorded pvpre in pnvrf"
+            );
             // Its ifindex may equal a host device's (no namespace in the key):
             // forget it so the sections below are not over-dropped.
             forget_vrf_master(&mut ebpf, i);
@@ -1645,11 +1661,11 @@ fn scope_programs_load_attach_and_hold() {
         );
         let vrf_ifx = ifindex_of("pvrf");
         assert!(
-            vrf_master(&ebpf, vrf_ifx),
+            vrf_live(&ebpf, vrf_ifx),
             "fexit register_netdevice recorded pvrf"
         );
         assert!(
-            !vrf_master(&ebpf, ifindex_of("pvd0")),
+            !vrf_live(&ebpf, ifindex_of("pvd0")),
             "a slave is not a master"
         );
         let vaddr = |port: u16| std::net::SocketAddr::from(([10, 212, 0, 1], port));
@@ -1792,9 +1808,107 @@ fn scope_programs_load_attach_and_hold() {
         std::fs::write("/proc/sys/net/ipv4/udp_l3mdev_accept", l3_accept.trim()).unwrap();
         drop((cm, sm, cs, ss, tp, tr, tp2, tr2, rx, vrf_u, vrf_l));
         let _ = ip("link del pvd0");
-        let _ = ip("link del pvrf");
-        forget_vrf_master(&mut ebpf, vrf_ifx);
-        println!("LOOPBACK VRF OK");
+        assert!(ip("link del pvrf"));
+        assert!(
+            !vrf_live(&ebpf, vrf_ifx),
+            "fentry unregister_netdevice_queue removed pvrf"
+        );
+
+        // Discovery reaches a namespace held only by a thread's private fd
+        // table (unshare(CLONE_FILES)): no bind mount, no task inside.
+        let _ = ip("netns del pntask");
+        assert!(ip("netns add pntask") && ip("-n pntask link add pvtask type vrf table 213"));
+        let task_ifx = {
+            let out = std::process::Command::new("ip")
+                .args(["-n", "pntask", "-o", "link", "show", "pvtask"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .split(':')
+                .next()
+                .and_then(|n| n.trim().parse::<u32>().ok())
+                .expect("pvtask ifindex")
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // SAFETY: this thread's own fd table only.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
+            let ns = File::open("/run/netns/pntask").unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv();
+            drop(ns);
+        });
+        held_rx.recv().unwrap();
+        assert!(
+            ip("netns del pntask"),
+            "bind mount removed; the fd keeps it"
+        );
+        let found = scan_vrf_masters().expect("scan");
+        assert!(
+            found.contains(&task_ifx),
+            "per-task fd discovery found pvtask ({task_ifx}): {found:?}"
+        );
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        // Exhaustion: with the hooks' map full, a new VRF cannot be counted,
+        // so classification fails (latched) and, with loopback off, every
+        // packet is dropped as vrf_unknown, a veth one too.
+        let mut filler = Vec::new();
+        {
+            let mut live: HashMap<&mut MapData, u32, u32> =
+                HashMap::try_from(ebpf.map_mut("VRF_LIVE").unwrap()).unwrap();
+            for k in 1_000_000u32.. {
+                if live.insert(k, 1, 0).is_err() {
+                    break;
+                }
+                filler.push(k);
+            }
+        }
+        assert!(!filler.is_empty() && vrf_failed_latch(&ebpf) == 0);
+        let _ = ip("link del pvfull");
+        assert!(ip("link add pvfull type vrf table 214"));
+        assert_eq!(vrf_failed_latch(&ebpf), 1, "map full latched VRF_FAILED");
+        assert!(
+            refuse_if_vrf_failed(&ebpf).is_err(),
+            "startup and arming refuse with the latch set"
+        );
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+        bump(&mut ebpf);
+        let unk0 = drops(&ebpf, DROP_VRF_UNKNOWN);
+        let (cu, su) = exchange(&vl, b"veth-latched");
+        let ev = drain(&mut ring);
+        assert!(
+            !ev.iter().any(|e| e.0 == cookie(&cu) || e.0 == cookie(&su)),
+            "nothing exported once VRF classification failed: {ev:?}"
+        );
+        assert!(
+            drops(&ebpf, DROP_VRF_UNKNOWN) >= unk0 + 2,
+            "counted vrf_unknown"
+        );
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
+        bump(&mut ebpf);
+        let (cu2, su2) = exchange(&vl, b"veth-latched-on");
+        let ev = drain(&mut ring);
+        assert!(
+            has(&ev, cookie(&cu2), b"veth-latched-on"),
+            "loopback on: the latch drops nothing: {ev:?}"
+        );
+        // Test-only reset, so the sections below run unlatched.
+        assert!(ip("link del pvfull"));
+        {
+            let mut live: HashMap<&mut MapData, u32, u32> =
+                HashMap::try_from(ebpf.map_mut("VRF_LIVE").unwrap()).unwrap();
+            for k in &filler {
+                let _ = live.remove(k);
+            }
+            let mut f: Array<&mut MapData, u32> =
+                Array::try_from(ebpf.map_mut("VRF_FAILED").unwrap()).unwrap();
+            f.set(0, 0, 0).unwrap();
+        }
+        drop((cu, su, cu2, su2));
+        println!("LOOPBACK VRF OK latch_after={} entries", filler.len());
     }
 
     // On again (a widening): loopback captured, TLS on it too.
