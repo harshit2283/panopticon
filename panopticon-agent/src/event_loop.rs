@@ -1419,13 +1419,14 @@ fn handle_messages(
             match ctx.pii_engine.as_ref() {
                 // Redact unless the mode is full, and in full too if the config
                 // asks for a redacted export ([pii] redact = true). The engine
-                // masks login secrets itself.
+                // protects known credential forms itself (best effort).
                 Some(e) => {
                     let redact = ctx.privacy != PrivacyMode::Full || e.redacts();
                     e.scan_message_with(msg, redact)
                 }
-                // No engine ([pii] enabled = false, full mode): login secrets
-                // are still masked unless `mask_credentials = false`.
+                // No engine ([pii] enabled = false, full mode): known
+                // credential forms are still protected (best effort) unless
+                // `mask_credentials = false`.
                 None => {
                     if crate::protocol::mask_credentials_enabled() {
                         crate::pii::mask_credentials(msg);

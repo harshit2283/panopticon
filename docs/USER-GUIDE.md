@@ -529,10 +529,13 @@ What is exported then:
   inside a body withholds the field.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
-- **A body with a capture gap** (bytes lost to ring drops or the capture
-  cap), or an HTTP/2 body whose stream's headers the agent did not see, is
-  not exported (its size is): what is left may hold a credential's value
-  without its name.
+- **A body with bytes captured after a gap** (bytes lost to ring drops
+  or the capture cap, then more of the same body kept), or an HTTP/2 body
+  whose stream's headers the agent did not see, is not exported (its size
+  is): what is left may hold a credential's value without its name. A gap
+  that only cuts a body's end, as the capture cap does to a large
+  response, keeps the captured prefix (it is scanned and trimmed like any
+  body).
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection.

@@ -180,7 +180,8 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    Bodies with a capture gap, HTTP/2 headers after a lost HPACK block,
+    Bodies with bytes kept after a capture gap (a cut end keeps its
+    prefix), HTTP/2 headers after a lost HPACK block,
     over-long header names and gRPC/protobuf body text are not exported;
     only known SQL keywords are exported as methods. `[credentials]
     patterns` adds the user's own formats (masked in every field, counted

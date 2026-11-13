@@ -95,7 +95,8 @@ fn mask_credential_fields(msg: &mut L7Message) {
         .retain(|a| !crate::protocol::has_credential_context(&a.name));
 }
 
-/// Protect login secrets in every string field of `msg` without the PII
+/// Protect known credential forms in every string field of `msg` (best
+/// effort, USER-GUIDE §5.3) without the PII
 /// engine (see [`crate::protocol::protect_text`]): what
 /// [`PiiEngine::scan_message_with`] does when `mask_credentials` is on, for
 /// `full` mode with `[pii] enabled = false`.
@@ -530,8 +531,8 @@ impl PiiEngine {
             return None;
         }
         let mut found = Found::default();
-        // Login secrets are masked whenever values are redacted, and also in
-        // `full` mode unless `[privacy] mask_credentials = false`.
+        // Known credential forms are protected whenever values are redacted,
+        // and also in `full` mode unless `[privacy] mask_credentials = false`.
         let mask_creds = redact_enabled || self.config.mask_credentials;
 
         if mask_creds {
@@ -1091,7 +1092,7 @@ mod tests {
         let all = format!("{:?} {:?}", msg.payload_text, msg.request_text);
         assert!(!all.contains("s3cret"), "{all}");
 
-        // full mode, redaction off: login secrets still masked by default
+        // full mode, redaction off: credentials still protected by default
         // ([privacy] mask_credentials = true), PII left as captured.
         let mut msg = auth();
         msg.payload_text = Some("mail alice@example.com".into());

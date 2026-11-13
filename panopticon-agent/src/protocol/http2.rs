@@ -78,6 +78,10 @@ struct StreamState {
     /// a credential's value without its name, so it is not exported.
     request_gap: bool,
     response_gap: bool,
+    /// A gap inside this stream's body; it becomes `*_gap` when more body
+    /// bytes of the stream are kept (a cut end keeps the prefix).
+    request_gap_pending: bool,
+    response_gap_pending: bool,
     /// Insertion order, for evicting the oldest stream at capacity.
     seq: u64,
 }
@@ -348,12 +352,14 @@ impl Http2Parser {
         }
         let stream = self.stream(stream_id);
         // A body this parser did not see start (late join, replaced after a
-        // gap) is a tail.
-        if from_client && stream.request_ts.is_none() {
-            stream.request_gap = true;
-        }
-        if !from_client && !stream.response_headers_seen {
-            stream.response_gap = true;
+        // gap) is a tail; so are bytes kept after a gap in the body.
+        if !body.is_empty() {
+            if from_client && (stream.request_ts.is_none() || stream.request_gap_pending) {
+                stream.request_gap = true;
+            }
+            if !from_client && (!stream.response_headers_seen || stream.response_gap_pending) {
+                stream.response_gap = true;
+            }
         }
         let (buf, size) = if from_client {
             (&mut stream.request_body, &mut stream.request_size)
@@ -539,10 +545,10 @@ impl Http2Parser {
         side.discard_frame = Some((stream_id, flags));
         let stream = self.stream(stream_id);
         let size = if from_client {
-            stream.request_gap = true;
+            stream.request_gap_pending = true;
             &mut stream.request_size
         } else {
-            stream.response_gap = true;
+            stream.response_gap_pending = true;
             &mut stream.response_size
         };
         *size += have_body as u64 + lost;
@@ -1163,6 +1169,8 @@ mod tests {
             1,
             &encode(&mut se, &[(":status", "200")]),
         );
+        // A whole first frame, then a large one cut by the capture cap.
+        resp.extend(make_frame(FRAME_DATA, 0, 1, b"prefix of the body"));
         let frame = make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &vec![b'a'; 16_000]);
         resp.extend_from_slice(&frame[..4096]); // captured part
         p.feed(&resp, Direction::Ingress, 5);
@@ -1170,8 +1178,10 @@ mod tests {
         assert!(p.skip(Direction::Ingress, 10_000, 6).is_some());
         let msgs = messages(p.feed(&frame[4096 + 10_000..], Direction::Ingress, 7));
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].response_size_bytes, 16_000);
+        assert_eq!(msgs[0].response_size_bytes, 16_018);
         assert_eq!(msgs[0].status, Some(200));
+        // Nothing was kept after the gap: the captured prefix is exported.
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("prefix of the body"));
     }
 
     /// Codex: a block that fails to decode may still have changed the
