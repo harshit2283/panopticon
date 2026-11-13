@@ -64,10 +64,15 @@ pub struct PostgresParser {
     /// exported on it.
     parses_lost: bool,
     /// Text-format parameter values from the current cycle's Bind message,
-    /// and the statement it binds (empty for the unnamed one). Applications
-    /// send their data here, not in the SQL text. Exported only when that
-    /// statement is confirmed with the cycle's SQL.
-    bind_params: Option<(String, String)>,
+    /// and the SQL it was sent against. Applications send their data here,
+    /// not in the SQL text. Exported only when that SQL is confirmed and is
+    /// the SQL the event shows.
+    bind_params: Option<(BindSql, String)>,
+    /// The SQL of each Bind read from the client but not consumed yet, in
+    /// order.
+    binds: VecDeque<BindSql>,
+    /// Id of the next Parse read.
+    next_parse: u64,
     /// The last statement built had credential context and was withheld.
     statement_withheld: bool,
 }
@@ -76,11 +81,6 @@ pub struct PostgresParser {
 const MAX_PREPARED_STATEMENTS: usize = 256;
 /// Max bytes of bind-parameter text kept per query.
 const MAX_BIND_TEXT: usize = 64 * 1024;
-
-/// A Bind's statement name and its text-format values.
-fn bound(payload: &[u8]) -> Option<(String, String)> {
-    Some((extract_second_string(payload), bind_param_text(payload)?))
-}
 
 /// Text-format parameter values of a Bind message, joined for PII scanning.
 /// Bind: portal\0 statement\0 i16 nfmt, i16 fmt[nfmt], i16 nparams,
@@ -132,12 +132,21 @@ const READY_FOR_QUERY: &[u8] = b"Z\x00\x00\x00\x05";
 
 /// A client message the server answers in order.
 enum Pending {
-    /// A Parse: (name, SQL; "" for the unnamed statement), entered into
-    /// `prepared` by its ParseComplete; None when a Close in the same
-    /// pipeline closed it.
-    Parse(Option<(String, String)>),
+    /// A Parse: its id, name ("" for the unnamed statement) and SQL,
+    /// entered into `prepared` by its ParseComplete; the SQL is None when a
+    /// later Close of the name or a simple Query cancelled it.
+    Parse(u64, String, Option<String>),
     /// A Sync or a simple Query: answered by a ReadyForQuery.
     Sync,
+}
+
+/// The SQL a Bind was sent against, fixed when the Bind is read: the
+/// statement's confirmed SQL at that point of the client's stream, or the
+/// SQL of the latest Parse of that name before it, which must then be
+/// confirmed (`awaits`, its id) before the values are exported.
+struct BindSql {
+    sql: Option<String>,
+    awaits: Option<u64>,
 }
 
 /// Most client messages awaiting an answer that are tracked.
@@ -164,6 +173,8 @@ impl PostgresParser {
             scanned: 0,
             parses_lost: false,
             bind_params: None,
+            binds: VecDeque::new(),
+            next_parse: 0,
             statement_withheld: false,
             query_ts: None,
             query_text: None,
@@ -387,12 +398,22 @@ impl PostgresParser {
             Self::try_read_frontend_msg(&self.client_buf)
         {
             match msg_type {
-                b'B' => self.bind_params = bound(&payload),
+                b'B' => self.bind_params = self.bound(&payload),
                 b'C' | b'D' | b'E' | b'H' | b'S' => {}
                 _ => break,
             }
             self.consume_client(consumed);
         }
+    }
+
+    /// A Bind being consumed: the SQL it was read against (taken from
+    /// `binds` whether or not it has values) and its text-format values.
+    fn bound(&mut self, payload: &[u8]) -> Option<(BindSql, String)> {
+        let bind = self.binds.pop_front().unwrap_or(BindSql {
+            sql: None,
+            awaits: None,
+        });
+        Some((bind, bind_param_text(payload)?))
     }
 
     fn consume_client(&mut self, n: usize) {
@@ -418,7 +439,29 @@ impl PostgresParser {
                     let name = extract_string(payload);
                     self.prepared.remove(&name);
                     let sql = extract_second_string(payload);
-                    Pending::Parse(Some((name, sql)))
+                    self.next_parse += 1;
+                    Pending::Parse(self.next_parse, name, Some(sql))
+                }
+                b'B' => {
+                    // The SQL this Bind runs: the latest Parse of its name
+                    // still unanswered, else the confirmed statement.
+                    let name = extract_second_string(payload);
+                    let parse = self.pending.iter().rev().find_map(|p| match p {
+                        Pending::Parse(id, n, sql) if *n == name => Some((*id, sql.clone())),
+                        _ => None,
+                    });
+                    let bind = match parse {
+                        Some((id, sql)) => BindSql {
+                            sql,
+                            awaits: Some(id),
+                        },
+                        None => BindSql {
+                            sql: self.prepared.get(&name).cloned(),
+                            awaits: None,
+                        },
+                    };
+                    self.binds.push_back(bind);
+                    continue;
                 }
                 b'S' => Pending::Sync,
                 b'Q' => {
@@ -427,8 +470,8 @@ impl PostgresParser {
                     // statement, confirmed or pending.
                     self.prepared.clear();
                     for p in self.pending.iter_mut() {
-                        if let Pending::Parse(parse) = p {
-                            *parse = None;
+                        if let Pending::Parse(_, _, sql) = p {
+                            *sql = None;
                         }
                     }
                     Pending::Sync
@@ -437,10 +480,10 @@ impl PostgresParser {
                     let name = extract_string(&payload[1..]);
                     self.prepared.remove(&name);
                     for p in self.pending.iter_mut() {
-                        if let Pending::Parse(parse) = p
-                            && parse.as_ref().is_some_and(|(n, _)| *n == name)
+                        if let Pending::Parse(_, n, sql) = p
+                            && *n == name
                         {
-                            *parse = None;
+                            *sql = None;
                         }
                     }
                     continue;
@@ -494,10 +537,11 @@ impl PostgresParser {
             b'B' => {
                 // Bind without Parse: execution of an already-prepared statement.
                 let statement = extract_second_string(&payload);
+                let bind = self.bound(&payload);
                 if let Some(query) = self.prepared.get(&statement) {
                     self.query_text = Some(query.clone());
                     self.query_ts = Some(ts);
-                    self.bind_params = bound(&payload);
+                    self.bind_params = bind;
                     self.state = State::InExtendedQuery;
                     self.absorb_extended_cycle();
                 }
@@ -544,12 +588,21 @@ impl PostgresParser {
                     // ParseComplete answers the oldest Parse pending (the
                     // unnamed statement is kept under "").
                     match self.pending.pop_front() {
-                        Some(Pending::Parse(Some((name, sql))))
-                            if name.is_empty() || self.prepared.len() < MAX_PREPARED_STATEMENTS =>
-                        {
-                            self.prepared.insert(name, sql);
+                        Some(Pending::Parse(id, name, sql)) => {
+                            // Binds sent against this Parse may export now.
+                            let current = self.bind_params.as_mut().map(|(b, _)| b);
+                            for b in self.binds.iter_mut().chain(current) {
+                                if b.awaits == Some(id) {
+                                    b.awaits = None;
+                                }
+                            }
+                            if let Some(sql) = sql
+                                && (name.is_empty()
+                                    || self.prepared.len() < MAX_PREPARED_STATEMENTS)
+                            {
+                                self.prepared.insert(name, sql);
+                            }
                         }
-                        Some(Pending::Parse(_)) => {}
                         Some(Pending::Sync) | None => self.lose_parses(),
                     }
                 }
@@ -557,7 +610,7 @@ impl PostgresParser {
                 b'E' => {
                     // The server skips to the Sync: the Parses before it
                     // failed or never ran.
-                    while matches!(self.pending.front(), Some(Pending::Parse(_))) {
+                    while matches!(self.pending.front(), Some(Pending::Parse(..))) {
                         self.pending.pop_front();
                     }
                     // ErrorResponse — stash the error; emit on ReadyForQuery so query_text
@@ -615,12 +668,15 @@ impl PostgresParser {
     fn build_msg(&mut self, ts: u64) -> L7Message {
         let mut msg = L7Message::new(Protocol::Postgres, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
-        // Bound values only under the SQL their statement was confirmed
-        // with: a Bind of another statement, or of one the server did not
-        // confirm, exports none.
-        let bound = self.bind_params.take().and_then(|(statement, values)| {
-            let confirmed = self.prepared.get(&statement);
-            (!self.parses_lost && confirmed.is_some() && confirmed == self.query_text.as_ref())
+        // Bound values only under the SQL their Bind was sent against, once
+        // confirmed, and only when that is the SQL this event shows: a Bind
+        // of another statement, or of one the server did not confirm,
+        // exports none, and values are never paired with other SQL.
+        let bound = self.bind_params.take().and_then(|(bind, values)| {
+            (!self.parses_lost
+                && bind.awaits.is_none()
+                && bind.sql.is_some()
+                && bind.sql == self.query_text)
                 .then_some(values)
         });
         self.statement_withheld = false;
@@ -1355,6 +1411,36 @@ mod tests {
         assert!(p.prepared.contains_key(""));
         simple(&mut p, "SELECT 1");
         assert!(p.prepared.is_empty(), "{:?}", p.prepared);
+    }
+
+    /// Codex R7 #1: a Bind is judged by the SQL its statement had when the
+    /// Bind was sent, not by a later redefinition in the same batch.
+    #[test]
+    fn test_bind_is_judged_by_the_sql_it_was_sent_against() {
+        let pw = "INSERT INTO users(password) VALUES ($1)";
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", pw)), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        // Parse t; Bind s; Execute; Close s; Parse s (benign); Sync.
+        let mut batch = make_frontend_msg(b'P', b"t\0SELECT $1::text\0\0\0");
+        batch.extend(make_bind("s", &["s7Kf2v9LmQ8z"]));
+        batch.extend(make_frontend_msg(b'E', b"\0\0\0\0\0"));
+        batch.extend(make_frontend_msg(b'C', b"Ss\0"));
+        batch.extend(make_frontend_msg(b'P', b"s\0SELECT $1::text\0\0\0"));
+        batch.extend(make_frontend_msg(b'S', b""));
+        p.feed(&batch, Direction::Egress, 3);
+        let mut resp = make_backend_msg(b'1', b"");
+        resp.extend(make_backend_msg(b'2', b""));
+        resp.extend(make_backend_msg(b'C', b"INSERT 0 1\0"));
+        resp.extend(make_backend_msg(b'3', b""));
+        resp.extend(make_backend_msg(b'1', b""));
+        resp.extend(make_backend_msg(b'Z', b"I"));
+        let out = format!("{:?}", p.feed(&resp, Direction::Ingress, 4));
+        assert!(!out.contains("s7Kf"), "{out}");
     }
 
     /// Codex R5 H4: a Bind's values are exported only under the SQL its
