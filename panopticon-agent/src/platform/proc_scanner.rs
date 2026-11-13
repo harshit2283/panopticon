@@ -67,15 +67,107 @@ pub fn open_examined(target: &TlsTarget) -> std::io::Result<std::fs::File> {
 }
 
 /// Open a file a workload controls (a mapped path under `/proc/<pid>/root`)
-/// without letting it block or reach anything but a regular file. The
-/// workload can replace the path at any moment: a FIFO with no writer would
-/// block open(2) forever (hanging the startup scan, or the attach while it
-/// holds the eBPF lock), a device open can have side effects. So: refused
-/// unless the path is a regular file, opened non-blocking, and refused again
-/// unless the opened descriptor is a regular file (a swap between the two
-/// checks gets a non-blocking open of whatever was swapped in, then the
-/// refusal).
-#[cfg(unix)]
+/// without letting it block, reach a device's driver, or be anything but a
+/// regular file. The workload can replace the path at any moment: a FIFO
+/// with no writer blocks open(2) forever (hanging the startup scan, or the
+/// attach while it holds the eBPF lock), and opening a device runs its
+/// driver's open (a watchdog starts counting down to a host reset).
+///
+/// So the path is first opened `O_PATH`, which pins an inode without
+/// opening it (no driver, no FIFO wait); that descriptor's type must be a
+/// regular file; only then is that same inode opened for reading, through
+/// `/proc/self/fd/<n>`, which cannot reach another file whatever the
+/// workload renames meanwhile. A path under `/proc/<pid>/root` is resolved
+/// inside that root (`openat2` `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`,
+/// Linux 5.6+), so the workload's absolute symlinks stay in its own
+/// filesystem; on older kernels (RHEL 8) it is resolved as a plain path.
+#[cfg(target_os = "linux")]
+pub fn open_workload_file(path: &str) -> std::io::Result<std::fs::File> {
+    open_workload_file_hooked(path, || ())
+}
+
+/// [`open_workload_file`], calling `between` after the `O_PATH` open and
+/// before the type check (tests swap the path there).
+#[cfg(target_os = "linux")]
+fn open_workload_file_hooked(path: &str, between: impl FnOnce()) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let pinned = open_path_in_root(path)?;
+    between();
+    let file = std::fs::File::from(pinned);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// An `O_PATH` descriptor for `path`, resolved inside `/proc/<pid>/root`
+/// when the path is under one and the kernel has `openat2`.
+#[cfg(target_os = "linux")]
+fn open_path_in_root(path: &str) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let cstr = |s: &str| CString::new(s).map_err(|_| std::io::Error::other("NUL in path"));
+    let open = |dir: i32, p: &CString, flags: i32| -> std::io::Result<OwnedFd> {
+        // SAFETY: openat(2) on a NUL-terminated path; the fd is owned here.
+        let fd = unsafe { libc::openat(dir, p.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    const O_PATH: i32 = libc::O_PATH | libc::O_CLOEXEC;
+    let in_root = path.strip_prefix("/proc/").and_then(|r| {
+        let (pid, rest) = r.split_once('/')?;
+        let rest = rest.strip_prefix("root/")?;
+        pid.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| (format!("/proc/{pid}/root"), rest))
+    });
+    if let Some((root, rest)) = in_root {
+        let root = open(libc::AT_FDCWD, &cstr(&root)?, O_PATH | libc::O_DIRECTORY)?;
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+        let how = OpenHow {
+            flags: O_PATH as u64,
+            mode: 0,
+            resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+        };
+        let rest = cstr(rest)?;
+        // SAFETY: openat2(2) with a valid dirfd, path and open_how.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root.as_raw_fd(),
+                rest.as_ptr(),
+                &how,
+                size_of::<OpenHow>(),
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(e);
+        }
+        // No openat2 (before 5.6): resolved as a plain path below.
+    }
+    open(libc::AT_FDCWD, &cstr(path)?, O_PATH)
+}
+
+/// Development builds off Linux (no `O_PATH`): refused unless a regular
+/// file, opened non-blocking, refused unless the descriptor is one.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn open_workload_file(path: &str) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let regular = |m: std::fs::Metadata| {
@@ -1123,6 +1215,44 @@ mod tests {
         // A regular file still opens.
         let exe = std::env::current_exe().unwrap();
         assert!(open_workload_file(exe.to_str().unwrap()).is_ok());
+    }
+
+    /// Codex: a path swapped after it was pinned changes nothing: a regular
+    /// file pinned then replaced by a FIFO still opens as that file, and a
+    /// FIFO or character device pinned then replaced by a regular file is
+    /// refused without being opened (no FIFO wait, no driver open).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_workload_path_swapped_after_pinning() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("panopticon-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, fifo, file) = (dir.join("lib"), dir.join("fifo"), dir.join("file"));
+        let mkfifo = |p: &std::path::Path| {
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        };
+        let p = path.to_str().unwrap();
+
+        std::fs::write(&path, b"examined").unwrap();
+        mkfifo(&fifo);
+        let mut f =
+            open_workload_file_hooked(p, || std::fs::rename(&fifo, &path).unwrap()).unwrap();
+        let mut got = String::new();
+        f.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "examined", "the pinned file, not the FIFO swapped in");
+
+        std::fs::remove_file(&path).unwrap();
+        mkfifo(&path);
+        std::fs::write(&file, b"swapped").unwrap();
+        let r = open_workload_file_hooked(p, || std::fs::rename(&file, &path).unwrap());
+        assert!(r.is_err(), "a pinned FIFO is refused");
+
+        // A character device, like a watchdog: refused without its open.
+        let link = dir.join("dev");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert!(open_workload_file(link.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

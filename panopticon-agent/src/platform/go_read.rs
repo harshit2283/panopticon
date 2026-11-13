@@ -174,6 +174,8 @@ pub fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
 pub struct Sweep {
     epochs: aya::maps::Map,
     calls: aya::maps::Map,
+    /// Whether the last pass walked with batched lookups ([`walk_map`]).
+    pub batched: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -190,6 +192,7 @@ impl Sweep {
         Ok(Self {
             epochs: open("PROC_EPOCH")?,
             calls: open("GO_READ_CALLS")?,
+            batched: false,
         })
     }
 
@@ -208,7 +211,7 @@ impl Sweep {
     /// Removing a live epoch (a PID reused between the `/proc` check and the
     /// removal) only makes that process's reads in flight emit nothing.
     ///
-    /// The walks run while the kernel inserts and deletes ([`walk_keys`]).
+    /// The walks run while the kernel inserts and deletes ([`walk_map`]).
     pub fn run(&mut self) -> anyhow::Result<(usize, usize)> {
         use aya::maps::{HashMap, Map, MapData};
         use panopticon_common::{GO_READS_IN_FLIGHT, GoReadCall, GoReadKey, TLS_SCRATCH_SIZE};
@@ -219,14 +222,19 @@ impl Sweep {
         };
         let (epochs_fd, calls_fd) = (fd(&self.epochs), fd(&self.calls));
         let mut epochs: HashMap<&mut MapData, u32, u64> = HashMap::try_from(&mut self.epochs)?;
-        let gone: Vec<u32> = walk_map(epochs_fd, TLS_SCRATCH_SIZE, |k| epochs.get(k, 0).is_ok())?
+        let (gone, batched) =
+            walk_map::<u32, u64>(epochs_fd, TLS_SCRATCH_SIZE, |k| epochs.get(k, 0).is_ok())?;
+        self.batched = batched;
+        let gone: Vec<u32> = gone
             .into_iter()
             .filter(|tgid| !std::path::Path::new(&format!("/proc/{tgid}")).exists())
             .collect();
         let gone = gone.iter().filter(|t| epochs.remove(t).is_ok()).count();
         let mut calls: HashMap<&mut MapData, GoReadKey, GoReadCall> =
             HashMap::try_from(&mut self.calls)?;
-        let keys = walk_map(calls_fd, GO_READS_IN_FLIGHT, |k| calls.get(k, 0).is_ok())?;
+        let (keys, _) = walk_map::<GoReadKey, GoReadCall>(calls_fd, GO_READS_IN_FLIGHT, |k| {
+            calls.get(k, 0).is_ok()
+        })?;
         let dead = keys
             .iter()
             .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && calls.remove(k).is_ok())
@@ -235,14 +243,21 @@ impl Sweep {
     }
 }
 
-/// [`walk_keys`] over a map, with BPF_MAP_GET_NEXT_KEY from any key (aya
+/// The keys of a hash map whose value type is `V`, and whether they came
+/// from a batched walk. Batched (`BPF_MAP_LOOKUP_BATCH`, Linux 5.6+) where
+/// the kernel has it: its cursor is a bucket index, so deletions under the
+/// walk never send it back, and every pass reaches every bucket. Otherwise
+/// (RHEL 8's 4.18) [`walk_keys`] with BPF_MAP_GET_NEXT_KEY from any key (aya
 /// only walks from the first).
 #[cfg(target_os = "linux")]
-fn walk_map<K: aya::Pod + Eq + std::hash::Hash>(
+fn walk_map<K: aya::Pod + Eq + std::hash::Hash, V: aya::Pod>(
     fd: u32,
     capacity: u32,
     exists: impl Fn(&K) -> bool,
-) -> anyhow::Result<Vec<K>> {
+) -> anyhow::Result<(Vec<K>, bool)> {
+    if let Some(keys) = batch_keys::<K, V>(fd, capacity)? {
+        return Ok((keys, true));
+    }
     let mut err = None;
     let next = |key: Option<&K>| -> Option<K> {
         #[repr(C)]
@@ -282,8 +297,80 @@ fn walk_map<K: aya::Pod + Eq + std::hash::Hash>(
     let keys = walk_keys(next, exists, 4 * capacity as usize);
     match err {
         Some(e) => Err(e.into()),
-        None => Ok(keys),
+        None => Ok((keys, false)),
     }
+}
+
+/// Every key by `BPF_MAP_LOOKUP_BATCH`, at most `capacity` of them, or None
+/// when the kernel refuses the first batch (no batch operations).
+#[cfg(target_os = "linux")]
+fn batch_keys<K: aya::Pod, V: aya::Pod>(fd: u32, capacity: u32) -> std::io::Result<Option<Vec<K>>> {
+    #[repr(C)]
+    struct Attr {
+        in_batch: u64,
+        out_batch: u64,
+        keys: u64,
+        values: u64,
+        count: u32,
+        map_fd: u32,
+        elem_flags: u64,
+        flags: u64,
+    }
+    const BPF_MAP_LOOKUP_BATCH: libc::c_long = 24;
+    let capacity = capacity as usize;
+    let mut chunk = 256usize;
+    let mut out: Vec<K> = Vec::new();
+    let (mut token_in, mut token_out) = (0u32, 0u32);
+    let mut first = true;
+    // Each call moves past at least one bucket; buckets <= 2 x capacity.
+    for _ in 0..=2 * capacity {
+        let mut keys = vec![std::mem::MaybeUninit::<K>::zeroed(); chunk];
+        let mut values = vec![std::mem::MaybeUninit::<V>::zeroed(); chunk];
+        let mut attr = Attr {
+            in_batch: if first {
+                0
+            } else {
+                &token_in as *const u32 as u64
+            },
+            out_batch: &mut token_out as *mut u32 as u64,
+            keys: keys.as_mut_ptr() as u64,
+            values: values.as_mut_ptr() as u64,
+            count: chunk as u32,
+            map_fd: fd,
+            elem_flags: 0,
+            flags: 0,
+        };
+        // SAFETY: bpf(2) writes at most `count` keys and values into buffers
+        // of that many elements, `count` and the 4-byte bucket token.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_LOOKUP_BATCH,
+                &mut attr,
+                size_of::<Attr>(),
+            )
+        };
+        let e = (r != 0).then(std::io::Error::last_os_error);
+        match e.as_ref().and_then(|e| e.raw_os_error()) {
+            None | Some(libc::ENOENT) => {}
+            Some(libc::ENOSPC) if chunk < capacity.max(256) => {
+                chunk *= 2; // one bucket holds more than a chunk
+                continue;
+            }
+            _ if first => return Ok(None),
+            _ => return Err(e.unwrap()),
+        }
+        let n = (attr.count as usize).min(chunk);
+        // SAFETY: the kernel wrote the first `n` keys; any bytes are a Pod.
+        out.extend(keys[..n].iter().map(|k| unsafe { k.assume_init() }));
+        if e.is_some() || out.len() >= capacity {
+            out.truncate(capacity);
+            return Ok(Some(out)); // ENOENT: past the last bucket
+        }
+        token_in = token_out;
+        first = false;
+    }
+    Ok(Some(out))
 }
 
 /// The keys of a hash map being changed under the walk, in at most `budget`
@@ -583,6 +670,24 @@ pub(crate) mod tests {
             cur = Some(k);
         }
         assert!(plain.iter().filter(|k| *k % 2 == 0 && **k < 2000).count() < 10);
+    }
+
+    /// The fallback's residual (Codex MED): a key deleted and re-inserted
+    /// at the same place between the walk's get-next-key and its check of
+    /// that key (A, restart, A again) can hold the walk at that key. The
+    /// walk then stays within its budget and keeps what it reached; on
+    /// kernels with batched lookups the sweep does not use this walk.
+    #[test]
+    fn test_walk_keys_same_key_churn_stays_bounded() {
+        let keys: Vec<u32> = (0..100).collect();
+        let next = |cur: Option<&u32>| match cur {
+            None => Some(0),
+            Some(5) => Some(0), // 5 deleted under the step: restart...
+            Some(c) => keys.get(*c as usize + 1).copied(),
+        };
+        let exists = |_: &u32| true; // ...and back before the check
+        let got = walk_keys(next, exists, 1000);
+        assert_eq!(got, (0..=5).collect::<Vec<_>>(), "held at 5, bounded");
     }
 
     /// A walk over a quiet map visits every key once, within the budget.
