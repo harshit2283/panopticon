@@ -123,6 +123,91 @@ pub fn protect_text(text: &str) -> Option<String> {
 /// A SQL statement with credential context, as exported: its verb and
 /// [`STATEMENT_WITHHELD`].
 pub fn withheld_statement(sql: &str) -> String {
+    match sql_verb(sql) {
+        Some(verb) => format!("{verb} {STATEMENT_WITHHELD}"),
+        None => STATEMENT_WITHHELD.to_string(),
+    }
+}
+
+/// Statement keywords a SQL statement may start with. Only these are
+/// exported as a method: a malformed statement's leading word may be
+/// anything, a secret included.
+const SQL_VERBS: &[&str] = &[
+    "ABORT",
+    "ALTER",
+    "ANALYZE",
+    "BEGIN",
+    "CALL",
+    "CHANGE",
+    "CHECK",
+    "CHECKPOINT",
+    "CHECKSUM",
+    "CLOSE",
+    "CLUSTER",
+    "COMMENT",
+    "COMMIT",
+    "COPY",
+    "CREATE",
+    "DEALLOCATE",
+    "DECLARE",
+    "DELETE",
+    "DESC",
+    "DESCRIBE",
+    "DISCARD",
+    "DO",
+    "DROP",
+    "END",
+    "EXECUTE",
+    "EXPLAIN",
+    "FETCH",
+    "FLUSH",
+    "GRANT",
+    "HANDLER",
+    "IMPORT",
+    "INSERT",
+    "INSTALL",
+    "KILL",
+    "LISTEN",
+    "LOAD",
+    "LOCK",
+    "MERGE",
+    "MOVE",
+    "NOTIFY",
+    "OPTIMIZE",
+    "PREPARE",
+    "PURGE",
+    "REASSIGN",
+    "REFRESH",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPAIR",
+    "REPLACE",
+    "RESET",
+    "REVOKE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "SECURITY",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "START",
+    "TABLE",
+    "TRUNCATE",
+    "UNINSTALL",
+    "UNLISTEN",
+    "UNLOCK",
+    "UPDATE",
+    "USE",
+    "VACUUM",
+    "VALUES",
+    "WITH",
+    "XA",
+];
+
+/// The statement's keyword (after leading comments), uppercased, if it is
+/// a known SQL statement keyword.
+pub fn sql_verb(sql: &str) -> Option<&'static str> {
     let mut s = sql.trim_start();
     // Leading comments.
     loop {
@@ -134,16 +219,14 @@ pub fn withheld_statement(sql: &str) -> String {
             break;
         }
     }
-    let verb: String = s
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .take(32)
-        .collect();
-    if verb.is_empty() {
-        STATEMENT_WITHHELD.to_string()
-    } else {
-        format!("{} {STATEMENT_WITHHELD}", verb.to_ascii_uppercase())
-    }
+    let end = s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    let word = &s[..end];
+    SQL_VERBS
+        .iter()
+        .find(|v| v.eq_ignore_ascii_case(word))
+        .copied()
 }
 
 // ── Normalised view ─────────────────────────────────────────────────────
@@ -609,6 +692,19 @@ mod tests {
             "ALTER <statement withheld>"
         );
         assert_eq!(withheld_statement("'x'"), STATEMENT_WITHHELD);
+        // Codex: the leading word of a malformed statement may be the
+        // secret itself; only a known SQL verb is shown.
+        assert_eq!(
+            withheld_statement("KJHGFDSA PASSWORD x"),
+            STATEMENT_WITHHELD
+        );
+        assert_eq!(sql_verb("KJHGFDSA x"), None);
+        assert_eq!(sql_verb("  /* c */ select 1"), Some("SELECT"));
+        assert_eq!(
+            sql_verb("with t as (select 1) select * from t"),
+            Some("WITH")
+        );
+        assert_eq!(sql_verb("(select 1)"), None);
         assert!(has_credential_context(
             "SET PASSWORD FOR \u{fc}@localhost = 'c'"
         ));

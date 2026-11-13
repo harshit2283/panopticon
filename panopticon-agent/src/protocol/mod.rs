@@ -141,7 +141,7 @@ pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
 pub use secrets::{
     FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
-    withheld_statement,
+    sql_verb, withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -174,14 +174,10 @@ pub fn export_statement(
         if let Some(mut b) = bound {
             zeroize::Zeroize::zeroize(&mut b);
         }
-        let verb = shown
-            .strip_suffix(STATEMENT_WITHHELD)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string);
+        let verb = sql_verb(&shown).map(str::to_string);
         return (verb, shown, None, true);
     }
-    let verb = query.split_whitespace().next().map(str::to_uppercase);
+    let verb = sql_verb(&query).map(str::to_string);
     let shown = truncate_utf8(&query, 4096).to_string();
     (verb, shown, bound, false)
 }
