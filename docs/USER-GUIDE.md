@@ -482,7 +482,9 @@ data. Known limits:
   `&gt;`, PostgreSQL `U&"…"` identifiers;
 - protobuf without its schema: field numbers, not names, so gRPC and
   protobuf body text is not exported at all while credentials are
-  protected;
+  protected, nor is an HTTP/2 body whose content type is unknown (that
+  direction lost a header block, the agent did not see the connection
+  start, or the content type is repeated or over 256 bytes);
 - packets forged or injected into a connection by someone who can do so,
   and state from before capture started that the parser cannot see.
 
@@ -545,10 +547,40 @@ What is exported then:
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
   body).
+- **HTTP/2 bodies** are not exported while credential masking is on when
+  their content type is unknown, since they may be protobuf: on a
+  direction of a connection that lost a header block (a block that failed
+  to decode, was skipped or was over the size limit, a final response
+  block after an informational `1xx` one included), for the rest of that
+  connection; on both directions of a connection the agent did not see
+  whole: joined mid-stream, a side whose start was not captured (a lost
+  SYN+ACK), or bytes lost outside a DATA frame, which restarts the
+  parser; and for a stream whose header block carries more than one
+  content type or one over 256 bytes (only the first 256 bytes of one
+  content type are ever examined). This lasts for the connection: a
+  client preface seen later on it does not lift it (it may be the payload
+  of a DATA frame). Only a new connection observed from its start
+  exports bodies again. Over TLS a new connection can reuse a closed
+  one's key (the library's connection object address). It starts clean
+  only once the agent has seen the library create the new object at that
+  address (the return of OpenSSL's `SSL_new`, in every mode), which
+  proves the old one was destroyed; nothing else resets the key (no
+  client preface, wherever it falls, nor `SSL_free`, which may drop one
+  reference of several). Otherwise a new connection on the key gets
+  neither its headers decoded nor its bodies exported, for as long as
+  the agent tracks that key: Go TLS (no such hook), a libssl whose
+  `SSL_new` the agent cannot find (static or renamed), an object reused
+  through `SSL_clear`, an object created before the agent attached, and
+  a record that was lost (ring or channel full, rate limit).
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
-  peer's, so no header of it is exported again on that connection.
-- **DNS answers** whose name has credential context are dropped.
+  peer's, so no header of it is exported again on that connection; on a
+  connection the agent did not see whole (as above), no header is decoded
+  at all. Both last for the connection, and a reused TLS key starts
+  clean only after the agent saw `SSL_new` return it, as above.
+- **DNS answers** whose name has credential context, or matches one of
+  your `[credentials]` patterns, are dropped before export and before the
+  name can reach the service graph.
 
 The price is more withheld text than a value-level mask would leave: a
 `SELECT` naming a `password` column, a body that mentions a token or a
@@ -594,9 +626,29 @@ that may answer a command sent before capture started, such as an
 `ACL GENPASS`, is therefore never exported under the first command
 captured. SQL bound values are exported only for a statement whose
 prepare the server confirmed on this connection, after the last lost
-client byte: in PostgreSQL a named statement is known from its
-`ParseComplete`, a `Parse` the server rejects does not replace it, and a
-re-`Parse` or `Close` forgets it until confirmed.
+client byte. In PostgreSQL a `Bind` is tied, when the agent reads it, to
+the SQL its statement (the unnamed one included) has at that point of
+the client's messages: the latest unanswered `Parse` of that name before
+it, which must then be confirmed by its `ParseComplete`, or else the
+statement already confirmed. Its values are exported only under that SQL,
+once confirmed, when it is the SQL the event shows and is not withheld,
+even if the statement is redefined later; a `Bind` of another statement
+than the cycle's `Parse`, or of one the server rejected, exports no
+values. Past 4096 retained `Bind` snapshots (Binds read but not yet
+consumed by their cycle), no bound value is exported on the connection. A `Parse` the server rejects
+does not replace a statement, and a re-`Parse` or `Close` forgets it
+until confirmed. A simple Query forgets every confirmed statement and
+cancels unanswered `Parse` messages: its SQL may `PREPARE` or
+`DEALLOCATE` any name, and it ends the unnamed statement. Several `Parse` messages may be sent before one `Sync`
+(pipelining); each `ParseComplete` confirms the oldest `Parse` still
+unanswered. After an error the server skips to the `Sync`, so the
+`Parse` messages before it are never confirmed; a `Close` of a name also
+cancels an unanswered `Parse` of it. If the agent ever cannot match the
+server's answers to the client's messages on a connection (it joined the
+connection mid-stream, server bytes were lost, an answer matches
+nothing), no `Parse` is confirmed for the rest of that connection and no
+bound value is exported on it, not even for a statement confirmed before,
+until a new connection is observed from its start.
 
 #### Your own credential formats: `[credentials]`
 
@@ -615,21 +667,31 @@ builtin = "full"                       # or "names_only"
 
 Patterns use the Rust `regex` syntax (linear time, no backreferences).
 Every text field of every protocol is checked: method, path, content type,
-header names and values, request and response bodies, SQL text and bound
-values, Redis arguments and replies, Kafka and AMQP fields. A match in the
-field as captured is replaced by `<REDACTED>`; a match only in its decoded
-view (escapes, entities and percent-encoding decoded, case kept) cannot be
-placed in the captured text, so the field becomes `<field withheld>`. The
-built-in rules run after yours. Patterns apply whenever credentials are
-protected (`mask_credentials` on, the default), and not to DNS names.
+header names (also when the value was wiped as a credential header) and
+values, request and response bodies, SQL text and bound values, Redis
+arguments and replies, Kafka and AMQP fields; a DNS answer whose name a
+pattern matches is dropped. A match in the field as captured is replaced
+by `<REDACTED>`. When the field has escapes, entities or percent-encoding,
+its decoded view (case kept) is matched too: a match there that is not
+the same match at the same place in the captured text cannot be placed
+there, so the field becomes `<field withheld>`. Your patterns and the built-in rules all look at the
+field as captured, before PII redaction rewrites it, and their matches are
+replaced together in one pass: the order of your patterns does not matter,
+and no pattern hides another's match or a credential name from the
+built-in rules. Captured text is matched whatever it reads like, a
+literal `<REDACTED>` included, in a header value as in any field. A
+field with more than 1024 matches is withheld. Patterns
+apply whenever credentials are protected (`mask_credentials` on, the
+default).
 
-Limits: at most 256 patterns, each at most 1024 bytes, none matching the
-empty string, and each and all together within a compiled-size limit. A
-pattern that is invalid or over a limit stops the agent at startup with
-the regex error, and a SIGHUP reload carrying one is refused (the running
-rules stay). A reload that changes `patterns` or `builtin` applies to
-every field protected after it; a message being scanned at that moment
-finishes with the previous rules.
+Limits: at most 256 patterns, each at most 1024 bytes, none able to match
+without consuming a character (`x*`, `\b`, `^`), and each and all
+together within a compiled-size limit. A pattern that is invalid or over
+a limit stops the agent at startup with the regex error, and a SIGHUP
+reload carrying one is refused (the running rules stay). A reload that
+changes `patterns` or `builtin` applies to every message whose scan starts
+after it; each message is protected under one rule set, so a message being
+scanned at that moment finishes with the previous rules.
 
 `builtin = "names_only"` keeps the cheap built-in rules: credential-named
 headers, the certain structures above (credential-named form parameters

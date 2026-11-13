@@ -1259,7 +1259,7 @@ fn mark_emitted(st: *mut SockState) {
 /// ring shard, reserved at the smallest power-of-two payload size class
 /// (64 to 4,096 bytes) that holds them: the header plus the captured bytes
 /// rounded up to a power of two (at least 64), where a whole DataEvent is
-/// 4,168 bytes.
+/// 4,192 bytes.
 /// Reserved in the ring, never built in a shared per-CPU buffer: egress
 /// runs in process context, where a softirq or (on a preemptible kernel)
 /// another task on the CPU can run these programs again mid-event; with

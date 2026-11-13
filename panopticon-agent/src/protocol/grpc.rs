@@ -83,6 +83,14 @@ impl ProtocolParser for GrpcParser {
     fn protocol_version(&self) -> Option<&str> {
         Some("2")
     }
+
+    fn joined_late(&mut self) {
+        self.inner.joined_late();
+    }
+
+    fn uncertain(&self) -> bool {
+        self.inner.uncertain()
+    }
 }
 
 impl GrpcParser {

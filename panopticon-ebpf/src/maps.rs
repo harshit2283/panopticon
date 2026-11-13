@@ -115,7 +115,7 @@ pub fn clear_scope_fields(event: *mut DataEvent) {
 // TC packets are copied in at their captured size (emit_scratch_event),
 // cgroup_skb packets reserved at a size class that holds them, and close and
 // connect/accept records as the header only (SizedEvent), but TLS events keep
-// fixed 4,168-byte reserves (see EVENT_SCRATCH), so one connection's TLS
+// fixed 4,192-byte reserves (see EVENT_SCRATCH), so one connection's TLS
 // burst has a single shard to fill: ~250 records at 1 MiB per shard on a
 // 64-CPU node, where the single 16 MiB ring held ~3,900. Every reserved byte
 // is written before submit: user space maps the whole ring.
@@ -225,7 +225,7 @@ pub fn shard_for(socket_cookie: u64) -> u32 {
 
 /// Send the event built in a scratch DataEvent to its connection's shard,
 /// copying only the header and `payload_len` payload bytes: a typical
-/// packet record is a few hundred bytes instead of 4,168, so a ring holds
+/// packet record is a few hundred bytes instead of 4,192, so a ring holds
 /// many times more of them. Counts a kernel drop if the shard is full.
 #[inline(always)]
 pub fn emit_scratch_event(event: *const DataEvent) {

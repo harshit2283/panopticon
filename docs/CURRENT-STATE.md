@@ -188,9 +188,18 @@ production-hardened compliance platform.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
-    reported as `EXECUTE` without their SQL.
-  - HTTP/2 headers cannot be decoded when the agent joins a connection that
-    was already open (HPACK state is lost).
+    reported as `EXECUTE` without their SQL. PostgreSQL bound values are
+    not exported on a connection the agent joined mid-stream or lost
+    server bytes on, and a simple Query forgets every confirmed statement.
+  - HTTP/2 headers are not decoded on a connection the agent did not see
+    whole: one already open when the agent started, a side whose start
+    was not captured, or one whose parser restarted after lost bytes; a
+    later client preface on it does not lift this. Over TLS a new
+    connection that reuses a closed one's key starts clean only once the
+    agent has seen OpenSSL's `SSL_new` return the new object; with Go TLS
+    (no such hook), a static or renamed libssl, `SSL_clear` reuse, or
+    when that record was lost, it is not decoded either. While credential masking is on its bodies are not exported
+    either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -214,11 +223,23 @@ production-hardened compliance platform.
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
     Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block,
+    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    the agent did not see whole (and, while masking is on, HTTP/2 bodies
+    on such a connection until a new connection is observed from its
+    start, over TLS on a reused key only after `SSL_new` returned
+    the new object as above,
+    and bodies whose content type is repeated or over 256 bytes),
     over-long header names and gRPC/protobuf body text are not exported;
+    PostgreSQL bound values are exported only under the SQL their
+    statement had when the Bind was sent, once confirmed, even if it is
+    redefined later (a simple Query forgets every statement), and not at
+    all on a connection joined mid-stream, after lost server bytes or
+    past 4096 retained Bind snapshots;
     only known SQL keywords are exported as methods. `[credentials]
-    patterns` adds the user's own formats (masked in every field, counted
-    in `panopticon_credential_matches_total`), and `builtin = "names_only"`
+    patterns` adds the user's own formats (masked in every field, matching
+    DNS answers dropped, counted in `panopticon_credential_matches_total`;
+    every rule sees the field as captured and one rule set covers a whole
+    message), and `builtin = "names_only"`
     skips the free-text scan. `full` does this too, with or without PII
     detection, unless `[privacy] mask_credentials = false`.
   - Credential protection is a hard guarantee only in `metrics_only`

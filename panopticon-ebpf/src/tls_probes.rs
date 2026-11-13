@@ -4,7 +4,9 @@
 //! OpenSSL 1.1.1+ applications such as CPython, curl and nginx call), and Go's
 //! `crypto/tls.(*Conn).Write`. Captures the plaintext buffer contents and
 //! emits TlsData events tagged with the connection object pointer (`SSL*`,
-//! `*tls.Conn`) so user space can tell connections apart.
+//! `*tls.Conn`) so user space can tell connections apart. `SSL_new`'s
+//! return sends a TlsNew record, so a connection that gets a destroyed
+//! object's address is not read as the old one.
 //!
 //! Go received plaintext is not taken from the caller's `Read` buffer, whose
 //! lifetime a probe cannot establish, but from each record as
@@ -24,9 +26,10 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_CALLS, PROC_EPOCH, SockTuple, TLS_ACTIVE,
-    TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH,
-    TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple,
+    TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR,
+    TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve,
+    shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_monitor::read_sock_tuple;
 use panopticon_common::{GoReadCall, GoReadKey};
@@ -684,6 +687,90 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         TlsLibrary::OpenSsl,
         addr,
     )
+}
+
+// ── OpenSSL: SSL_new ───────────────────────────────────────────────────────
+
+/// Return probe of `SSL_new`: the library created a connection object at
+/// the returned address X. Sends a header-only `TlsNew` record keyed like
+/// that object's data events (same address and pid: the same ring shard
+/// and worker), which user space takes as the start of a new connection
+/// on X's key.
+///
+/// Why the order holds: an address is returned by `SSL_new` only once
+/// any earlier object at it was destroyed (the allocator hands X out
+/// again only after its final free), whatever reference counts it had
+/// (`SSL_up_ref`), and the earlier object's last data event was emitted
+/// by an SSL_read / SSL_write probe before that destruction. The new
+/// object's first I/O comes after `SSL_new` returned, so after this
+/// record. Every one of them is reserved in `shard_for(X)`, and ring
+/// reservations are serialised. `SSL_free` is not a boundary (it only
+/// drops a reference), nor `SSL_clear` or `SSL_dup` (same object).
+///
+/// Gated like the data events, per process (no socket I/O yet): a record
+/// carries no data, so an extra one is harmless and a missed one only
+/// leaves the key latched. An out-of-scope one counts no drop.
+#[uretprobe]
+pub fn ssl_new_ret(ctx: RetProbeContext) {
+    let _ = try_ssl_new_ret(&ctx);
+}
+
+#[inline(always)]
+fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
+    let ssl = ctx.ret::<u64>();
+    if ssl == 0 || !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    // The new object has its own sockets: no address of an earlier one.
+    let _ = TLS_CONN_ADDR.remove(&TlsConnKey {
+        conn: ssl,
+        pid,
+        _pad: 0,
+    });
+    let mode = crate::sock_capture::scope_mode();
+    let mut scope_gen = crate::sock_capture::scope_gen();
+    if panopticon_common::scope::is_unscoped_full(mode) {
+        if !pid_allowed(pid) {
+            return Ok(());
+        }
+    } else {
+        match crate::sock_capture::tls_call_scope(mode, pid) {
+            Ok(g) => scope_gen = g,
+            Err(_) => return Ok(()),
+        }
+    }
+    let shard = shard_for(ssl);
+    let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
+        crate::maps::count_kernel_drop();
+        return Ok(());
+    };
+    // Header fields only: they all lie in the reserved record.
+    let event = entry.as_mut_ptr() as *mut DataEvent;
+    unsafe {
+        (*event).timestamp_ns = bpf_ktime_get_ns();
+        (*event).socket_cookie = ssl;
+        (*event).event_type = EventType::TlsNew;
+        (*event).direction = Direction::Egress;
+        (*event).pid = pid;
+        (*event).tgid = pid_tgid as u32;
+        (*event).src_addr = 0;
+        (*event).dst_addr = 0;
+        (*event).src_port = 0;
+        (*event).dst_port = 0;
+        (*event).ip_proto = 0;
+        (*event).tls_library = TlsLibrary::OpenSsl;
+        (*event).payload_len = 0;
+        (*event).orig_len = 0;
+        (*event).tcp_flags = 0;
+        (*event).tcp_seq = 0;
+        (*event).tcp_ack = 0;
+        crate::maps::clear_scope_fields(event);
+        (*event).scope_gen = scope_gen;
+    }
+    entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
+    Ok(())
 }
 
 // ── Go TLS: crypto/tls.(*Conn).Write ──────────────────────────────────────

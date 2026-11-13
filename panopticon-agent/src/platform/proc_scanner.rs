@@ -200,6 +200,9 @@ pub enum TlsType {
         /// use them never call `SSL_write` / `SSL_read`.
         ssl_write_ex_offset: Option<u64>,
         ssl_read_ex_offset: Option<u64>,
+        /// `SSL_new`: its return starts a new connection on the returned
+        /// object's key (tls_probes.rs `ssl_new_ret`).
+        ssl_new_offset: Option<u64>,
     },
     /// Only for a build [`go_build_admitted`] accepts.
     GoTls {
@@ -599,7 +602,13 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
     if is_openssl_library(path)
         && let Ok(syms) = resolve_elf_symbols(
             namespace_path,
-            &["SSL_write", "SSL_read", "SSL_write_ex", "SSL_read_ex"],
+            &[
+                "SSL_write",
+                "SSL_read",
+                "SSL_write_ex",
+                "SSL_read_ex",
+                "SSL_new",
+            ],
         )
         && let (Some(&write_off), Some(&read_off)) = (syms.get("SSL_write"), syms.get("SSL_read"))
     {
@@ -609,6 +618,7 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
             ssl_read_offset: read_off,
             ssl_write_ex_offset: syms.get("SSL_write_ex").copied(),
             ssl_read_ex_offset: syms.get("SSL_read_ex").copied(),
+            ssl_new_offset: syms.get("SSL_new").copied(),
         });
     }
 
@@ -1007,6 +1017,7 @@ mod tests {
                 ssl_read_offset: 2,
                 ssl_write_ex_offset: None,
                 ssl_read_ex_offset: None,
+                ssl_new_offset: None,
             },
             file_key: None,
         };

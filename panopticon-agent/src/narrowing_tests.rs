@@ -1717,6 +1717,122 @@ fn publisher_ending_any_way_is_a_fatal_stop() {
     });
 }
 
+// ── TLS key incarnations (Codex R9, R10) ────────────────────────────────────
+
+/// An HTTP/2 frame.
+fn h2_frame(t: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+    f.extend([t, flags]);
+    f.extend(stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Client preface and SETTINGS, then `rest`.
+fn h2_start(rest: &[u8]) -> Vec<u8> {
+    let mut d = crate::protocol::detect::HTTP2_PREFACE.to_vec();
+    d.extend(h2_frame(0x4, 0, 0, &[]));
+    d.extend_from_slice(rest);
+    d
+}
+
+/// GET / on `stream` (static-table HEADERS) with `body`, END_STREAM.
+fn h2_request(stream: u32, body: &[u8]) -> Vec<u8> {
+    let mut d = h2_frame(0x1, 0x4, stream, &[0x82, 0x84]);
+    d.extend(h2_frame(0x0, 0x1, stream, body));
+    d
+}
+
+/// An OpenSSL read or write on object 0x9000 of pid 70 (`kind` TlsNew:
+/// `SSL_new` returning it, on another thread).
+fn ssl_rec(kind: EventType, dir: Direction, payload: &[u8]) -> DataEvent {
+    // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
+    let mut e: DataEvent = unsafe { std::mem::zeroed() };
+    e.event_type = kind;
+    e.direction = dir;
+    (e.pid, e.tgid) = (70, if kind == EventType::TlsNew { 71 } else { 70 });
+    e.socket_cookie = 0x9000;
+    e.tls_library = panopticon_common::TlsLibrary::OpenSsl;
+    e.payload[..payload.len()].copy_from_slice(payload);
+    (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
+    e.scope_gen = 1;
+    e.timestamp_ns = 1;
+    e
+}
+
+/// Through the real worker loop: only a TlsNew record (`SSL_new` returned
+/// the object) starts a new connection on a TLS key. Codex R10's up-ref
+/// schedule (`SSL_up_ref`, a non-final `SSL_free`, the object still in
+/// use, no new object) sends no TlsNew: a latched connection followed by
+/// a preface stays withheld. After a TlsNew the next connection exports,
+/// and an embedded preface inside its DATA does not restart it. Every
+/// record is on one key, so one worker handles them in order.
+#[test]
+fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
+    t2(
+        "only_ssl_new_starts_a_new_connection_on_a_tls_key",
+        4,
+        async {
+            let env = Env::new("tlsnew").await;
+            let data = |dir, p: &[u8]| ssl_rec(EventType::TlsData, dir, p);
+            let born = || ssl_rec(EventType::TlsNew, Direction::Egress, b"");
+            let reply = |stream| h2_frame(0x1, 0x4 | 0x1, stream, &[0x88]);
+            let bad = h2_frame(0x1, 0x4 | 0x1, 1, &[0x80]); // HPACK index 0
+            // An embedded preface: a DATA frame of stream 1 whose payload the
+            // next write carries.
+            let mut open = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]); // POST /
+            open.extend(&h2_frame(0x0, 0, 1, &[0; 4096])[..9]);
+            let mut forged = h2_start(&h2_request(3, b"tlsnew-canary-three"));
+            forged.extend(h2_frame(0x3, 0, 0, &[0; 4])); // RST_STREAM(0)
+            env.feed(&[
+                born(),
+                // Latched (HPACK failure), then a preface with no TlsNew.
+                data(Direction::Egress, &h2_start(&bad)),
+                data(
+                    Direction::Egress,
+                    &h2_start(&h2_request(3, b"tlsnew-canary-one")),
+                ),
+                data(Direction::Ingress, &reply(3)),
+                // A new object at the address: a clean connection.
+                born(),
+                data(Direction::Egress, &h2_start(&h2_request(1, b"tlsnew-two"))),
+                data(Direction::Ingress, &reply(1)),
+                // Then an embedded preface on it.
+                data(Direction::Egress, &h2_start(&open)),
+                data(Direction::Egress, &forged),
+                data(Direction::Ingress, &reply(3)),
+                // A last new connection: once it exports, everything before
+                // it on the key was handled.
+                born(),
+                data(Direction::Egress, &h2_start(&h2_request(1, b"tlsnew-four"))),
+                data(Direction::Ingress, &reply(1)),
+            ]);
+            env.wait_for("tlsnew-two", &["json"]).await;
+            env.wait_for("tlsnew-four", &["json"]).await;
+            for sink in ["json", "otlp"] {
+                let out = env
+                    .outputs()
+                    .into_iter()
+                    .find(|(n, _)| *n == sink)
+                    .unwrap()
+                    .1;
+                for canary in ["tlsnew-canary-one", "tlsnew-canary-three"] {
+                    assert!(!contains(&out, canary), "{canary} reached {sink}");
+                }
+            }
+            // The raw dump keeps the TlsNew records, for a replay.
+            let raw = env.file("raw.pncap");
+            let mut reader = crate::replay::CaptureReader::new(&raw[..]).unwrap();
+            let mut news = 0;
+            while let Some(e) = reader.read_event().unwrap() {
+                news += (e.event_type == EventType::TlsNew) as usize;
+            }
+            assert_eq!(news, 3, "TlsNew records in the raw dump");
+            env.scope.shutdown().await;
+        },
+    );
+}
+
 /// The publisher resolves cgroups with openat2 (`scope_select::resolve`):
 /// Linux only.
 #[cfg(target_os = "linux")]

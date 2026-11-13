@@ -69,6 +69,7 @@ pub const TLS_PROGRAMS: &[&str] = &[
     "ssl_read_entry",
     "ssl_read_ex_entry",
     "ssl_read_ret",
+    "ssl_new_ret",
     "go_tls_write_entry",
     "go_tls_rrc_entry",
     "go_tls_rrc_ret",

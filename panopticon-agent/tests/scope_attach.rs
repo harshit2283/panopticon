@@ -100,6 +100,13 @@ pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i
     n
 }
 
+/// Stand-in for OpenSSL's `SSL_new(ctx)`: returns the object address.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn panop_test_ssl_new(obj: u64) -> u64 {
+    std::hint::black_box(obj)
+}
+
 /// Stand-in for OpenSSL's `SSL_read(ssl, buf, num)`: reads from `TEST_FD`.
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -2207,6 +2214,33 @@ fn scope_programs_load_attach_and_hold() {
         (Direction::Ingress, c4_port),
         "control: read carries its own address"
     );
+    // SSL_new's return sends a header-only TlsNew keyed like the returned
+    // object's data; a NULL return sends nothing.
+    {
+        let p: &mut aya::programs::UProbe =
+            ebpf.program_mut("ssl_new_ret").unwrap().try_into().unwrap();
+        let link = p
+            .attach("panop_test_ssl_new", "/proc/self/exe", Some(me))
+            .expect("ssl_new_ret attaches");
+        let new = std::hint::black_box(panop_test_ssl_new as extern "C" fn(u64) -> u64);
+        assert_eq!(new(0), 0);
+        assert_eq!(new(ssl), ssl);
+        let mut seen = Vec::new();
+        while let Some(item) = ring.next() {
+            // SAFETY: all-zero is a valid DataEvent.
+            let mut r: DataEvent = unsafe { std::mem::zeroed() };
+            if read_data_event_into(&item, &mut r) && r.event_type == EventType::TlsNew {
+                seen.push((r.socket_cookie, r.pid, r.payload_len, item.len()));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![(ssl, e.pid, 0, panopticon_common::DATA_EVENT_HEADER_LEN)],
+            "SSL_new: one header-only TlsNew for the returned object"
+        );
+        p.detach(link).unwrap();
+    }
+    println!("TLS_BORN OK");
     for (index, what) in stops {
         pre(Some((index, 0)));
         read_once(&mut s4, b"r-stop");

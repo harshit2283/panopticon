@@ -102,6 +102,9 @@ HTTP/2 over TLS had two problems of its own:
   connection object, so a new connection can get the same `*tls.Conn` /
   `SSL*` key. Its preface then landed in the old connection's parser, along
   with its stale HPACK state. A client preface now restarts the parser.
+  Since then (credential masking, USER-GUIDE §5.3) a reused key starts
+  clean only after the agent saw OpenSSL's `SSL_new` return the new
+  object; otherwise the restarted parser stays latched.
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
@@ -632,7 +635,8 @@ VM (5.15 verifier included).
 
 **Limits.**
 
-- **TLS bursts.** TLS events still use fixed 4,168-byte records,
+- **TLS bursts.** TLS events still use fixed full-size records (4,168
+  bytes in these runs, 4,192 now),
   and one connection's events all go to one shard. A shard holds about 250
   of them on a 64-CPU node (1 MiB per shard), where the single ring held
   about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy
@@ -1316,21 +1320,23 @@ machine), medians; the PII engine on the same machine, for scale:
 
 | Body | `builtin` | User patterns | Median | Throughput |
 |---|---|---|---|---|
-| clean | `full` | 0 | 12.3 µs | 313 MiB/s |
-| clean | `full` | 256 | 18.7 µs | 205 MiB/s |
-| clean | `names_only` | 0 | 11.9 µs | 323 MiB/s |
-| clean | `names_only` | 256 | 18.2 µs | 211 MiB/s |
-| context | `full` | 0 | 33.1 µs | 116 MiB/s |
-| context | `full` | 256 | 39.4 µs | 97 MiB/s |
-| context | `names_only` | 0 | 14.5 µs | 264 MiB/s |
-| context | `names_only` | 256 | 20.9 µs | 183 MiB/s |
+| clean | `full` | 0 | 13.3 µs | 290 MiB/s |
+| clean | `full` | 256 | 20.8 µs | 185 MiB/s |
+| clean | `names_only` | 0 | 12.1 µs | 319 MiB/s |
+| clean | `names_only` | 256 | 19.4 µs | 198 MiB/s |
+| context | `full` | 0 | 34.1 µs | 113 MiB/s |
+| context | `full` | 256 | 41.6 µs | 93 MiB/s |
+| context | `names_only` | 0 | 14.6 µs | 264 MiB/s |
+| context | `names_only` | 256 | 21.9 µs | 176 MiB/s |
 
 On clean text `full` costs what `names_only` does: one pass looks for any
 credential word and skips the word scan when there is none. With context
 `full` adds the word scan, the structure masking and the re-check of
-what is left (about 2.3× `names_only`). 256 patterns add about 6.5 µs
+what is left (about 2.3× `names_only`). 256 patterns add about 7.5 µs
 per message (one `RegexSet` pass per field, plus the decoded view when a
-field has escapes). Without the single-pass word check and the shortcut
+field has escapes). Every rule runs on the field as captured and the
+matches are replaced in one pass; that change cost 0 to 2 µs per message
+over the previous sequential replacement. Without the single-pass word check and the shortcut
 for plain field names, the same messages took 37.9 µs (clean) and
 77.8 µs (context) with `full` and no patterns.
 
@@ -1356,8 +1362,13 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   deployments MySQL plaintext comes from the OpenSSL uprobes, which are
   validated with HTTP (above) but not yet with a MySQL client.
 - **HTTP/2 joined mid-connection** (agent started after the connection was
-  opened): HPACK state is lost, so most headers, including the path, cannot be
-  decoded until a new connection is opened.
+  opened, a side's start not captured, or the parser restarted after bytes
+  lost outside a DATA frame): HPACK state is unknown, so no header,
+  including the path, is decoded for the rest of that connection (a later
+  client preface on it does not lift this; over TLS a reused key starts
+  clean only after `SSL_new` returned the new object, USER-GUIDE §5.3), and while credential masking
+  is on its bodies are not exported (nor are bodies after any lost header
+  block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.

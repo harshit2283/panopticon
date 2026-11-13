@@ -60,10 +60,10 @@ current release report.
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |
 | Windows runtime | Unsupported | No Windows eBPF/runtime support. |
 | HTTP/1.1 parsing | Supported | 100% recall against ground truth, incl. keep-alive, chunked and >4KB bodies ([benchmarks](docs/BENCHMARKS.md)). |
-| HTTP/2 parsing | Supported | Per-direction HPACK; headers are lost when the agent joins an existing connection. |
-| gRPC parsing | Supported | 100% recall, method path and `grpc-status` against ground truth; payloads shown as printable strings (no schema decoding, no compressed messages). |
+| HTTP/2 parsing | Supported | Per-direction HPACK; on a connection the agent did not see whole (joined an existing connection, a side's start not captured, or the parser restarted after lost bytes) headers are not decoded for the rest of that connection, and bodies are withheld while credential masking is on. Over TLS a reused connection key starts clean only after the agent saw OpenSSL's `SSL_new` return the new object (not available for Go TLS). |
+| gRPC parsing | Supported | 100% recall, method path and `grpc-status` against ground truth; payloads are not exported while credential masking is on (the default); with it off they are shown as printable strings (no schema decoding, no compressed messages). |
 | MySQL parsing | Supported | Text protocol (incl. MySQL 8 query attributes) and prepared statements (binary protocol, with bound parameter values) at 100% recall against ground truth on plaintext connections. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. |
-| PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall; COPY and large objects not parsed. |
+| PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall; COPY and large objects not parsed. Bound values are not exported on connections joined mid-stream. |
 | Redis parsing | Supported | RESP2 and RESP3, pipelining; 100% recall against ground truth. |
 | Kafka parsing | Supported | Classic and flexible (KIP-482) versions, topic IDs; 100% recall, topic and error code against ground truth (librdkafka, kafka-python). Record keys/values of uncompressed batches are PII-scanned; compressed batches are not decoded. Detected on port 9092 only. |
 | AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. |

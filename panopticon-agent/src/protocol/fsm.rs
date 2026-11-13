@@ -126,6 +126,11 @@ pub trait ProtocolFsm: Send {
 
     /// See [`ProtocolParser::joined_late`].
     fn joined_late(&mut self) {}
+
+    /// See [`ProtocolParser::uncertain`].
+    fn uncertain(&self) -> bool {
+        false
+    }
 }
 
 pub struct ProtocolFsmAdapter {
@@ -186,6 +191,10 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 
     fn joined_late(&mut self) {
         self.parser.joined_late();
+    }
+
+    fn uncertain(&self) -> bool {
+        self.parser.uncertain()
     }
 }
 
@@ -334,6 +343,15 @@ struct ConnectionEntry {
     /// FIN seen from the client / from the server.
     fin: [bool; 2],
     tcp: TcpTracker,
+    /// Payload was fed to a parser of this entry.
+    fed: bool,
+    /// Bytes of the connection were lost, its start was proved missing (an
+    /// unplaced TCP side, a gap the parser could not account for), or its
+    /// parser latched (`ProtocolFsm::uncertain`: a preface that did not
+    /// prove a connection start, an HPACK failure). Lives as long as the
+    /// entry: a replacement parser is latched again (`joined_late`), and
+    /// only a new entry starts without it.
+    lost: bool,
 }
 
 impl ConnectionEntry {
@@ -422,6 +440,8 @@ impl ConnectionFsmManager {
             server,
             fin: [false; 2],
             tcp: TcpTracker::default(),
+            fed: false,
+            lost: false,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
@@ -466,6 +486,7 @@ impl ConnectionFsmManager {
             .count()
     }
 
+    /// Feed a packet in `direction`, used as given.
     pub fn process_packet(
         &self,
         conn_id: u64,
@@ -474,8 +495,7 @@ impl ConnectionFsmManager {
         timestamp_ns: u64,
     ) -> Option<FsmResult> {
         let mut entry = self.connections.get_mut(&conn_id)?;
-        entry.last_seen = Instant::now();
-        Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+        Some(self.feed(&mut entry, direction, data, timestamp_ns))
     }
 
     /// Feed a packet sent by `src`. If the connection's server endpoint is
@@ -490,22 +510,41 @@ impl ConnectionFsmManager {
         timestamp_ns: u64,
     ) -> Option<FsmResult> {
         let mut entry = self.connections.get_mut(&conn_id)?;
-        entry.last_seen = Instant::now();
         let direction = entry.direction_of(src, capture_direction);
-        // A connection key can be reused by a new connection: TLS keys are
-        // the library's connection object address, which the allocator hands
-        // to the next connection once the old one is freed. A client preface
-        // means a new HTTP/2 connection started; its frames and HPACK state
-        // must not be read as a continuation of the old one.
-        if direction == Direction::Egress
-            && matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc)
-            && data.starts_with(super::detect::HTTP2_PREFACE)
-        {
+        Some(self.feed(&mut entry, direction, data, timestamp_ns))
+    }
+
+    fn feed(
+        &self,
+        entry: &mut ConnectionEntry,
+        direction: Direction,
+        data: &[u8],
+        timestamp_ns: u64,
+    ) -> FsmResult {
+        entry.last_seen = Instant::now();
+        // A client preface means a new HTTP/2 connection may have started;
+        // its frames and HPACK state must not be read as a continuation of
+        // the old one, so the parser is replaced. The replacement starts
+        // clean only as the entry's first payload with no loss recorded:
+        // anywhere else the preface bytes can be the inside of a DATA
+        // payload, so it is latched. A new connection reusing a TLS key
+        // gets a new entry only when the library created a new object at
+        // that address (`EventType::TlsNew`, `SSL_new`), never by its bytes.
+        let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
+        let preface = h2 && data.starts_with(super::detect::HTTP2_PREFACE);
+        let first = !entry.fed && !entry.lost;
+        if preface && (first || direction == Direction::Egress) {
             let protocol = entry.fsm.protocol();
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
             entry.fin = [false; 2];
+            if !first {
+                entry.fsm.joined_late();
+            }
         }
-        Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+        entry.fed = true;
+        let result = entry.fsm.process_packet(direction, data, timestamp_ns);
+        entry.lost |= entry.fsm.uncertain();
+        result
     }
 
     /// Check a TCP segment sent by `src` against the connection's sequence
@@ -527,6 +566,7 @@ impl ConnectionFsmManager {
         let unplaced = entry.tcp.next[side].is_none();
         let verdict = entry.tcp.admit(side, seg);
         if unplaced && verdict != SegmentVerdict::Drop {
+            entry.lost = true;
             entry.fsm.joined_late();
         }
         Some(verdict)
@@ -619,7 +659,14 @@ impl ConnectionFsmManager {
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
         }
         // Bytes were lost: whatever the parser does next starts mid-stream.
-        entry.fsm.joined_late();
+        // The exception: an HTTP/2 parser that accounted for the gap inside
+        // a DATA frame (its HPACK state and framing are intact).
+        let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
+        if result.is_none() || !h2 {
+            entry.lost = true;
+            entry.fsm.joined_late();
+        }
+        entry.lost |= entry.fsm.uncertain();
         result
     }
 
@@ -728,19 +775,45 @@ mod tests {
         };
         let m = ConnectionFsmManager::new(16);
         let (client, server) = ((0, 1), (0, 2));
-        m.get_or_create_with_server(9, Protocol::Http2, Some(server));
-        // First connection: one exchange, then it closes...
+        // What the worker does for a TLS event (event_loop `feed_event`).
+        let open = || {
+            if !m.contains(9) {
+                m.get_or_create_with_server(9, Protocol::Http2, Some(server));
+                m.mark_joined_late(9);
+            }
+        };
+        // First connection: one exchange, then a new object at the same
+        // address (a TlsNew record closes the key)...
         let (mut c1, mut s1) = (hpack::Encoder::new(), hpack::Encoder::new());
+        open();
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c1, "/one"), 1);
         let first =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s1), 2));
         assert_eq!(first, vec![Some("/one".to_string())]);
-        // ...and a new one gets the same key (freed and reallocated SSL*).
+        assert!(m.close_connection(9));
+        // ...and a new one gets the same key (reallocated SSL*).
         let (mut c2, mut s2) = (hpack::Encoder::new(), hpack::Encoder::new());
+        open();
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c2, "/two"), 3);
         let second =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s2), 4));
         assert_eq!(second, vec![Some("/two".to_string())]);
+    }
+
+    /// Codex R8 #3: `process_packet` uses the direction it is given, even on
+    /// a connection whose server endpoint is known.
+    #[test]
+    fn test_process_packet_keeps_the_given_direction() {
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create_with_server(1, Protocol::Redis, Some((0x0A00_0001, 6379)));
+        m.process_packet(1, Direction::Egress, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", 1);
+        let out = m.process_packet(1, Direction::Ingress, b"$3\r\nbob\r\n", 2);
+        let method = match &out {
+            Some(FsmResult::MessageComplete(msg)) => msg.method.clone(),
+            Some(FsmResult::Messages(ms)) => ms.first().and_then(|m| m.method.clone()),
+            _ => None,
+        };
+        assert_eq!(method.as_deref(), Some("GET"), "{out:?}");
     }
 
     #[test]

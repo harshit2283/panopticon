@@ -97,6 +97,11 @@ pub enum EventType {
     SockClose = 6,
     UdpSend = 7,
     UdpRecv = 8,
+    /// The TLS library created a connection object (`SSL_new` returned it):
+    /// the header only, keyed like that object's `TlsData` events. Any
+    /// earlier object at that address was destroyed: a new connection
+    /// starts on its key.
+    TlsNew = 9,
 }
 
 impl EventType {
@@ -111,6 +116,7 @@ impl EventType {
             6 => Some(Self::SockClose),
             7 => Some(Self::UdpSend),
             8 => Some(Self::UdpRecv),
+            9 => Some(Self::TlsNew),
             _ => None,
         }
     }
@@ -689,6 +695,7 @@ mod tests {
         assert_eq!(EventType::SockClose as u32, 6);
         assert_eq!(EventType::UdpSend as u32, 7);
         assert_eq!(EventType::UdpRecv as u32, 8);
+        assert_eq!(EventType::TlsNew as u32, 9);
     }
 
     #[test]

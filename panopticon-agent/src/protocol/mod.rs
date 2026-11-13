@@ -141,13 +141,16 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
 // Installed by main's (Linux-only) startup and reload.
+#[cfg(test)]
+pub use credential_rules::LOADS as CREDENTIAL_RULE_LOADS;
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use credential_rules::{
-    Builtin, CredentialRules, count_builtin, credential_matches, set_credential_rules,
+    Builtin, CredentialRules, count_builtin, credential_matches, credential_rules,
+    set_credential_rules,
 };
 pub use secrets::{
-    FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
-    sql_verb, withheld_statement,
+    Decision, FIELD_WITHHELD, STATEMENT_WITHHELD, decide, has_credential_context,
+    is_credential_name, sql_verb, withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -203,10 +206,11 @@ pub fn export_error_text(text: String, statement_withheld: bool) -> String {
     }
 }
 
-/// [`protect_text`] in place: credential values masked, or the field
+/// Protect `text` in place under `rules` (see [`decide`]; the built-in
+/// rules only when `builtin`): credential values masked, or the field
 /// replaced by [`FIELD_WITHHELD`].
-pub fn protect_text_in(text: &mut String) {
-    if let Some(out) = protect_text(text) {
+pub fn protect_text_in(rules: &CredentialRules, text: &mut String, builtin: bool) {
+    if let Some(out) = decide(rules, text, builtin).apply(text) {
         zeroize::Zeroize::zeroize(text);
         *text = out;
     }
@@ -268,6 +272,13 @@ pub trait ProtocolParser: Send {
     /// A parser that pairs replies with requests by order must stop
     /// trusting that pairing.
     fn joined_late(&mut self) {}
+
+    /// The parser holds a latch that withholds what it can no longer
+    /// read with certainty (HTTP/2: header state lost). The connection
+    /// keeps it for its lifetime, past any parser replacement.
+    fn uncertain(&self) -> bool {
+        false
+    }
 }
 
 // ── Parser Factory ───────────────────────────────────────────────────────
