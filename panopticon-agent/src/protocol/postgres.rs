@@ -1027,8 +1027,8 @@ mod tests {
         );
     }
 
-    /// Codex R8 #2: Binds the server has not answered are retained one
-    /// record each; a client pipelining Binds of a large statement must not
+    /// Codex R8 #2: Binds read but not yet consumed by their cycle are
+    /// retained one snapshot each; a client pipelining Binds of a large statement must not
     /// grow memory without bound (records capped, SQL shared, not copied).
     #[test]
     fn test_unanswered_binds_stay_bounded() {

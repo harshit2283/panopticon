@@ -552,20 +552,20 @@ What is exported then:
   client preface seen later on it does not lift it (it may be the payload
   of a DATA frame). Only a new connection observed from its start
   exports bodies again. Over TLS a new connection can reuse a closed
-  one's key (the library's connection object address): a new TCP socket
-  under a reused key starts clean, nothing else does (no client preface,
-  wherever it falls). The agent knows the socket of a TLS read or write
-  only for OpenSSL with the `cgroup_skb` backend and a `pid_filter`,
-  `cgroup_filter` or `pod_filter`, and only for calls that did socket
-  I/O; elsewhere (the TC backend, an unfiltered `cgroup_skb`, Go TLS) a
-  new connection that reuses a key gets neither its headers decoded nor
-  its bodies exported, for as long as the agent tracks that key.
+  one's key (the library's connection object address). It starts clean
+  only once the agent has seen the library free the old object (OpenSSL
+  `SSL_free`, in every mode); nothing else resets the key (no client
+  preface, wherever it falls). Go TLS has no such hook, and a free whose
+  record was lost (ring or channel full, rate limit) counts as none:
+  then a new connection that reuses the key gets neither its headers
+  decoded nor its bodies exported, for as long as the agent tracks that
+  key.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
-  clean only on a new TCP socket, as above.
+  clean only after the agent saw the old object freed, as above.
 - **DNS answers** whose name has credential context, or matches one of
   your `[credentials]` patterns, are dropped before export and before the
   name can reach the service graph.
@@ -622,8 +622,8 @@ statement already confirmed. Its values are exported only under that SQL,
 once confirmed, when it is the SQL the event shows and is not withheld,
 even if the statement is redefined later; a `Bind` of another statement
 than the cycle's `Parse`, or of one the server rejected, exports no
-values. Past 4096 `Bind` messages the server has not answered yet, no
-bound value is exported on the connection. A `Parse` the server rejects
+values. Past 4096 retained `Bind` snapshots (Binds read but not yet
+consumed by their cycle), no bound value is exported on the connection. A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
 until confirmed. A simple Query forgets every confirmed statement and
 cancels unanswered `Parse` messages: its SQL may `PREPARE` or
