@@ -247,7 +247,8 @@ impl Sweep {
 /// from a batched walk. Batched (`BPF_MAP_LOOKUP_BATCH`, Linux 5.6+) where
 /// the kernel has it: its cursor is a bucket index, so deletions under the
 /// walk never send it back, and every pass reaches every bucket. Otherwise
-/// (RHEL 8's 4.18) [`walk_keys`] with BPF_MAP_GET_NEXT_KEY from any key (aya
+/// (kernels without batch operations; the five lab kernels, RHEL 8.10
+/// included, all have them) [`walk_keys`] with BPF_MAP_GET_NEXT_KEY from any key (aya
 /// only walks from the first).
 #[cfg(target_os = "linux")]
 fn walk_map<K: aya::Pod + Eq + std::hash::Hash, V: aya::Pod>(
