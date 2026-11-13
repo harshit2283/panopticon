@@ -1294,6 +1294,36 @@ grows with payload size.
 The PII rows predate the validation added in §3. On a laptop that change
 moved them by −3%, 0% and +7% respectively.
 
+### Credential protection
+
+`cargo bench --bench credential_rules`: `pii::mask_credentials` (what every
+exported message goes through with `mask_credentials` on) on one HTTP
+message with a 4 KiB JSON body, a path, four headers and a short request
+body. "Context" puts an `api_key` member in every 20th record, so the
+body is scanned, masked and re-checked. Apple M-series laptop (macOS dev
+machine), medians; the PII engine on the same machine, for scale:
+`scan_4kb_clean` 5.7 µs, `scan_4kb_with_pii` 9.1 µs.
+
+| Body | `builtin` | User patterns | Median | Throughput |
+|---|---|---|---|---|
+| clean | `full` | 0 | 12.3 µs | 313 MiB/s |
+| clean | `full` | 256 | 18.7 µs | 205 MiB/s |
+| clean | `names_only` | 0 | 11.9 µs | 323 MiB/s |
+| clean | `names_only` | 256 | 18.2 µs | 211 MiB/s |
+| context | `full` | 0 | 33.1 µs | 116 MiB/s |
+| context | `full` | 256 | 39.4 µs | 97 MiB/s |
+| context | `names_only` | 0 | 14.5 µs | 264 MiB/s |
+| context | `names_only` | 256 | 20.9 µs | 183 MiB/s |
+
+On clean text `full` costs what `names_only` does: one pass looks for any
+credential word and skips the word scan when there is none. With context
+`full` adds the word scan, the structure masking and the re-check of
+what is left (about 2.3× `names_only`). 256 patterns add about 6.5 µs
+per message (one `RegexSet` pass per field, plus the decoded view when a
+field has escapes). Without the single-pass word check and the shortcut
+for plain field names, the same messages took 37.9 µs (clean) and
+77.8 µs (context) with `full` and no patterns.
+
 ## 6. Fuzzing
 
 The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has two targets:
@@ -1391,7 +1421,7 @@ cargo test -p panopticon-agent pii_accuracy -- --nocapture
 python3 tests/pii/gen_corpus.py
 
 # Micro-benchmarks
-cargo bench -p panopticon-agent --bench parser_throughput --bench pii_regex --bench protocol_detect
+cargo bench -p panopticon-agent --bench parser_throughput --bench pii_regex --bench protocol_detect --bench credential_rules
 
 # Fuzzing (nightly)
 cd fuzz && cargo +nightly fuzz run parsers -- -max_total_time=600

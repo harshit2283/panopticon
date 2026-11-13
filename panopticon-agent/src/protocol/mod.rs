@@ -155,9 +155,11 @@ pub use secrets::{
 // `set_mask_credentials`; only ever flipped false -> true at runtime.
 static MASK_CREDENTIALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether login secrets (Redis AUTH, SQL credential statements, credential
-/// headers, fields with credential context) are protected before any sink. `[privacy]
-/// mask_credentials`, default true; false is only allowed in `full` mode.
+/// Whether known credential forms (Redis AUTH, SQL credential statements,
+/// credential headers, fields with credential context, `[credentials]`
+/// patterns) are protected before any sink: best effort in the modes that
+/// export fields (USER-GUIDE §5.3). `[privacy] mask_credentials`, default
+/// true; false is only allowed in `full` mode.
 pub fn mask_credentials_enabled() -> bool {
     MASK_CREDENTIALS.load(std::sync::atomic::Ordering::Relaxed)
 }

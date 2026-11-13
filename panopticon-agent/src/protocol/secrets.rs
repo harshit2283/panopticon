@@ -932,7 +932,7 @@ mod tests {
             "<input name=\"pass&#119;ord\" value=\"s7Kf2v9LmQ8z\">",
             "<input name=\"pass&#x77;ord\" value=\"s7Kf2v9LmQ8z\">",
             "&item=₹2;&x=1&#112;assword=s7Kf2v9LmQ8z",
-            "<\0p\0a\0s\0s\0w\0o\0r\0d\0>\0s\07\0K\0<\0/\0p\0>\0",
+            "<\0p\0a\0s\0s\0w\0o\0r\0d\0>\0s\0q\0K\0<\0/\0p\0>\0",
             // #9: more authentication material.
             r#"{"otp":"739204","n":[1]}"#,
             r#"{"pin":"739204","n":[1]}"#,

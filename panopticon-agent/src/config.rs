@@ -258,8 +258,9 @@ pub struct AgentConfig {
     /// `[pii] redact` as written in the config file, if it was. Only checked
     /// against `privacy_mode`; redaction itself follows the mode.
     pub pii_redact_setting: Option<bool>,
-    /// `[privacy] mask_credentials` (default true): mask login secrets in
-    /// every export. false is only accepted in `full` with PII redaction off.
+    /// `[privacy] mask_credentials` (default true): protect known credential
+    /// forms in every export (best effort; USER-GUIDE §5.3). false is only
+    /// accepted in `full` with PII redaction off.
     pub mask_credentials: bool,
     /// `[credentials] patterns`: the user's own credential formats (Rust
     /// `regex` syntax), validated at load: every match is masked.
@@ -431,8 +432,8 @@ pub struct PiiConfig {
     /// Replace detected PII with `<CATEGORY>` placeholders. Derived from
     /// `privacy_mode` by `apply_privacy` (false only in `full`).
     pub redact: bool,
-    /// Mask login secrets even when `redact` is off. Copied from `[privacy]
-    /// mask_credentials` by `apply_privacy`.
+    /// Protect known credential forms even when `redact` is off. Copied
+    /// from `[privacy] mask_credentials` by `apply_privacy`.
     pub mask_credentials: bool,
     /// Minimum confidence threshold for detected entities.
     pub min_confidence: f32,
@@ -564,7 +565,8 @@ pub struct AgentConfigFile {
 pub struct PrivacyConfigFile {
     /// `"full"`, `"redacted"` or `"metrics_only"`.
     pub mode: Option<PrivacyMode>,
-    /// Mask login secrets in exports (default true). Only `full` may set false.
+    /// Protect known credential forms in exports (default true, best
+    /// effort). Only `full` may set false.
     pub mask_credentials: Option<bool>,
 }
 
@@ -1878,6 +1880,17 @@ mod tests {
             crate::protocol::Builtin::NamesOnly
         );
         assert!(credential_rules(&config).is_ok());
+        // The USER-GUIDE §5.3 example.
+        let guide = include_str!("../../docs/USER-GUIDE.md");
+        let example = guide
+            .split("```toml\n[credentials]\npatterns = [\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the [credentials] example in USER-GUIDE.md");
+        let config =
+            load_config_from_str(&format!("[credentials]\npatterns = [\n{example}")).unwrap();
+        assert_eq!(config.credential_patterns.len(), 4);
+        assert!(config.credential_patterns[1].contains(r"\s*=\s*\S+"));
         assert_eq!(
             load_config_from_str("").unwrap().credential_builtin,
             crate::protocol::Builtin::Full
