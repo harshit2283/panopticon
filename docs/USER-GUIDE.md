@@ -596,10 +596,15 @@ captured. SQL bound values are exported only for a statement whose
 prepare the server confirmed on this connection, after the last lost
 client byte: in PostgreSQL a named statement is known from its
 `ParseComplete`, a `Parse` the server rejects does not replace it, and a
-re-`Parse` or `Close` forgets it until confirmed. A `ParseComplete`
-confirms only the `Parse` it answers: a `Parse` whose answer was lost or
-whose cycle was abandoned, or that a `Close` in the same cycle closed, is
-never confirmed by a later one.
+re-`Parse` or `Close` forgets it until confirmed. Several `Parse`
+messages may be sent before one `Sync` (pipelining); each `ParseComplete`
+confirms the oldest `Parse` still unanswered, in the order the client
+sent them. After an error the server skips to the `Sync`, so the `Parse`
+messages before it are never confirmed; a `Close` of a name also cancels
+an unanswered `Parse` of it. When answers may have been lost (a gap in
+the server's bytes, a connection joined mid-stream, an answer that
+matches nothing), no `Parse` is confirmed until a `ReadyForQuery` leaves
+nothing unanswered.
 
 #### Your own credential formats: `[credentials]`
 

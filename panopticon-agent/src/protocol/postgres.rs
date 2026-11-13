@@ -5,7 +5,7 @@
 //! Wire format: 1-byte message type + 4-byte length + payload.
 //! StartupMessage has no type byte (length + protocol version instead).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
@@ -50,13 +50,19 @@ pub struct PostgresParser {
     /// A name being re-Parsed or Closed is removed at once: until the server
     /// confirms, its SQL is unknown and a Bind of it exports no values.
     prepared: HashMap<String, String>,
-    /// The current cycle's Parse (name, SQL; the name empty for the
-    /// unnamed statement), awaiting its ParseComplete, which enters a
-    /// named one into `prepared`. Dropped when the cycle ends
-    /// (ErrorResponse, ReadyForQuery), is abandoned (a response gap, the
-    /// next query starting) or a Close of that name follows it: a later
-    /// acknowledgement never commits it.
-    pending_parse: Option<(String, String)>,
+    /// What the server still has to answer, in the order the client sent
+    /// it: each Parse (several may come before one Sync) and each Sync or
+    /// simple Query, whose answer is a ReadyForQuery. Read from the client
+    /// bytes as they arrive (`scanned`), whatever the parser's state.
+    pending: VecDeque<Pending>,
+    /// Bytes at the front of `client_buf` already read into `pending`.
+    scanned: usize,
+    /// The order of the server's answers is not known (a response gap, a
+    /// connection joined mid-stream, an answer that matched nothing): no
+    /// Parse is committed until a ReadyForQuery leaves nothing pending.
+    parses_lost: bool,
+    /// `pending` overflowed: no Parse is committed on this connection.
+    parses_off: bool,
     /// Text-format parameter values from the current cycle's Bind message.
     /// Applications send their data here, not in the SQL text.
     bind_params: Option<String>,
@@ -117,6 +123,19 @@ fn bind_param_text(payload: &[u8]) -> Option<String> {
 /// ReadyForQuery header: 'Z', length 5; followed by the status byte.
 const READY_FOR_QUERY: &[u8] = b"Z\x00\x00\x00\x05";
 
+/// A client message the server answers in order.
+enum Pending {
+    /// A Parse: (name, SQL), entered into `prepared` by its ParseComplete;
+    /// None for the unnamed statement, or one that must not be committed
+    /// (closed in the same pipeline, sent while answers are untracked).
+    Parse(Option<(String, String)>),
+    /// A Sync or a simple Query: answered by a ReadyForQuery.
+    Sync,
+}
+
+/// Most client messages awaiting an answer that are tracked.
+const MAX_PENDING: usize = 4096;
+
 /// Offset of a ReadyForQuery message (header + I/T/E status) in `data`.
 fn find_ready_for_query(data: &[u8]) -> Option<usize> {
     data.windows(READY_FOR_QUERY.len() + 1).position(|w| {
@@ -134,7 +153,10 @@ impl PostgresParser {
             awaiting_encryption_reply: false,
             resync_server: false,
             prepared: HashMap::new(),
-            pending_parse: None,
+            pending: VecDeque::new(),
+            scanned: 0,
+            parses_lost: false,
+            parses_off: false,
             bind_params: None,
             statement_withheld: false,
             query_ts: None,
@@ -187,6 +209,12 @@ impl PostgresParser {
     fn process(&mut self, ts: u64) -> ParseResult {
         let mut messages = Vec::new();
         loop {
+            if matches!(
+                self.state,
+                State::Ready | State::InSimpleQuery | State::InExtendedQuery | State::InResponse
+            ) {
+                self.scan_client();
+            }
             match self.state.clone() {
                 State::WaitingForStartup => {
                     if !self.handle_startup() {
@@ -205,12 +233,14 @@ impl PostgresParser {
                 }
                 State::Encrypted => {
                     self.client_buf.clear();
+                    self.scanned = 0;
                     self.server_buf.clear();
                     break;
                 }
                 State::InSimpleQuery | State::InExtendedQuery | State::InResponse
                     if self.resync_server
-                        && matches!(self.client_buf.data().first(), Some(b'Q' | b'P' | b'B')) =>
+                        && matches!(self.client_buf.data().first(), Some(b'Q' | b'P' | b'B'))
+                        && find_ready_for_query(self.server_buf.data()).is_none() =>
                 {
                     // Resyncing after a gap and the client already started the
                     // next query (Q, P, or B for a reused prepared statement —
@@ -226,7 +256,6 @@ impl PostgresParser {
                     messages.push(msg);
                     self.server_buf.clear();
                     self.resync_server = false;
-                    self.pending_parse = None;
                     self.state = State::Ready;
                 }
                 State::InSimpleQuery | State::InExtendedQuery | State::InResponse => {
@@ -271,6 +300,8 @@ impl PostgresParser {
         // every later frontend message begins with a non-zero type byte.
         if self.client_buf.data().first().is_some_and(|&b| b != 0) {
             self.state = State::Ready;
+            // Answers to messages sent before capture may still come.
+            self.parses_lost = true;
             return true;
         }
 
@@ -351,23 +382,71 @@ impl PostgresParser {
         {
             match msg_type {
                 b'B' => self.bind_params = bind_param_text(&payload),
-                b'C' => self.close(&payload),
-                b'D' | b'E' | b'H' | b'S' => {}
+                b'C' | b'D' | b'E' | b'H' | b'S' => {}
                 _ => break,
             }
-            self.client_buf.consume(consumed);
+            self.consume_client(consumed);
         }
     }
 
-    /// Close (`C`): `S` + name forgets that statement (`P` is a portal),
-    /// and a pending Parse of it.
-    fn close(&mut self, payload: &[u8]) {
-        if payload.first() == Some(&b'S') {
-            let name = extract_string(&payload[1..]);
-            if self.pending_parse.as_ref().is_some_and(|(n, _)| *n == name) {
-                self.pending_parse = None;
+    fn consume_client(&mut self, n: usize) {
+        self.client_buf.consume(n);
+        self.scanned = self.scanned.saturating_sub(n);
+    }
+
+    /// Read the client messages that arrived since the last call into
+    /// `pending`. A Parse or a Close of a statement forgets it at once
+    /// (its SQL is unknown until the server confirms); a Close also stops
+    /// an earlier Parse of that name from being committed.
+    fn scan_client(&mut self) {
+        let data = self.client_buf.data();
+        let mut at = self.scanned;
+        while let Some(head) = data.get(at..at + 5) {
+            let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let Some(payload) = data.get(at + 5..at + 1 + len.max(4)) else {
+                break;
+            };
+            at += 1 + len.max(4);
+            let entry = match head[0] {
+                b'P' => {
+                    let name = extract_string(payload);
+                    self.prepared.remove(&name);
+                    let keep = !name.is_empty() && !self.parses_lost && !self.parses_off;
+                    Pending::Parse(keep.then(|| (name, extract_second_string(payload))))
+                }
+                b'S' | b'Q' => Pending::Sync,
+                b'C' if payload.first() == Some(&b'S') => {
+                    let name = extract_string(&payload[1..]);
+                    self.prepared.remove(&name);
+                    for p in self.pending.iter_mut() {
+                        if let Pending::Parse(parse) = p
+                            && parse.as_ref().is_some_and(|(n, _)| *n == name)
+                        {
+                            *parse = None;
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if self.pending.len() == MAX_PENDING {
+                self.pending.clear();
+                self.parses_off = true;
             }
-            self.prepared.remove(&name);
+            if !self.parses_off {
+                self.pending.push_back(entry);
+            }
+        }
+        self.scanned = at;
+    }
+
+    /// The answers' order is no longer known: nothing pending is committed.
+    fn lose_parses(&mut self) {
+        self.parses_lost = true;
+        for p in self.pending.iter_mut() {
+            if let Pending::Parse(parse) = p {
+                *parse = None;
+            }
         }
     }
 
@@ -376,11 +455,7 @@ impl PostgresParser {
             Some(m) => m,
             None => return false,
         };
-        self.client_buf.consume(consumed);
-        if matches!(msg_type, b'Q' | b'P' | b'B') {
-            // A new cycle: the previous one's Parse is answered or lost.
-            self.pending_parse = None;
-        }
+        self.consume_client(consumed);
 
         match msg_type {
             b'Q' => {
@@ -393,10 +468,7 @@ impl PostgresParser {
             }
             b'P' => {
                 // Parse (extended query): name\0 + query\0 + param types
-                let name = extract_string(&payload);
                 let query = extract_second_string(&payload);
-                self.prepared.remove(&name);
-                self.pending_parse = Some((name, query.clone()));
                 self.query_text = Some(query);
                 self.query_ts = Some(ts);
                 self.state = State::InExtendedQuery;
@@ -415,14 +487,9 @@ impl PostgresParser {
                 }
                 true
             }
-            b'D' | b'E' | b'H' | b'S' => {
-                // Describe, Execute, Flush, Sync outside a tracked cycle.
-                true
-            }
-            b'C' => {
-                self.close(&payload);
-                true
-            }
+            // Describe, Execute, Flush, Sync, Close outside a tracked cycle
+            // (a Close was applied when it was read into `pending`).
+            b'C' | b'D' | b'E' | b'H' | b'S' => true,
             b'X' => false, // Terminate
             _ => true,
         }
@@ -458,25 +525,40 @@ impl PostgresParser {
                     // Don't emit yet — wait for ReadyForQuery
                 }
                 b'1' => {
-                    // ParseComplete: the server holds the statement now.
-                    if let Some((name, sql)) = self.pending_parse.take()
-                        && !name.is_empty()
-                        && self.prepared.len() < MAX_PREPARED_STATEMENTS
-                    {
-                        self.prepared.insert(name, sql);
+                    // ParseComplete answers the oldest Parse pending.
+                    match self.pending.pop_front() {
+                        Some(Pending::Parse(Some((name, sql))))
+                            if self.prepared.len() < MAX_PREPARED_STATEMENTS =>
+                        {
+                            self.prepared.insert(name, sql);
+                        }
+                        Some(Pending::Parse(_)) => {}
+                        Some(Pending::Sync) | None => self.lose_parses(),
                     }
                 }
                 b'E' => {
-                    // The server skips the rest of the cycle: a pending Parse
+                    // The server skips to the Sync: the Parses before it
                     // failed or never ran.
-                    self.pending_parse = None;
+                    while matches!(self.pending.front(), Some(Pending::Parse(_))) {
+                        self.pending.pop_front();
+                    }
                     // ErrorResponse — stash the error; emit on ReadyForQuery so query_text
                     // isn't consumed here (build_msg would clear it via take()).
                     self.pending_error = Some(parse_error_response(&payload));
                     self.pending_status = Some(1);
                 }
                 b'Z' => {
-                    self.pending_parse = None;
+                    // The Sync (or Query) it answers, and any Parse before it
+                    // left unanswered.
+                    match self.pending.iter().position(|p| matches!(p, Pending::Sync)) {
+                        Some(i) => {
+                            self.pending.drain(..=i);
+                            if self.pending.is_empty() {
+                                self.parses_lost = false;
+                            }
+                        }
+                        None => self.lose_parses(),
+                    }
                     // ReadyForQuery — build message from accumulated query state + any error.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
@@ -610,8 +692,8 @@ impl ProtocolParser for PostgresParser {
             ) => {
                 self.server_buf.clear();
                 self.resync_server = true;
-                // Its ParseComplete may be among the lost bytes.
-                self.pending_parse = None;
+                // Answers among the lost bytes: their order is unknown.
+                self.lose_parses();
                 Some(ParseResult::NeedMoreData)
             }
             (_, State::Encrypted) => Some(ParseResult::NeedMoreData),
@@ -1062,6 +1144,81 @@ mod tests {
         p.feed(&resp, Direction::Ingress, 2);
         let out = bound(&mut p);
         assert!(no_canary(&out), "{out:?}");
+    }
+
+    /// Parse `name` with `sql` and its Bind/Execute, no Sync.
+    fn parse_bind(name: &str, sql: &str) -> Vec<u8> {
+        let mut out = extended_cycle(Some((name, sql)), name, &[]);
+        out.truncate(out.len() - 5); // drop the Sync
+        out
+    }
+
+    /// Pipelines: several Parses before one Sync; each ParseComplete
+    /// answers the oldest Parse pending. (Which statements are known is
+    /// read from `prepared`: a pipeline's later cycles are exported one
+    /// answer late, a separate limitation.)
+    #[test]
+    fn test_pipelined_parses_are_answered_in_order() {
+        let ok = |n: usize| {
+            let mut r = Vec::new();
+            for _ in 0..n {
+                r.extend(make_backend_msg(b'1', b""));
+                r.extend(make_backend_msg(b'2', b""));
+                r.extend(make_backend_msg(b'C', b"SELECT 1\0"));
+            }
+            r
+        };
+        let ready = || make_backend_msg(b'Z', b"I");
+        let pipeline = |p: &mut PostgresParser, second: &str| {
+            let mut batch = parse_bind("s1", "SELECT $1 AS one");
+            batch.extend(parse_bind("s2", second));
+            batch.extend(make_frontend_msg(b'S', b""));
+            p.feed(&batch, Direction::Egress, 1);
+        };
+        let known = |p: &PostgresParser, s: &str| p.prepared.get(s).cloned();
+
+        // Two named Parses, one Sync, two ParseCompletes: both known.
+        let mut p = setup_ready_parser();
+        pipeline(&mut p, "SELECT $1 AS two");
+        let mut resp = ok(2);
+        resp.extend(ready());
+        p.feed(&resp, Direction::Ingress, 2);
+        assert_eq!(known(&p, "s1").as_deref(), Some("SELECT $1 AS one"));
+        assert_eq!(known(&p, "s2").as_deref(), Some("SELECT $1 AS two"));
+
+        // A Parse error mid-pipeline: the server skips to the Sync, so s2
+        // is never committed, not even by a later Parse's ParseComplete.
+        let mut p = setup_ready_parser();
+        pipeline(&mut p, "SELECT $1 FROM nowhere");
+        let mut resp = ok(1);
+        resp.extend(make_backend_msg(b'E', b"SERROR\0C42P01\0Mno table\0\0"));
+        resp.extend(ready());
+        p.feed(&resp, Direction::Ingress, 2);
+        p.feed(
+            &extended_cycle(Some(("s3", "SELECT 3")), "s3", &[]),
+            Direction::Egress,
+            3,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 4);
+        assert_eq!(known(&p, "s1").as_deref(), Some("SELECT $1 AS one"));
+        assert_eq!(known(&p, "s2"), None);
+        assert_eq!(known(&p, "s3").as_deref(), Some("SELECT 3"));
+
+        // A lost response: neither Parse of that pipeline is committed by
+        // a later ParseComplete; once nothing is pending, a new Parse is.
+        let mut p = setup_ready_parser();
+        pipeline(&mut p, "SELECT $1 AS two");
+        assert!(p.skip(Direction::Ingress, 30, 2).is_some());
+        p.feed(&ready(), Direction::Ingress, 3);
+        p.feed(
+            &extended_cycle(Some(("s3", "SELECT 3")), "s3", &[]),
+            Direction::Egress,
+            4,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 5);
+        assert_eq!(known(&p, "s1"), None);
+        assert_eq!(known(&p, "s2"), None);
+        assert_eq!(known(&p, "s3").as_deref(), Some("SELECT 3"));
     }
 
     #[test]
