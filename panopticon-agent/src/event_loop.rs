@@ -1621,6 +1621,16 @@ fn scan_with_body_cap(
     scan: impl FnOnce(&mut crate::protocol::L7Message) -> Option<crate::pii::PiiReport>,
 ) -> Option<crate::pii::PiiReport> {
     cap_body_text(msg, max.saturating_add(SCAN_LOOKAHEAD));
+    // A header name is classified whole (credential header or not): one
+    // that would be cut is withheld with its value instead.
+    for (name, value) in msg.headers.iter_mut() {
+        if name.len() > MAX_FIELD_BYTES {
+            for f in [name, value] {
+                zeroize::Zeroize::zeroize(f);
+                f.push_str(crate::protocol::FIELD_WITHHELD);
+            }
+        }
+    }
     let fields = |msg: &mut crate::protocol::L7Message, f: &mut dyn FnMut(&mut String)| {
         [&mut msg.method, &mut msg.path, &mut msg.content_type]
             .into_iter()
@@ -2393,6 +2403,32 @@ mod tests {
         assert!(msg.payload_text.as_deref().unwrap().ends_with("ssn "));
     }
 
+    /// Codex: a header name past the field cap lost its `-token` suffix to
+    /// the cut before the credential-header check saw it. Such a header is
+    /// withheld whole.
+    #[test]
+    fn overlong_header_name_is_withheld_whole() {
+        let name = format!("x-{}-token", "a".repeat(8500));
+        let mut msg =
+            crate::protocol::L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.headers = vec![(name, "s7Kf2v9LmQ8z".into()), ("x-ok".into(), "v".into())];
+        scan_with_body_cap(&mut msg, 4096, |m| {
+            crate::pii::mask_credentials(m);
+            None
+        });
+        assert!(
+            msg.headers
+                .iter()
+                .all(|(n, v)| !v.contains("s7Kf") && n.len() < 100),
+            "{:?}",
+            msg.headers
+                .iter()
+                .map(|(n, v)| (n.len(), v))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(msg.headers[1], ("x-ok".into(), "v".into()));
+    }
+
     /// Path and header fields are bounded like bodies before the scan: a
     /// crafted 200 KiB header or path is neither scanned nor exported whole.
     #[test]
@@ -2405,11 +2441,15 @@ mod tests {
         msg.headers = vec![("x-pad".into(), big.clone()), (big.clone(), "v".into())];
         // Redaction off (full mode): the cap, not the redaction, bounds them.
         scan_with_body_cap(&mut msg, 4096, |m| engine.scan_message_with(m, false));
-        let fields = [
-            msg.path.as_deref().unwrap(),
-            &msg.headers[0].1,
-            &msg.headers[1].0,
-        ];
+        // An overlong name is withheld whole with its value.
+        assert_eq!(
+            msg.headers[1],
+            (
+                crate::protocol::FIELD_WITHHELD.into(),
+                crate::protocol::FIELD_WITHHELD.into()
+            )
+        );
+        let fields = [msg.path.as_deref().unwrap(), &msg.headers[0].1];
         for f in fields {
             assert!(f.len() <= MAX_FIELD_BYTES, "{}", f.len());
             // Never cut inside a value.
