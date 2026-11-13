@@ -119,10 +119,12 @@ production-hardened compliance platform.
   - OpenSSL via a shared `libssl` (including the `_ex` API) is validated
     against ground truth: 100% recall from both client and server processes
     (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
-    found. A workload's mapped files are opened non-blocking and only if
-    they are regular files, and a mapping whose file was deleted is
-    skipped, so a FIFO or device put at a mapped path cannot hang or reach
-    the scanner.
+    found. A workload's mapped file is first pinned without being opened
+    (`O_PATH`, resolved inside the workload's root where the kernel has
+    `openat2`), and that same file is opened for reading only if it is a
+    regular file; a mapping whose file was deleted is skipped. A FIFO or
+    device put at a mapped path is refused without being opened, so it can
+    neither hang the agent nor run a driver's open.
   - TLS exchanges carry their socket addresses and join the service graph:
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
