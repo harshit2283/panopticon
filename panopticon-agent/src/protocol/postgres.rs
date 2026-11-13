@@ -420,7 +420,19 @@ impl PostgresParser {
                     let sql = extract_second_string(payload);
                     Pending::Parse(Some((name, sql)))
                 }
-                b'S' | b'Q' => Pending::Sync,
+                b'S' => Pending::Sync,
+                b'Q' => {
+                    // SQL PREPARE / DEALLOCATE may redefine any name, and a
+                    // simple Query ends the unnamed statement: forget every
+                    // statement, confirmed or pending.
+                    self.prepared.clear();
+                    for p in self.pending.iter_mut() {
+                        if let Pending::Parse(parse) = p {
+                            *parse = None;
+                        }
+                    }
+                    Pending::Sync
+                }
                 b'C' if payload.first() == Some(&b'S') => {
                     let name = extract_string(&payload[1..]);
                     self.prepared.remove(&name);
@@ -608,7 +620,8 @@ impl PostgresParser {
         // confirm, exports none.
         let bound = self.bind_params.take().and_then(|(statement, values)| {
             let confirmed = self.prepared.get(&statement);
-            (confirmed.is_some() && confirmed == self.query_text.as_ref()).then_some(values)
+            (!self.parses_lost && confirmed.is_some() && confirmed == self.query_text.as_ref())
+                .then_some(values)
         });
         self.statement_withheld = false;
         match self.query_text.take() {
@@ -961,7 +974,11 @@ mod tests {
             Direction::Egress,
             2000,
         );
-        match p.feed(&insert_done(), Direction::Ingress, 2600) {
+        // No Parse in this cycle, so no ParseComplete in its answer.
+        let mut done = make_backend_msg(b'2', b"");
+        done.extend(make_backend_msg(b'C', b"INSERT 0 1\0"));
+        done.extend(make_backend_msg(b'Z', b"I"));
+        match p.feed(&done, Direction::Ingress, 2600) {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs[0].method.as_deref(), Some("INSERT"));
                 assert_eq!(msgs[0].payload_text.as_deref(), Some(sql));
@@ -1267,6 +1284,77 @@ mod tests {
         done.extend(ready());
         let out = format!("{:?}", p.feed(&done, Direction::Ingress, 7));
         assert!(!out.contains("s7Kf"), "{out}");
+    }
+
+    /// Codex R6 N2: once server bytes are lost, a confirmed statement's
+    /// Bind values are not exported either.
+    #[test]
+    fn test_no_bound_values_after_lost_server_bytes() {
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1::text")), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        p.feed(
+            &extended_cycle(None, "s", &["s7Kf2v9LmQ8z"]),
+            Direction::Egress,
+            3,
+        );
+        assert!(p.skip(Direction::Ingress, 20, 4).is_some());
+        let out = format!(
+            "{:?}",
+            p.feed(&make_backend_msg(b'Z', b"I"), Direction::Ingress, 5)
+        );
+        assert!(!out.contains("s7Kf"), "{out}");
+    }
+
+    /// Codex R6 N3: a simple Query can redefine or destroy statements
+    /// (PREPARE / DEALLOCATE, and any Query ends the unnamed one): every
+    /// confirmed statement is forgotten.
+    #[test]
+    fn test_simple_query_forgets_statements() {
+        let simple = |p: &mut PostgresParser, sql: &str| {
+            p.feed(
+                &make_frontend_msg(b'Q', format!("{sql}\0").as_bytes()),
+                Direction::Egress,
+                5,
+            );
+            let mut r = make_backend_msg(b'C', b"PREPARE\0");
+            r.extend(make_backend_msg(b'Z', b"I"));
+            p.feed(&r, Direction::Ingress, 6);
+        };
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1::text")), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        simple(
+            &mut p,
+            "DEALLOCATE s; PREPARE s(text) AS INSERT INTO users(password) VALUES ($1)",
+        );
+        p.feed(
+            &extended_cycle(None, "s", &["s7Kf2v9LmQ8z"]),
+            Direction::Egress,
+            7,
+        );
+        let out = format!("{:?}", p.feed(&insert_done(), Direction::Ingress, 8));
+        assert!(!out.contains("s7Kf"), "{out}");
+
+        // The unnamed statement, confirmed, then a Query.
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("", "SELECT $1::text")), "", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        assert!(p.prepared.contains_key(""));
+        simple(&mut p, "SELECT 1");
+        assert!(p.prepared.is_empty(), "{:?}", p.prepared);
     }
 
     /// Codex R5 H4: a Bind's values are exported only under the SQL its
