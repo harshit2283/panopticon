@@ -53,6 +53,26 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the [privacy] mask_credentials config flag",
     ),
     (
+        "protocol/secrets.rs",
+        "HINT_SEARCH",
+        "a regex compiled from a constant word list",
+    ),
+    (
+        "protocol/credential_rules.rs",
+        "RULES",
+        "the compiled [credentials] config (operator patterns, builtin level)",
+    ),
+    (
+        "protocol/credential_rules.rs",
+        "USER_MATCHES",
+        "a counter of user-pattern matches (a number, never a value)",
+    ),
+    (
+        "protocol/credential_rules.rs",
+        "BUILTIN_MATCHES",
+        "a counter of fields the built-in rules changed (a number, never a value)",
+    ),
+    (
         "graph/aggregator.rs",
         "UUID_RE_SHARED",
         "a compiled regex from a literal",

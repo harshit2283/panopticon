@@ -129,6 +129,10 @@ capture_raw_max_bytes = 1073741824  # raw capture stops at this size (1 GiB)
 [privacy]
 mode = "redacted"      # "full" | "redacted" | "metrics_only" (§4.3)
 
+[credentials]          # your own credential formats (§5.3); reloadable by SIGHUP
+# patterns = ["AKIA[0-9A-Z]{16}", "(?i)acme_[a-z0-9]{32}"]  # default: none
+# builtin = "full"     # "full" | "names_only"
+
 [pii]
 enabled = true
 regex_enabled = true
@@ -287,7 +291,7 @@ setting covers that range, `[privacy] mode` in the config file or
 
 | Mode | What can leave the agent |
 |---|---|
-| `full` | Everything: the event export unredacted (login secrets still masked unless `mask_credentials = false`, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
+| `full` | Everything: the event export unredacted (known credential forms still masked, best effort, unless `mask_credentials = false`, §5.3), and the raw dump of every payload with TLS decrypted (§5.5). |
 | `redacted` (default) | Events with every detected PII value replaced by `<CATEGORY>` (§5.3) in the JSON export, OTLP spans and `--log-events` output. No raw dump. |
 | `metrics_only` | Prometheus metrics, `/debug/state` counters and the PII audit log (category and count per service, never values or paths). No per-request export, no raw dump, no OTLP. Paths, query templates, headers and bodies are dropped as soon as PII has been counted, so they reach no sink, and no log at info level or above. The service map still names services (Kubernetes workload, DNS name or `ip:port`) and protocols; the audit log names them by Kubernetes workload or `ip:port` only. |
 
@@ -452,31 +456,66 @@ exported:
   whatever the protocol, unless every credential in it can be masked with
   certainty (below).
 
-A field has credential context when, read with JSON escapes decoded
-(`\u0070`), percent-encoding decoded up to three times (`%2570` is `p`)
-with `+` as a space, case folded, and SQL comment markers (`/*`, `/*!`,
-`*/`, `--`, `#`) ignored so a comment's text counts, it contains:
+**What credential protection promises.** In `metrics_only` no path,
+header or body leaves the agent, so no credential in one can. In
+`redacted` and `full` those fields are exported, and credential protection
+is best-effort defence in depth for known credential forms: the names,
+encodings and structures below, and your own formats (`[credentials]`,
+below). It cannot recognise a secret that nothing tells apart from other
+data. Known limits:
+
+- an opaque secret under a name not in the lists (an OAuth `code=`, a
+  field called `answer`), or a `Basic` credential (base64 `user:password`)
+  outside the `Authorization` header: base64 is not decoded;
+- encodings the agent does not decode: compressed bodies (gzip, deflate,
+  compressed gRPC and Kafka batches), UTF-16 or UTF-32 text beyond plain
+  ASCII, HTML named entities other than `&amp;` `&quot;` `&apos;` `&lt;`
+  `&gt;`, PostgreSQL `U&"…"` identifiers;
+- protobuf without its schema: field numbers, not names, so gRPC and
+  protobuf body text is not exported at all while credentials are
+  protected;
+- packets forged or injected into a connection by someone who can do so,
+  and state from before capture started that the parser cannot see.
+
+If what these miss must not leave the node, use `metrics_only`.
+
+A field has credential context when its *normalised view* contains one of
+the words or forms below. The view is the field with NUL bytes dropped
+(UTF-16 text of ASCII), then up to three rounds of JSON escapes
+(`\u0070`), HTML character references (`&#112;`, `&#x70;`, `&amp;` …)
+and percent-encoding (`%70`, `+` as a space), so an encoding revealed by
+another is decoded too (`%5Cu0077` is `w`); case folded; SQL comment
+markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
+`-` and `.` read as `_`. The words and forms:
 
 - a word containing `password`, `passwd`, `passphrase`, `secret`, `token`,
   `apikey`, `api_key`, `access_key`, `private_key`, `credential`,
-  `signature`, `authorization`, `requirepass`, `masterauth`, `csrf` or
-  `xsrf`, or ending in `_pass` or `_auth` (names of any length; `-` and
-  `.` read as `_`), or `IDENTIFIED` followed by `BY`, `WITH`, `VIA`, `AS`
-  or `USING`;
+  `signature`, `authorization`, `requirepass`, `masterauth`, `csrf`,
+  `xsrf`, `bearer` or `client_assertion`, or ending in `_pass` or `_auth`
+  (names of any length), or `IDENTIFIED` followed by `BY`, `WITH`, `VIA`,
+  `AS` or `USING`;
 - one of the names `auth`, `pwd`, `pass`, `key`, `sig`, `session`,
-  `sessionid`, `session_id`, `sid`, `cookie`, `jwt` or `masteruser` used
-  as a name, that is followed by `=` or `:` (so `/api/auth/login`, a Redis
-  `AUTH` command name or "press any key" are not context);
+  `sessionid`, `session_id`, `sid`, `cookie`, `jwt`, `masteruser`, `otp`
+  or `pin` used as a name: followed by `=` or `:`, a form or HTML field
+  name (`name="pwd"`, as in multipart form data), or an XML element
+  (`<pwd>`); in SQL also a column in a list or assignment (`users(pwd)`,
+  `SET a = 1, pass = $1`). So `/api/auth/login`, a Redis `AUTH` command
+  name or "press any key" are not context;
 - userinfo, `user:password@host`, with or without a scheme (the `:` of
-  `scheme://` and `mailto:` do not count).
+  `scheme://` and `mailto:` do not count), and any `//` authority whose
+  userinfo holds a `:` (RFC 3986: `,` and `;` may be part of the
+  password).
 
 What is exported then:
 
-- **SQL** (MySQL, PostgreSQL): the statement becomes its verb and
+- **SQL** (MySQL, PostgreSQL): the statement becomes its keyword and
   `<statement withheld>` (`ALTER <statement withheld>`), its bound
   parameter values are not exported, and a server error for it (which may
   quote it) becomes `<statement withheld>`; so does any error message that
-  shows credential context itself.
+  shows credential context itself. Only a known SQL statement keyword
+  (`SELECT`, `INSERT`, `ALTER`, …) is ever exported as the method: a
+  statement starting with anything else exports the method `QUERY`, and
+  just `<statement withheld>` when withheld.
 - **Any other field** (path, header value, method, content type, bodies,
   Redis arguments and replies, Kafka and AMQP fields): `<field withheld>`,
   unless every credential in it is one of these, in which case only the
@@ -488,6 +527,18 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
+- **A header whose name is over 8 KiB** is replaced, name and value, by
+  `<field withheld>`: a name is classified whole, never cut first.
+- **A body with bytes captured after a gap** (bytes lost to ring drops
+  or the capture cap, then more of the same body kept), or an HTTP/2 body
+  whose stream's headers the agent did not see, is not exported (its size
+  is): what is left may hold a credential's value without its name. A gap
+  that only cuts a body's end, as the capture cap does to a large
+  response, keeps the captured prefix (it is scanned and trimmed like any
+  body).
+- **HTTP/2 headers**: after a header block of one direction fails to
+  decode or is skipped, that direction's header table may differ from the
+  peer's, so no header of it is exported again on that connection.
 - **DNS answers** whose name has credential context are dropped.
 
 The price is more withheld text than a value-level mask would leave: a
@@ -507,15 +558,18 @@ applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
 command or reply naming `requirepass`, `masterauth` or another word from
 the first list (`CONFIG SET requirepass …`, `CONFIG GET masterauth`) is
 withheld whole. Protocol and subscription state follow the server's
-replies only. A reply that cannot be matched to its command is exported
-without its text. No reply text is exported for the rest of the
-connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;
+replies only, and a subscription acknowledgement counts only as the reply
+to the pending subscription command (a script returning an array of the
+same shape changes nothing). A reply that cannot be matched to its command
+is exported without its text. No reply text is exported for the rest of
+the connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;
 `CLIENT REPLY OFF|SKIP` (never acknowledged, so a refusal cannot be seen);
 any `CLIENT REPLY` other than `CLIENT REPLY ON`; `MULTI`, `EXEC`,
 `DISCARD` or `RESET` sent with arguments; `CLIENT`, `HELLO`, `MONITOR` or
 a subscription command queued inside `MULTI`; a transaction past 1024
-commands or 64 KiB. An `EXEC` whose
-`MULTI` came before capture started has its whole result masked.
+commands or 64 KiB; an array in place of a subscription command's
+acknowledgement. An `EXEC` whose `MULTI` came before capture started has
+its whole result masked.
 
 Replies are paired with commands by order, which is only safe when the
 agent saw both directions of the connection from their first byte. With
@@ -526,11 +580,62 @@ for the rest of the connection without their text or the command they
 answer (status, timing and sizes only). That covers every connection
 already open when the agent started (pooled clients, until they
 reconnect), every TLS-captured Redis connection (TLS plaintext carries no
-stream position), and any connection whose SYN events were lost. A reply that may answer a
-command sent before capture started, such as an `ACL GENPASS`, is
-therefore never exported under the first command captured. SQL bound
-values are exported only for a statement whose prepare was seen on the
-connection, after the last lost client byte.
+stream position), and any connection whose SYN events were lost. A reply
+that may answer a command sent before capture started, such as an
+`ACL GENPASS`, is therefore never exported under the first command
+captured. SQL bound values are exported only for a statement whose
+prepare the server confirmed on this connection, after the last lost
+client byte: in PostgreSQL a named statement is known from its
+`ParseComplete`, a `Parse` the server rejects does not replace it, and a
+re-`Parse` or `Close` forgets it until confirmed.
+
+#### Your own credential formats: `[credentials]`
+
+When you know what your secrets look like, list them:
+
+```toml
+[credentials]
+patterns = [
+  "AKIA[0-9A-Z]{16}",                  # AWS access key IDs
+  "(?i)aws_secret_access_key\\s*=\\s*\\S+", # an AWS secret in a config dump
+  "sk_live_[0-9a-zA-Z]{24,}",          # Stripe-style live keys
+  "(?i)acme_[a-z0-9]{32}",             # an internal token format
+]
+builtin = "full"                       # or "names_only"
+```
+
+Patterns use the Rust `regex` syntax (linear time, no backreferences).
+Every text field of every protocol is checked: method, path, content type,
+header names and values, request and response bodies, SQL text and bound
+values, Redis arguments and replies, Kafka and AMQP fields. A match in the
+field as captured is replaced by `<REDACTED>`; a match only in its decoded
+view (escapes, entities and percent-encoding decoded, case kept) cannot be
+placed in the captured text, so the field becomes `<field withheld>`. The
+built-in rules run after yours. Patterns apply whenever credentials are
+protected (`mask_credentials` on, the default), and not to DNS names.
+
+Limits: at most 256 patterns, each at most 1024 bytes, none matching the
+empty string, and each and all together within a compiled-size limit. A
+pattern that is invalid or over a limit stops the agent at startup with
+the regex error, and a SIGHUP reload carrying one is refused (the running
+rules stay). A reload that changes `patterns` or `builtin` applies to
+every field protected after it; a message being scanned at that moment
+finishes with the previous rules.
+
+`builtin = "names_only"` keeps the cheap built-in rules: credential-named
+headers, the certain structures above (credential-named form parameters
+and JSON members, URI userinfo) and SQL statement withholding. It skips
+looking for credential context in the free text of other fields, so a
+body mentioning a token in prose, or a JSON array under a credential name,
+is exported. Use it when your own patterns cover the formats that matter
+to you and the free-text scan costs too much (BENCHMARKS.md, "Credential
+protection").
+
+Your patterns make masking stronger for your formats; they do not change
+the best-effort nature of credential protection in `redacted` and `full`.
+`panopticon_credential_matches_total{source="user"}` counts your
+patterns' matches and `{source="builtin"}` the fields the built-in rules
+changed (never values).
 
 All of this applies in every privacy mode by default, `full` included,
 and with PII detection off (`[pii] enabled = false`). The raw dump
@@ -552,18 +657,16 @@ reloads that change it are rejected).
 
 | `full` mode settings | PII values | Login secrets |
 |---|---|---|
-| default | exported | masked |
-| `[pii] redact = true` | masked | masked |
+| default | exported | masked (best effort) |
+| `[pii] redact = true` | masked | masked (best effort) |
 | `mask_credentials = false` | exported | exported |
 
 Detection is pattern-based. It will miss PII that does not match a pattern
 (names, free-text addresses), a bare phone or passport number with no keyword
 before it (e.g. in a positional SQL `VALUES` list), and anything past
 `max_body_bytes`. It flags every IPv4 address and PAN-shaped product codes.
-Treat the exports as sensitive anyway.
-A password bound as a prepared-statement parameter (`ALTER ROLE … PASSWORD $1`)
-is not recognised as one. If what the patterns miss must not leave the node,
-use `metrics_only`.
+Treat the exports as sensitive anyway. If what the patterns miss must not
+leave the node, use `metrics_only`.
 
 ### 5.4 Metrics and endpoints (`--metrics-bind`)
 
@@ -593,6 +696,7 @@ use `metrics_only`.
 | `panopticon_sampled_out_events_total` | `connection_sample`: events of those connections |
 | `panopticon_head_only_cut_events_total` | `head_only`: events cut or dropped past a direction's first `head_only_bytes` |
 | `panopticon_pii_detections_total` | PII values found |
+| `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
 | `panopticon_active_connections` | Connections being parsed |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 

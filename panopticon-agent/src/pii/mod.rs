@@ -87,12 +87,16 @@ fn mask_credential_fields(msg: &mut L7Message) {
         .filter(|(name, _)| {
             (http && is_credential_header(name)) || crate::protocol::is_credential_name(name)
         })
-        .for_each(|(_, value)| wipe(value));
+        .for_each(|(_, value)| {
+            crate::protocol::count_builtin();
+            wipe(value)
+        });
     msg.dns_answers
         .retain(|a| !crate::protocol::has_credential_context(&a.name));
 }
 
-/// Protect login secrets in every string field of `msg` without the PII
+/// Protect known credential forms in every string field of `msg` (best
+/// effort, USER-GUIDE §5.3) without the PII
 /// engine (see [`crate::protocol::protect_text`]): what
 /// [`PiiEngine::scan_message_with`] does when `mask_credentials` is on, for
 /// `full` mode with `[pii] enabled = false`.
@@ -527,8 +531,8 @@ impl PiiEngine {
             return None;
         }
         let mut found = Found::default();
-        // Login secrets are masked whenever values are redacted, and also in
-        // `full` mode unless `[privacy] mask_credentials = false`.
+        // Known credential forms are protected whenever values are redacted,
+        // and also in `full` mode unless `[privacy] mask_credentials = false`.
         let mask_creds = redact_enabled || self.config.mask_credentials;
 
         if mask_creds {
@@ -964,6 +968,62 @@ mod tests {
         }
     }
 
+    /// `[credentials] patterns` mask in every field of every protocol, with
+    /// and without the engine, and are counted. The only test that installs
+    /// global rules (its pattern matches no other test's data).
+    #[test]
+    fn test_user_patterns_mask_every_field() {
+        use crate::protocol::{Builtin, CredentialRules, credential_matches, set_credential_rules};
+        let token = "acmetok_q7w8e9r0t1y2";
+        let pattern = vec!["acmetok_[a-z0-9]{12}".to_string()];
+        set_credential_rules(CredentialRules::compile(&pattern, Builtin::Full).unwrap());
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let (user_before, builtin_before) = credential_matches();
+        let mut checked = 0;
+        for protocol in [
+            Protocol::Http1,
+            Protocol::Http2,
+            Protocol::Mysql,
+            Protocol::Postgres,
+            Protocol::Redis,
+            Protocol::Kafka,
+        ] {
+            for engine_on in [false, true] {
+                let mut msg = L7Message::new(protocol, crate::protocol::Direction::Egress, 0);
+                msg.method = Some(format!("GET{token}"));
+                msg.path = Some(format!("/v1/{token}/x"));
+                msg.content_type = Some(format!("text/{token}"));
+                msg.headers = vec![
+                    ("x-note".into(), format!("a {token} b")),
+                    (format!("x-{token}"), "v".into()),
+                ];
+                // SQL text, Redis arguments, bound values, bodies.
+                msg.payload_text = Some(format!("SELECT * FROM t WHERE k = '{token}'"));
+                msg.request_text = Some(format!("{token}, 42"));
+                if engine_on {
+                    engine.scan_message_with(&mut msg, false);
+                } else {
+                    mask_credentials(&mut msg);
+                }
+                let dump = format!("{msg:?}");
+                assert!(!dump.contains(token), "{protocol:?} {engine_on}: {dump}");
+                checked += 1;
+            }
+        }
+        let (user_after, builtin_after) = credential_matches();
+        // 7 fields per message.
+        assert!(
+            user_after - user_before >= 7 * checked,
+            "{user_before} {user_after}"
+        );
+        // A plain Authorization header counts as builtin.
+        let mut msg = L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.headers = vec![("authorization".into(), "Bearer x".into())];
+        mask_credentials(&mut msg);
+        assert!(credential_matches().1 > builtin_after.max(builtin_before));
+        set_credential_rules(CredentialRules::default());
+    }
+
     /// Codex round 3: credential context the value masker could not
     /// delimit. Each field must leave without its secret, with and without
     /// the engine.
@@ -1032,7 +1092,7 @@ mod tests {
         let all = format!("{:?} {:?}", msg.payload_text, msg.request_text);
         assert!(!all.contains("s3cret"), "{all}");
 
-        // full mode, redaction off: login secrets still masked by default
+        // full mode, redaction off: credentials still protected by default
         // ([privacy] mask_credentials = true), PII left as captured.
         let mut msg = auth();
         msg.payload_text = Some("mail alice@example.com".into());

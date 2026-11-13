@@ -73,6 +73,15 @@ struct StreamState {
     response_body: Vec<u8>,
     /// Server already sent its response HEADERS; further ones are trailers.
     response_headers_seen: bool,
+    /// Bytes of the request / response body were lost, or the body began
+    /// before this parser saw the stream's HEADERS: what remains may hold
+    /// a credential's value without its name, so it is not exported.
+    request_gap: bool,
+    response_gap: bool,
+    /// A gap inside this stream's body; it becomes `*_gap` when more body
+    /// bytes of the stream are kept (a cut end keeps the prefix).
+    request_gap_pending: bool,
+    response_gap_pending: bool,
     /// Insertion order, for evicting the oldest stream at capacity.
     seq: u64,
 }
@@ -87,6 +96,12 @@ struct Side {
     /// that frame's stream id and flags (END_STREAM applies once dropped).
     discard: usize,
     discard_frame: Option<(u32, u8)>,
+    /// A header block of this side failed to decode or was skipped: the
+    /// HPACK table may differ from the peer's (insertions before an error
+    /// are kept, later ones missed), so a later block could decode a value
+    /// under another header's name. No header of this side is exported
+    /// again.
+    headers_lost: bool,
 }
 
 impl Side {
@@ -97,6 +112,7 @@ impl Side {
             pending_block: None,
             discard: 0,
             discard_frame: None,
+            headers_lost: false,
         }
     }
 }
@@ -271,6 +287,7 @@ impl Http2Parser {
                 // find no pending block and are ignored.
                 side.pending_block =
                     (block.len() <= MAX_HEADER_BLOCK).then_some((stream_id, flags, is_push, block));
+                side.headers_lost |= side.pending_block.is_none();
                 if flags & FLAG_END_HEADERS != 0 {
                     return self.finish_header_block(from_client, ts);
                 }
@@ -285,6 +302,7 @@ impl Http2Parser {
                 if let Some((_, _, _, block)) = side.pending_block.as_mut() {
                     if block.len() + payload.len() > MAX_HEADER_BLOCK {
                         side.pending_block = None;
+                        side.headers_lost = true;
                     } else {
                         block.extend_from_slice(payload);
                     }
@@ -333,6 +351,16 @@ impl Http2Parser {
             return FrameEvent::None;
         }
         let stream = self.stream(stream_id);
+        // A body this parser did not see start (late join, replaced after a
+        // gap) is a tail; so are bytes kept after a gap in the body.
+        if !body.is_empty() {
+            if from_client && (stream.request_ts.is_none() || stream.request_gap_pending) {
+                stream.request_gap = true;
+            }
+            if !from_client && (!stream.response_headers_seen || stream.response_gap_pending) {
+                stream.response_gap = true;
+            }
+        }
         let (buf, size) = if from_client {
             (&mut stream.request_body, &mut stream.request_size)
         } else {
@@ -358,6 +386,7 @@ impl Http2Parser {
             return FrameEvent::None;
         };
         if hpack_oversized_table_update(&block) {
+            side.headers_lost = true;
             return FrameEvent::None;
         }
         let budget = if is_push {
@@ -378,16 +407,19 @@ impl Http2Parser {
         let mut used = 0usize;
         // hpack can panic on malformed input; a failed block still has to be
         // skipped so later frames parse (its table updates are lost).
-        let ok = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            side.decoder.decode_with_cb(&block, |n, v| {
-                used = used.saturating_add(n.len() + v.len() + 32);
-                if used <= budget {
-                    decoded.push((n.into_owned(), v.into_owned()));
-                }
-            })
-        }));
-        if !matches!(ok, Ok(Ok(()))) {
-            decoded.clear();
+        if !side.headers_lost {
+            let ok = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                side.decoder.decode_with_cb(&block, |n, v| {
+                    used = used.saturating_add(n.len() + v.len() + 32);
+                    if used <= budget {
+                        decoded.push((n.into_owned(), v.into_owned()));
+                    }
+                })
+            }));
+            if !matches!(ok, Ok(Ok(()))) {
+                decoded.clear();
+                side.headers_lost = true;
+            }
         }
         if is_push {
             return FrameEvent::None; // decoded only to keep the server table in sync
@@ -456,15 +488,25 @@ impl Http2Parser {
         msg.request_size_bytes = stream.request_size;
         msg.response_size_bytes = stream.response_size;
         msg.latency_ns = stream.request_ts.map(|t| ts.saturating_sub(t));
+        // Protobuf without its schema carries field numbers, not names: a
+        // password field cannot be told from any other string, so its text
+        // is not exported while credentials are protected.
+        let protobuf = self.is_grpc
+            || msg
+                .content_type
+                .as_deref()
+                .is_some_and(|c| c.contains("grpc") || c.contains("protobuf"));
         let text = |body: &[u8]| {
-            if self.is_grpc {
+            if protobuf && super::mask_credentials_enabled() {
+                None
+            } else if self.is_grpc {
                 grpc_text(body)
             } else {
                 body_text(body)
             }
         };
-        msg.request_text = text(&stream.request_body);
-        msg.payload_text = text(&stream.response_body);
+        msg.request_text = text(&stream.request_body).filter(|_| !stream.request_gap);
+        msg.payload_text = text(&stream.response_body).filter(|_| !stream.response_gap);
         Some(msg)
     }
 
@@ -503,8 +545,10 @@ impl Http2Parser {
         side.discard_frame = Some((stream_id, flags));
         let stream = self.stream(stream_id);
         let size = if from_client {
+            stream.request_gap_pending = true;
             &mut stream.request_size
         } else {
+            stream.response_gap_pending = true;
             &mut stream.response_size
         };
         *size += have_body as u64 + lost;
@@ -1039,8 +1083,11 @@ mod tests {
             (msgs[0].path.as_deref(), msgs[0].status),
             (Some("/pkg.Svc/Ok"), Some(0))
         );
-        assert_eq!(msgs[0].request_text.as_deref(), Some("bob@x.y"));
-        assert_eq!(msgs[0].payload_text.as_deref(), None); // "yes" is < 4 chars
+        // Codex round 4: schema-less protobuf text has no field names, so a
+        // password field is indistinguishable from any other string. With
+        // credential masking on (the default) it is not exported.
+        assert_eq!(msgs[0].request_text.as_deref(), None);
+        assert_eq!(msgs[0].payload_text.as_deref(), None);
         assert_eq!(
             (msgs[1].path.as_deref(), msgs[1].status),
             (Some("/pkg.Svc/Missing"), Some(5))
@@ -1122,6 +1169,8 @@ mod tests {
             1,
             &encode(&mut se, &[(":status", "200")]),
         );
+        // A whole first frame, then a large one cut by the capture cap.
+        resp.extend(make_frame(FRAME_DATA, 0, 1, b"prefix of the body"));
         let frame = make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &vec![b'a'; 16_000]);
         resp.extend_from_slice(&frame[..4096]); // captured part
         p.feed(&resp, Direction::Ingress, 5);
@@ -1129,8 +1178,101 @@ mod tests {
         assert!(p.skip(Direction::Ingress, 10_000, 6).is_some());
         let msgs = messages(p.feed(&frame[4096 + 10_000..], Direction::Ingress, 7));
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].response_size_bytes, 16_000);
+        assert_eq!(msgs[0].response_size_bytes, 16_018);
         assert_eq!(msgs[0].status, Some(200));
+        // Nothing was kept after the gap: the captured prefix is exported.
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("prefix of the body"));
+    }
+
+    /// Codex: a block that fails to decode may still have changed the
+    /// table (insertions before the error are kept, those after it are
+    /// missed), so a later block can decode a credential value under
+    /// another name. After a failed or skipped block, no header of that
+    /// side is exported again.
+    #[test]
+    fn test_hpack_error_stops_header_export() {
+        fn lit_new(out: &mut Vec<u8>, name: &str, value: &str) {
+            out.push(0x40); // literal, incremental indexing, new name
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(value.len() as u8);
+            out.extend_from_slice(value.as_bytes());
+        }
+        // Captured mid-connection; the peer had indexed `x-before` already.
+        let mut b1 = vec![0x83, 0x84]; // :method POST, :path /
+        lit_new(&mut b1, "x-note", "ok");
+        b1.push(0x80 | 63); // x-before: unknown to the agent → error
+        lit_new(&mut b1, "x-api-key", "old"); // missed by the agent
+        let mut b2 = vec![0x83, 0x84];
+        b2.push(0x40 | 62); // the peer's newest entry: x-api-key
+        b2.push(12);
+        b2.extend_from_slice(b"s7Kf2v9LmQ8z");
+        let mut p = Http2Parser::new(false);
+        let status = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1,
+            &[0x88],
+        );
+        let mut out = vec![];
+        for (sid, block) in [(1u32, b1), (3, b2)] {
+            let req = make_frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                sid,
+                &block,
+            );
+            p.feed(&req, Direction::Egress, 1);
+            let mut resp = status.clone();
+            resp[5..9].copy_from_slice(&sid.to_be_bytes());
+            out.extend(messages(p.feed(&resp, Direction::Ingress, 2)));
+        }
+        for m in &out {
+            for (n, v) in &m.headers {
+                assert!(!v.contains("s7Kf"), "{n}: {v}");
+            }
+        }
+    }
+
+    /// A DATA gap: the stream's body is incomplete, and a parser that did
+    /// not see a stream's HEADERS (late join, replaced after a gap) does
+    /// not export what it sees of that stream's body.
+    #[test]
+    fn test_body_with_a_gap_is_withheld() {
+        let mut ce = hpack::Encoder::new();
+        let mut p = Http2Parser::new(false);
+        let mut req = preface();
+        req.extend(make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            1,
+            &encode(&mut ce, &[(":method", "POST"), (":path", "/login")]),
+        ));
+        let frame = make_frame(
+            FRAME_DATA,
+            0,
+            1,
+            br#"{"note":"a","password":"s7Kf2v9LmQ8z"}"#,
+        );
+        req.extend_from_slice(&frame[..9 + 11]);
+        p.feed(&req, Direction::Egress, 1);
+        assert!(p.skip(Direction::Egress, frame.len() - 20, 2).is_some());
+        p.feed(
+            &make_frame(FRAME_DATA, FLAG_END_STREAM, 1, b"tail"),
+            Direction::Egress,
+            3,
+        );
+        let h = encode(&mut hpack::Encoder::new(), &[(":status", "200")]);
+        let resp = make_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &h);
+        let m = messages(p.feed(&resp, Direction::Ingress, 4));
+        assert_eq!(m[0].request_text, None, "{m:?}");
+
+        // Replaced after losing a whole frame: the next frame is a tail.
+        let mut p = Http2Parser::new(false);
+        let tail = make_frame(FRAME_DATA, FLAG_END_STREAM, 1, br#"s7Kf2v9LmQ8z"}"#);
+        p.feed(&tail, Direction::Egress, 1);
+        let m = messages(p.feed(&resp, Direction::Ingress, 2));
+        assert!(m.iter().all(|m| m.request_text.is_none()), "{m:?}");
     }
 
     #[test]
@@ -1139,6 +1281,13 @@ mod tests {
         assert_eq!(ProtocolParser::protocol(&p), Protocol::Http2);
         assert_eq!(p.state_name(), "preface");
         assert_eq!(ProtocolParser::protocol_version(&p), Some("2"));
+    }
+
+    #[test]
+    fn test_grpc_text_extracts_strings() {
+        let mut msg = vec![0u8, 0, 0, 0, 9, 0x0a, 7];
+        msg.extend_from_slice(b"bob@x.y");
+        assert_eq!(grpc_text(&msg).as_deref(), Some("bob@x.y"));
     }
 
     #[test]

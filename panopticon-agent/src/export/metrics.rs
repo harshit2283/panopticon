@@ -42,6 +42,9 @@ pub struct AgentMetrics {
     pub sampled_out_connections: Counter<u64>,
     pub sampled_out_events: Counter<u64>,
     pub head_only_cut_events: Counter<u64>,
+    /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
+    pub credential_matches_user: Counter<u64>,
+    pub credential_matches_builtin: Counter<u64>,
     /// cgroup_skb only ([`Self::register_scope_drops`]): kernel scope drops,
     /// one per `SCOPE_DROP_NAMES` entry in that order; empty on TC.
     pub scope_drops: Vec<Counter<u64>>,
@@ -205,6 +208,21 @@ impl AgentMetrics {
             ringbuf_approx_pending.clone(),
         );
 
+        let credential_matches =
+            Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_credential_matches",
+            "Credentials protected: user-pattern matches replaced (source=user), fields the \
+             built-in rules masked or withheld (source=builtin). Never values.",
+            credential_matches.clone(),
+        );
+        let credential_matches_user = credential_matches
+            .get_or_create(&[("source", "user")])
+            .clone();
+        let credential_matches_builtin = credential_matches
+            .get_or_create(&[("source", "builtin")])
+            .clone();
+
         let metrics = Self {
             events_received,
             events_dropped,
@@ -225,6 +243,8 @@ impl AgentMetrics {
             sampled_out_connections,
             sampled_out_events,
             head_only_cut_events,
+            credential_matches_user,
+            credential_matches_builtin,
             scope_drops: Vec::new(),
             drops_stale_scope_gen: None,
             parse_latency,
@@ -344,6 +364,13 @@ impl AgentMetrics {
                 .inner()
                 .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        let (user, builtin) = crate::protocol::credential_matches();
+        self.credential_matches_user
+            .inner()
+            .store(user, Ordering::Relaxed);
+        self.credential_matches_builtin
+            .inner()
+            .store(builtin, Ordering::Relaxed);
         for (counter, value) in self.scope_drops.iter().zip(&stats.scope_drops) {
             counter
                 .inner()

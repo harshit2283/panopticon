@@ -180,9 +180,22 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    `full` does this too, with or without PII detection, unless
-    `[privacy] mask_credentials = false`. The leak test covers HTTP, OpenSSL
-    TLS, Redis AUTH and Kafka client ids; withheld SQL statements and AMQP
+    Bodies with bytes kept after a capture gap (a cut end keeps its
+    prefix), HTTP/2 headers after a lost HPACK block,
+    over-long header names and gRPC/protobuf body text are not exported;
+    only known SQL keywords are exported as methods. `[credentials]
+    patterns` adds the user's own formats (masked in every field, counted
+    in `panopticon_credential_matches_total`), and `builtin = "names_only"`
+    skips the free-text scan. `full` does this too, with or without PII
+    detection, unless `[privacy] mask_credentials = false`.
+  - Credential protection is a hard guarantee only in `metrics_only`
+    (no path, header or body leaves the agent). In `redacted` and `full`
+    it is best-effort defence in depth for known credential forms: it does
+    not catch opaque secrets under unrecognised names, base64 `Basic`
+    credentials outside `Authorization`, compressed or non-ASCII UTF-16/32
+    bodies, PostgreSQL `U&` identifiers, or packets forged into a
+    connection (USER-GUIDE §5.3). The leak test covers HTTP, OpenSSL TLS,
+    Redis AUTH and Kafka client ids; withheld SQL statements and AMQP
     metadata are covered by unit tests only.
 - Service graphing:
   - DNS/IP-based identity works. DNS names come only from answers to

@@ -115,3 +115,7 @@ harness = false
 [[bench]]
 name = "pii_regex"
 harness = false
+
+[[bench]]
+name = "credential_rules"
+harness = false

@@ -7,6 +7,7 @@
 //! Parsers handle Keep-Alive reset internally (no separate reset method).
 
 pub mod amqp;
+mod credential_rules;
 pub mod detect;
 pub mod dns;
 pub mod fsm;
@@ -139,9 +140,14 @@ pub fn truncate_utf8(s: &str, max: usize) -> &str {
 /// the PII engine.
 pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
 
+// Installed by main's (Linux-only) startup and reload.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub use credential_rules::{
+    Builtin, CredentialRules, count_builtin, credential_matches, set_credential_rules,
+};
 pub use secrets::{
-    STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
-    withheld_statement,
+    FIELD_WITHHELD, STATEMENT_WITHHELD, has_credential_context, is_credential_name, protect_text,
+    sql_verb, withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -149,9 +155,11 @@ pub use secrets::{
 // `set_mask_credentials`; only ever flipped false -> true at runtime.
 static MASK_CREDENTIALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether login secrets (Redis AUTH, SQL credential statements, credential
-/// headers, fields with credential context) are protected before any sink. `[privacy]
-/// mask_credentials`, default true; false is only allowed in `full` mode.
+/// Whether known credential forms (Redis AUTH, SQL credential statements,
+/// credential headers, fields with credential context, `[credentials]`
+/// patterns) are protected before any sink: best effort in the modes that
+/// export fields (USER-GUIDE §5.3). `[privacy] mask_credentials`, default
+/// true; false is only allowed in `full` mode.
 pub fn mask_credentials_enabled() -> bool {
     MASK_CREDENTIALS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -168,20 +176,17 @@ pub fn export_statement(
     mut query: String,
     bound: Option<String>,
 ) -> (Option<String>, String, Option<String>, bool) {
-    if mask_credentials_enabled() && has_credential_context(&query) {
+    if mask_credentials_enabled() && secrets::has_sql_credential_context(&query) {
+        count_builtin();
         let shown = withheld_statement(&query);
         zeroize::Zeroize::zeroize(&mut query);
         if let Some(mut b) = bound {
             zeroize::Zeroize::zeroize(&mut b);
         }
-        let verb = shown
-            .strip_suffix(STATEMENT_WITHHELD)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string);
+        let verb = sql_verb(&shown).map(str::to_string);
         return (verb, shown, None, true);
     }
-    let verb = query.split_whitespace().next().map(str::to_uppercase);
+    let verb = sql_verb(&query).map(str::to_string);
     let shown = truncate_utf8(&query, 4096).to_string();
     (verb, shown, bound, false)
 }
@@ -199,7 +204,7 @@ pub fn export_error_text(text: String, statement_withheld: bool) -> String {
 }
 
 /// [`protect_text`] in place: credential values masked, or the field
-/// replaced by [`secrets::FIELD_WITHHELD`].
+/// replaced by [`FIELD_WITHHELD`].
 pub fn protect_text_in(text: &mut String) {
     if let Some(out) = protect_text(text) {
         zeroize::Zeroize::zeroize(text);

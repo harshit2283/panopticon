@@ -44,10 +44,15 @@ pub struct PostgresParser {
     /// Server bytes were lost mid-response (capture gap): discard until the
     /// next ReadyForQuery, which ends every query cycle.
     resync_server: bool,
-    /// Named prepared statements seen in Parse messages: name -> SQL. Lets a
-    /// Bind/Execute cycle that reuses a statement (no Parse — what ORMs and
-    /// drivers do after preparing) be attributed to its query.
+    /// Named prepared statements the server accepted (ParseComplete): name
+    /// -> SQL. Lets a Bind/Execute cycle that reuses a statement (no Parse —
+    /// what ORMs and drivers do after preparing) be attributed to its query.
+    /// A name being re-Parsed or Closed is removed at once: until the server
+    /// confirms, its SQL is unknown and a Bind of it exports no values.
     prepared: HashMap<String, String>,
+    /// The current cycle's named Parse, entered into `prepared` on the
+    /// server's ParseComplete; dropped on ErrorResponse / ReadyForQuery.
+    pending_parse: Option<(String, String)>,
     /// Text-format parameter values from the current cycle's Bind message.
     /// Applications send their data here, not in the SQL text.
     bind_params: Option<String>,
@@ -125,6 +130,7 @@ impl PostgresParser {
             awaiting_encryption_reply: false,
             resync_server: false,
             prepared: HashMap::new(),
+            pending_parse: None,
             bind_params: None,
             statement_withheld: false,
             query_ts: None,
@@ -340,10 +346,18 @@ impl PostgresParser {
         {
             match msg_type {
                 b'B' => self.bind_params = bind_param_text(&payload),
-                b'D' | b'E' | b'H' | b'S' | b'C' => {}
+                b'C' => self.close(&payload),
+                b'D' | b'E' | b'H' | b'S' => {}
                 _ => break,
             }
             self.client_buf.consume(consumed);
+        }
+    }
+
+    /// Close (`C`): `S` + name forgets that statement (`P` is a portal).
+    fn close(&mut self, payload: &[u8]) {
+        if payload.first() == Some(&b'S') {
+            self.prepared.remove(&extract_string(&payload[1..]));
         }
     }
 
@@ -367,8 +381,9 @@ impl PostgresParser {
                 // Parse (extended query): name\0 + query\0 + param types
                 let name = extract_string(&payload);
                 let query = extract_second_string(&payload);
-                if !name.is_empty() && self.prepared.len() < MAX_PREPARED_STATEMENTS {
-                    self.prepared.insert(name, query.clone());
+                if !name.is_empty() {
+                    self.prepared.remove(&name);
+                    self.pending_parse = Some((name, query.clone()));
                 }
                 self.query_text = Some(query);
                 self.query_ts = Some(ts);
@@ -390,6 +405,10 @@ impl PostgresParser {
             }
             b'D' | b'E' | b'H' | b'S' => {
                 // Describe, Execute, Flush, Sync outside a tracked cycle.
+                true
+            }
+            b'C' => {
+                self.close(&payload);
                 true
             }
             b'X' => false, // Terminate
@@ -426,13 +445,25 @@ impl PostgresParser {
                     let _tag = extract_string(&payload);
                     // Don't emit yet — wait for ReadyForQuery
                 }
+                b'1' => {
+                    // ParseComplete: the server holds the statement now.
+                    if let Some((name, sql)) = self.pending_parse.take()
+                        && self.prepared.len() < MAX_PREPARED_STATEMENTS
+                    {
+                        self.prepared.insert(name, sql);
+                    }
+                }
                 b'E' => {
+                    // The server skips the rest of the cycle: a pending Parse
+                    // failed or never ran.
+                    self.pending_parse = None;
                     // ErrorResponse — stash the error; emit on ReadyForQuery so query_text
                     // isn't consumed here (build_msg would clear it via take()).
                     self.pending_error = Some(parse_error_response(&payload));
                     self.pending_status = Some(1);
                 }
                 b'Z' => {
+                    self.pending_parse = None;
                     // ReadyForQuery — build message from accumulated query state + any error.
                     let mut msg = self.build_msg(ts);
                     msg.status = Some(self.pending_status.take().unwrap_or(0));
@@ -448,8 +479,8 @@ impl PostgresParser {
                     // ParameterStatus (can arrive during query)
                     self.parse_parameter_status(&payload);
                 }
-                b'I' => {}                                    // EmptyQueryResponse
-                b'1' | b'2' | b'3' | b'n' | b's' | b't' => {} // Extended query sub-responses
+                b'I' => {}                             // EmptyQueryResponse
+                b'2' | b'3' | b'n' | b's' | b't' => {} // Extended query sub-responses
                 _ => {}
             }
         }
@@ -874,6 +905,90 @@ mod tests {
             out.iter().flatten().all(|v| !v.contains("canary")),
             "{out:?}"
         );
+    }
+
+    /// Codex: the statement cache follows the server, not the client. A
+    /// Parse the server rejects (duplicate name) does not replace the
+    /// statement; a Close forgets it; a full cache cannot keep a stale
+    /// entry for a re-Parsed name. Binds of a statement whose SQL is not
+    /// known for certain export no values.
+    #[test]
+    fn test_statement_cache_follows_the_server() {
+        let bound = |p: &mut PostgresParser, resp: &[u8]| -> Vec<Option<String>> {
+            p.feed(
+                &extended_cycle(None, "s", &["canary-bound"]),
+                Direction::Egress,
+                5,
+            );
+            match p.feed(resp, Direction::Ingress, 6) {
+                ParseResult::Messages(m) => m.into_iter().map(|m| m.request_text).collect(),
+                _ => vec![],
+            }
+        };
+        let no_canary = |v: &[Option<String>]| v.iter().flatten().all(|t| !t.contains("canary"));
+        let mut rejected = make_backend_msg(b'E', b"SERROR\0C42P05\0Mduplicate\0\0");
+        rejected.extend(make_backend_msg(b'Z', b"I"));
+
+        // Rejected duplicate Parse.
+        let mut p = setup_ready_parser();
+        let pw = "INSERT INTO users (password) VALUES ($1)";
+        p.feed(
+            &extended_cycle(Some(("s", pw)), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1")), "s", &["y"]),
+            Direction::Egress,
+            3,
+        );
+        p.feed(&rejected, Direction::Ingress, 4);
+        let out = bound(&mut p, &insert_done());
+        assert!(no_canary(&out), "{out:?}");
+
+        // Close.
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1")), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        let mut close = make_frontend_msg(b'C', b"Ss\0");
+        close.extend(make_frontend_msg(b'S', b""));
+        p.feed(&close, Direction::Egress, 3);
+        let mut closed = make_backend_msg(b'3', b"");
+        closed.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&closed, Direction::Ingress, 4);
+        let out = bound(&mut p, &insert_done());
+        assert!(no_canary(&out), "{out:?}");
+
+        // Full cache, then `s` re-Parsed (after a Close the agent missed).
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1")), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        for i in 0..MAX_PREPARED_STATEMENTS {
+            let name = format!("f{i}");
+            p.feed(
+                &extended_cycle(Some((&name, "SELECT 1")), &name, &[]),
+                Direction::Egress,
+                3,
+            );
+            p.feed(&insert_done(), Direction::Ingress, 4);
+        }
+        p.feed(
+            &extended_cycle(Some(("s", pw)), "s", &["x"]),
+            Direction::Egress,
+            5,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 6);
+        let out = bound(&mut p, &insert_done());
+        assert!(no_canary(&out), "{out:?}");
     }
 
     #[test]

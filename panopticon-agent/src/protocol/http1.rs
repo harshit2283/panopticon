@@ -51,6 +51,15 @@ pub struct Http1Parser {
     response_headers: Vec<(String, String)>,
     response_status: Option<u32>,
     response_content_type: Option<String>,
+    /// Body bytes were kept after bytes of the same body were lost: they
+    /// may hold a credential's value without its name, so the body is not
+    /// exported (sizes are). A gap that only cuts a body's end (the capture
+    /// cap on a large segment) keeps the captured prefix.
+    request_gap: bool,
+    response_gap: bool,
+    /// A gap inside the body; it becomes `*_gap` if more body bytes follow.
+    request_gap_pending: bool,
+    response_gap_pending: bool,
 }
 
 /// Request-line prefixes; anything else at the start of the client buffer is
@@ -127,6 +136,10 @@ impl Http1Parser {
             response_headers: Vec::new(),
             response_status: None,
             response_content_type: None,
+            request_gap: false,
+            response_gap: false,
+            request_gap_pending: false,
+            response_gap_pending: false,
         }
     }
 
@@ -434,11 +447,12 @@ impl Http1Parser {
             msg.headers = self.response_headers.clone();
         }
 
-        msg.payload_text = body_text(&self.response_body);
+        msg.payload_text = body_text(&self.response_body).filter(|_| !self.response_gap);
         msg.request_text = self
             .pending_request
             .as_ref()
-            .and_then(|req| body_text(&req.body));
+            .and_then(|req| body_text(&req.body))
+            .filter(|_| !self.request_gap);
 
         Some(msg)
     }
@@ -462,6 +476,10 @@ impl Http1Parser {
         self.response_headers.clear();
         self.response_status = None;
         self.response_content_type = None;
+        self.request_gap = false;
+        self.response_gap = false;
+        self.request_gap_pending = false;
+        self.response_gap_pending = false;
     }
 }
 
@@ -489,6 +507,22 @@ impl ProtocolParser for Http1Parser {
             }
         };
 
+        // Body bytes after a gap inside that body.
+        match target {
+            BufferTarget::Client
+                if self.request_gap_pending
+                    && matches!(self.state, State::ReadingRequestBody { .. }) =>
+            {
+                self.request_gap = true
+            }
+            BufferTarget::Server
+                if self.response_gap_pending
+                    && matches!(self.state, State::ReadingResponseBody { .. }) =>
+            {
+                self.response_gap = true
+            }
+            _ => {}
+        }
         match target {
             BufferTarget::Client => {
                 if self.client_buf.extend(data).is_err() {
@@ -510,6 +544,7 @@ impl ProtocolParser for Http1Parser {
             (Direction::Egress, State::ReadingRequestBody { remaining })
                 if n <= remaining && self.client_buf.is_empty() =>
             {
+                self.request_gap_pending |= n < remaining;
                 self.state = if n == remaining {
                     State::WaitingForResponse
                 } else {
@@ -524,6 +559,7 @@ impl ProtocolParser for Http1Parser {
             (Direction::Ingress, State::ReadingResponseBody { remaining })
                 if n <= remaining && self.server_buf.is_empty() =>
             {
+                self.response_gap_pending |= n < remaining;
                 self.response_size += n as u64;
                 if n == remaining {
                     let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
@@ -580,6 +616,67 @@ fn is_http1_response(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture gap inside a body can remove a credential's name and keep
+    /// its value: a body with a gap is withheld (sizes kept).
+    #[test]
+    fn test_body_with_a_gap_is_withheld() {
+        let body = br#"{"password":"s7Kf2v9LmQ8z","n":1}"#;
+        let mut p = Http1Parser::new();
+        let head = format!(
+            "POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        p.feed(head.as_bytes(), Direction::Egress, 1);
+        assert!(p.skip(Direction::Egress, 13, 2).is_some()); // {"password":"
+        p.feed(&body[13..], Direction::Egress, 3);
+        let tail = r#"{"token_hint":"s7Kf2v9LmQ8z"}"#;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", tail.len());
+        p.feed(head.as_bytes(), Direction::Ingress, 4);
+        assert!(p.skip(Direction::Ingress, 2, 5).is_some());
+        let ParseResult::Messages(m) = p.feed(&tail.as_bytes()[2..], Direction::Ingress, 6) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].request_text, None, "{m:?}");
+        assert_eq!(m[0].payload_text, None, "{m:?}");
+        assert_eq!(m[0].status, Some(200));
+
+        // The next exchange on the connection is exported normally.
+        p.feed(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n", Direction::Egress, 7);
+        let ParseResult::Messages(m) = p.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            Direction::Ingress,
+            8,
+        ) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].payload_text.as_deref(), Some("ok"));
+    }
+
+    /// A gap that only cuts the end of a body (the capture cap on a large
+    /// segment) keeps the captured prefix: names come before values, and
+    /// the export scans and trims a cut value.
+    #[test]
+    fn test_body_cut_at_its_end_keeps_its_prefix() {
+        let mut p = Http1Parser::new();
+        p.feed(
+            b"POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nhead of the body",
+            Direction::Egress,
+            1,
+        );
+        assert!(p.skip(Direction::Egress, 84, 2).is_some());
+        p.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\nfirst part",
+            Direction::Ingress,
+            3,
+        );
+        let Some(ParseResult::Messages(m)) = p.skip(Direction::Ingress, 9990, 4) else {
+            panic!("the gap finishes the response");
+        };
+        assert_eq!(m[0].request_text.as_deref(), Some("head of the body"));
+        assert_eq!(m[0].payload_text.as_deref(), Some("first part"));
+        assert_eq!(m[0].response_size_bytes, 10000);
+    }
 
     #[test]
     fn test_simple_get() {

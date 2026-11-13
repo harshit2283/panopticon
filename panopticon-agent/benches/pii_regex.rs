@@ -19,6 +19,20 @@ mod pii;
 #[allow(unused_imports)]
 #[path = "../src/protocol/mod.rs"]
 mod protocol;
+// `pii` reaches the external-service client through `io_gate`, which
+// writes through `export::open_private` (unused here) and `test_hooks`.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/io_gate.rs"]
+mod io_gate;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/test_hooks.rs"]
+mod test_hooks;
+#[allow(dead_code)]
+mod export {
+    pub fn open_private(_path: &str, _append: bool) -> anyhow::Result<std::fs::File> {
+        anyhow::bail!("not used by the benchmark")
+    }
+}
 
 use config::PiiConfig;
 use pii::PiiEngine;
