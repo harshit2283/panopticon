@@ -82,8 +82,9 @@ struct StreamState {
     /// bytes of the stream are kept (a cut end keeps the prefix).
     request_gap_pending: bool,
     response_gap_pending: bool,
-    /// The request / response is gRPC or protobuf: such a content-type was
-    /// decoded, whether or not the header budget kept it.
+    /// The request / response may be gRPC or protobuf: such a content-type
+    /// was decoded, whether or not the header budget kept it, or that
+    /// side's headers could not be decoded (the content-type is unknown).
     request_protobuf: bool,
     response_protobuf: bool,
     /// Insertion order, for evicting the oldest stream at capacity.
@@ -435,6 +436,10 @@ impl Http2Parser {
         if is_push {
             return FrameEvent::None; // decoded only to keep the server table in sync
         }
+        // A block this side could not decode (joined mid-connection, a
+        // lost or failed block): its content-type is unknown, so the body
+        // is treated as protobuf, withheld while credentials are masked.
+        protobuf |= side.headers_lost;
 
         let stream = self.stream(stream_id);
         if from_client {
@@ -1260,6 +1265,38 @@ mod tests {
             assert_eq!(text.as_bytes(), &body[..kept], "padded {padded}");
             assert_eq!(msgs[0].response_size_bytes, payload.len() as u64);
         }
+    }
+
+    /// Joined mid-connection: the client's header block indexes table
+    /// entries the agent never saw, so the request's content-type is
+    /// unknown and its body (here protobuf that is valid UTF-8) is
+    /// withheld while credentials are masked. The response side, decoded,
+    /// keeps its body.
+    #[test]
+    fn test_body_under_undecodable_headers_is_withheld() {
+        let mut p = Http2Parser::new(false);
+        // No preface seen; :method POST, then an unknown dynamic entry.
+        let mut req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &[0x83, 0x80 | 70]);
+        let mut msg = vec![0, 0, 0, 0, 14, 0x0a, 12];
+        msg.extend_from_slice(b"s7Kf2v9LmQ8z");
+        req.extend(make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &msg));
+        p.feed(&req, Direction::Egress, 1);
+        let mut se = hpack::Encoder::new();
+        let mut resp = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            1,
+            &encode(
+                &mut se,
+                &[(":status", "200"), ("content-type", "text/plain")],
+            ),
+        );
+        resp.extend(make_frame(FRAME_DATA, FLAG_END_STREAM, 1, b"plain reply"));
+        let out = messages(p.feed(&resp, Direction::Ingress, 2));
+        assert_eq!(out.len(), 1);
+        assert!(super::super::mask_credentials_enabled());
+        assert_eq!(out[0].request_text, None, "{:?}", out[0]);
+        assert_eq!(out[0].payload_text.as_deref(), Some("plain reply"));
     }
 
     /// Codex round 5 #8: gRPC is recognised from a content-type the header

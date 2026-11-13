@@ -157,7 +157,8 @@ production-hardened compliance platform.
     parsed. MySQL statements prepared before the agent started are
     reported as `EXECUTE` without their SQL.
   - HTTP/2 headers cannot be decoded when the agent joins a connection that
-    was already open (HPACK state is lost).
+    was already open (HPACK state is lost); while credential masking is on
+    its bodies are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -181,7 +182,9 @@ production-hardened compliance platform.
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
     Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block,
+    prefix), HTTP/2 headers after a lost HPACK block (and, while masking
+    is on, HTTP/2 bodies on such a connection, e.g. one joined
+    mid-stream, until a new connection is observed from its start),
     over-long header names and gRPC/protobuf body text are not exported;
     only known SQL keywords are exported as methods. `[credentials]
     patterns` adds the user's own formats (masked in every field, matching

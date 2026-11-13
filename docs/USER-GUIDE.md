@@ -473,7 +473,9 @@ data. Known limits:
   `&gt;`, PostgreSQL `U&"…"` identifiers;
 - protobuf without its schema: field numbers, not names, so gRPC and
   protobuf body text is not exported at all while credentials are
-  protected;
+  protected, nor is an HTTP/2 body whose content type is unknown because
+  that direction's headers could not be decoded (a connection the agent
+  joined mid-stream: until a new connection is observed from its start);
 - packets forged or injected into a connection by someone who can do so,
   and state from before capture started that the parser cannot see.
 
@@ -536,6 +538,11 @@ What is exported then:
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
   body).
+- **HTTP/2 bodies** of a direction whose headers could not be decoded
+  (a connection the agent joined mid-stream, a failed or skipped header
+  block) are not exported while credential masking is on: their content
+  type is unknown, so they may be protobuf. A new connection observed from
+  its start exports bodies again.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection.
