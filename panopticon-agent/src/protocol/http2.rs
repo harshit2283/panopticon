@@ -82,6 +82,10 @@ struct StreamState {
     /// bytes of the stream are kept (a cut end keeps the prefix).
     request_gap_pending: bool,
     response_gap_pending: bool,
+    /// The request / response is gRPC or protobuf: such a content-type was
+    /// decoded, whether or not the header budget kept it.
+    request_protobuf: bool,
+    response_protobuf: bool,
     /// Insertion order, for evicting the oldest stream at capacity.
     seq: u64,
 }
@@ -405,12 +409,19 @@ impl Http2Parser {
         // block is still decoded to keep the table in sync.
         let mut decoded = Vec::new();
         let mut used = 0usize;
+        // The body's kind is read from every content-type decoded, kept
+        // within the budget or not: (gRPC, gRPC or protobuf).
+        let (mut grpc, mut protobuf) = (false, false);
         // hpack can panic on malformed input; a failed block still has to be
         // skipped so later frames parse (its table updates are lost).
         if !side.headers_lost {
             let ok = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 side.decoder.decode_with_cb(&block, |n, v| {
                     used = used.saturating_add(n.len() + v.len() + 32);
+                    if n.eq_ignore_ascii_case(b"content-type") {
+                        grpc |= v.starts_with(b"application/grpc");
+                        protobuf |= contains(&v, b"grpc") || contains(&v, b"protobuf");
+                    }
                     if used <= budget {
                         decoded.push((n.into_owned(), v.into_owned()));
                     }
@@ -425,8 +436,12 @@ impl Http2Parser {
             return FrameEvent::None; // decoded only to keep the server table in sync
         }
 
-        let mut grpc = false;
         let stream = self.stream(stream_id);
+        if from_client {
+            stream.request_protobuf |= protobuf;
+        } else {
+            stream.response_protobuf |= protobuf;
+        }
         let trailers = !from_client && stream.response_headers_seen;
         if from_client && stream.request_ts.is_none() {
             stream.request_ts = Some(ts);
@@ -443,9 +458,6 @@ impl Http2Parser {
                 ":path" if from_client => stream.path = Some(value.clone()),
                 ":status" if !from_client => stream.status = value.parse().ok(),
                 "content-type" => {
-                    if value.starts_with("application/grpc") {
-                        grpc = true;
-                    }
                     if !trailers {
                         stream.content_type = Some(value.clone());
                     }
@@ -491,13 +503,10 @@ impl Http2Parser {
         // Protobuf without its schema carries field numbers, not names: a
         // password field cannot be told from any other string, so its text
         // is not exported while credentials are protected.
-        let protobuf = self.is_grpc
-            || msg
-                .content_type
-                .as_deref()
-                .is_some_and(|c| c.contains("grpc") || c.contains("protobuf"));
-        let text = |body: &[u8]| {
-            if protobuf && super::mask_credentials_enabled() {
+        // Each body by its own side's content-type, decoded whether or not
+        // the header budget kept it.
+        let text = |body: &[u8], protobuf: bool| {
+            if (self.is_grpc || protobuf) && super::mask_credentials_enabled() {
                 None
             } else if self.is_grpc {
                 grpc_text(body)
@@ -505,8 +514,10 @@ impl Http2Parser {
                 body_text(body)
             }
         };
-        msg.request_text = text(&stream.request_body).filter(|_| !stream.request_gap);
-        msg.payload_text = text(&stream.response_body).filter(|_| !stream.response_gap);
+        msg.request_text =
+            text(&stream.request_body, stream.request_protobuf).filter(|_| !stream.request_gap);
+        msg.payload_text =
+            text(&stream.response_body, stream.response_protobuf).filter(|_| !stream.response_gap);
         Some(msg)
     }
 
@@ -537,12 +548,22 @@ impl Http2Parser {
         }
         let flags = data[4];
         let stream_id = u32::from_be_bytes([data[5] & 0x7F, data[6], data[7], data[8]]);
-        let have_body = data.len() - FRAME_HEADER_SIZE;
-        // Count the bytes we will never see toward the stream's size.
-        let lost = (n + (missing - n)) as u64;
+        let payload = &data[FRAME_HEADER_SIZE..];
+        // The frame's data captured so far is the body's next bytes: kept
+        // as its provable prefix (the pad-length byte and padding are not
+        // data).
+        let prefix = if flags & FLAG_PADDED != 0 {
+            let end = len.saturating_sub(payload.first().map_or(len, |&p| p as usize));
+            payload.get(1..end.min(payload.len())).unwrap_or_default()
+        } else {
+            payload
+        }
+        .to_vec();
+        let other = (payload.len() - prefix.len()) as u64;
         side.buf.clear();
         side.discard = missing - n;
         side.discard_frame = Some((stream_id, flags));
+        self.on_data(from_client, stream_id, 0, &prefix, 0);
         let stream = self.stream(stream_id);
         let size = if from_client {
             stream.request_gap_pending = true;
@@ -551,7 +572,8 @@ impl Http2Parser {
             stream.response_gap_pending = true;
             &mut stream.response_size
         };
-        *size += have_body as u64 + lost;
+        // The bytes we will never see count toward the stream's size.
+        *size += other + missing as u64;
         true
     }
 }
@@ -607,6 +629,12 @@ fn hpack_oversized_table_update(block: &[u8]) -> bool {
         Some(false)
     };
     walk().unwrap_or(true)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 fn body_text(body: &[u8]) -> Option<String> {
@@ -1180,8 +1208,94 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].response_size_bytes, 16_018);
         assert_eq!(msgs[0].status, Some(200));
-        // Nothing was kept after the gap: the captured prefix is exported.
-        assert_eq!(msgs[0].payload_text.as_deref(), Some("prefix of the body"));
+        // Nothing was kept after the gap: the captured prefix, the cut
+        // frame's captured bytes included, is exported.
+        let text = msgs[0].payload_text.as_deref().unwrap();
+        assert_eq!(text.len(), 18 + 4096 - FRAME_HEADER_SIZE);
+        assert!(text.starts_with("prefix of the bodyaaa"), "{text}");
+    }
+
+    /// Codex round 5 #12: a single DATA frame carrying END_STREAM, its
+    /// tail lost: the captured beginning is the body's provable prefix
+    /// (padding and the pad-length byte not part of it).
+    #[test]
+    fn test_cut_end_of_a_single_frame_keeps_its_prefix() {
+        for padded in [false, true] {
+            let (mut ce, mut se) = (hpack::Encoder::new(), hpack::Encoder::new());
+            let mut p = Http2Parser::new(false);
+            let mut req = preface();
+            req.extend(make_frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                &encode(&mut ce, &[(":method", "GET"), (":path", "/big")]),
+            ));
+            p.feed(&req, Direction::Egress, 0);
+            let mut resp = make_frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS,
+                1,
+                &encode(&mut se, &[(":status", "200")]),
+            );
+            let mut body = b"start of the body ".to_vec();
+            body.extend(vec![b'a'; 9_000]);
+            let (flags, payload) = if padded {
+                let mut pl = vec![100u8];
+                pl.extend(&body);
+                pl.extend(vec![0u8; 100]);
+                (FLAG_END_STREAM | FLAG_PADDED, pl)
+            } else {
+                (FLAG_END_STREAM, body.clone())
+            };
+            let frame = make_frame(FRAME_DATA, flags, 1, &payload);
+            resp.extend_from_slice(&frame[..4096]);
+            p.feed(&resp, Direction::Ingress, 5);
+            let msgs = match p.skip(Direction::Ingress, frame.len() - 4096, 6) {
+                Some(r) => messages(r),
+                None => panic!("gap not accounted"),
+            };
+            assert_eq!(msgs.len(), 1, "padded {padded}");
+            let text = msgs[0].payload_text.as_deref().unwrap_or("");
+            let kept = 4096 - FRAME_HEADER_SIZE - usize::from(padded);
+            assert_eq!(text.as_bytes(), &body[..kept], "padded {padded}");
+            assert_eq!(msgs[0].response_size_bytes, payload.len() as u64);
+        }
+    }
+
+    /// Codex round 5 #8: gRPC is recognised from a content-type the header
+    /// budget did not keep, so its protobuf body is not exported.
+    #[test]
+    fn test_grpc_past_the_header_budget_is_recognised() {
+        let mut block = vec![0x83, 0x84]; // :method POST, :path /
+        block.extend([0x40, 0x05]); // literal, incremental indexing, name
+        block.extend_from_slice(b"x-pad");
+        block.extend([0x7f, 0xd1, 0x0e]); // value length 127 + 1873 = 2000
+        block.extend(std::iter::repeat_n(b'p', 2000));
+        block.extend(std::iter::repeat_n(0xbe, 40)); // x-pad again, 40 times
+        block.push(0x00); // literal, not indexed, new name
+        block.push(12);
+        block.extend_from_slice(b"content-type");
+        block.push(16);
+        block.extend_from_slice(b"application/grpc");
+        let mut p = Http2Parser::new(false);
+        let mut req = preface();
+        req.extend(make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &block));
+        // One gRPC message: field 1, string "s7Kf2v9LmQ8z".
+        let mut msg = vec![0, 0, 0, 0, 14, 0x0a, 12];
+        msg.extend_from_slice(b"s7Kf2v9LmQ8z");
+        req.extend(make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &msg));
+        p.feed(&req, Direction::Egress, 1);
+        let status = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1,
+            &[0x88],
+        );
+        let out = messages(p.feed(&status, Direction::Ingress, 2));
+        assert_eq!(out.len(), 1);
+        assert!(super::super::mask_credentials_enabled());
+        let dump = format!("{:?}", out[0]);
+        assert!(!dump.contains("s7Kf"), "{dump}");
     }
 
     /// Codex: a block that fails to decode may still have changed the
