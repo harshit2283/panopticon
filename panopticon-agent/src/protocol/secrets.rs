@@ -844,6 +844,20 @@ mod tests {
         protect_text(s).unwrap_or_else(|| s.to_string())
     }
 
+    /// The prefilter skips the word scan when no hint is present: every
+    /// word that can be context must contain one.
+    #[test]
+    fn hints_cover_every_credential_word() {
+        for w in PARTS
+            .iter()
+            .chain(NAMES)
+            .chain(&["x_pass", "x_auth", "identified"])
+        {
+            assert!(has_hint(w), "{w}");
+            assert!(plain_credential_name(w) || *w == "identified", "{w}");
+        }
+    }
+
     fn rules(patterns: &[&str], builtin: Builtin) -> CredentialRules {
         let p: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
         CredentialRules::compile(&p, builtin).unwrap()
