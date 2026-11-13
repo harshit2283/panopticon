@@ -774,10 +774,8 @@ impl ProtocolParser for Http2Parser {
         self.server.headers_lost = true;
     }
 
-    fn at_frame_boundary(&self) -> bool {
-        [&self.client, &self.server]
-            .iter()
-            .all(|s| s.buf.data().is_empty() && s.discard == 0 && s.pending_block.is_none())
+    fn uncertain(&self) -> bool {
+        self.client.headers_lost || self.server.headers_lost
     }
 }
 

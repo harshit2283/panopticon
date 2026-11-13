@@ -163,7 +163,7 @@ impl TlsLibrary {
 
 /// Network data event (TC capture or TLS intercept).
 ///
-/// At 4192 bytes this MUST be allocated via RingBuf reserve in eBPF,
+/// At 4200 bytes this MUST be allocated via RingBuf reserve in eBPF,
 /// never on the 512-byte BPF stack.
 /// Manual `Debug` implementation that omits the 4KB payload array
 /// to avoid flooding logs when debugging events.
@@ -241,6 +241,12 @@ pub struct DataEvent {
     /// `scope::ROLE_*`.
     pub role: u8,
     pub _pad: [u8; 1],
+    /// `TlsData` from a restricted mode's OpenSSL return probes: the cookie
+    /// of the TCP socket the call did its I/O on. A new nonzero value under
+    /// the same `socket_cookie` (connection object address) is a new
+    /// connection reusing that address. 0 when unknown (unscoped capture,
+    /// Go TLS, a call with no checked socket) and for every other event.
+    pub tls_sock_cookie: u64,
     // Payload last (largest field)
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
@@ -347,6 +353,7 @@ struct RawDataEvent {
     pub tcp_flags: u8,
     pub role: u8,
     pub _pad: [u8; 1],
+    pub tls_sock_cookie: u64,
     pub payload: [u8; MAX_PAYLOAD_SIZE],
 }
 
@@ -377,6 +384,7 @@ impl RawDataEvent {
             tcp_flags: self.tcp_flags,
             role: self.role,
             _pad: self._pad,
+            tls_sock_cookie: self.tls_sock_cookie,
             payload: self.payload,
         })
     }
@@ -521,7 +529,7 @@ mod tests {
     fn test_data_event_size() {
         assert_eq!(
             size_of::<DataEvent>(),
-            4192,
+            4200,
             "DataEvent size changed! This breaks kernel↔userspace ABI."
         );
     }
@@ -589,8 +597,9 @@ mod tests {
         assert_eq!(offset_of!(DataEvent, tcp_flags), 93);
         assert_eq!(offset_of!(DataEvent, role), 94);
         assert_eq!(offset_of!(DataEvent, _pad), 95);
-        assert_eq!(offset_of!(DataEvent, payload), 96);
-        assert_eq!(DATA_EVENT_HEADER_LEN, 96);
+        assert_eq!(offset_of!(DataEvent, tls_sock_cookie), 96);
+        assert_eq!(offset_of!(DataEvent, payload), 104);
+        assert_eq!(DATA_EVENT_HEADER_LEN, 104);
     }
 
     #[test]
@@ -602,6 +611,10 @@ mod tests {
             offset_of!(DataEvent, payload)
         );
         assert_eq!(offset_of!(RawDataEvent, role), offset_of!(DataEvent, role));
+        assert_eq!(
+            offset_of!(RawDataEvent, tls_sock_cookie),
+            offset_of!(DataEvent, tls_sock_cookie)
+        );
         assert_eq!(
             offset_of!(RawDataEvent, scope_gen),
             offset_of!(DataEvent, scope_gen)
@@ -746,6 +759,7 @@ mod tests {
             + 4 + 4 + 4       // owner_tgid, acceptor_tgid, scope_gen
             + 2 + 2           // src_port, dst_port
             + 1 + 1 + 1 + 1   // ip_proto, tcp_flags, role, _pad
+            + 8               // tls_sock_cookie
             + MAX_PAYLOAD_SIZE;
         assert_eq!(
             size_of::<DataEvent>(),
@@ -857,7 +871,7 @@ mod record_tests {
 
     #[test]
     fn record_accepts_header_only_and_size_class_records() {
-        // cgroup_skb close record: the 96-byte header, nothing after it.
+        // cgroup_skb close record: the 104-byte header, nothing after it.
         let mut e: DataEvent = unsafe { core::mem::zeroed() };
         e.event_type = EventType::SockClose;
         e.socket_cookie = 7;

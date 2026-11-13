@@ -273,10 +273,10 @@ pub trait ProtocolParser: Send {
     /// trusting that pairing.
     fn joined_late(&mut self) {}
 
-    /// Both directions are between frames: no partial frame is buffered
-    /// and no frame is being skipped, so new bytes cannot be the rest of
-    /// one (an HTTP/2 DATA payload). False when unknown.
-    fn at_frame_boundary(&self) -> bool {
+    /// The parser holds a latch that withholds what it can no longer
+    /// read with certainty (HTTP/2: header state lost). The connection
+    /// keeps it for its lifetime, past any parser replacement.
+    fn uncertain(&self) -> bool {
         false
     }
 }

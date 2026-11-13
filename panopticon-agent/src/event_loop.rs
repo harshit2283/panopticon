@@ -1316,6 +1316,11 @@ fn feed_event(
     {
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
+    // TLS: another socket under a tracked connection object is a new
+    // connection reusing its address (0, unknown, for all other events).
+    if manager.note_socket(cookie, event.tls_sock_cookie) {
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
     let mut created = false;
     if !payload.is_empty()
         && !manager.contains(cookie)
@@ -1343,6 +1348,9 @@ fn feed_event(
                     .fetch_sub(evicted, Ordering::Relaxed);
             }
             CreateResult::AlreadyExists => {}
+        }
+        if created {
+            manager.note_socket(cookie, event.tls_sock_cookie);
         }
         if log_events {
             tracing::debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
@@ -2151,6 +2159,156 @@ mod tests {
         };
         e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, 6);
         e
+    }
+
+    /// An HTTP/2 frame.
+    fn h2_frame(t: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend([t, flags]);
+        f.extend(stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Client preface and SETTINGS, then `rest`.
+    fn h2_start(rest: &[u8]) -> Vec<u8> {
+        let mut d = crate::protocol::detect::HTTP2_PREFACE.to_vec();
+        d.extend(h2_frame(0x4, 0, 0, &[]));
+        d.extend_from_slice(rest);
+        d
+    }
+
+    /// A request on `stream`: static-table HEADERS (GET, /) and a DATA
+    /// body, END_STREAM.
+    fn h2_request(stream: u32, body: &[u8]) -> Vec<u8> {
+        let mut d = h2_frame(0x1, 0x4, stream, &[0x82, 0x84]);
+        d.extend(h2_frame(0x0, 0x1, stream, body));
+        d
+    }
+
+    /// A `:status 200` reply ending `stream`.
+    fn h2_reply(stream: u32) -> Vec<u8> {
+        h2_frame(0x1, 0x4 | 0x1, stream, &[0x88])
+    }
+
+    /// An OpenSSL read or write on connection object 0x7000 of pid 50,
+    /// whose call did its I/O on the socket with cookie `sock`.
+    fn ssl_event(dir: Direction, sock: u64, payload: &[u8]) -> DataEvent {
+        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
+        let mut e: DataEvent = unsafe { std::mem::zeroed() };
+        e.event_type = EventType::TlsData;
+        e.direction = dir;
+        (e.pid, e.tgid) = (50, 50);
+        e.socket_cookie = 0x7000;
+        e.tls_sock_cookie = sock;
+        e.tls_library = panopticon_common::TlsLibrary::OpenSsl;
+        e.payload[..payload.len()].copy_from_slice(payload);
+        (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
+        e
+    }
+
+    /// Feed events the way worker_task does; every completed message.
+    fn run_events(events: &[DataEvent]) -> Vec<crate::protocol::L7Message> {
+        let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
+        let mut out = vec![];
+        for e in events {
+            for r in feed_event(&m, e, connection_key(e), &stats, 0, false)
+                .into_iter()
+                .flatten()
+            {
+                match r {
+                    FsmResult::Messages(ms) => out.extend(ms),
+                    FsmResult::MessageComplete(m) => out.push(m),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    const CANARY: &[u8] = b"canary-s7Kf2v9LmQ8z";
+
+    /// Codex R8 #1: TLS writes inside one DATA payload that start with the
+    /// client preface (an upload of captured HTTP/2 bytes) must not restart
+    /// the connection clean: the second embedded preface is no proof either.
+    #[test]
+    fn embedded_prefaces_on_one_socket_stay_withheld() {
+        for sock in [11, 0] {
+            // A clean start, then a DATA frame (stream 1) of 4096 bytes whose
+            // payload the next writes carry.
+            let mut open = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]); // POST /
+            open.extend(&h2_frame(0x0, 0, 1, &[0; 4096])[..9]);
+            let mut forged = h2_start(&h2_request(3, CANARY));
+            forged.extend(h2_frame(0x3, 0, 0, &[0; 4])); // RST_STREAM(0)
+            let out = run_events(&[
+                ssl_event(Direction::Egress, sock, &h2_start(&open)),
+                ssl_event(Direction::Egress, sock, &h2_start(&[])),
+                ssl_event(Direction::Egress, sock, &forged),
+                ssl_event(Direction::Ingress, sock, &h2_reply(3)),
+            ]);
+            let dump = format!("{out:?}");
+            assert!(!dump.contains("s7Kf"), "sock {sock}: {dump}");
+        }
+    }
+
+    /// A new TCP socket under a reused SSL object is a new connection: it
+    /// starts clean however the old one ended (here inside a frame).
+    #[test]
+    fn reused_ssl_object_on_a_new_socket_starts_clean() {
+        let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20]; // ends inside DATA
+        let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
+        first.extend_from_slice(cut);
+        let out = run_events(&[
+            ssl_event(Direction::Egress, 11, &h2_start(&first)),
+            ssl_event(Direction::Egress, 12, &h2_start(&h2_request(1, CANARY))),
+            ssl_event(Direction::Ingress, 12, &h2_reply(1)),
+        ]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].path.as_deref(), Some("/"));
+        assert_eq!(out[0].status, Some(200));
+        let dump = format!("{out:?}");
+        assert!(dump.contains("s7Kf"), "body must export: {dump}");
+    }
+
+    /// The same socket (or an unknown one) under the SSL object: a preface
+    /// is not a new connection, and does not clear a latch.
+    #[test]
+    fn preface_on_the_same_or_unknown_socket_stays_latched() {
+        for (a, b) in [(11, 11), (0, 0), (11, 0), (0, 11)] {
+            let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20];
+            let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
+            first.extend_from_slice(cut);
+            let out = run_events(&[
+                ssl_event(Direction::Egress, a, &h2_start(&first)),
+                ssl_event(Direction::Egress, b, &h2_start(&h2_request(3, CANARY))),
+                ssl_event(Direction::Ingress, b, &h2_reply(3)),
+            ]);
+            let dump = format!("{out:?}");
+            assert!(!dump.contains("s7Kf"), "socks {a}/{b}: {dump}");
+        }
+        // Between frames, with nothing lost: still latched.
+        let out = run_events(&[
+            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(1, b"x"))),
+            ssl_event(Direction::Ingress, 11, &h2_reply(1)),
+            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(1, CANARY))),
+            ssl_event(Direction::Ingress, 11, &h2_reply(1)),
+        ]);
+        let dump = format!("{out:?}");
+        assert!(!dump.contains("s7Kf"), "{dump}");
+    }
+
+    /// An HPACK failure latches the connection: a later preface at a frame
+    /// boundary does not clear it.
+    #[test]
+    fn hpack_failure_then_boundary_preface_stays_latched() {
+        let bad = h2_frame(0x1, 0x4 | 0x1, 1, &[0x80]); // index 0: invalid
+        let out = run_events(&[
+            ssl_event(Direction::Egress, 11, &h2_start(&bad)),
+            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(3, CANARY))),
+            ssl_event(Direction::Ingress, 11, &h2_reply(3)),
+        ]);
+        let dump = format!("{out:?}");
+        assert!(!dump.contains("s7Kf"), "{dump}");
     }
 
     /// Feed events the way worker_task does; (method, reply text) of every

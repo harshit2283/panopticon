@@ -127,8 +127,8 @@ pub trait ProtocolFsm: Send {
     /// See [`ProtocolParser::joined_late`].
     fn joined_late(&mut self) {}
 
-    /// See [`ProtocolParser::at_frame_boundary`].
-    fn at_frame_boundary(&self) -> bool {
+    /// See [`ProtocolParser::uncertain`].
+    fn uncertain(&self) -> bool {
         false
     }
 }
@@ -193,8 +193,8 @@ impl ProtocolFsm for ProtocolFsmAdapter {
         self.parser.joined_late();
     }
 
-    fn at_frame_boundary(&self) -> bool {
-        self.parser.at_frame_boundary()
+    fn uncertain(&self) -> bool {
+        self.parser.uncertain()
     }
 }
 
@@ -345,12 +345,16 @@ struct ConnectionEntry {
     tcp: TcpTracker,
     /// Payload was fed to a parser of this entry.
     fed: bool,
-    /// Bytes of the connection were lost or its start was proved missing
-    /// (an unplaced TCP side, a gap the parser could not account for).
-    /// Lives as long as the entry: a replacement parser is latched again
-    /// (`joined_late`), and only a new entry (a new connection key) starts
-    /// without it.
+    /// Bytes of the connection were lost, its start was proved missing (an
+    /// unplaced TCP side, a gap the parser could not account for), or its
+    /// parser latched (`ProtocolFsm::uncertain`: a preface that did not
+    /// prove a connection start, an HPACK failure). Lives as long as the
+    /// entry: a replacement parser is latched again (`joined_late`), and
+    /// only a new entry starts without it.
     lost: bool,
+    /// TLS: the cookie of the TCP socket under the connection object
+    /// (`DataEvent::tls_sock_cookie`), once one was seen; 0 if unknown.
+    sock: u64,
 }
 
 impl ConnectionEntry {
@@ -441,6 +445,7 @@ impl ConnectionFsmManager {
             tcp: TcpTracker::default(),
             fed: false,
             lost: false,
+            sock: 0,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
@@ -485,6 +490,7 @@ impl ConnectionFsmManager {
             .count()
     }
 
+    /// Feed a packet in `direction`, used as given.
     pub fn process_packet(
         &self,
         conn_id: u64,
@@ -492,8 +498,8 @@ impl ConnectionFsmManager {
         data: &[u8],
         timestamp_ns: u64,
     ) -> Option<FsmResult> {
-        // No endpoint: `direction` is used as given.
-        self.process_packet_from(conn_id, (0, 0), direction, data, timestamp_ns)
+        let mut entry = self.connections.get_mut(&conn_id)?;
+        Some(self.feed(&mut entry, direction, data, timestamp_ns))
     }
 
     /// Feed a packet sent by `src`. If the connection's server endpoint is
@@ -508,35 +514,60 @@ impl ConnectionFsmManager {
         timestamp_ns: u64,
     ) -> Option<FsmResult> {
         let mut entry = self.connections.get_mut(&conn_id)?;
-        entry.last_seen = Instant::now();
         let direction = entry.direction_of(src, capture_direction);
-        // A connection key can be reused by a new connection: TLS keys are
-        // the library's connection object address, which the allocator hands
-        // to the next connection once the old one is freed. A client preface
-        // means a new HTTP/2 connection may have started; its frames and
-        // HPACK state must not be read as a continuation of the old one, so
-        // the parser is replaced. The replacement starts clean only when the
-        // preface proves a connection start: as the entry's first payload,
-        // or on a TLS key (no TCP sequence state: a new TCP connection is a
-        // new key) with both directions between frames, where it cannot be
-        // the rest of a DATA frame; never once a loss was recorded.
-        // Otherwise (a DATA payload starting with the preface bytes) the
-        // replacement is latched.
+        Some(self.feed(&mut entry, direction, data, timestamp_ns))
+    }
+
+    fn feed(
+        &self,
+        entry: &mut ConnectionEntry,
+        direction: Direction,
+        data: &[u8],
+        timestamp_ns: u64,
+    ) -> FsmResult {
+        entry.last_seen = Instant::now();
+        // A client preface means a new HTTP/2 connection may have started;
+        // its frames and HPACK state must not be read as a continuation of
+        // the old one, so the parser is replaced. The replacement starts
+        // clean only as the entry's first payload with no loss recorded:
+        // anywhere else the preface bytes can be the inside of a DATA
+        // payload, so it is latched. A new connection reusing a TLS key is
+        // told apart by its socket (`note_socket`), never by its bytes.
         let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
         let preface = h2 && data.starts_with(super::detect::HTTP2_PREFACE);
         let first = !entry.fed && !entry.lost;
-        let tls = entry.tcp.next == [None, None];
         if preface && (first || direction == Direction::Egress) {
-            let clean = first || (tls && !entry.lost && entry.fsm.at_frame_boundary());
             let protocol = entry.fsm.protocol();
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
             entry.fin = [false; 2];
-            if !clean {
+            if !first {
                 entry.fsm.joined_late();
             }
         }
         entry.fed = true;
-        Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+        let result = entry.fsm.process_packet(direction, data, timestamp_ns);
+        entry.lost |= entry.fsm.uncertain();
+        result
+    }
+
+    /// TLS: the connection object under `conn_id` did I/O on the TCP socket
+    /// with cookie `sock` (0: unknown). A known socket other than the one
+    /// recorded is a new connection reusing the object's address: its
+    /// entry is dropped (true), so the next payload creates a new one with
+    /// no latches. 0 never drops an entry or replaces a recorded socket.
+    pub fn note_socket(&self, conn_id: u64, sock: u64) -> bool {
+        let Some(mut entry) = self.connections.get_mut(&conn_id) else {
+            return false;
+        };
+        if sock == 0 || entry.sock == sock {
+            return false;
+        }
+        if entry.sock == 0 {
+            entry.sock = sock;
+            return false;
+        }
+        drop(entry);
+        self.close_connection(conn_id)
     }
 
     /// Check a TCP segment sent by `src` against the connection's sequence
@@ -658,6 +689,7 @@ impl ConnectionFsmManager {
             entry.lost = true;
             entry.fsm.joined_late();
         }
+        entry.lost |= entry.fsm.uncertain();
         result
     }
 
@@ -766,19 +798,47 @@ mod tests {
         };
         let m = ConnectionFsmManager::new(16);
         let (client, server) = ((0, 1), (0, 2));
-        m.get_or_create_with_server(9, Protocol::Http2, Some(server));
+        // What the worker does for a TLS event on socket `sock` (event_loop
+        // `feed_event`).
+        let on_socket = |sock: u64| {
+            m.note_socket(9, sock);
+            if !m.contains(9) {
+                m.get_or_create_with_server(9, Protocol::Http2, Some(server));
+                m.note_socket(9, sock);
+                m.mark_joined_late(9);
+            }
+        };
         // First connection: one exchange, then it closes...
         let (mut c1, mut s1) = (hpack::Encoder::new(), hpack::Encoder::new());
+        on_socket(101);
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c1, "/one"), 1);
         let first =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s1), 2));
         assert_eq!(first, vec![Some("/one".to_string())]);
-        // ...and a new one gets the same key (freed and reallocated SSL*).
+        // ...and a new one, on another socket, gets the same key (freed and
+        // reallocated SSL*).
         let (mut c2, mut s2) = (hpack::Encoder::new(), hpack::Encoder::new());
+        on_socket(102);
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c2, "/two"), 3);
         let second =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s2), 4));
         assert_eq!(second, vec![Some("/two".to_string())]);
+    }
+
+    /// Codex R8 #3: `process_packet` uses the direction it is given, even on
+    /// a connection whose server endpoint is known.
+    #[test]
+    fn test_process_packet_keeps_the_given_direction() {
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create_with_server(1, Protocol::Redis, Some((0x0A00_0001, 6379)));
+        m.process_packet(1, Direction::Egress, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", 1);
+        let out = m.process_packet(1, Direction::Ingress, b"$3\r\nbob\r\n", 2);
+        let method = match &out {
+            Some(FsmResult::MessageComplete(msg)) => msg.method.clone(),
+            Some(FsmResult::Messages(ms)) => ms.first().and_then(|m| m.method.clone()),
+            _ => None,
+        };
+        assert_eq!(method.as_deref(), Some("GET"), "{out:?}");
     }
 
     #[test]

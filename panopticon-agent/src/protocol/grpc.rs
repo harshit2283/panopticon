@@ -88,8 +88,8 @@ impl ProtocolParser for GrpcParser {
         self.inner.joined_late();
     }
 
-    fn at_frame_boundary(&self) -> bool {
-        self.inner.at_frame_boundary()
+    fn uncertain(&self) -> bool {
+        self.inner.uncertain()
     }
 }
 

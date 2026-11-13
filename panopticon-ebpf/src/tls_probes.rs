@@ -282,6 +282,10 @@ fn same_frame(entry_sp: u64, ret_sp: u64) -> bool {
 struct CallAddr {
     ok: u32,
     scope_gen: u32,
+    /// Cookie of the checked socket, as two halves: a u64 would give this
+    /// struct and `Ended` alignment padding.
+    cookie_lo: u32,
+    cookie_hi: u32,
     local_addr: u32,
     remote_addr: u32,
     local_port: u16,
@@ -291,6 +295,8 @@ struct CallAddr {
 const NO_ADDR: CallAddr = CallAddr {
     ok: 0,
     scope_gen: 0,
+    cookie_lo: 0,
+    cookie_hi: 0,
     local_addr: 0,
     remote_addr: 0,
     local_port: 0,
@@ -375,6 +381,8 @@ fn end_call(ctx: &RetProbeContext, pid_tgid: u64) -> Ended {
                 e.addr = CallAddr {
                     ok: 1,
                     scope_gen: (*call).scope_gen,
+                    cookie_lo: (*call).cookie as u32,
+                    cookie_hi: ((*call).cookie >> 32) as u32,
                     local_addr: (*call).tuple.local_addr,
                     remote_addr: (*call).tuple.remote_addr,
                     local_port: (*call).tuple.local_port,
@@ -766,6 +774,9 @@ struct TlsHeader {
     direction: Direction,
     tls_lib: TlsLibrary,
     scope_gen: u32,
+    /// `DataEvent::tls_sock_cookie`: restricted modes only, same condition
+    /// as the address; 0 otherwise.
+    sock_cookie: u64,
 }
 
 #[inline(always)]
@@ -792,6 +803,7 @@ fn tls_header(
         direction,
         tls_lib,
         scope_gen,
+        sock_cookie: 0,
     };
     // Unscoped: addresses are known once this connection has done socket
     // I/O inside a hooked call (see try_tls_tcp_io); zero until then.
@@ -802,6 +814,7 @@ fn tls_header(
     let mut t = (0u32, 0u32, 0u16, 0u16, false);
     if restricted {
         if call_addr.ok != 0 && call_addr.scope_gen == scope_gen {
+            h.sock_cookie = call_addr.cookie_lo as u64 | (call_addr.cookie_hi as u64) << 32;
             t = (
                 call_addr.local_addr,
                 call_addr.remote_addr,
@@ -1001,6 +1014,7 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
         (*event).scope_gen = h.scope_gen;
+        (*event).tls_sock_cookie = h.sock_cookie;
         (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE. The u32
