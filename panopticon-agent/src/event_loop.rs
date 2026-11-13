@@ -203,6 +203,9 @@ pub struct EventStats {
     /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
     /// (refreshed from the map; indexed by `scope::DROP_*`).
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
+    /// cgroup_skb: the kernel VRF hooks' `VRF_EVENTS`, summed over CPUs
+    /// (indexed by `scope::VRF_EV_*`).
+    pub vrf_events: [AtomicU64; panopticon_common::scope::VRF_EVENT_KINDS as usize],
 }
 
 impl EventStats {
@@ -233,6 +236,7 @@ impl EventStats {
             drops_no_pipeline: AtomicU64::new(0),
             capture_stopped: AtomicBool::new(false),
             scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
+            vrf_events: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }

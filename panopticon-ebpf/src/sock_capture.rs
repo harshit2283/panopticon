@@ -35,18 +35,20 @@ use panopticon_common::{
     CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary,
     scope::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
-        DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE,
-        FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY,
-        OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState,
-        VERDICT_IN, cached_verdict, drop_reason, head_take, in_sample, is_initialised,
+        DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, DROP_VRF_UNKNOWN,
+        FLAG_BASELINE, FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER,
+        FLAGS_STICKY, OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN,
+        SockState, VERDICT_IN, VRF_EV_MAP_FULL, VRF_EV_READ_FAILED, VRF_EV_RECORDED,
+        VRF_EV_REMOVED, cached_verdict, drop_reason, head_take, in_sample, is_initialised,
         is_unscoped_full, local_packet, pid_inputs, reserved_take, role_of, stream_offset,
         tls_addr_in_scope, udp_should_reserve, verdict, verdict_cacheable, verdict_word,
     },
 };
 
 use crate::maps::{
-    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, VRF_MASTERS,
-    count_kernel_drop, count_scope_drop, shard_for, shard_reserve_as, shard_submit_flags_for,
+    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, VRF_DEVS, VRF_EVENTS,
+    VRF_FAILED, VRF_LIVE, VRF_MASTERS, count_kernel_drop, count_scope_drop, shard_for,
+    shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -559,46 +561,114 @@ fn on_tcp_close(ctx: &SockOpsContext) {
 
 // ── VRF masters (§3.7) ─────────────────────────────────────────────────────
 
-/// fexit `register_netdevice(dev)`: a new device, in any namespace. A VRF
-/// master is recorded before it can carry a packet (the ifindex is assigned
-/// inside; the link ops are set before, by `rtnl_create_link`). A VRF
-/// cannot change namespace (`NETIF_F_NETNS_LOCAL`), so its ifindex is final.
+/// fexit `register_netdevice(dev) -> ret`: a new device, in any namespace.
+/// A VRF master is counted before it can carry a packet (the ifindex is
+/// assigned inside; the link ops are set before, by `rtnl_create_link`). A
+/// VRF cannot change namespace (`NETIF_F_NETNS_LOCAL`), so its ifindex is
+/// final. A failed registration counts nothing.
 #[fexit(function = "register_netdevice")]
 pub fn scope_vrf_register(ctx: FExitContext) -> i32 {
-    on_netdev(ctx.arg(0));
+    let ret: i32 = ctx.arg(1);
+    if ret == 0 {
+        on_netdev(ctx.arg(0), true);
+    }
     0
 }
 
-/// Record `dev`'s ifindex if its link kind is "vrf". Whatever the return
-/// value: a failed registration leaves at worst a stale entry, which
-/// over-drops.
+/// fentry `unregister_netdevice_queue(dev, head)`: every unregistration
+/// (a delete, a namespace teardown) goes through it, under RTNL.
+#[fentry(function = "unregister_netdevice_queue")]
+pub fn scope_vrf_unregister(ctx: FEntryContext) -> i32 {
+    on_netdev(ctx.arg(0), false);
+    0
+}
+
 #[inline(always)]
-fn on_netdev(dev: *const u8) {
+fn vrf_event(i: u32) {
+    if let Some(n) = VRF_EVENTS.get_ptr_mut(i) {
+        unsafe { *n += 1 };
+    }
+}
+
+/// Classification failed: from now on, while loopback is dropped, so is
+/// every packet (`vrf_unknown`).
+#[inline(always)]
+fn vrf_fail(event: u32) {
+    vrf_event(event);
+    if let Some(f) = VRF_FAILED.get_ptr_mut(0) {
+        unsafe { *f = 1 };
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vrf_failed() -> bool {
+    VRF_FAILED.get(0).is_some_and(|&f| f != 0)
+}
+
+/// Count (`register`) or uncount `dev` if its link kind is "vrf". With
+/// valid offsets, a failed read latches the failure (the device might be a
+/// VRF); a device without link ops or with another kind is not a VRF.
+#[inline(always)]
+fn on_netdev(dev: *const u8, register: bool) {
     let (Some(&ifx_off), Some(&ops_off), Some(&kind_off)) =
         (NETDEV_OFFS.get(0), NETDEV_OFFS.get(1), NETDEV_OFFS.get(2))
     else {
-        return;
+        return vrf_fail(VRF_EV_READ_FAILED);
     };
-    if dev.is_null() || ifx_off == 0 {
-        return;
+    if ifx_off == 0 {
+        return; // not written yet: the loader writes before attaching
+    }
+    if dev.is_null() {
+        return vrf_fail(VRF_EV_READ_FAILED);
     }
     let read_ptr = |p: *const u8| unsafe { bpf_probe_read_kernel(p as *const *const u8) };
     let Ok(ops) = read_ptr(unsafe { dev.add(ops_off as usize) }) else {
-        return;
+        return vrf_fail(VRF_EV_READ_FAILED);
     };
     if ops.is_null() {
-        return;
+        return; // no rtnetlink link ops: not created as a VRF
     }
-    let Ok(kind) = read_ptr(unsafe { ops.add(kind_off as usize) }) else {
-        return;
+    let (Ok(kind), Ok(ifindex)) = (read_ptr(unsafe { ops.add(kind_off as usize) }), unsafe {
+        bpf_probe_read_kernel(dev.add(ifx_off as usize) as *const u32)
+    }) else {
+        return vrf_fail(VRF_EV_READ_FAILED);
     };
-    if kind.is_null() || unsafe { bpf_probe_read_kernel(kind as *const [u8; 4]) } != Ok(*b"vrf\0") {
+    if kind.is_null() {
+        return vrf_fail(VRF_EV_READ_FAILED);
+    }
+    let Ok(k) = (unsafe { bpf_probe_read_kernel(kind as *const [u8; 4]) }) else {
+        return vrf_fail(VRF_EV_READ_FAILED);
+    };
+    if k != *b"vrf\0" {
         return;
     }
-    if let Ok(ifindex) = unsafe { bpf_probe_read_kernel(dev.add(ifx_off as usize) as *const u32) }
-        && ifindex != 0
-    {
-        let _ = VRF_MASTERS.insert(&ifindex, &1, 0);
+    if ifindex == 0 {
+        return vrf_fail(VRF_EV_READ_FAILED);
+    }
+    let key = dev as u64;
+    if register {
+        // Serialised by RTNL: no concurrent update of these entries.
+        let counted = match VRF_LIVE.get_ptr_mut(&ifindex) {
+            Some(n) => {
+                unsafe { *n += 1 };
+                true
+            }
+            None => VRF_LIVE.insert(&ifindex, &1, 0).is_ok(),
+        };
+        if !counted || VRF_DEVS.insert(&key, &ifindex, 0).is_err() {
+            return vrf_fail(VRF_EV_MAP_FULL);
+        }
+        vrf_event(VRF_EV_RECORDED);
+    } else if unsafe { VRF_DEVS.get(&key) }.is_some() {
+        let _ = VRF_DEVS.remove(&key);
+        if let Some(n) = VRF_LIVE.get_ptr_mut(&ifindex) {
+            if unsafe { *n } <= 1 {
+                let _ = VRF_LIVE.remove(&ifindex);
+            } else {
+                unsafe { *n -= 1 };
+            }
+        }
+        vrf_event(VRF_EV_REMOVED);
     }
 }
 
@@ -863,13 +933,17 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     let g0 = scope_gen();
     let marked = !st.is_null() && rd!(st, local) != 0;
     let ifindex = unsafe { (*skb).ifindex };
-    let vrf = unsafe { VRF_MASTERS.get(&ifindex) }.is_some();
+    let vrf = unsafe { VRF_MASTERS.get(&ifindex).is_some() || VRF_LIVE.get(&ifindex).is_some() };
     let lo = local_packet(ifindex, vrf, marked);
     if lo && !marked && !st.is_null() {
         wr!(st, local, 1);
     }
-    if lo && !capture_loopback() {
-        return drop(DROP_LOOPBACK);
+    // VRF classification failed: no packet can be shown not VRF-local.
+    // Only `excl` is carried past this point (another carried value, even
+    // the drop reason, splits the verifier's states past RHEL 8's limit).
+    let excl = lo || vrf_failed();
+    if excl && !capture_loopback() {
+        return drop(if lo { DROP_LOOPBACK } else { DROP_VRF_UNKNOWN });
     }
     let mode = scope_mode();
 
@@ -933,8 +1007,14 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     };
     // The loopback setting was read under `g0`; a later generation may
     // have turned it off.
-    if lo && g != g0 {
-        return drop(DROP_LOOPBACK);
+    // The reason is re-derived from the latch: with it set, a loopback
+    // packet caught only here is counted vrf_unknown (both are dropped).
+    if excl && g != g0 {
+        return drop(if vrf_failed() {
+            DROP_VRF_UNKNOWN
+        } else {
+            DROP_LOOPBACK
+        });
     }
 
     // ── kTLS: the payload may be plaintext at this hook (§3.5). After the

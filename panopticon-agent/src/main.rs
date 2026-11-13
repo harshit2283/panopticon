@@ -357,10 +357,13 @@ async fn main() -> Result<()> {
             .context("Failed to initialize event source from eBPF maps")?;
         let kernel_drops = loader::take_per_cpu_counters(&mut programs.ebpf, "KERNEL_DROPS");
         let cgroup_backend = agent_config.capture_backend == config::CaptureBackend::CgroupSkb;
-        let scope_drops = if cgroup_backend {
-            loader::take_per_cpu_counters(&mut programs.ebpf, "SCOPE_DROPS")
+        let (scope_drops, vrf_events) = if cgroup_backend {
+            (
+                loader::take_per_cpu_counters(&mut programs.ebpf, "SCOPE_DROPS"),
+                loader::take_per_cpu_counters(&mut programs.ebpf, "VRF_EVENTS"),
+            )
         } else {
-            None
+            (None, None)
         };
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
@@ -495,6 +498,11 @@ async fn main() -> Result<()> {
                     }
                     if let Some(map) = &scope_drops {
                         for (i, c) in stats.scope_drops.iter().enumerate() {
+                            c.store(loader::sum_per_cpu(map, i as u32), Relaxed);
+                        }
+                    }
+                    if let Some(map) = &vrf_events {
+                        for (i, c) in stats.vrf_events.iter().enumerate() {
                             c.store(loader::sum_per_cpu(map, i as u32), Relaxed);
                         }
                     }
