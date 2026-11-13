@@ -92,6 +92,10 @@ HTTP/2 over TLS had two problems of its own:
   connection object, so a new connection can get the same `*tls.Conn` /
   `SSL*` key. Its preface then landed in the old connection's parser, along
   with its stale HPACK state. A client preface now restarts the parser.
+  Since then (credential masking, USER-GUIDE §5.3) the restarted parser
+  decodes headers and exports bodies only on a new TCP socket under the
+  key, which the agent sees only for OpenSSL with the `cgroup_skb` backend
+  and a process, cgroup or pod filter; elsewhere it stays latched.
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
@@ -622,7 +626,8 @@ VM (5.15 verifier included).
 
 **Limits.**
 
-- **TLS bursts.** TLS events still use fixed 4,168-byte records,
+- **TLS bursts.** TLS events still use fixed full-size records (4,168
+  bytes in these runs, 4,200 now),
   and one connection's events all go to one shard. A shard holds about 250
   of them on a 64-CPU node (1 MiB per shard), where the single ring held
   about 3,900. The TLS oracles pass with zero kernel drops. TLS under heavy
@@ -1103,7 +1108,8 @@ high ends are under connection churn):
   scope (before compact records; out of scope on 7.0 it is now 7.6 µs, 8.8
   before, without the close records). The hooks above account for 3.5-4.4 µs
   of each new local connection.
-- **Close records.** A TCP socket's close sends a 96-byte close record to
+- **Close records.** A TCP socket's close sends a header-only close
+  record (96 bytes in these runs, 104 now) to
   user space only if a packet record of that socket was emitted (the only
   sockets user space holds state for) and the socket is in scope when it
   closes. Before compact records (below),
@@ -1175,7 +1181,8 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   At 200 KB bodies, throughput is 13% below TC's.
 - **Ring capacity.** Each packet record is reserved at the header plus the
   smallest power-of-two payload class (64 to 4,096 bytes) that holds the
-  captured bytes, and a close record is the 96-byte header. Before that,
+  captured bytes, and a close record is the header (96 bytes in these
+  runs, 104 now). Before that,
   every record was a fixed 4,168 bytes, and at 1K connections `pid_filter`
   lost 2.6-8.2K events in the kernel ring where TC lost none. Now it loses
   none (see Compact records).
@@ -1351,7 +1358,8 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   opened, a side's start not captured, or the parser restarted after bytes
   lost outside a DATA frame): HPACK state is unknown, so no header,
   including the path, is decoded for the rest of that connection (a later
-  client preface on it does not lift this), and while credential masking
+  client preface on it does not lift this; over TLS a reused key starts
+  clean only on a new TCP socket, USER-GUIDE §5.3), and while credential masking
   is on its bodies are not exported (nor are bodies after any lost header
   block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that

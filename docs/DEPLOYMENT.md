@@ -237,7 +237,12 @@ journalctl -u panopticon -f
   `tcp_seq` and `tcp_ack` (4168 bytes), used to drop retransmitted and
   forged TCP segments. With `map_pin_path`, remove the old pins before
   upgrading, as above.
-- Replay capture files (`PNCAP`) are now format version 3 (0.1.0 wrote
+- **The event format changed again** after that: capture-scope fields
+  (4192 bytes), then `tls_sock_cookie` (4200 bytes), the TCP socket under a
+  TLS connection, used to tell a new connection that reuses a TLS
+  connection object's address from the old one. With `map_pin_path`, remove
+  the old pins before upgrading, as above.
+- Replay capture files (`PNCAP`) are now format version 5 (0.1.0 wrote
   version 2); older files are rejected.
 
 ## 8. Releasing (maintainers)

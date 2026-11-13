@@ -161,8 +161,12 @@ production-hardened compliance platform.
   - HTTP/2 headers are not decoded on a connection the agent did not see
     whole: one already open when the agent started, a side whose start
     was not captured, or one whose parser restarted after lost bytes; a
-    later client preface on it does not lift this. While credential
-    masking is on its bodies are not exported either.
+    later client preface on it does not lift this. Over TLS a new
+    connection that reuses a closed one's key starts clean only on a new
+    TCP socket, which the agent sees only for OpenSSL with the
+    `cgroup_skb` backend and a process, cgroup or pod filter; elsewhere
+    (the TC backend, Go TLS) it is not decoded either. While
+    credential masking is on its bodies are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -189,12 +193,14 @@ production-hardened compliance platform.
     prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
-    start, and bodies whose content type is repeated or over 256 bytes),
+    start, over TLS on a reused key only on a new TCP socket as above,
+    and bodies whose content type is repeated or over 256 bytes),
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their
-    statement had when the Bind was sent, once confirmed (a simple Query
-    forgets every statement), and not at all on a connection joined
-    mid-stream or after lost server bytes;
+    statement had when the Bind was sent, once confirmed, even if it is
+    redefined later (a simple Query forgets every statement), and not at
+    all on a connection joined mid-stream, after lost server bytes or
+    past 4096 unanswered Binds;
     only known SQL keywords are exported as methods. `[credentials]
     patterns` adds the user's own formats (masked in every field, matching
     DNS answers dropped, counted in `panopticon_credential_matches_total`;
