@@ -126,6 +126,11 @@ pub trait ProtocolFsm: Send {
 
     /// See [`ProtocolParser::joined_late`].
     fn joined_late(&mut self) {}
+
+    /// See [`ProtocolParser::at_frame_boundary`].
+    fn at_frame_boundary(&self) -> bool {
+        false
+    }
 }
 
 pub struct ProtocolFsmAdapter {
@@ -186,6 +191,10 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 
     fn joined_late(&mut self) {
         self.parser.joined_late();
+    }
+
+    fn at_frame_boundary(&self) -> bool {
+        self.parser.at_frame_boundary()
     }
 }
 
@@ -334,6 +343,14 @@ struct ConnectionEntry {
     /// FIN seen from the client / from the server.
     fin: [bool; 2],
     tcp: TcpTracker,
+    /// Payload was fed to a parser of this entry.
+    fed: bool,
+    /// Bytes of the connection were lost or its start was proved missing
+    /// (an unplaced TCP side, a gap the parser could not account for).
+    /// Lives as long as the entry: a replacement parser is latched again
+    /// (`joined_late`), and only a new entry (a new connection key) starts
+    /// without it.
+    lost: bool,
 }
 
 impl ConnectionEntry {
@@ -422,6 +439,8 @@ impl ConnectionFsmManager {
             server,
             fin: [false; 2],
             tcp: TcpTracker::default(),
+            fed: false,
+            lost: false,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
@@ -473,9 +492,8 @@ impl ConnectionFsmManager {
         data: &[u8],
         timestamp_ns: u64,
     ) -> Option<FsmResult> {
-        let mut entry = self.connections.get_mut(&conn_id)?;
-        entry.last_seen = Instant::now();
-        Some(entry.fsm.process_packet(direction, data, timestamp_ns))
+        // No endpoint: `direction` is used as given.
+        self.process_packet_from(conn_id, (0, 0), direction, data, timestamp_ns)
     }
 
     /// Feed a packet sent by `src`. If the connection's server endpoint is
@@ -495,16 +513,29 @@ impl ConnectionFsmManager {
         // A connection key can be reused by a new connection: TLS keys are
         // the library's connection object address, which the allocator hands
         // to the next connection once the old one is freed. A client preface
-        // means a new HTTP/2 connection started; its frames and HPACK state
-        // must not be read as a continuation of the old one.
-        if direction == Direction::Egress
-            && matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc)
-            && data.starts_with(super::detect::HTTP2_PREFACE)
-        {
+        // means a new HTTP/2 connection may have started; its frames and
+        // HPACK state must not be read as a continuation of the old one, so
+        // the parser is replaced. The replacement starts clean only when the
+        // preface proves a connection start: as the entry's first payload,
+        // or on a TLS key (no TCP sequence state: a new TCP connection is a
+        // new key) with both directions between frames, where it cannot be
+        // the rest of a DATA frame; never once a loss was recorded.
+        // Otherwise (a DATA payload starting with the preface bytes) the
+        // replacement is latched.
+        let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
+        let preface = h2 && data.starts_with(super::detect::HTTP2_PREFACE);
+        let first = !entry.fed && !entry.lost;
+        let tls = entry.tcp.next == [None, None];
+        if preface && (first || direction == Direction::Egress) {
+            let clean = first || (tls && !entry.lost && entry.fsm.at_frame_boundary());
             let protocol = entry.fsm.protocol();
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
             entry.fin = [false; 2];
+            if !clean {
+                entry.fsm.joined_late();
+            }
         }
+        entry.fed = true;
         Some(entry.fsm.process_packet(direction, data, timestamp_ns))
     }
 
@@ -527,6 +558,7 @@ impl ConnectionFsmManager {
         let unplaced = entry.tcp.next[side].is_none();
         let verdict = entry.tcp.admit(side, seg);
         if unplaced && verdict != SegmentVerdict::Drop {
+            entry.lost = true;
             entry.fsm.joined_late();
         }
         Some(verdict)
@@ -619,7 +651,13 @@ impl ConnectionFsmManager {
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
         }
         // Bytes were lost: whatever the parser does next starts mid-stream.
-        entry.fsm.joined_late();
+        // The exception: an HTTP/2 parser that accounted for the gap inside
+        // a DATA frame (its HPACK state and framing are intact).
+        let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
+        if result.is_none() || !h2 {
+            entry.lost = true;
+            entry.fsm.joined_late();
+        }
         result
     }
 

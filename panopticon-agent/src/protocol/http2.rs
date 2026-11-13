@@ -140,9 +140,6 @@ pub struct Http2Parser {
     /// the connection preface when seen; defaults to Egress.
     client_dir: Direction,
     preface_seen: bool,
-    /// The client preface was this parser's first input: it saw the
-    /// connection from its start.
-    from_start: bool,
     streams: HashMap<u32, StreamState>,
     next_seq: u64,
     is_grpc: bool,
@@ -156,7 +153,6 @@ impl Http2Parser {
             server: Side::new(),
             client_dir: Direction::Egress,
             preface_seen: false,
-            from_start: false,
             streams: HashMap::new(),
             next_seq: 0,
             is_grpc,
@@ -711,13 +707,12 @@ impl ProtocolParser for Http2Parser {
             // capture direction says (TLS uprobes report process-relative
             // directions, which are inverted on servers).
             if data.starts_with(HTTP2_PREFACE) {
-                // The connection's first bytes: its start is proved, and
-                // nothing was lost before them.
+                // This parser's first bytes. Whether they are the
+                // connection's start is decided by the connection manager,
+                // which latches a replacement parser (`joined_late`)
+                // otherwise; a preface never clears a latch.
                 self.client_dir = direction;
                 self.preface_seen = true;
-                self.from_start = true;
-                self.client.headers_lost = false;
-                self.server.headers_lost = false;
                 data = &data[HTTP2_PREFACE.len()..];
             } else if !data.is_empty() {
                 // Joined mid-connection: header blocks and bodies before
@@ -768,17 +763,21 @@ impl ProtocolParser for Http2Parser {
         Some("2")
     }
 
-    /// Unless this parser saw the connection start (the client preface as
-    /// its first bytes), its header state is unknown: both sides count as
-    /// having lost a header block, so no header is decoded and bodies are
-    /// withheld while credentials are masked, for the rest of the
-    /// connection. A gap this parser accounted for (inside a DATA frame)
-    /// changes nothing.
+    /// The parser did not see some of the connection (a side's start, or
+    /// bytes it could not account for): both sides count as having lost a
+    /// header block, so no header is decoded and bodies are withheld while
+    /// credentials are masked, for the rest of this parser's life. Always
+    /// latches; the one gap that does not call it is a DATA-frame gap
+    /// `skip` accounted for (see `ConnectionFsmManager::skip_from`).
     fn joined_late(&mut self) {
-        if !self.from_start {
-            self.client.headers_lost = true;
-            self.server.headers_lost = true;
-        }
+        self.client.headers_lost = true;
+        self.server.headers_lost = true;
+    }
+
+    fn at_frame_boundary(&self) -> bool {
+        [&self.client, &self.server]
+            .iter()
+            .all(|s| s.buf.data().is_empty() && s.discard == 0 && s.pending_block.is_none())
     }
 }
 
@@ -836,6 +835,92 @@ mod tests {
         // Same for a parser that joined mid-connection without a gap.
         let mut p = Http2Parser::new(false);
         p.feed(&req, Direction::Egress, 1);
+        let out = format!("{:?}", messages(p.feed(&status, Direction::Ingress, 2)));
+        assert!(!out.contains("s7Kf"), "{out}");
+    }
+
+    /// Codex R7 #2: a segment starting with the preface bytes in the middle
+    /// of a connection (here the payload of a DATA frame whose header came
+    /// first, or after a recorded loss) replaces the parser but never
+    /// clears the uncertainty: the replacement is latched.
+    #[test]
+    fn test_preface_mid_stream_never_clears_the_latch() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let canary = b"\x0a\x0cs7Kf2v9LmQ8z";
+        let new_stream = |m: &ConnectionFsmManager, sid: u32| {
+            let mut req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS, sid, &[0x83, 0x84]);
+            req.extend(make_frame(FRAME_DATA, FLAG_END_STREAM, sid, canary));
+            m.process_packet(1, Direction::Egress, &req, 5);
+            let status = make_frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                sid,
+                &[0x88],
+            );
+            let out = match m.process_packet(1, Direction::Ingress, &status, 6) {
+                Some(FsmResult::MessageComplete(msg)) => vec![msg],
+                Some(FsmResult::Messages(ms)) => ms,
+                _ => vec![],
+            };
+            format!("{out:?}")
+        };
+        // A DATA frame's header, then its payload starting with the preface.
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Http2);
+        let mut ce = hpack::Encoder::new();
+        let mut req = preface();
+        req.extend(make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            1,
+            &encode(&mut ce, &[(":method", "POST"), (":path", "/a")]),
+        ));
+        let mut payload = HTTP2_PREFACE.to_vec();
+        payload.extend(make_frame(FRAME_SETTINGS, 0, 0, &[]));
+        let data = make_frame(FRAME_DATA, 0, 1, &payload);
+        req.extend_from_slice(&data[..FRAME_HEADER_SIZE]);
+        m.process_packet(1, Direction::Egress, &req, 1);
+        m.process_packet(1, Direction::Egress, &data[FRAME_HEADER_SIZE..], 2);
+        let out = new_stream(&m, 3);
+        assert!(!out.contains("s7Kf"), "{out}");
+
+        // A loss recorded, then the preface at a frame boundary.
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Http2);
+        let mut req = preface();
+        let headers = make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &[0x83, 0x84]);
+        req.extend_from_slice(&headers[..headers.len() - 1]);
+        m.process_packet(1, Direction::Egress, &req, 1);
+        assert!(m.skip_from(1, (0, 0), Direction::Egress, 1, 2).is_none());
+        let mut again = HTTP2_PREFACE.to_vec();
+        again.extend(make_frame(FRAME_SETTINGS, 0, 0, &[]));
+        m.process_packet(1, Direction::Egress, &again, 3);
+        let out = new_stream(&m, 3);
+        assert!(!out.contains("s7Kf"), "{out}");
+    }
+
+    /// Codex R7 #3: a parser that saw the connection start is still
+    /// latched when told a side was not seen from its start (an unplaced
+    /// TCP side: a lost SYN+ACK and first response).
+    #[test]
+    fn test_joined_late_always_latches() {
+        let mut p = Http2Parser::new(false);
+        p.feed(&preface(), Direction::Egress, 0);
+        p.joined_late();
+        let mut req = make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 3, &[0x83, 0x84]);
+        req.extend(make_frame(
+            FRAME_DATA,
+            FLAG_END_STREAM,
+            3,
+            b"\x0a\x0cs7Kf2v9LmQ8z",
+        ));
+        p.feed(&req, Direction::Egress, 1);
+        let status = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &[0x88],
+        );
         let out = format!("{:?}", messages(p.feed(&status, Direction::Ingress, 2)));
         assert!(!out.contains("s7Kf"), "{out}");
     }

@@ -87,6 +87,10 @@ impl ProtocolParser for GrpcParser {
     fn joined_late(&mut self) {
         self.inner.joined_late();
     }
+
+    fn at_frame_boundary(&self) -> bool {
+        self.inner.at_frame_boundary()
+    }
 }
 
 impl GrpcParser {

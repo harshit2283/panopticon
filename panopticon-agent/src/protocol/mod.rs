@@ -272,6 +272,13 @@ pub trait ProtocolParser: Send {
     /// A parser that pairs replies with requests by order must stop
     /// trusting that pairing.
     fn joined_late(&mut self) {}
+
+    /// Both directions are between frames: no partial frame is buffered
+    /// and no frame is being skipped, so new bytes cannot be the rest of
+    /// one (an HTTP/2 DATA payload). False when unknown.
+    fn at_frame_boundary(&self) -> bool {
+        false
+    }
 }
 
 // ── Parser Factory ───────────────────────────────────────────────────────
