@@ -65,8 +65,8 @@ production-hardened compliance platform.
   than TC with no kernel ring drops (records are sized to what they carry),
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
   both ends of node-local connections, about twice the events and agent
-  CPU; node-local packets (127/8, the host's own address, and every
-  socket in a VRF) only with
+  CPU; node-local packets (127/8, the host's own address, and sockets
+  seen on a VRF device) only with
   `capture_loopback = true` (default false, as TC never saw them; TLS
   plaintext over loopback is scoped by process either way, as on TC). `pid_filter` matches TC's
   recall only for a server whose listener was created after the agent
