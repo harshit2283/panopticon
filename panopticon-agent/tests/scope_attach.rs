@@ -2364,7 +2364,7 @@ fn go_tls_reads() {
         }
         assert_eq!(keys(ebpf, tgid), want, "GO_READ_CALLS slots: {what}");
     };
-    let sweep = |ebpf: &Ebpf| go_read::Sweep::open(ebpf).unwrap().run();
+    let sweep = |ebpf: &Ebpf| go_read::Sweep::open(ebpf).unwrap().run().unwrap();
 
     // ── unscoped full: every record whole, from both processes; the server
     // reads from a goroutine whose stack moves mid-read

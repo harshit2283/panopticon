@@ -57,12 +57,38 @@ pub fn file_key(file: &std::fs::File) -> std::io::Result<FileKey> {
 /// this inode and not the path again.
 #[cfg(unix)]
 pub fn open_examined(target: &TlsTarget) -> std::io::Result<std::fs::File> {
-    let file = std::fs::File::open(&target.library_path)?;
+    let file = open_workload_file(&target.library_path)?;
     if target.file_key.is_none() || target.file_key != Some(file_key(&file)?) {
         return Err(std::io::Error::other(
             "the file changed since it was examined",
         ));
     }
+    Ok(file)
+}
+
+/// Open a file a workload controls (a mapped path under `/proc/<pid>/root`)
+/// without letting it block or reach anything but a regular file. The
+/// workload can replace the path at any moment: a FIFO with no writer would
+/// block open(2) forever (hanging the startup scan, or the attach while it
+/// holds the eBPF lock), a device open can have side effects. So: refused
+/// unless the path is a regular file, opened non-blocking, and refused again
+/// unless the opened descriptor is a regular file (a swap between the two
+/// checks gets a non-blocking open of whatever was swapped in, then the
+/// refusal).
+#[cfg(unix)]
+pub fn open_workload_file(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let regular = |m: std::fs::Metadata| {
+        m.is_file()
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other("not a regular file"))
+    };
+    regular(std::fs::metadata(path)?)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)?;
+    regular(file.metadata()?)?;
     Ok(file)
 }
 
@@ -177,7 +203,7 @@ impl<'a> ReadRef<'a> for BudgetedRead<'a> {
 /// Open a workload-controlled ELF and run `f` over a budgeted reader. Every
 /// parse of a file under `/proc/<pid>/root` must go through here.
 fn with_untrusted_elf<T>(path: &str, f: impl FnOnce(BudgetedRead<'_>) -> T) -> Result<T> {
-    let file = std::fs::File::open(path)?;
+    let file = open_workload_file(path)?;
     let size = file.metadata()?.len();
     anyhow::ensure!(size <= MAX_ELF_FILE_BYTES, "ELF too large: {size} bytes");
     let cache = ReadCache::new(file);
@@ -446,7 +472,7 @@ fn examine_cached(path: &str, namespace_path: &str) -> Option<(TlsType, FileKey)
     use std::sync::{Mutex, OnceLock};
 
     static VERDICTS: OnceLock<Mutex<HashMap<FileKey, Option<TlsType>>>> = OnceLock::new();
-    let file = std::fs::File::open(namespace_path).ok()?;
+    let file = open_workload_file(namespace_path).ok()?;
     let key = file_key(&file).ok()?;
     let cache = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(verdict) = cache.lock().ok()?.get(&key) {
@@ -529,35 +555,31 @@ fn parse_proc_maps(pid: u32) -> Result<Vec<(String, u64)>> {
     let mut libs = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for line in content.lines() {
-        // Format: address perms offset dev inode pathname
-        // Example: 7f1234000000-7f1234100000 r-xp 00000000 08:01 12345 /usr/lib/libssl.so.3
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-
-        let perms = parts[1];
-        let path = parts[5];
-
-        // Only care about executable mappings with real file paths
-        if !perms.contains('x') || !path.starts_with('/') {
-            continue;
-        }
-
-        // Parse base address from the address range
-        let base_addr = parts[0]
-            .split('-')
-            .next()
-            .and_then(|s| u64::from_str_radix(s, 16).ok())
-            .unwrap_or(0);
-
-        if seen.insert(path.to_string()) {
-            libs.push((path.to_string(), base_addr));
+    for (path, base_addr) in content.lines().filter_map(maps_exec_file) {
+        if seen.insert(path.clone()) {
+            libs.push((path, base_addr));
         }
     }
 
     Ok(libs)
+}
+
+/// The file and start address of an executable file mapping in one
+/// `/proc/<pid>/maps` line (`address perms offset dev inode pathname`), or
+/// None. A pathname may contain spaces. A mapping whose file was deleted
+/// (` (deleted)`) is skipped: its path now names another file, if any, which
+/// the workload chose.
+fn maps_exec_file(line: &str) -> Option<(String, u64)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 6 || !parts[1].contains('x') {
+        return None;
+    }
+    let path = parts[5..].join(" ");
+    if !path.starts_with('/') || path.ends_with(" (deleted)") {
+        return None;
+    }
+    let base = parts[0].split('-').next()?;
+    Some((path, u64::from_str_radix(base, 16).unwrap_or(0)))
 }
 
 /// Resolve a process-local mapped path through that process's mount namespace.
@@ -640,7 +662,8 @@ pub async fn tls_scanner_task(
         };
         prune_attached_libs(&shared_ebpf, &targets);
         let newly_attached = attach_new_targets(&shared_ebpf, targets);
-        sweep_go_reads(&shared_ebpf);
+        let shared = shared_ebpf.clone();
+        let _ = tokio::task::spawn_blocking(move || sweep_go_reads(&shared)).await;
         if newly_attached > 0 {
             info!(
                 new_libraries = newly_attached,
@@ -652,14 +675,15 @@ pub async fn tls_scanner_task(
 
 /// Go TLS read slots of process instances that ended (go_read.rs `Sweep`).
 /// The shared state is locked only to open the map handles: the walk runs
-/// after the lock is released, so scope publication never waits on it.
+/// after the lock is released, so scope publication never waits on it, and
+/// on a blocking thread (`tls_scanner_task`), not an async worker.
 #[cfg(target_os = "linux")]
 fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>) {
     let opened = {
         let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
         super::go_read::Sweep::open(&state.ebpf)
     };
-    match opened.map(|mut sweep| sweep.run()) {
+    match opened.and_then(|mut sweep| sweep.run()) {
         Ok((0, 0)) => {}
         Ok((slots, epochs)) => debug!(
             slots,
@@ -1044,6 +1068,61 @@ mod tests {
         let found = resolve_elf_symbols_from_bytes(NoStrings(&elf, &lookups), &["SSL_write"]);
         assert!(found.unwrap().is_empty());
         assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn test_maps_exec_file() {
+        let m = |l| maps_exec_file(l);
+        assert_eq!(
+            m("7f12-7f13 r-xp 00000000 08:01 12345    /usr/lib/libssl.so.3"),
+            Some(("/usr/lib/libssl.so.3".into(), 0x7f12))
+        );
+        assert_eq!(
+            m("1000-2000 r-xp 0 08:01 7 /opt/my app/bin"),
+            Some(("/opt/my app/bin".into(), 0x1000))
+        );
+        assert_eq!(m("1000-2000 r-xp 0 08:01 7 /tmp/evil (deleted)"), None);
+        assert_eq!(m("1000-2000 r--p 0 08:01 7 /usr/lib/libssl.so.3"), None);
+        assert_eq!(m("1000-2000 r-xp 0 00:00 0 [vdso]"), None);
+        assert_eq!(m("1000-2000 r-xp 0 00:00 0"), None);
+    }
+
+    /// Codex: a FIFO at a mapped path is refused at once, by every opener
+    /// of workload files (examination and attach), instead of blocking
+    /// open(2) forever for want of a writer.
+    #[cfg(unix)]
+    #[test]
+    fn test_workload_fifo_refused_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("panopticon-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("evil");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let p = fifo.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let target = TlsTarget {
+                pid: 1,
+                library_path: p.clone(),
+                tls_type: TlsType::GoTls {
+                    write_offset: 0,
+                    read: None,
+                },
+                file_key: Some((0, 0, 0, 0)),
+            };
+            let _ = tx.send((
+                open_workload_file(&p).is_err(),
+                open_examined(&target).is_err(),
+                resolve_elf_symbols(&p, &["SSL_write"]).is_err(),
+                go_build_admitted(&p).is_err(),
+            ));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got, Ok((true, true, true, true)), "refused, not blocked");
+        // A regular file still opens.
+        let exe = std::env::current_exe().unwrap();
+        assert!(open_workload_file(exe.to_str().unwrap()).is_ok());
     }
 
     #[test]
