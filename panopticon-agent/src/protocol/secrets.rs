@@ -6,18 +6,23 @@
 //! whole, unless every credential in it sits in a structure whose value is
 //! delimited with certainty, in which case only those values are masked.
 //!
-//! The normalised view (used for detection only, never exported): JSON
-//! escapes decoded (`p`), percent-decoding repeated up to three times
-//! (`%2570` → `p`) with `+` as a space, ASCII case folded, and SQL comment
-//! delimiters (`/*`, `/*!`, `*/`, `--`, `#`) blanked so their content is
-//! read as text. Credential context is:
+//! The normalised view (used for detection only, never exported): NUL
+//! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
+//! string escapes (`\u0070`), HTML character references (`&#112;`,
+//! `&#x70;`, `&amp;` ...) and percent-decoding (`%70`, `+` as a space), so
+//! one encoding revealed by another is decoded too; ASCII case folded; SQL
+//! comment delimiters (`/*`, `/*!`, `*/`, `--`, `#`) blanked so their
+//! content is read as text; `-` and `.` read as `_`. Credential context is:
 //! - a word containing a credential part ([`PARTS`]: `password`, `secret`,
 //!   `token`, `api_key`, ...), ending in `_pass` or `_auth`, or
 //!   `identified` followed by `by`, `with`, `via`, `as` or `using`;
 //! - a short credential name ([`NAMES`]: `auth`, `key`, `session`, `pwd`,
-//!   ...) used as a name, that is followed by `=` or `:`;
+//!   ...) used as a name: followed by `=` or `:`, given as a form or HTML
+//!   field name (`name="pwd"`), or an XML element (`<pwd>`); in SQL also a
+//!   column in a list or assignment (`users(pwd)`, `, pwd)`);
 //! - userinfo, `user:password@host`, with or without a scheme (the `:` of
-//!   `scheme://` and of `mailto:` do not count).
+//!   `scheme://` and of `mailto:` do not count), and any `//` authority
+//!   whose userinfo has a `:` (RFC 3986: `,` and `;` may appear in it).
 //!
 //! The certain structures, on the raw text: a query or form parameter
 //! (`name=value` at the start of the text or after `?` or `&`), a JSON
@@ -53,6 +58,8 @@ const PARTS: &[&str] = &[
     "authorization",
     "csrf",
     "xsrf",
+    "bearer",
+    "client_assertion",
 ];
 
 /// Short names that are credential context only when used as a name.
@@ -69,6 +76,8 @@ const NAMES: &[&str] = &[
     "cookie",
     "jwt",
     "masteruser",
+    "otp",
+    "pin",
 ];
 
 fn strong_word(w: &str) -> bool {
@@ -79,25 +88,34 @@ fn strong_word(w: &str) -> bool {
 /// (any length; percent- and JSON-decoded, case-folded).
 pub fn is_credential_name(name: &str) -> bool {
     let n = normalize(name);
-    let whole = n.trim().replace(['-', '.'], "_");
-    NAMES.contains(&whole.as_str())
-        || words(&n).any(|(w, _)| strong_word(&w) || NAMES.contains(&w.as_str()))
+    NAMES.contains(&n.trim()) || words(&n).any(|(w, _, _)| strong_word(w) || NAMES.contains(&w))
 }
 
 /// Whether `text` shows credential context (see the module docs).
 pub fn has_credential_context(text: &str) -> bool {
+    context(text, false)
+}
+
+/// [`has_credential_context`] for a SQL statement: a short credential name
+/// also counts as a column in a list or assignment (`users(pwd)`,
+/// `SET a = 1, pass = $1`).
+pub fn has_sql_credential_context(sql: &str) -> bool {
+    context(sql, true)
+}
+
+fn context(text: &str, sql: bool) -> bool {
     let n = normalize(text);
     let b = n.as_bytes();
     let mut prev_identified = false;
-    for (w, end) in words(&n) {
-        if prev_identified && matches!(w.as_str(), "by" | "with" | "via" | "as" | "using") {
+    for (w, start, end) in words(&n) {
+        if prev_identified && matches!(w, "by" | "with" | "via" | "as" | "using") {
             return true;
         }
         prev_identified = w == "identified";
-        if w != "identified" && strong_word(&w) {
+        if w != "identified" && strong_word(w) {
             return true;
         }
-        if NAMES.contains(&w.as_str()) && used_as_name(b, end) {
+        if NAMES.contains(&w) && (used_as_name(b, start, end) || sql && sql_column(b, start, end)) {
             return true;
         }
     }
@@ -232,26 +250,92 @@ pub fn sql_verb(sql: &str) -> Option<&'static str> {
 // ── Normalised view ─────────────────────────────────────────────────────
 
 fn normalize(text: &str) -> String {
-    let mut s = json_unescape(text);
+    let mut s = text.to_string();
     for _ in 0..3 {
-        match percent_decode(&s) {
-            Some(d) => s = d,
-            None => break,
+        let mut changed = false;
+        if s.contains('\0') {
+            s.retain(|c| c != '\0');
+            changed = true;
+        }
+        for decode in [json_unescape, html_unescape, percent_decode] {
+            if let Some(d) = decode(&s) {
+                s = d;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
+    s.retain(|c| c != '\0');
     s.make_ascii_lowercase();
     for delim in ["/*!", "/*", "*/", "--", "#"] {
         if s.contains(delim) {
             s = s.replace(delim, &" ".repeat(delim.len()));
         }
     }
+    if s.contains(['-', '.']) {
+        s = s.replace(['-', '.'], "_");
+    }
     s
 }
 
-/// JSON string escapes decoded wherever they appear.
-fn json_unescape(text: &str) -> String {
+/// HTML character references decoded (`&#119;`, `&#x77;`, `&amp;`,
+/// `&quot;`, `&apos;`, `&lt;`, `&gt;`), or None when there are none.
+fn html_unescape(text: &str) -> Option<String> {
+    if !text.contains('&') {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut changed = false;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let semi = rest.as_bytes()[..rest.len().min(12)]
+            .iter()
+            .position(|&c| c == b';');
+        let decoded = semi.and_then(|e| {
+            let body = &rest[1..e];
+            let c = if let Some(num) = body.strip_prefix('#') {
+                match num.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => num.parse().ok(),
+                }
+                .and_then(char::from_u32)
+            } else {
+                match body {
+                    "amp" => Some('&'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    _ => None,
+                }
+            };
+            c.map(|c| (c, e + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+                changed = true;
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// JSON string escapes decoded wherever they appear, or None when there
+/// are none.
+fn json_unescape(text: &str) -> Option<String> {
     if !text.contains('\\') {
-        return text.to_string();
+        return None;
     }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -284,7 +368,7 @@ fn json_unescape(text: &str) -> String {
             None => out.push('\\'),
         }
     }
-    out
+    (out != text).then_some(out)
 }
 
 /// One pass of `%XX` and `+` decoding, or None when there is nothing to
@@ -316,44 +400,111 @@ fn percent_decode(text: &str) -> Option<String> {
     (decoded != text).then_some(decoded)
 }
 
-/// The words of a normalised text (`a-z`, digits, `_`; `-` and `.` read
-/// as `_`) and where each ends.
-fn words(n: &str) -> impl Iterator<Item = (String, usize)> + '_ {
+/// The words of a normalised text (`a-z`, digits, `_`; leading and
+/// trailing `_` dropped), borrowed, with where each starts and ends.
+fn words(n: &str) -> impl Iterator<Item = (&str, usize, usize)> + '_ {
     let b = n.as_bytes();
-    let is_word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut i = 0;
     std::iter::from_fn(move || {
-        while i < b.len() && !is_word(b[i]) {
-            i += 1;
+        loop {
+            while i < b.len() && !is_word(b[i]) {
+                i += 1;
+            }
+            if i >= b.len() {
+                return None;
+            }
+            let mut start = i;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            let mut end = i;
+            while start < end && b[start] == b'_' {
+                start += 1;
+            }
+            while end > start && b[end - 1] == b'_' {
+                end -= 1;
+            }
+            if start < end {
+                return Some((&n[start..end], start, end));
+            }
         }
-        if i >= b.len() {
-            return None;
-        }
-        let start = i;
-        while i < b.len() && is_word(b[i]) {
-            i += 1;
-        }
-        let w = n[start..i]
-            .replace(['-', '.'], "_")
-            .trim_matches('_')
-            .to_string();
-        Some((w, i))
     })
 }
 
-/// Whether the word ending at `end` is followed (after spaces and closing
-/// quotes) by `=` or `:`.
-fn used_as_name(b: &[u8], end: usize) -> bool {
+/// The next byte after `end` that is not a space or closing quote.
+fn after(b: &[u8], end: usize) -> Option<u8> {
     b[end..]
         .iter()
+        .copied()
         .find(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'`' | b']'))
-        .is_some_and(|c| matches!(c, b'=' | b':'))
+}
+
+/// The last byte before `start` that is not a space or opening quote.
+fn before(b: &[u8], start: usize) -> Option<u8> {
+    b[..start]
+        .iter()
+        .copied()
+        .rev()
+        .find(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'`' | b'['))
+}
+
+/// Whether the word at `start..end` is used as a name: followed by `=` or
+/// `:`, a form or HTML field name (`name="w"`), or an XML element (`<w>`).
+fn used_as_name(b: &[u8], start: usize, end: usize) -> bool {
+    let head = &b[..start];
+    matches!(after(b, end), Some(b'=' | b':'))
+        || [&b"name=\""[..], b"name='", b"name="]
+            .iter()
+            .any(|p| head.ends_with(p))
+        || (head.ends_with(b"<") || head.ends_with(b"</")) && b.get(end) == Some(&b'>')
+}
+
+/// In SQL, a column in a list or assignment: after `(` or `,`, or before
+/// `)` or `,`.
+fn sql_column(b: &[u8], start: usize, end: usize) -> bool {
+    matches!(before(b, start), Some(b'(' | b',')) || matches!(after(b, end), Some(b')' | b','))
 }
 
 /// `user:password@host` anywhere: a `:` (not that of `scheme://` or
 /// `mailto:`) then `@` and a host character, with no whitespace, quote or
 /// bracket between. One forward pass.
 fn has_userinfo(b: &[u8]) -> bool {
+    authority_userinfo(b) || schemeless_userinfo(b)
+}
+
+/// A `//` authority (RFC 3986) whose userinfo, before its last `@`, holds a
+/// `:`: the authority runs to `/`, `?`, `#`, whitespace, a quote or `<>\`,
+/// so `,` and `;` in the password are kept.
+fn authority_userinfo(b: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(o) = b[from..].windows(2).position(|w| w == b"//") {
+        let a = from + o + 2;
+        from = a;
+        let e = b[a..]
+            .iter()
+            .position(|&c| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'<' | b'>' | b'\\'
+                    )
+            })
+            .map_or(b.len(), |p| a + p);
+        if let Some(at) = b[a..e].iter().rposition(|&c| c == b'@').map(|p| a + p)
+            && b[a..at].contains(&b':')
+            && b.get(at + 1)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'[')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `user:password@host` without a `//`: a `:` then `@` and a host
+/// character, with no whitespace, quote, bracket or `,;&` between.
+fn schemeless_userinfo(b: &[u8]) -> bool {
     let mut colon = false;
     for i in 0..b.len() {
         match b[i] {
@@ -580,6 +731,47 @@ mod tests {
         protect_text(s).unwrap_or_else(|| s.to_string())
     }
 
+    /// Codex round 4: forms the detector missed.
+    #[test]
+    fn round_four_forms_are_context() {
+        // #10: URI userinfo may hold `,` `;` (RFC 3986).
+        assert_eq!(
+            p("https://alice:ca,nary@host/db"),
+            "https://alice:<REDACTED>@host/db"
+        );
+        assert_eq!(p("//alice:ca;nary@host/db"), "//alice:<REDACTED>@host/db");
+        // #8: short names in SQL column lists and multipart / HTML names.
+        assert!(has_sql_credential_context(
+            "INSERT INTO users(pwd) VALUES ('s7Kf2v9LmQ8z')"
+        ));
+        assert!(has_sql_credential_context("UPDATE u SET a = 1, pass = $1"));
+        for clean in [
+            "INSERT INTO t (id) VALUES (1) ON DUPLICATE KEY UPDATE n = 2",
+            "CREATE TABLE t (id int, PRIMARY KEY (id))",
+            "SET SESSION sql_mode = ''",
+        ] {
+            assert!(!has_sql_credential_context(clean), "{clean}");
+        }
+        for withheld in [
+            "Content-Disposition: form-data; name=\"pwd\"\r\n\r\ns7Kf2v9LmQ8z",
+            // #7: decodings revealed by other decodings, entities, UTF-16.
+            "/login?data=%7B%22pass%5Cu0077ord%22%3A%22s7Kf2v9LmQ8z%22%7D",
+            "<input name=\"pass&#119;ord\" value=\"s7Kf2v9LmQ8z\">",
+            "<input name=\"pass&#x77;ord\" value=\"s7Kf2v9LmQ8z\">",
+            "&item=₹2;&x=1&#112;assword=s7Kf2v9LmQ8z",
+            "<\0p\0a\0s\0s\0w\0o\0r\0d\0>\0s\07\0K\0<\0/\0p\0>\0",
+            // #9: more authentication material.
+            r#"{"otp":"739204","n":[1]}"#,
+            r#"{"pin":"739204","n":[1]}"#,
+            r#"{"bearer":"s7Kf2v9LmQ8z","n":[1]}"#,
+            r#"{"client_assertion":"s7Kf2v9LmQ8z","n":[1]}"#,
+        ] {
+            assert!(has_credential_context(withheld), "{withheld:?}");
+            assert!(!p(withheld).contains("s7Kf2v9LmQ8z"), "{withheld:?}");
+            assert!(!p(withheld).contains("739204"), "{withheld:?}");
+        }
+    }
+
     #[test]
     fn certain_values_are_masked_the_rest_kept() {
         for (input, want) in [
@@ -595,7 +787,7 @@ mod tests {
             ),
             (
                 r#"{"pin":1,"api_key":12345}"#,
-                r#"{"pin":1,"api_key":<REDACTED>}"#,
+                r#"{"pin":<REDACTED>,"api_key":<REDACTED>}"#,
             ),
             (
                 "x-api-key=k1&keyword=shoes",

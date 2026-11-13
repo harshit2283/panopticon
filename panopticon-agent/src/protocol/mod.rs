@@ -168,7 +168,7 @@ pub fn export_statement(
     mut query: String,
     bound: Option<String>,
 ) -> (Option<String>, String, Option<String>, bool) {
-    if mask_credentials_enabled() && has_credential_context(&query) {
+    if mask_credentials_enabled() && secrets::has_sql_credential_context(&query) {
         let shown = withheld_statement(&query);
         zeroize::Zeroize::zeroize(&mut query);
         if let Some(mut b) = bound {
