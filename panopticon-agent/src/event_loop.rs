@@ -1039,7 +1039,12 @@ pub(crate) async fn worker_task(
             // connection's state and reaches no sink. Counted processed (it
             // is consumed here). On TC and in replay a close takes the gated
             // path below, as before.
-            if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
+            // A TlsClose record (SSL_free, every mode) likewise ends the
+            // TLS key's connection, so a new connection the library gives
+            // the same object address starts with no state.
+            if (ctx.kernel_scope && scratch.event_type == EventType::SockClose)
+                || scratch.event_type == EventType::TlsClose
+            {
                 ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
                 end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
                 continue;
@@ -1316,11 +1321,6 @@ fn feed_event(
     {
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
-    // TLS: another socket under a tracked connection object is a new
-    // connection reusing its address (0, unknown, for all other events).
-    if manager.note_socket(cookie, event.tls_sock_cookie) {
-        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
     let mut created = false;
     if !payload.is_empty()
         && !manager.contains(cookie)
@@ -1348,9 +1348,6 @@ fn feed_event(
                     .fetch_sub(evicted, Ordering::Relaxed);
             }
             CreateResult::AlreadyExists => {}
-        }
-        if created {
-            manager.note_socket(cookie, event.tls_sock_cookie);
         }
         if log_events {
             tracing::debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
@@ -1770,11 +1767,12 @@ fn server_endpoint(
 /// process and unique only within it: it is hashed with the PID under a
 /// per-process random key, so no process can pick a pointer that lands on
 /// another connection's key (F18), and bit 63 is set so a TLS key never
-/// equals a TC cookie. Events without one fall back to a per-thread key.
+/// equals a TC cookie. A `TlsClose` record is keyed like the data of the
+/// object it retires. Events without one fall back to a per-thread key.
 fn connection_key(event: &DataEvent) -> u64 {
     use std::hash::BuildHasher;
     static TLS_KEY: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
-    if event.event_type != EventType::TlsData {
+    if !matches!(event.event_type, EventType::TlsData | EventType::TlsClose) {
         return event.socket_cookie;
     }
     if event.socket_cookie == 0 {
@@ -2191,27 +2189,44 @@ mod tests {
         h2_frame(0x1, 0x4 | 0x1, stream, &[0x88])
     }
 
-    /// An OpenSSL read or write on connection object 0x7000 of pid 50,
-    /// whose call did its I/O on the socket with cookie `sock`.
-    fn ssl_event(dir: Direction, sock: u64, payload: &[u8]) -> DataEvent {
+    /// An OpenSSL read or write on connection object 0x7000 of pid 50.
+    fn ssl_event(dir: Direction, payload: &[u8]) -> DataEvent {
         // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
         let mut e: DataEvent = unsafe { std::mem::zeroed() };
         e.event_type = EventType::TlsData;
         e.direction = dir;
         (e.pid, e.tgid) = (50, 50);
         e.socket_cookie = 0x7000;
-        e.tls_sock_cookie = sock;
         e.tls_library = panopticon_common::TlsLibrary::OpenSsl;
         e.payload[..payload.len()].copy_from_slice(payload);
         (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
         e
     }
 
-    /// Feed events the way worker_task does; every completed message.
+    /// `SSL_free` of that object, from another thread of the process.
+    fn ssl_free() -> DataEvent {
+        let mut e = ssl_event(Direction::Egress, b"");
+        e.event_type = EventType::TlsClose;
+        e.tgid = 51;
+        e
+    }
+
+    #[test]
+    fn tls_close_is_keyed_like_the_objects_data() {
+        let data = ssl_event(Direction::Ingress, b"x");
+        assert_eq!(connection_key(&ssl_free()), connection_key(&data));
+    }
+
+    /// Feed events the way worker_task does (a TlsClose ends its key's
+    /// connection before the gate); every completed message.
     fn run_events(events: &[DataEvent]) -> Vec<crate::protocol::L7Message> {
         let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
         let mut out = vec![];
         for e in events {
+            if e.event_type == EventType::TlsClose {
+                m.close_connection(connection_key(e));
+                continue;
+            }
             for r in feed_event(&m, e, connection_key(e), &stats, 0, false)
                 .into_iter()
                 .flatten()
@@ -2228,40 +2243,66 @@ mod tests {
 
     const CANARY: &[u8] = b"canary-s7Kf2v9LmQ8z";
 
-    /// Codex R8 #1: TLS writes inside one DATA payload that start with the
-    /// client preface (an upload of captured HTTP/2 bytes) must not restart
-    /// the connection clean: the second embedded preface is no proof either.
+    /// Codex R8 #1 / R9: TLS writes inside one DATA payload that start with
+    /// the client preface (an upload of captured HTTP/2 bytes) must not
+    /// restart the connection clean: the second embedded preface is no
+    /// proof either. Nothing but the object's retirement is (R9: not a
+    /// socket seen during a call, which can be another socket's).
     #[test]
-    fn embedded_prefaces_on_one_socket_stay_withheld() {
-        for sock in [11, 0] {
-            // A clean start, then a DATA frame (stream 1) of 4096 bytes whose
-            // payload the next writes carry.
-            let mut open = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]); // POST /
+    fn embedded_prefaces_stay_withheld() {
+        // A clean start, then a DATA frame (stream 1) of 4096 bytes whose
+        // payload the next writes carry.
+        let mut open = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]); // POST /
+        open.extend(&h2_frame(0x0, 0, 1, &[0; 4096])[..9]);
+        let mut forged = h2_start(&h2_request(3, CANARY));
+        forged.extend(h2_frame(0x3, 0, 0, &[0; 4])); // RST_STREAM(0)
+        let out = run_events(&[
+            ssl_event(Direction::Egress, &h2_start(&open)),
+            ssl_event(Direction::Egress, &h2_start(&[])),
+            ssl_event(Direction::Egress, &forged),
+            ssl_event(Direction::Ingress, &h2_reply(3)),
+        ]);
+        let dump = format!("{out:?}");
+        assert!(!dump.contains("s7Kf"), "{dump}");
+    }
+
+    /// Codex R9's schedule: a read or write whose call did I/O on another
+    /// socket (a BIO callback) carries an embedded preface, HEADERS and a
+    /// body. Under R8 the socket change reset the key and this exported.
+    #[test]
+    fn embedded_preface_in_a_mislabelled_call_stays_withheld() {
+        for dir in [Direction::Egress, Direction::Ingress] {
+            let mut open = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
             open.extend(&h2_frame(0x0, 0, 1, &[0; 4096])[..9]);
             let mut forged = h2_start(&h2_request(3, CANARY));
             forged.extend(h2_frame(0x3, 0, 0, &[0; 4])); // RST_STREAM(0)
+            let back = match dir {
+                Direction::Egress => Direction::Ingress,
+                Direction::Ingress => Direction::Egress,
+            };
             let out = run_events(&[
-                ssl_event(Direction::Egress, sock, &h2_start(&open)),
-                ssl_event(Direction::Egress, sock, &h2_start(&[])),
-                ssl_event(Direction::Egress, sock, &forged),
-                ssl_event(Direction::Ingress, sock, &h2_reply(3)),
+                ssl_event(dir, &h2_start(&open)),
+                ssl_event(dir, &forged),
+                ssl_event(back, &h2_reply(3)),
             ]);
             let dump = format!("{out:?}");
-            assert!(!dump.contains("s7Kf"), "sock {sock}: {dump}");
+            assert!(!dump.contains("s7Kf"), "{dir:?}: {dump}");
         }
     }
 
-    /// A new TCP socket under a reused SSL object is a new connection: it
-    /// starts clean however the old one ended (here inside a frame).
+    /// The library retired the SSL object: a new connection that gets its
+    /// address starts clean, however the old one ended (here inside a
+    /// frame).
     #[test]
-    fn reused_ssl_object_on_a_new_socket_starts_clean() {
+    fn reused_ssl_object_after_ssl_free_starts_clean() {
         let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20]; // ends inside DATA
         let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
         first.extend_from_slice(cut);
         let out = run_events(&[
-            ssl_event(Direction::Egress, 11, &h2_start(&first)),
-            ssl_event(Direction::Egress, 12, &h2_start(&h2_request(1, CANARY))),
-            ssl_event(Direction::Ingress, 12, &h2_reply(1)),
+            ssl_event(Direction::Egress, &h2_start(&first)),
+            ssl_free(),
+            ssl_event(Direction::Egress, &h2_start(&h2_request(1, CANARY))),
+            ssl_event(Direction::Ingress, &h2_reply(1)),
         ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].path.as_deref(), Some("/"));
@@ -2270,28 +2311,26 @@ mod tests {
         assert!(dump.contains("s7Kf"), "body must export: {dump}");
     }
 
-    /// The same socket (or an unknown one) under the SSL object: a preface
-    /// is not a new connection, and does not clear a latch.
+    /// No retirement seen: a preface on the SSL object is not a new
+    /// connection, and does not clear a latch.
     #[test]
-    fn preface_on_the_same_or_unknown_socket_stays_latched() {
-        for (a, b) in [(11, 11), (0, 0), (11, 0), (0, 11)] {
-            let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20];
-            let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
-            first.extend_from_slice(cut);
-            let out = run_events(&[
-                ssl_event(Direction::Egress, a, &h2_start(&first)),
-                ssl_event(Direction::Egress, b, &h2_start(&h2_request(3, CANARY))),
-                ssl_event(Direction::Ingress, b, &h2_reply(3)),
-            ]);
-            let dump = format!("{out:?}");
-            assert!(!dump.contains("s7Kf"), "socks {a}/{b}: {dump}");
-        }
+    fn preface_without_ssl_free_stays_latched() {
+        let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20];
+        let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
+        first.extend_from_slice(cut);
+        let out = run_events(&[
+            ssl_event(Direction::Egress, &h2_start(&first)),
+            ssl_event(Direction::Egress, &h2_start(&h2_request(3, CANARY))),
+            ssl_event(Direction::Ingress, &h2_reply(3)),
+        ]);
+        let dump = format!("{out:?}");
+        assert!(!dump.contains("s7Kf"), "{dump}");
         // Between frames, with nothing lost: still latched.
         let out = run_events(&[
-            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(1, b"x"))),
-            ssl_event(Direction::Ingress, 11, &h2_reply(1)),
-            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(1, CANARY))),
-            ssl_event(Direction::Ingress, 11, &h2_reply(1)),
+            ssl_event(Direction::Egress, &h2_start(&h2_request(1, b"x"))),
+            ssl_event(Direction::Ingress, &h2_reply(1)),
+            ssl_event(Direction::Egress, &h2_start(&h2_request(1, CANARY))),
+            ssl_event(Direction::Ingress, &h2_reply(1)),
         ]);
         let dump = format!("{out:?}");
         assert!(!dump.contains("s7Kf"), "{dump}");
@@ -2303,9 +2342,9 @@ mod tests {
     fn hpack_failure_then_boundary_preface_stays_latched() {
         let bad = h2_frame(0x1, 0x4 | 0x1, 1, &[0x80]); // index 0: invalid
         let out = run_events(&[
-            ssl_event(Direction::Egress, 11, &h2_start(&bad)),
-            ssl_event(Direction::Egress, 11, &h2_start(&h2_request(3, CANARY))),
-            ssl_event(Direction::Ingress, 11, &h2_reply(3)),
+            ssl_event(Direction::Egress, &h2_start(&bad)),
+            ssl_event(Direction::Egress, &h2_start(&h2_request(3, CANARY))),
+            ssl_event(Direction::Ingress, &h2_reply(3)),
         ]);
         let dump = format!("{out:?}");
         assert!(!dump.contains("s7Kf"), "{dump}");

@@ -4,7 +4,9 @@
 //! OpenSSL 1.1.1+ applications such as CPython, curl and nginx call), and Go's
 //! TLS write function. Captures the plaintext buffer contents and emits
 //! TlsData events tagged with the connection object pointer (`SSL*`,
-//! `*tls.Conn`) so user space can tell connections apart.
+//! `*tls.Conn`) so user space can tell connections apart. `SSL_free` sends
+//! a TlsClose record, so a connection that reuses a freed object's address
+//! is not read as the old one.
 //!
 //! Go TLS reads are not captured. A read's buffer is only filled when the
 //! call returns, and nothing saved at entry can be proven to still belong
@@ -26,9 +28,10 @@ use aya_ebpf::{
 use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY,
-    TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH, TlsCall, TlsConnKey,
-    TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_submit_flags,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, SizedEvent, SockTuple, TLS_ACTIVE, TLS_CALL,
+    TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_SCRATCH, TlsCall,
+    TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_reserve_as,
+    shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_monitor::read_sock_tuple;
 
@@ -282,10 +285,6 @@ fn same_frame(entry_sp: u64, ret_sp: u64) -> bool {
 struct CallAddr {
     ok: u32,
     scope_gen: u32,
-    /// Cookie of the checked socket, as two halves: a u64 would give this
-    /// struct and `Ended` alignment padding.
-    cookie_lo: u32,
-    cookie_hi: u32,
     local_addr: u32,
     remote_addr: u32,
     local_port: u16,
@@ -295,8 +294,6 @@ struct CallAddr {
 const NO_ADDR: CallAddr = CallAddr {
     ok: 0,
     scope_gen: 0,
-    cookie_lo: 0,
-    cookie_hi: 0,
     local_addr: 0,
     remote_addr: 0,
     local_port: 0,
@@ -381,8 +378,6 @@ fn end_call(ctx: &RetProbeContext, pid_tgid: u64) -> Ended {
                 e.addr = CallAddr {
                     ok: 1,
                     scope_gen: (*call).scope_gen,
-                    cookie_lo: (*call).cookie as u32,
-                    cookie_hi: ((*call).cookie >> 32) as u32,
                     local_addr: (*call).tuple.local_addr,
                     remote_addr: (*call).tuple.remote_addr,
                     local_port: (*call).tuple.local_port,
@@ -695,6 +690,78 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     )
 }
 
+// ── OpenSSL: SSL_free ──────────────────────────────────────────────────────
+
+/// Intercepts `SSL_free(ssl)`: the connection object is retired, and the
+/// allocator may hand its address to the next connection. Sends a header-
+/// only `TlsClose` record keyed like the object's data events (same
+/// address, same pid, so the same ring shard and worker, in order). No
+/// read or write is in progress on an object being freed, so the record
+/// follows all of its data. Gated like the data events; an out-of-scope
+/// free sends nothing and counts no drop (it carries no data).
+#[uprobe]
+pub fn ssl_free_entry(ctx: ProbeContext) {
+    let _ = try_ssl_free_entry(&ctx);
+}
+
+#[inline(always)]
+fn try_ssl_free_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    let ssl: u64 = ctx.arg(0).ok_or(())?;
+    if ssl == 0 || !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let mode = crate::sock_capture::scope_mode();
+    let mut scope_gen = crate::sock_capture::scope_gen();
+    if panopticon_common::scope::is_unscoped_full(mode) {
+        if !pid_allowed(pid) {
+            return Ok(());
+        }
+        // The next connection at this address has its own sockets.
+        let _ = TLS_CONN_ADDR.remove(&TlsConnKey {
+            conn: ssl,
+            pid,
+            _pad: 0,
+        });
+    } else {
+        match crate::sock_capture::tls_call_scope(mode, pid) {
+            Ok(g) => scope_gen = g,
+            Err(_) => return Ok(()),
+        }
+    }
+    let shard = shard_for(ssl);
+    let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
+        crate::maps::count_kernel_drop();
+        return Ok(());
+    };
+    // Header fields only: they all lie in the reserved record.
+    let event = entry.as_mut_ptr() as *mut DataEvent;
+    unsafe {
+        (*event).timestamp_ns = bpf_ktime_get_ns();
+        (*event).socket_cookie = ssl;
+        (*event).event_type = EventType::TlsClose;
+        (*event).direction = Direction::Egress;
+        (*event).pid = pid;
+        (*event).tgid = pid_tgid as u32;
+        (*event).src_addr = 0;
+        (*event).dst_addr = 0;
+        (*event).src_port = 0;
+        (*event).dst_port = 0;
+        (*event).ip_proto = 0;
+        (*event).tls_library = TlsLibrary::OpenSsl;
+        (*event).payload_len = 0;
+        (*event).orig_len = 0;
+        (*event).tcp_flags = 0;
+        (*event).tcp_seq = 0;
+        (*event).tcp_ack = 0;
+        crate::maps::clear_scope_fields(event);
+        (*event).scope_gen = scope_gen;
+    }
+    entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
+    Ok(())
+}
+
 // ── Go TLS: crypto/tls.(*Conn).Write ──────────────────────────────────────
 
 /// Intercepts Go TLS writes. Go 1.17+ uses register-based ABI:
@@ -774,9 +841,6 @@ struct TlsHeader {
     direction: Direction,
     tls_lib: TlsLibrary,
     scope_gen: u32,
-    /// `DataEvent::tls_sock_cookie`: restricted modes only, same condition
-    /// as the address; 0 otherwise.
-    sock_cookie: u64,
 }
 
 #[inline(always)]
@@ -803,7 +867,6 @@ fn tls_header(
         direction,
         tls_lib,
         scope_gen,
-        sock_cookie: 0,
     };
     // Unscoped: addresses are known once this connection has done socket
     // I/O inside a hooked call (see try_tls_tcp_io); zero until then.
@@ -814,7 +877,6 @@ fn tls_header(
     let mut t = (0u32, 0u32, 0u16, 0u16, false);
     if restricted {
         if call_addr.ok != 0 && call_addr.scope_gen == scope_gen {
-            h.sock_cookie = call_addr.cookie_lo as u64 | (call_addr.cookie_hi as u64) << 32;
             t = (
                 call_addr.local_addr,
                 call_addr.remote_addr,
@@ -1014,7 +1076,6 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
         (*event).scope_gen = h.scope_gen;
-        (*event).tls_sock_cookie = h.sock_cookie;
         (*event).orig_len = len as u32;
 
         // Copy plaintext from user space, clamped to MAX_PAYLOAD_SIZE. The u32

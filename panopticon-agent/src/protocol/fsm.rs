@@ -352,9 +352,6 @@ struct ConnectionEntry {
     /// entry: a replacement parser is latched again (`joined_late`), and
     /// only a new entry starts without it.
     lost: bool,
-    /// TLS: the cookie of the TCP socket under the connection object
-    /// (`DataEvent::tls_sock_cookie`), once one was seen; 0 if unknown.
-    sock: u64,
 }
 
 impl ConnectionEntry {
@@ -445,7 +442,6 @@ impl ConnectionFsmManager {
             tcp: TcpTracker::default(),
             fed: false,
             lost: false,
-            sock: 0,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
@@ -531,8 +527,9 @@ impl ConnectionFsmManager {
         // the old one, so the parser is replaced. The replacement starts
         // clean only as the entry's first payload with no loss recorded:
         // anywhere else the preface bytes can be the inside of a DATA
-        // payload, so it is latched. A new connection reusing a TLS key is
-        // told apart by its socket (`note_socket`), never by its bytes.
+        // payload, so it is latched. A new connection reusing a TLS key
+        // gets a new entry only when the library retired the old one
+        // (`EventType::TlsClose`, `SSL_free`), never by its bytes.
         let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
         let preface = h2 && data.starts_with(super::detect::HTTP2_PREFACE);
         let first = !entry.fed && !entry.lost;
@@ -548,26 +545,6 @@ impl ConnectionFsmManager {
         let result = entry.fsm.process_packet(direction, data, timestamp_ns);
         entry.lost |= entry.fsm.uncertain();
         result
-    }
-
-    /// TLS: the connection object under `conn_id` did I/O on the TCP socket
-    /// with cookie `sock` (0: unknown). A known socket other than the one
-    /// recorded is a new connection reusing the object's address: its
-    /// entry is dropped (true), so the next payload creates a new one with
-    /// no latches. 0 never drops an entry or replaces a recorded socket.
-    pub fn note_socket(&self, conn_id: u64, sock: u64) -> bool {
-        let Some(mut entry) = self.connections.get_mut(&conn_id) else {
-            return false;
-        };
-        if sock == 0 || entry.sock == sock {
-            return false;
-        }
-        if entry.sock == 0 {
-            entry.sock = sock;
-            return false;
-        }
-        drop(entry);
-        self.close_connection(conn_id)
     }
 
     /// Check a TCP segment sent by `src` against the connection's sequence
@@ -798,27 +775,25 @@ mod tests {
         };
         let m = ConnectionFsmManager::new(16);
         let (client, server) = ((0, 1), (0, 2));
-        // What the worker does for a TLS event on socket `sock` (event_loop
-        // `feed_event`).
-        let on_socket = |sock: u64| {
-            m.note_socket(9, sock);
+        // What the worker does for a TLS event (event_loop `feed_event`).
+        let open = || {
             if !m.contains(9) {
                 m.get_or_create_with_server(9, Protocol::Http2, Some(server));
-                m.note_socket(9, sock);
                 m.mark_joined_late(9);
             }
         };
-        // First connection: one exchange, then it closes...
+        // First connection: one exchange, then it is freed (a TlsClose
+        // record closes the key)...
         let (mut c1, mut s1) = (hpack::Encoder::new(), hpack::Encoder::new());
-        on_socket(101);
+        open();
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c1, "/one"), 1);
         let first =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s1), 2));
         assert_eq!(first, vec![Some("/one".to_string())]);
-        // ...and a new one, on another socket, gets the same key (freed and
-        // reallocated SSL*).
+        assert!(m.close_connection(9));
+        // ...and a new one gets the same key (reallocated SSL*).
         let (mut c2, mut s2) = (hpack::Encoder::new(), hpack::Encoder::new());
-        on_socket(102);
+        open();
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c2, "/two"), 3);
         let second =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s2), 4));

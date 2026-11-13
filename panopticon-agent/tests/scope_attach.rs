@@ -92,6 +92,13 @@ pub extern "C" fn panop_test_ssl_write(_ssl: u64, buf: *const u8, num: i32) -> i
     n
 }
 
+/// Stand-in for OpenSSL's `SSL_free(ssl)`.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn panop_test_ssl_free(ssl: u64) {
+    std::hint::black_box(ssl);
+}
+
 /// Stand-in for OpenSSL's `SSL_read(ssl, buf, num)`: reads from `TEST_FD`.
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -2085,8 +2092,34 @@ fn scope_programs_load_attach_and_hold() {
         (Direction::Ingress, c4_port),
         "control: read carries its own address"
     );
-    assert_ne!(e.tls_sock_cookie, 0, "control: read carries its socket");
-    println!("TLS_SOCK_COOKIE OK");
+    // SSL_free sends a header-only TlsClose keyed like the object's data.
+    {
+        let p: &mut aya::programs::UProbe = ebpf
+            .program_mut("ssl_free_entry")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let link = p
+            .attach("panop_test_ssl_free", "/proc/self/exe", Some(me))
+            .expect("ssl_free_entry attaches");
+        let free = std::hint::black_box(panop_test_ssl_free as extern "C" fn(u64));
+        free(ssl);
+        let mut seen = Vec::new();
+        while let Some(item) = ring.next() {
+            // SAFETY: all-zero is a valid DataEvent.
+            let mut r: DataEvent = unsafe { std::mem::zeroed() };
+            if read_data_event_into(&item, &mut r) && r.event_type == EventType::TlsClose {
+                seen.push((r.socket_cookie, r.pid, r.payload_len, item.len()));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![(ssl, e.pid, 0, panopticon_common::DATA_EVENT_HEADER_LEN)],
+            "SSL_free: one header-only TlsClose for the object"
+        );
+        p.detach(link).unwrap();
+    }
+    println!("TLS_RETIRE OK");
     for (index, what) in stops {
         pre(Some((index, 0)));
         read_once(&mut s4, b"r-stop");

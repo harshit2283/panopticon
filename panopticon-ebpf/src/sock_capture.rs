@@ -480,7 +480,7 @@ fn on_established(ctx: &SockOpsContext, active: bool) {
 /// generation, so user space applies its admission floor to it as to any
 /// record; a socket narrowed out never sends one (narrowing replaces the
 /// pipeline, which drops its state). The record is the header only
-/// (104 bytes, `SizedEvent<0>`).
+/// (96 bytes, `SizedEvent<0>`).
 #[inline(always)]
 fn on_tcp_close(ctx: &SockOpsContext) {
     let ops = ctx.ops;
@@ -1179,7 +1179,7 @@ fn mark_emitted(st: *mut SockState) {
 /// ring shard, reserved at the smallest power-of-two payload size class
 /// (64 to 4,096 bytes) that holds them: the header plus the captured bytes
 /// rounded up to a power of two (at least 64), where a whole DataEvent is
-/// 4,200 bytes.
+/// 4,192 bytes.
 /// Reserved in the ring, never built in a shared per-CPU buffer: egress
 /// runs in process context, where a softirq or (on a preemptible kernel)
 /// another task on the CPU can run these programs again mid-event; with

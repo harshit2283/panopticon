@@ -113,7 +113,6 @@ fn test_data_event_specific_byte_offsets() {
     event.acceptor_tgid = 32;
     event.scope_gen = 33;
     event.role = 2;
-    event.tls_sock_cookie = 0x0102_0304_0506_0708;
 
     let bytes = as_bytes(&event);
     let u32_at =
@@ -130,7 +129,6 @@ fn test_data_event_specific_byte_offsets() {
     assert_eq!(src_port, 0x1F90);
     assert_eq!(bytes[92], 6); // ip_proto
     assert_eq!(bytes[94], 2); // role
-    assert_eq!(u64_at(96), 0x0102_0304_0506_0708); // tls_sock_cookie
 }
 
 #[test]
@@ -140,10 +138,6 @@ fn test_max_payload_event() {
     event.payload.fill(0xAA);
 
     let bytes = as_bytes(&event);
-    // Payload starts at offset 104
-    assert!(
-        bytes[104..104 + MAX_PAYLOAD_SIZE]
-            .iter()
-            .all(|&b| b == 0xAA)
-    );
+    // Payload starts at offset 96
+    assert!(bytes[96..96 + MAX_PAYLOAD_SIZE].iter().all(|&b| b == 0xAA));
 }
