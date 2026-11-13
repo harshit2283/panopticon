@@ -246,10 +246,13 @@ impl Sweep {
 /// The keys of a hash map whose value type is `V`, and whether they came
 /// from a batched walk. Batched (`BPF_MAP_LOOKUP_BATCH`, Linux 5.6+) where
 /// the kernel has it: its cursor is a bucket index, so deletions under the
-/// walk never send it back, and every pass reaches every bucket. Otherwise
-/// (kernels without batch operations; the five lab kernels, RHEL 8.10
-/// included, all have them) [`walk_keys`] with BPF_MAP_GET_NEXT_KEY from any key (aya
-/// only walks from the first).
+/// walk never send it back, and every pass reaches every bucket
+/// ([`batch_walk`]). Otherwise (kernels without batch operations; the five
+/// lab kernels, RHEL 8.10 included, all have them) [`walk_keys`] with
+/// BPF_MAP_GET_NEXT_KEY from any key (aya only walks from the first), whose
+/// guarantee is weaker: a key deleted and re-inserted in place between its
+/// steps can hold it at that key for the pass, so later keys wait for a
+/// later pass.
 #[cfg(target_os = "linux")]
 fn walk_map<K: aya::Pod + Eq + std::hash::Hash, V: aya::Pod>(
     fd: u32,
@@ -302,8 +305,10 @@ fn walk_map<K: aya::Pod + Eq + std::hash::Hash, V: aya::Pod>(
     }
 }
 
-/// Every key by `BPF_MAP_LOOKUP_BATCH`, at most `capacity` of them, or None
-/// when the kernel refuses the first batch (no batch operations).
+/// Every key by `BPF_MAP_LOOKUP_BATCH`, or None when the kernel has no
+/// batch operations for this map (the first batch refused with EINVAL,
+/// ENOTSUPP or EOPNOTSUPP). Any other error fails the walk, and with it this
+/// sweep, rather than switching to the weaker walk.
 #[cfg(target_os = "linux")]
 fn batch_keys<K: aya::Pod, V: aya::Pod>(fd: u32, capacity: u32) -> std::io::Result<Option<Vec<K>>> {
     #[repr(C)]
@@ -318,21 +323,13 @@ fn batch_keys<K: aya::Pod, V: aya::Pod>(fd: u32, capacity: u32) -> std::io::Resu
         flags: u64,
     }
     const BPF_MAP_LOOKUP_BATCH: libc::c_long = 24;
-    let capacity = capacity as usize;
-    let mut chunk = 256usize;
-    let mut out: Vec<K> = Vec::new();
-    let (mut token_in, mut token_out) = (0u32, 0u32);
-    let mut first = true;
-    // Each call moves past at least one bucket; buckets <= 2 x capacity.
-    for _ in 0..=2 * capacity {
+    let call = |token: Option<u32>, chunk: usize| -> std::io::Result<(Vec<K>, u32, bool)> {
         let mut keys = vec![std::mem::MaybeUninit::<K>::zeroed(); chunk];
         let mut values = vec![std::mem::MaybeUninit::<V>::zeroed(); chunk];
+        let token_in = token.unwrap_or(0);
+        let mut token_out = 0u32;
         let mut attr = Attr {
-            in_batch: if first {
-                0
-            } else {
-                &token_in as *const u32 as u64
-            },
+            in_batch: token.map_or(0, |_| &token_in as *const u32 as u64),
             out_batch: &mut token_out as *mut u32 as u64,
             keys: keys.as_mut_ptr() as u64,
             values: values.as_mut_ptr() as u64,
@@ -351,27 +348,70 @@ fn batch_keys<K: aya::Pod, V: aya::Pod>(fd: u32, capacity: u32) -> std::io::Resu
                 size_of::<Attr>(),
             )
         };
-        let e = (r != 0).then(std::io::Error::last_os_error);
-        match e.as_ref().and_then(|e| e.raw_os_error()) {
-            None | Some(libc::ENOENT) => {}
-            Some(libc::ENOSPC) if chunk < capacity.max(256) => {
-                chunk *= 2; // one bucket holds more than a chunk
-                continue;
-            }
-            _ if first => return Ok(None),
-            _ => return Err(e.unwrap()),
-        }
+        let end = match r {
+            0 => false,
+            _ => match std::io::Error::last_os_error() {
+                e if e.raw_os_error() == Some(libc::ENOENT) => true, // past the last bucket
+                e => return Err(e),
+            },
+        };
         let n = (attr.count as usize).min(chunk);
         // SAFETY: the kernel wrote the first `n` keys; any bytes are a Pod.
-        out.extend(keys[..n].iter().map(|k| unsafe { k.assume_init() }));
-        if e.is_some() || out.len() >= capacity {
-            out.truncate(capacity);
-            return Ok(Some(out)); // ENOENT: past the last bucket
+        let got = keys[..n]
+            .iter()
+            .map(|k| unsafe { k.assume_init() })
+            .collect();
+        Ok((got, token_out, end))
+    };
+    // Hash buckets: max_entries rounded up to a power of two, so at most
+    // twice the capacity; each successful batch moves past at least one.
+    let buckets = 2 * capacity as usize;
+    batch_walk(call, buckets + 1, buckets.max(256))
+}
+
+/// A batched walk run to its end (ENOENT): `call(token, chunk)` returns up
+/// to `chunk` keys from the buckets after `token` (None: the first), the
+/// token of the last bucket read, and whether that was the end. The cursor
+/// is a bucket index, so keys deleted or added elsewhere never move it back
+/// and every bucket is read once per pass, the last one included, however
+/// many keys churn adds to the buckets before it. Work is bounded per batch
+/// (`chunk` keys, doubled when one bucket holds more, up to `max_chunk`) and
+/// per pass (`max_calls` batches, at least one bucket each), never by a
+/// running total of keys, which churn could inflate before the walk reaches
+/// the last bucket.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn batch_walk<K>(
+    mut call: impl FnMut(Option<u32>, usize) -> std::io::Result<(Vec<K>, u32, bool)>,
+    max_calls: usize,
+    max_chunk: usize,
+) -> std::io::Result<Option<Vec<K>>> {
+    const ENOTSUPP: i32 = 524; // kernel-internal, returned by some map types
+    let (mut chunk, mut token, mut out) = (256usize, None, Vec::new());
+    for _ in 0..max_calls {
+        match call(token, chunk) {
+            Ok((keys, next, end)) => {
+                out.extend(keys);
+                if end {
+                    return Ok(Some(out));
+                }
+                token = Some(next);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOSPC) && chunk < max_chunk => {
+                chunk *= 2; // one bucket holds more than a chunk: same token again
+            }
+            Err(e)
+                if token.is_none()
+                    && matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINVAL | libc::EOPNOTSUPP | ENOTSUPP)
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         }
-        token_in = token_out;
-        first = false;
     }
-    Ok(Some(out))
+    Ok(Some(out)) // the bucket bound was reached: what was read
 }
 
 /// The keys of a hash map being changed under the walk, in at most `budget`
@@ -701,5 +741,83 @@ pub(crate) mod tests {
         assert_eq!(got, (0..100).collect::<Vec<_>>());
         // Two steps a key (get-next-key, then the check of the key stood on).
         assert_eq!(walk_keys(|c| m.next(c), |_| true, 10).len(), 5, "budget");
+    }
+
+    /// Codex MED: a dead key in the last bucket is reached however churn
+    /// grows the buckets before it. Each batch reads one bucket; after each,
+    /// a key read earlier is deleted and two new keys land in the next
+    /// unread bucket. A walk that stopped at a running total of `capacity`
+    /// keys never got to the last bucket.
+    #[test]
+    fn test_batch_walk_reaches_last_bucket_under_churn() {
+        const DEAD: u32 = 999;
+        let capacity = 10;
+        let buckets = std::cell::RefCell::new({
+            let mut b: Vec<Vec<u32>> = (0..10).map(|i| vec![i]).collect();
+            b[9].push(DEAD);
+            b
+        });
+        let fresh = std::cell::Cell::new(100);
+        let call = |token: Option<u32>, _chunk: usize| -> std::io::Result<(Vec<u32>, u32, bool)> {
+            let i = token.map_or(0, |t| t as usize + 1);
+            let mut b = buckets.borrow_mut();
+            let keys = b[i].clone();
+            if i > 0 {
+                b[i - 1].pop(); // an earlier key deleted...
+            }
+            if let Some(next) = b.get_mut(i + 1) {
+                for _ in 0..2 {
+                    next.push(fresh.get()); // ...and reads start again further on
+                    fresh.set(fresh.get() + 1);
+                }
+            }
+            Ok((keys, i as u32, i + 1 == 10))
+        };
+        let keys = batch_walk(call, 2 * capacity + 1, 2 * capacity)
+            .unwrap()
+            .unwrap();
+        assert!(keys.contains(&DEAD), "the last bucket was read: {keys:?}");
+        assert!(
+            keys.len() > capacity,
+            "churn grew the walk past the capacity"
+        );
+    }
+
+    /// Only "no batch operations" errors on the first batch mean fall back;
+    /// any other error, or any error later, fails the walk.
+    #[test]
+    fn test_batch_walk_errors() {
+        let err = |n| std::io::Error::from_raw_os_error(n);
+        let first = |n: i32| batch_walk::<u32>(|_, _| Err(err(n)), 4, 256).map(|o| o.is_none());
+        assert!(first(libc::EINVAL).unwrap());
+        assert!(first(libc::EOPNOTSUPP).unwrap());
+        assert!(first(524).unwrap());
+        assert!(first(libc::EPERM).is_err());
+        assert!(first(libc::EFAULT).is_err());
+        let later = batch_walk::<u32>(
+            |t, _| match t {
+                None => Ok((vec![1], 0, false)),
+                Some(_) => Err(err(libc::EINVAL)),
+            },
+            4,
+            256,
+        );
+        assert!(later.is_err(), "EINVAL after the first batch is an error");
+        // ENOSPC: the same bucket again with a bigger chunk.
+        let mut chunks = Vec::new();
+        let got = batch_walk::<u32>(
+            |_, c| {
+                chunks.push(c);
+                if c < 1024 {
+                    Err(err(libc::ENOSPC))
+                } else {
+                    Ok((vec![7], 0, true))
+                }
+            },
+            8,
+            4096,
+        );
+        assert_eq!(got.unwrap(), Some(vec![7]));
+        assert_eq!(chunks, vec![256, 512, 1024]);
     }
 }

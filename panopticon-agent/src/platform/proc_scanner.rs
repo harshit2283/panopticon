@@ -78,9 +78,13 @@ pub fn open_examined(target: &TlsTarget) -> std::io::Result<std::fs::File> {
 /// regular file; only then is that same inode opened for reading, through
 /// `/proc/self/fd/<n>`, which cannot reach another file whatever the
 /// workload renames meanwhile. A path under `/proc/<pid>/root` is resolved
-/// inside that root (`openat2` `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`,
-/// Linux 5.6+), so the workload's absolute symlinks stay in its own
-/// filesystem; on older kernels (RHEL 8) it is resolved as a plain path.
+/// inside that root (`openat2` `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`),
+/// so the workload's absolute symlinks stay in its own filesystem. A kernel
+/// without `openat2` gets no workload file opened at all: a plain lookup
+/// would follow those symlinks into the host's filesystem. (Every lab
+/// kernel has it, RHEL 8.10's 4.18 included.) Any other path is opened as
+/// it is: only the agent's own `/proc/self/fd/<n>` of a file already
+/// pinned this way.
 #[cfg(target_os = "linux")]
 pub fn open_workload_file(path: &str) -> std::io::Result<std::fs::File> {
     open_workload_file_hooked(path, || ())
@@ -105,7 +109,7 @@ fn open_workload_file_hooked(path: &str, between: impl FnOnce()) -> std::io::Res
 }
 
 /// An `O_PATH` descriptor for `path`, resolved inside `/proc/<pid>/root`
-/// when the path is under one and the kernel has `openat2`.
+/// when the path is under one (refused on a kernel without `openat2`).
 #[cfg(target_os = "linux")]
 fn open_path_in_root(path: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::ffi::CString;
@@ -157,10 +161,12 @@ fn open_path_in_root(path: &str) -> std::io::Result<std::os::fd::OwnedFd> {
             return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
         }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::ENOSYS) {
-            return Err(e);
+        if e.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(std::io::Error::other(
+                "no openat2: a workload's path cannot be confined to its root",
+            ));
         }
-        // No openat2 (before 5.6): resolved as a plain path below.
+        return Err(e);
     }
     open(libc::AT_FDCWD, &cstr(path)?, O_PATH)
 }
@@ -564,7 +570,13 @@ fn examine_cached(path: &str, namespace_path: &str) -> Option<(TlsType, FileKey)
     use std::sync::{Mutex, OnceLock};
 
     static VERDICTS: OnceLock<Mutex<HashMap<FileKey, Option<TlsType>>>> = OnceLock::new();
-    let file = open_workload_file(namespace_path).ok()?;
+    let file = match open_workload_file(namespace_path) {
+        Ok(file) => file,
+        Err(e) => {
+            debug!(path, target = %namespace_path, error = %e, "TLS candidate not examined");
+            return None;
+        }
+    };
     let key = file_key(&file).ok()?;
     let cache = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(verdict) = cache.lock().ok()?.get(&key) {
@@ -674,18 +686,14 @@ fn maps_exec_file(line: &str) -> Option<(String, u64)> {
     Some((path, u64::from_str_radix(base, 16).unwrap_or(0)))
 }
 
-/// Resolve a process-local mapped path through that process's mount namespace.
-///
-/// This allows the agent container to attach uprobes to binaries and shared
-/// libraries that live in sibling containers with different root filesystems.
+/// A process-local mapped path through that process's root (its mount
+/// namespace), so the agent reaches binaries and shared libraries of sibling
+/// containers. Always this path, never the bare one: the bare path names
+/// whatever the agent's own filesystem has there. A root the agent cannot
+/// use fails the open later ([`open_workload_file`]) and the file is skipped.
 #[cfg(target_os = "linux")]
 fn namespace_resolved_path(pid: u32, path: &str) -> String {
-    let namespaced = format!("/proc/{pid}/root{path}");
-    if std::fs::metadata(&namespaced).is_ok() {
-        namespaced
-    } else {
-        path.to_string()
-    }
+    format!("/proc/{pid}/root{path}")
 }
 
 /// Check if a path looks like an OpenSSL shared library.
