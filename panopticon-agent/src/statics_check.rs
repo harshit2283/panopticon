@@ -78,6 +78,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "test-only count of rule-set loads on this thread (a number, never a value)",
     ),
     (
+        "protocol/http2.rs",
+        "SCANNED",
+        "test-only count of content-type bytes classified (a number, never a value)",
+    ),
+    (
         "graph/aggregator.rs",
         "UUID_RE_SHARED",
         "a compiled regex from a literal",

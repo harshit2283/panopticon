@@ -55,6 +55,10 @@ const MAX_HEADER_BLOCK: usize = 64 * 1024;
 /// Largest dynamic-table size update accepted. hpack applies any size the
 /// peer sends; RFC 7541 §6.3 makes one above the SETTINGS limit an error.
 const MAX_HPACK_TABLE: usize = 64 * 1024;
+/// Longest content-type value classified; a longer one is unknown (and
+/// its body treated as protobuf). Bounds the work an indexed value
+/// repeated many times in one block can cost.
+const MAX_CONTENT_TYPE: usize = 256;
 
 #[derive(Debug, Default)]
 struct StreamState {
@@ -83,8 +87,8 @@ struct StreamState {
     request_gap_pending: bool,
     response_gap_pending: bool,
     /// The request / response may be gRPC or protobuf: such a content-type
-    /// was decoded, whether or not the header budget kept it, or that
-    /// side's headers could not be decoded (the content-type is unknown).
+    /// was decoded, whether or not the header budget kept it, or it was
+    /// oversized or repeated (see `emit` for blocks not decoded at all).
     request_protobuf: bool,
     response_protobuf: bool,
     /// Insertion order, for evicting the oldest stream at capacity.
@@ -410,9 +414,11 @@ impl Http2Parser {
         // block is still decoded to keep the table in sync.
         let mut decoded = Vec::new();
         let mut used = 0usize;
-        // The body's kind is read from every content-type decoded, kept
-        // within the budget or not: (gRPC, gRPC or protobuf).
-        let (mut grpc, mut protobuf) = (false, false);
+        // The body's kind is read from the block's content-type, kept
+        // within the budget or not: (gRPC, gRPC or protobuf). Only the
+        // first one is classified, and only up to MAX_CONTENT_TYPE bytes; an
+        // oversized or repeated content-type makes the kind unknown.
+        let (mut grpc, mut protobuf, mut content_types) = (false, false, 0usize);
         // hpack can panic on malformed input; a failed block still has to be
         // skipped so later frames parse (its table updates are lost).
         if !side.headers_lost {
@@ -420,8 +426,13 @@ impl Http2Parser {
                 side.decoder.decode_with_cb(&block, |n, v| {
                     used = used.saturating_add(n.len() + v.len() + 32);
                     if n.eq_ignore_ascii_case(b"content-type") {
-                        grpc |= v.starts_with(b"application/grpc");
-                        protobuf |= contains(&v, b"grpc") || contains(&v, b"protobuf");
+                        content_types += 1;
+                        if content_types > 1 || v.len() > MAX_CONTENT_TYPE {
+                            protobuf = true;
+                        } else {
+                            grpc |= v.starts_with(b"application/grpc");
+                            protobuf |= contains(&v, b"grpc") || contains(&v, b"protobuf");
+                        }
                     }
                     if used <= budget {
                         decoded.push((n.into_owned(), v.into_owned()));
@@ -436,10 +447,6 @@ impl Http2Parser {
         if is_push {
             return FrameEvent::None; // decoded only to keep the server table in sync
         }
-        // A block this side could not decode (joined mid-connection, a
-        // lost or failed block): its content-type is unknown, so the body
-        // is treated as protobuf, withheld while credentials are masked.
-        protobuf |= side.headers_lost;
 
         let stream = self.stream(stream_id);
         if from_client {
@@ -509,7 +516,12 @@ impl Http2Parser {
         // password field cannot be told from any other string, so its text
         // is not exported while credentials are protected.
         // Each body by its own side's content-type, decoded whether or not
-        // the header budget kept it.
+        // the header budget kept it. A side that lost a header block
+        // (joined mid-connection, oversized, failed or skipped, including
+        // a final block after an informational one) has an unknown
+        // content-type: its bodies are treated as protobuf.
+        let request_protobuf = stream.request_protobuf || self.client.headers_lost;
+        let response_protobuf = stream.response_protobuf || self.server.headers_lost;
         let text = |body: &[u8], protobuf: bool| {
             if (self.is_grpc || protobuf) && super::mask_credentials_enabled() {
                 None
@@ -520,9 +532,9 @@ impl Http2Parser {
             }
         };
         msg.request_text =
-            text(&stream.request_body, stream.request_protobuf).filter(|_| !stream.request_gap);
+            text(&stream.request_body, request_protobuf).filter(|_| !stream.request_gap);
         msg.payload_text =
-            text(&stream.response_body, stream.response_protobuf).filter(|_| !stream.response_gap);
+            text(&stream.response_body, response_protobuf).filter(|_| !stream.response_gap);
         Some(msg)
     }
 
@@ -637,6 +649,8 @@ fn hpack_oversized_table_update(block: &[u8]) -> bool {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    #[cfg(test)]
+    tests::SCANNED.with(|n| n.set(n.get() + haystack.len()));
     haystack
         .windows(needle.len())
         .any(|w| w.eq_ignore_ascii_case(needle))
@@ -746,6 +760,103 @@ impl ProtocolParser for Http2Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Content-type bytes scanned by `contains` on this thread.
+        pub static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Codex R5 H1: a 60,000-byte content-type indexed again and again
+    /// costs one bounded check per block, and its body is withheld.
+    #[test]
+    fn test_content_type_classification_is_bounded() {
+        let mut seed = vec![0x3f, 0xe1, 0xff, 0x03]; // table size 65,536
+        seed.push(0x40 | 31); // literal, incremental indexing, name: content-type (31)
+        seed.extend([0x7f, 0xe1, 0xd3, 0x03]); // value length 127 + 59,873 = 60,000
+        seed.extend(std::iter::repeat_n(b'a', 60_000));
+        let mut repeat = vec![0x83, 0x84]; // :method POST, :path /
+        repeat.extend(std::iter::repeat_n(0xbe, 1000)); // the content-type, 1000 times
+        let mut p = Http2Parser::new(false);
+        let mut req = preface();
+        for (sid, block) in [(1u32, &seed), (3, &repeat)] {
+            let mut first = make_frame(FRAME_HEADERS, 0, sid, &block[..block.len().min(16_000)]);
+            let mut at = 16_000;
+            while at < block.len() {
+                let end = (at + 16_000).min(block.len());
+                let flags = if end == block.len() {
+                    FLAG_END_HEADERS
+                } else {
+                    0
+                };
+                first.extend(make_frame(FRAME_CONTINUATION, flags, sid, &block[at..end]));
+                at = end;
+            }
+            if block.len() <= 16_000 {
+                first[4] = FLAG_END_HEADERS;
+            }
+            req.extend(first);
+        }
+        req.extend(make_frame(
+            FRAME_DATA,
+            FLAG_END_STREAM,
+            3,
+            b"\x0a\x0cs7Kf2v9LmQ8z",
+        ));
+        let before = SCANNED.with(|n| n.get());
+        p.feed(&req, Direction::Egress, 1);
+        let scanned = SCANNED.with(|n| n.get()) - before;
+        assert!(scanned <= 2 * MAX_CONTENT_TYPE, "{scanned} bytes scanned");
+        let status = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &[0x88],
+        );
+        let out = messages(p.feed(&status, Direction::Ingress, 2));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].request_text, None, "{:?}", out[0].request_text);
+    }
+
+    /// Codex R5 H5: a 103 decoded, then a final response block over the
+    /// size limit (dropped): the body's content-type is unknown, so the
+    /// protobuf body is not exported.
+    #[test]
+    fn test_body_after_a_lost_final_header_block_is_withheld() {
+        let (mut ce, mut se) = (hpack::Encoder::new(), hpack::Encoder::new());
+        let mut p = Http2Parser::new(false);
+        let mut req = preface();
+        req.extend(make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1,
+            &encode(&mut ce, &[(":method", "GET"), (":path", "/x")]),
+        ));
+        p.feed(&req, Direction::Egress, 0);
+        let mut resp = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            1,
+            &encode(&mut se, &[(":status", "103")]),
+        );
+        let big = vec![0x88u8; 70_000]; // never decoded: over MAX_HEADER_BLOCK
+        resp.extend(make_frame(FRAME_HEADERS, 0, 1, &big[..40_000]));
+        resp.extend(make_frame(
+            FRAME_CONTINUATION,
+            FLAG_END_HEADERS,
+            1,
+            &big[40_000..],
+        ));
+        resp.extend(make_frame(
+            FRAME_DATA,
+            FLAG_END_STREAM,
+            1,
+            b"\x0a\x0cs7Kf2v9LmQ8z",
+        ));
+        let out = messages(p.feed(&resp, Direction::Ingress, 1));
+        assert_eq!(out.len(), 1);
+        assert!(super::super::mask_credentials_enabled());
+        assert_eq!(out[0].payload_text, None, "{:?}", out[0].payload_text);
+    }
 
     fn make_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len();
