@@ -4,7 +4,7 @@
 #   openssl  http_oracle.py over TLS with the system python3, whose ssl
 #            module uses the shared libssl (SSL_read_ex / SSL_write_ex)
 #   go       go_tls_oracle.go: Go net/http + crypto/tls, client and server
-#            (Conn.Write entry probe, Conn.Read entry + RET probes), HTTP/1.1
+#            (Conn.Write entry probe; reads at halfConn.decrypt's RETs), HTTP/1.1
 #   go-h2    the same over HTTP/2 (ALPN h2, Go's default)
 # Each runs on loopback. The uprobes see both ends, so every exchange is
 # exported twice: once from the client process and once from the server.

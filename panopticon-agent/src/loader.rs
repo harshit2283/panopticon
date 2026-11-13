@@ -11,14 +11,14 @@ use aya::{
 use tracing::{debug, info, warn};
 
 use crate::config::{AgentConfig, CaptureBackend, SamplingMode};
-use crate::platform::proc_scanner::{GoVersion, TlsTarget, TlsType};
+use crate::platform::proc_scanner::{TlsTarget, TlsType};
 use crate::scope_loader::{self, ScopeSetup};
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES,
     CONFIG_MAX_PAYLOAD, CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON,
     CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN,
     CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF, DATA_RING_SHARDS,
-    MAX_PAYLOAD_SIZE, scope,
+    MAX_PAYLOAD_SIZE, MAX_PID_FILTER, scope,
 };
 
 /// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
@@ -95,8 +95,8 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 /// pid_filter maps): their contents are only valid for the run that wrote
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
-/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL): owner-only
-/// maps whose entries belong to this run's probes.
+/// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_CALLS,
+/// PROC_EPOCH): owner-only maps whose entries belong to this run's probes.
 const PINNED_MAP_NAMES: [&str; 9] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
@@ -133,6 +133,9 @@ pub struct LoadedPrograms {
     /// cgroup_skb: the cgroup v2 root the programs attach to, against
     /// which the scope publisher resolves selectors.
     pub cgroup_root: Option<std::path::PathBuf>,
+    /// Whether Go TLS reads may be attached: both process tracepoints are,
+    /// which end a process instance's `PROC_EPOCH` (tls_probes.rs).
+    pub go_reads: bool,
 }
 
 /// Shared eBPF state for concurrent access between event loop and scanner.
@@ -142,6 +145,8 @@ pub struct EbpfState {
     /// `(device_id, inode)` pairs of already-attached libraries —
     /// handles symlinks and mount namespace ambiguity.
     pub attached_libs: HashSet<(u64, u64)>,
+    /// [`LoadedPrograms::go_reads`].
+    pub go_reads: bool,
 }
 
 /// Detect kernel capabilities from /proc/version, sysfs and a BPF map probe.
@@ -335,21 +340,26 @@ pub fn load_and_attach(
     }
 
     // ── Tracepoints for process monitoring ────────────────────────────
-    attach_tracepoint(
+    // Before any TLS uprobe: Go read entries are only made once both can
+    // end their process instance.
+    let exec_tp = attach_tracepoint(
         &mut ebpf,
         "sched_process_exec",
         "sched",
         "sched_process_exec",
         &mut links,
     );
-    if !exit_tp_attached {
-        attach_tracepoint(
+    let exit_tp = exit_tp_attached
+        || attach_tracepoint(
             &mut ebpf,
             "sched_process_exit",
             "sched",
             "sched_process_exit",
             &mut links,
         );
+    let go_reads = exec_tp && exit_tp;
+    if !go_reads {
+        warn!("Go TLS reads not captured: the sched_process_exec/exit tracepoints are required");
     }
 
     info!(
@@ -382,6 +392,7 @@ pub fn load_and_attach(
         ebpf,
         _links: links,
         cgroup_root,
+        go_reads,
     })
 }
 
@@ -410,10 +421,19 @@ pub fn sync_config_to_ebpf(
             ebpf.map_mut("PID_FILTER")
                 .context("PID_FILTER map not found")?,
         )?;
-        let stale: Vec<u32> = pids.keys().collect::<Result<_, _>>()?;
-        for pid in stale {
-            pids.remove(&pid)?;
+        // Drained one first key at a time: the exit tracepoint deletes
+        // entries meanwhile, which restarts a key walk, and only deletes,
+        // so the map empties in at most its capacity of steps.
+        for _ in 0..=MAX_PID_FILTER {
+            match pids.keys().next() {
+                Some(pid) => drop(pids.remove(&pid?)), // gone already: fine
+                None => break,
+            }
         }
+        anyhow::ensure!(
+            pids.keys().next().is_none(),
+            "cannot empty the PID_FILTER map"
+        );
         // The cgroup_skb backend publishes the list itself, only once the
         // exit tracepoint is attached (scope_loader::arm).
         let publish = config.capture_backend != CaptureBackend::CgroupSkb;
@@ -477,6 +497,7 @@ pub fn attach_tls_uprobes(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
+    go_reads: bool,
 ) -> usize {
     use std::os::fd::AsRawFd;
     let file = match crate::platform::proc_scanner::open_examined(target) {
@@ -490,7 +511,7 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
-    let attached = attach_tls_uprobes_to(ebpf, &pinned, links);
+    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads);
     drop(file); // the uprobes hold the inode now
     if attached > 0 {
         info!(
@@ -519,6 +540,7 @@ fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
+    go_reads: bool,
 ) -> usize {
     let mut attached = 0;
     // Restricted modes emit SSL_write* at return, with that call's own
@@ -620,33 +642,17 @@ fn attach_tls_uprobes_to(
                 }
             }
         }
-        TlsType::GoTls {
-            write_offset,
-            read,
-            go_version,
-        } => {
-            match go_version {
-                GoVersion::RegisterAbi => {
-                    // No PID filter: like libssl, the probes cover every
-                    // process running this binary (every replica on the node).
-                    let path = &target.library_path;
-                    if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
-                        attached += 1;
-                    }
-                    // Go TLS reads are not captured (tls_probes.rs module
-                    // comment): their probes are not attached.
-                    if read.is_some() {
-                        debug!(pid = target.pid, "Go TLS reads not captured; writes only");
-                    }
-                }
-                GoVersion::StackAbi => {
-                    // Stack-based ABI not supported in v1 — needs different eBPF probe
-                    warn!(
-                        pid = target.pid,
-                        path = %target.library_path,
-                        "Skipping Go TLS (stack ABI, Go < 1.17)"
-                    );
-                }
+        TlsType::GoTls { write_offset, read } => {
+            // No PID filter: like libssl, the probes cover every process
+            // running this binary (every replica on the node).
+            let path = &target.library_path;
+            if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
+                attached += 1;
+            }
+            if let Some(read) = read
+                && go_reads
+            {
+                attached += attach_go_read(ebpf, path, read, links);
             }
         }
     }
@@ -657,7 +663,38 @@ fn attach_tls_uprobes_to(
 /// Attach TLS uprobes operating on shared `EbpfState` directly.
 /// Caller is responsible for locking the mutex.
 pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) -> usize {
-    attach_tls_uprobes(&mut state.ebpf, target, &mut state.links)
+    let go_reads = state.go_reads;
+    attach_tls_uprobes(&mut state.ebpf, target, &mut state.links, go_reads)
+}
+
+/// Go TLS reads (go_read.rs): every RET probe of `readRecordOrCCS` and of
+/// `decrypt` first, then the `readRecordOrCCS` entry probe only if all of
+/// them attached. Without the entry no slot is ever saved and nothing is
+/// emitted, so a binary gets all of its reads or none: a saved slot always
+/// has its returns watched, and no record returns through an unwatched RET
+/// (tls_probes.rs `go_tls_decrypt_ret`). Returns the probes attached.
+fn attach_go_read(
+    ebpf: &mut Ebpf,
+    path: &str,
+    read: &crate::platform::proc_scanner::GoReadProbes,
+    links: &mut Vec<Box<dyn std::any::Any + Send>>,
+) -> usize {
+    let mut attach_all = |prog: &str, offsets: &[u64]| {
+        offsets
+            .iter()
+            .filter(|&&off| attach_uprobe(ebpf, prog, path, off, None, links))
+            .count()
+    };
+    let rets = attach_all("go_tls_rrc_ret", &read.read_record_rets)
+        + attach_all("go_tls_decrypt_ret", &read.decrypt_rets);
+    if rets < read.read_record_rets.len() + read.decrypt_rets.len() {
+        warn!(
+            path,
+            "Go TLS reads not captured: a RET probe did not attach"
+        );
+        return rets;
+    }
+    rets + attach_all("go_tls_rrc_entry", &[read.read_record_entry])
 }
 
 fn attach_uprobe(
@@ -1074,14 +1111,16 @@ fn attach_tracepoint(
     category: &str,
     name: &str,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) {
+) -> bool {
     match try_attach_tracepoint(ebpf, prog_name, category, name) {
         Ok(link) => {
             info!(prog = prog_name, category, name, "tracepoint attached");
             links.push(Box::new(link));
+            true
         }
         Err(e) => {
-            warn!(prog = prog_name, category, name, error = %e, "Failed to attach tracepoint")
+            warn!(prog = prog_name, category, name, error = %e, "Failed to attach tracepoint");
+            false
         }
     }
 }
@@ -1419,6 +1458,8 @@ CapPrm:\t00000000ffffffff
             "PID_EXITED_LOST",
             "TLS_SCRATCH",
             "TLS_CALL",
+            "GO_READ_CALLS",
+            "PROC_EPOCH",
         ] {
             assert!(!pinned_map_names().any(|n| n == m), "{m} is pinned");
         }

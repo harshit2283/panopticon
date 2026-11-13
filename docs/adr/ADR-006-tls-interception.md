@@ -44,7 +44,7 @@ Go's calling convention changed in 1.17:
 - **Go < 1.17**: Stack-based ABI (arguments on stack)
 - **Go ≥ 1.17**: Register-based ABI (arguments in registers)
 
-Uprobe attachment must detect Go version and use correct argument extraction. Additionally, uretprobes on Go functions cause crashes due to goroutine stack relocation—Go runtime can move stacks during execution, invalidating return probe addresses.
+Uprobe attachment must detect Go version and use correct argument extraction. Additionally, uretprobes on Go functions cause crashes due to goroutine stack relocation—Go runtime can move stacks during execution, invalidating return probe addresses. Return values are therefore read by uprobes on the `RET` instructions (found by decoding the function). Reads do not use the caller's `(*Conn).Read` buffer, whose lifetime a probe cannot establish: received plaintext is copied per TLS record at the return of `(*halfConn).decrypt`, which decrypts in place in the connection's own input buffer, while the entry of `(*Conn).readRecordOrCCS`, keyed by goroutine and process instance, names the connection. The register ABI is not inferred from a version: a Go binary is probed only when its `.go.buildinfo` shows a gc build of Go 1.18+ for the node's architecture (amd64 or arm64) with no `noregabi` experiment.
 
 ## Decision
 
@@ -56,8 +56,8 @@ We will use **eBPF uprobes** on OpenSSL and Go TLS (register ABI only) with expl
 |---------|------|-------|-------|
 | OpenSSL 1.1.x | ✅ | ✅ | SSL_read/SSL_write |
 | OpenSSL 3.x | ✅ | ✅ | SSL_read/SSL_write |
-| Go ≥ 1.17 | ❌ | ✅ | crypto/tls.(*Conn).Write |
-| Go < 1.17 | ❌ | ❌ | Stack ABI incompatible |
+| Go ≥ 1.18, gc, amd64/arm64, register ABI (from `.go.buildinfo`) | ✅ | ✅ | `(*halfConn).decrypt` RETs, `(*Conn).readRecordOrCCS` entry + RETs / `(*Conn).Write` |
+| Other Go builds (stack ABI, `noregabi` experiment, gccgo, unestablished) | ❌ | ❌ | Not probed |
 | BoringSSL | ❌ | ❌ | Not implemented |
 | GnuTLS | ❌ | ❌ | Not implemented |
 | Rust rustls | ❌ | ❌ | Not implemented |
@@ -70,7 +70,7 @@ We will use **eBPF uprobes** on OpenSSL and Go TLS (register ABI only) with expl
 │                                                                      │
 │   ┌──────────────┐     ┌──────────────┐                             │
 │   │   OpenSSL    │     │   Go Runtime │                             │
-│   │   libssl.so  │     │   (≥1.17)    │                             │
+│   │   libssl.so  │     │   (≥1.18)    │                             │
 │   └──────┬───────┘     └──────┬───────┘                             │
 │          │                    │                                      │
 │   SSL_read()            Write() method                               │
@@ -149,7 +149,7 @@ fn uretprobe_ssl_read(ctx: *mut c_void) -> i64 {
 
 SEC("uprobe/go_tls_write")
 fn uprobe_go_tls_write(ctx: *mut c_void) -> i64 {
-    // Go 1.17+ register ABI:
+    // Register ABI (admitted builds only, see below):
     // R0 = *tls.Conn (receiver)
     // R1 = []byte (data slice: ptr, len, cap)
     
@@ -175,33 +175,16 @@ fn uprobe_go_tls_write(ctx: *mut c_void) -> i64 {
 }
 ```
 
-### Go Version Detection
+### Go Build Admission
 
-```rust
-// In panopticon-agent/src/platform/proc_scanner.rs
-
-pub fn detect_go_version(binary_path: &Path) -> Option<GoVersion> {
-    let data = std::fs::read(binary_path).ok()?;
-    
-    // Look for build info in ELF .go.buildinfo section
-    // or parse from runtime.buildVersion symbol
-    
-    let version_str = extract_go_buildinfo(&data)?;
-    parse_go_version(&version_str)
-}
-
-pub struct GoVersion {
-    pub major: u8,
-    pub minor: u8,
-    pub patch: u8,
-}
-
-impl GoVersion {
-    pub fn supports_register_abi(&self) -> bool {
-        self.major > 1 || (self.major == 1 && self.minor >= 17)
-    }
-}
-```
+`proc_scanner.rs` `go_build_admitted` reads `.go.buildinfo` (the Go 1.18+
+format: 64-bit, little-endian, inline strings) and admits a binary only when
+its version is `go1.N` with N >= 18, its build settings record
+`-compiler=gc` and a `GOARCH` (amd64 or arm64) equal to the ELF's machine and
+the agent's architecture, and no `noregabi*` experiment appears in the
+`GOEXPERIMENT` setting or the version. A version alone does not establish the
+ABI (Go 1.18 arm64 can be built with `GOEXPERIMENT=noregabiargs`); anything
+missing or different rejects the binary for writes and reads alike.
 
 ### Attachment Logic
 
@@ -215,17 +198,9 @@ pub fn attach_tls_probes(&mut self, program: &mut TlsProbes) -> Result<()> {
             self.attach_openssl_probes(program, pid, libssl_path)?;
         }
         
-        // Go TLS attachment
-        if let Some(go_version) = &proc_info.go_version {
-            if go_version.supports_register_abi() {
-                self.attach_go_tls_probes(program, pid, &proc_info.binary_path)?;
-            } else {
-                tracing::warn!(
-                    pid = pid,
-                    version = format!("{}.{}.{}", go_version.major, go_version.minor, go_version.patch),
-                    "Go version too old for TLS interception (need ≥1.17)"
-                );
-            }
+        // Go TLS attachment: admitted builds only (Go Build Admission)
+        if proc_info.go_build_admitted {
+            self.attach_go_tls_probes(program, pid, &proc_info.binary_path)?;
         }
     }
     Ok(())
@@ -244,15 +219,15 @@ pub fn attach_tls_probes(&mut self, program: &mut TlsProbes) -> Result<()> {
 
 ### Negative
 
-1. **Limited library coverage**: Only OpenSSL and Go ≥1.17 supported at launch
-2. **No Go TLS Read**: Goroutine stack relocation makes uretprobes unsafe
-3. **Version detection required**: Go ABI changes require binary analysis
+1. **Limited library coverage**: Only OpenSSL and admitted Go builds (gc, Go ≥1.18, amd64/arm64, register ABI)
+2. **No uretprobe for Go**: goroutine stack relocation makes uretprobes unsafe; reads need RET-instruction probes on `readRecordOrCCS` and `decrypt` and per-goroutine state
+3. **Build admission required**: the Go ABI is established from the binary's build information, not guessed
 4. **Process attachment latency**: New processes must be detected and attached
 5. **Container complexity**: Must resolve library paths inside container mount namespaces
 
 ### Neutral
 
-1. **Write-only for Go**: Captures outbound traffic but not inbound for Go services
+1. **Go reads are per record**: received plaintext is emitted per TLS record as decrypted, not per `Read` call
 2. **Runtime attachment**: uprobes attach to running processes without restart
 
 ## Alternatives Considered
@@ -363,8 +338,8 @@ fn resolve_container_path(pid: u32, lib_path: &str) -> Result<PathBuf> {
 ### Testing Requirements
 
 1. **OpenSSL 1.1.x** and **3.x** compatibility tests
-2. **Go 1.17, 1.18, 1.19, 1.20, 1.21, 1.22** compatibility tests
-3. **Go < 1.17** rejection tests (verify no attachment)
+2. **Go 1.18 and later** compatibility tests
+3. **Unadmitted Go builds** (before 1.18, `noregabi` experiments, other compilers or architectures) rejection tests (verify no attachment)
 4. **Container namespace** resolution tests
 5. **High connection churn** stress test (attach/detach cycles)
 

@@ -16,8 +16,7 @@ hardening work.
 - Captures cleartext traffic with TC eBPF hooks.
 - Captures TLS plaintext through uprobes: OpenSSL (shared `libssl`, including
   the `SSL_read_ex`/`SSL_write_ex` API used by OpenSSL 3 applications) and Go
-  `crypto/tls` (writes only, Go 1.17+ binaries with symbols; reads are not
-  captured).
+  `crypto/tls` (reads and writes; gc builds of Go 1.18+, amd64 or arm64, with symbols).
 - Parses HTTP/1.1, HTTP/2, gRPC, MySQL, PostgreSQL, Redis, Kafka, DNS, and AMQP.
 - Runs regex-first PII detection with optional ONNX-backed ML inference.
 - Builds a service graph named by Kubernetes workload (`namespace/workload`)
@@ -70,7 +69,7 @@ current release report.
 | AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. |
 | DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
 | OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated with the `sock_send/recv_length` tracepoints, 6.3+, and with the fentry fallback on RHEL 8 and 9; kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
-| Go TLS plaintext capture | Partial | `crypto/tls` writes only (Go 1.17+, amd64 validated; binaries stripped of symbols are not found). Reads are not captured: a read's buffer is only filled at return, and the arguments saved at entry cannot be proven to still belong to that call (goroutine stack moves, calls that unwind without returning). |
+| Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, established from the binary's build information; amd64 validated; binaries stripped of symbols are not found). Received plaintext is taken per TLS record where `(*halfConn).decrypt` returns it, in the connection's own input buffer, never from the caller's `Read` buffer ([current state](docs/CURRENT-STATE.md)). |
 | Regex-first PII detection | Supported | 16 validated patterns, including Aadhaar, PAN, UPI, GSTIN, Indian passport and phone, and IBAN. Precision and recall are measured per type on a labelled corpus, and a `cargo test` gate fails on regressions (`docs/BENCHMARKS.md`). Names and addresses need the ML path. |
 | Privacy modes (`full`, `redacted`, `metrics_only`) | Supported | Enforced at startup and only tightened on reload. Ground-truth leak test over HTTP, OpenSSL TLS, Redis AUTH and Kafka: planted values found only where the mode allows, at 100% recall ([current state](docs/CURRENT-STATE.md)). |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |

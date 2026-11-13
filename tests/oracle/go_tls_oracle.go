@@ -9,7 +9,7 @@
 // of up to 6 requests: GETs with 0 B to 70 KB bodies and POSTs whose JSON body
 // carries an email and an SSN. The server uses an in-memory self-signed
 // certificate; the client does not verify it. Build with symbols (the
-// default) so the agent can find crypto/tls.(*Conn).Read/Write.
+// default) so the agent can find the crypto/tls functions it probes.
 package main
 
 import (

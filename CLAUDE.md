@@ -50,7 +50,7 @@ Single-binary agent deployed as a Kubernetes DaemonSet.
 
 **eBPF programs** (`panopticon-ebpf/src/`):
 - `tc_capture.rs` — TC ingress/egress classifiers, packet parsing, payload capture
-- `tls_probes.rs` — OpenSSL SSL_write/SSL_read uprobes, Go TLS write uprobe
+- `tls_probes.rs` — OpenSSL SSL_write/SSL_read uprobes, Go TLS write uprobe, read uprobes (readRecordOrCCS entry + RETs, halfConn.decrypt RETs)
 - `sock_monitor.rs` — TCP connect/accept/close kprobes, UDP send/recv
 - `process_monitor.rs` — sched_process_exec/exit tracepoints
 - `maps.rs` — All BPF maps (RingBuf, PerfEventArray, HashMap, Array, PerCpuArray)
