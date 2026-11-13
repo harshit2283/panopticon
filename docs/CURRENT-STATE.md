@@ -119,7 +119,10 @@ production-hardened compliance platform.
   - OpenSSL via a shared `libssl` (including the `_ex` API) is validated
     against ground truth: 100% recall from both client and server processes
     (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
-    found.
+    found. A workload's mapped files are opened non-blocking and only if
+    they are regular files, and a mapping whose file was deleted is
+    skipped, so a FIFO or device put at a mapped path cannot hang or reach
+    the scanner.
   - TLS exchanges carry their socket addresses and join the service graph:
     validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
     via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
@@ -153,7 +156,11 @@ production-hardened compliance platform.
     (new ones are not captured until some exit). Reads in flight when their process's main thread exits, or
     when it execs, are not captured. Go TLS events carry no socket address
     under a restricted capture scope. Binaries built with `-s` (no symbol
-    table) are not found; arm64 is untested.
+    table) are not found; arm64 is untested. Reads need `readRecordOrCCS`
+    and `decrypt` as functions of their own: a build where the compiler
+    inlined them (possible with profile-guided optimisation) or that lacks
+    their symbols has its reads lost, never wrongly attributed; its writes
+    are unaffected.
 - TCP stream integrity (TC capture):
   - Each direction's next expected sequence number is tracked
     (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,
