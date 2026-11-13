@@ -473,9 +473,9 @@ data. Known limits:
   `&gt;`, PostgreSQL `U&"…"` identifiers;
 - protobuf without its schema: field numbers, not names, so gRPC and
   protobuf body text is not exported at all while credentials are
-  protected, nor is an HTTP/2 body whose content type is unknown because
-  that direction's headers could not be decoded (a connection the agent
-  joined mid-stream: until a new connection is observed from its start);
+  protected, nor is an HTTP/2 body whose content type is unknown (that
+  direction lost a header block, as on a connection the agent joined
+  mid-stream, or the content type is repeated or over 256 bytes);
 - packets forged or injected into a connection by someone who can do so,
   and state from before capture started that the parser cannot see.
 
@@ -538,11 +538,15 @@ What is exported then:
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
   body).
-- **HTTP/2 bodies** of a direction whose headers could not be decoded
-  (a connection the agent joined mid-stream, a failed or skipped header
-  block) are not exported while credential masking is on: their content
-  type is unknown, so they may be protobuf. A new connection observed from
-  its start exports bodies again.
+- **HTTP/2 bodies** are not exported while credential masking is on when
+  their content type is unknown, since they may be protobuf: on a
+  direction of a connection that lost a header block (joined mid-stream,
+  a block that failed to decode, was skipped or was over the size limit,
+  a final response block after an informational `1xx` one included), for
+  the rest of that connection; and for a stream whose header block
+  carries more than one content type or one over 256 bytes (only the
+  first 256 bytes of one content type are ever examined). A new
+  connection observed from its start exports bodies again.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection.
@@ -594,17 +598,22 @@ that may answer a command sent before capture started, such as an
 `ACL GENPASS`, is therefore never exported under the first command
 captured. SQL bound values are exported only for a statement whose
 prepare the server confirmed on this connection, after the last lost
-client byte: in PostgreSQL a named statement is known from its
-`ParseComplete`, a `Parse` the server rejects does not replace it, and a
-re-`Parse` or `Close` forgets it until confirmed. Several `Parse`
-messages may be sent before one `Sync` (pipelining); each `ParseComplete`
-confirms the oldest `Parse` still unanswered, in the order the client
-sent them. After an error the server skips to the `Sync`, so the `Parse`
-messages before it are never confirmed; a `Close` of a name also cancels
-an unanswered `Parse` of it. When answers may have been lost (a gap in
-the server's bytes, a connection joined mid-stream, an answer that
-matches nothing), no `Parse` is confirmed until a `ReadyForQuery` leaves
-nothing unanswered.
+client byte. In PostgreSQL a `Bind`'s values are exported only when the
+statement it names (the unnamed one included) was confirmed by its
+`ParseComplete` with the SQL the event shows, and that SQL is not
+withheld; a `Bind` of another statement than the cycle's `Parse`, or of
+one the server rejected, exports no values. A `Parse` the server rejects
+does not replace a statement, and a re-`Parse` or `Close` forgets it
+until confirmed. Several `Parse` messages may be sent before one `Sync`
+(pipelining); each `ParseComplete` confirms the oldest `Parse` still
+unanswered. After an error the server skips to the `Sync`, so the
+`Parse` messages before it are never confirmed; a `Close` of a name also
+cancels an unanswered `Parse` of it. If the agent ever cannot match the
+server's answers to the client's messages on a connection (it joined the
+connection mid-stream, server bytes were lost, an answer matches
+nothing), no `Parse` is confirmed for the rest of that connection, so its
+bound values are withheld until a new connection is observed from its
+start.
 
 #### Your own credential formats: `[credentials]`
 
@@ -627,15 +636,16 @@ header names (also when the value was wiped as a credential header) and
 values, request and response bodies, SQL text and bound values, Redis
 arguments and replies, Kafka and AMQP fields; a DNS answer whose name a
 pattern matches is dropped. A match in the field as captured is replaced
-by `<REDACTED>`; a match in its decoded view (escapes, entities and
-percent-encoding decoded, case kept) that is not also a match in the
-captured text cannot be placed there, so the field becomes
+by `<REDACTED>`. When the field has escapes, entities or percent-encoding,
+the matches are removed and what is left is decoded (case kept): a match
+there cannot be placed in the captured text, so the field becomes
 `<field withheld>`. Your patterns and the built-in rules all look at the
 field as captured, before PII redaction rewrites it, and their matches are
 replaced together in one pass: the order of your patterns does not matter,
-no pattern hides another's match or a credential name from the built-in
-rules, and text already reading `<REDACTED>` or `<field withheld>` is not
-matched again. A field with more than 1024 matches is withheld. Patterns
+and no pattern hides another's match or a credential name from the
+built-in rules. Captured text is matched whatever it reads like, a
+literal `<REDACTED>` included. A field with more than 1024 matches is
+withheld. Patterns
 apply whenever credentials are protected (`mask_credentials` on, the
 default).
 

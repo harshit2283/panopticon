@@ -1350,7 +1350,8 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 - **HTTP/2 joined mid-connection** (agent started after the connection was
   opened): HPACK state is lost, so most headers, including the path, cannot be
   decoded until a new connection is opened, and while credential masking is
-  on that connection's bodies are not exported.
+  on that connection's bodies are not exported (nor are bodies after any
+  lost header block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.
