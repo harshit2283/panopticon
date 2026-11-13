@@ -251,36 +251,34 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
 /// skipped), or None when the field must be withheld: more than
 /// [`MAX_SPANS`] matches, or, when decoding changes the field, any match
 /// in the decoded view (escapes, entities and percent-encoding decoded,
-/// not case-folded) that is not a raw match of the same pattern at the
-/// same position with the same text: only then is it certainly masked.
+/// not case-folded) that is not one of the raw matches collected for
+/// masking, of the same pattern, at the same position, with the same text:
+/// only then is it certainly masked.
 fn user_spans(
     (set, each): &(regex::RegexSet, Vec<regex::Regex>),
     text: &str,
 ) -> Option<Vec<(usize, usize)>> {
-    let mut spans = Vec::new();
+    // (pattern, start, end) of every raw match collected for masking.
+    let mut found = Vec::new();
     for i in set.matches(text).iter() {
         for m in each[i].find_iter(text).filter(|m| !m.is_empty()) {
-            if spans.len() == MAX_SPANS {
+            if found.len() == MAX_SPANS {
                 return None;
             }
-            spans.push((m.start(), m.end()));
+            found.push((i, m.start(), m.end()));
         }
     }
     if let Some(decoded) = decode(text) {
         for i in set.matches(&decoded).iter() {
             for m in each[i].find_iter(&decoded).filter(|m| !m.is_empty()) {
-                let raw = text.get(m.start()..m.end());
-                if raw != Some(m.as_str())
-                    || !each[i]
-                        .find_at(text, m.start())
-                        .is_some_and(|r| r.range() == m.range())
-                {
+                let collected = found.contains(&(i, m.start(), m.end()));
+                if !collected || text.get(m.range()) != Some(m.as_str()) {
                     return None;
                 }
             }
         }
     }
-    Some(spans)
+    Some(found.into_iter().map(|(_, s, e)| (s, e)).collect())
 }
 
 /// Every built-in rule: the values to mask where certain, or None (the
@@ -1009,6 +1007,11 @@ mod tests {
             protect_text_with(&across, "xabc%31y").as_deref(),
             Some(FIELD_WITHHELD)
         );
+        // R6 N1: a decoded match that is a raw match of the pattern, but
+        // not one find_iter collected (it overlaps an earlier one).
+        let overlap = rules(&[r"foo\+acme_|acme_[a-z0-9]{8}"], Builtin::Full);
+        let out = protect_text_with(&overlap, "foo+acme_abcd1234").unwrap();
+        assert!(!out.contains("abcd1234"), "{out}");
         // An encoded neighbour that is not a match still masks.
         let acme = rules(&["acme_[a-z0-9]{8}"], Builtin::Full);
         assert_eq!(

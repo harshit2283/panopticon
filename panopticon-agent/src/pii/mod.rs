@@ -127,11 +127,12 @@ fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
     for (name, value) in msg.headers.iter_mut() {
         // A wiped credential header keeps its name readable; the user's
         // patterns still apply to it.
+        // A value that reads `<REDACTED>` (wiped, or sent so by the peer)
+        // still gets the user's patterns; the built-in rules find nothing
+        // in it.
         let wiped = value == REDACTED_CREDENTIAL;
         protect_text_in(rules, name, !wiped);
-        if !wiped {
-            protect_text_in(rules, value, true);
-        }
+        protect_text_in(rules, value, !wiped);
     }
 }
 
@@ -580,9 +581,11 @@ impl PiiEngine {
         }
         for (name, value) in msg.headers.iter_mut() {
             // A wiped credential header keeps its name readable; the user's
-            // patterns still apply to it.
+            // patterns still apply to it, and to a value reading
+            // `<REDACTED>` (wiped, or sent so by the peer).
             if let Some(rules) = rules.filter(|_| value == REDACTED_CREDENTIAL) {
                 protect_text_in(rules, name, false);
+                protect_text_in(rules, value, false);
                 continue;
             }
             self.scan_field(value, false, redact_enabled, rules, &mut found);
@@ -1111,6 +1114,26 @@ mod tests {
                 assert!(!dump.contains(secret), "{how}: {dump}");
             }
             assert!(m.dns_answers.is_empty(), "{how}");
+        }
+    }
+
+    /// Codex R6 N5: a header value that reads `<REDACTED>` but was not
+    /// wiped by the agent still gets the user's patterns.
+    #[test]
+    fn test_marker_looking_header_value_is_scanned() {
+        use crate::protocol::{Builtin, CredentialRules, Direction};
+        let rules = CredentialRules::compile(&["REDACTED".to_string()], Builtin::Full).unwrap();
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for how in ["no engine", "redact", "full"] {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.headers = vec![("x-note".into(), REDACTED_CREDENTIAL.into())];
+            match how {
+                "no engine" => mask_credentials_with(&rules, &mut m),
+                h => {
+                    let _ = engine.scan_message_under(&mut m, h == "redact", Some(&rules));
+                }
+            }
+            assert_eq!(m.headers[0].1, "<<REDACTED>>", "{how}");
         }
     }
 
