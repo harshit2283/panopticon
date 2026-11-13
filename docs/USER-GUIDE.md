@@ -543,17 +543,22 @@ What is exported then:
   direction of a connection that lost a header block (a block that failed
   to decode, was skipped or was over the size limit, a final response
   block after an informational `1xx` one included), for the rest of that
-  connection; on both directions of a connection whose start (the client
-  preface) the parser did not see: joined mid-stream, or bytes lost
-  outside a DATA frame, which restarts the parser; and for a stream whose
-  header block carries more than one content type or one over 256 bytes
-  (only the first 256 bytes of one content type are ever examined). A new
-  connection observed from its start exports bodies again.
+  connection; on both directions of a connection the agent did not see
+  whole: joined mid-stream, a side whose start was not captured (a lost
+  SYN+ACK), or bytes lost outside a DATA frame, which restarts the
+  parser; and for a stream whose header block carries more than one
+  content type or one over 256 bytes (only the first 256 bytes of one
+  content type are ever examined). This lasts for the connection: a
+  client preface seen later on it does not lift it (it may be the payload
+  of a DATA frame). Only a new connection observed from its start exports
+  bodies again; over TLS, where a new connection can reuse an old one's
+  key, that is a client preface at a frame boundary in both directions on
+  a connection with no recorded loss.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
-  connection whose start the parser did not see, no header is decoded at
-  all.
+  connection the agent did not see whole (as above), no header is decoded
+  at all.
 - **DNS answers** whose name has credential context, or matches one of
   your `[credentials]` patterns, are dropped before export and before the
   name can reach the service graph.
@@ -602,11 +607,14 @@ that may answer a command sent before capture started, such as an
 `ACL GENPASS`, is therefore never exported under the first command
 captured. SQL bound values are exported only for a statement whose
 prepare the server confirmed on this connection, after the last lost
-client byte. In PostgreSQL a `Bind`'s values are exported only when the
-statement it names (the unnamed one included) was confirmed by its
-`ParseComplete` with the SQL the event shows, and that SQL is not
-withheld; a `Bind` of another statement than the cycle's `Parse`, or of
-one the server rejected, exports no values. A `Parse` the server rejects
+client byte. In PostgreSQL a `Bind` is tied, when the agent reads it, to
+the SQL its statement (the unnamed one included) has at that point of
+the client's messages: the latest unanswered `Parse` of that name before
+it, which must then be confirmed by its `ParseComplete`, or else the
+statement already confirmed. Its values are exported only under that SQL,
+when it is the SQL the event shows and is not withheld; a `Bind` of
+another statement than the cycle's `Parse`, of one the server rejected,
+or of one redefined later in the same batch exports no values. A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
 until confirmed. A simple Query forgets every confirmed statement and
 cancels unanswered `Parse` messages: its SQL may `PREPARE` or

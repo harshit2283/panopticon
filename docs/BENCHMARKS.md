@@ -1348,11 +1348,12 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   deployments MySQL plaintext comes from the OpenSSL uprobes, which are
   validated with HTTP (above) but not yet with a MySQL client.
 - **HTTP/2 joined mid-connection** (agent started after the connection was
-  opened, or the parser restarted after bytes lost outside a DATA frame):
-  HPACK state is unknown, so no header, including the path, is decoded
-  until a new connection is opened, and while credential masking is on
-  that connection's bodies are not exported (nor are bodies after any lost
-  header block, or with a content type repeated or over 256 bytes).
+  opened, a side's start not captured, or the parser restarted after bytes
+  lost outside a DATA frame): HPACK state is unknown, so no header,
+  including the path, is decoded for the rest of that connection (a later
+  client preface on it does not lift this), and while credential masking
+  is on its bodies are not exported (nor are bodies after any lost header
+  block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.
