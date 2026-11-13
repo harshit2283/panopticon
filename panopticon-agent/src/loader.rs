@@ -620,9 +620,19 @@ fn attach_tls_uprobes_to(
             {
                 attached += 1;
             }
-            // SSL_new's return: without it a reused SSL* address stays
-            // latched (HTTP/2 headers and bodies withheld) in user space.
+            // SSL_new, entry and return: without them a reused SSL*
+            // address stays latched (HTTP/2 headers and bodies withheld)
+            // in user space. The return sends nothing for a call whose
+            // entry it did not see.
             if let Some(offset) = *ssl_new_offset
+                && attach_uprobe(
+                    ebpf,
+                    "ssl_new_entry",
+                    &target.library_path,
+                    offset,
+                    None,
+                    links,
+                )
                 && attach_uretprobe(
                     ebpf,
                     "ssl_new_ret",

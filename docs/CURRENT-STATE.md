@@ -197,8 +197,9 @@ production-hardened compliance platform.
     later client preface on it does not lift this. Over TLS a new
     connection that reuses a closed one's key starts clean only once the
     agent has seen OpenSSL's `SSL_new` return the new object; with Go TLS
-    (no such hook), a static or renamed libssl, `SSL_clear` reuse, or
-    when that record was lost, it is not decoded either. While credential masking is on its bodies are not exported
+    (no such hook), a static or renamed libssl, `SSL_clear` reuse, I/O
+    inside `SSL_new` (a creation callback), or when that record was lost,
+    it is not decoded either. While credential masking is on its bodies are not exported
     either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are

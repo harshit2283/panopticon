@@ -23,13 +23,15 @@ use aya_ebpf::{
     macros::{fentry, kprobe, tracepoint, uprobe, uretprobe},
     programs::{FEntryContext, ProbeContext, RetProbeContext, TracePointContext},
 };
-use panopticon_common::{DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
+use panopticon_common::{
+    DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TLS_NEW_CLEAN, TLS_NEW_IO, TlsLibrary,
+};
 
 use crate::maps::{
     CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple,
     TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR,
-    TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve,
-    shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
+    TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for,
+    shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_monitor::read_sock_tuple;
 use panopticon_common::{GoReadCall, GoReadKey};
@@ -702,14 +704,33 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
 /// again only after its final free), whatever reference counts it had
 /// (`SSL_up_ref`), and the earlier object's last data event was emitted
 /// by an SSL_read / SSL_write probe before that destruction. The new
-/// object's first I/O comes after `SSL_new` returned, so after this
-/// record. Every one of them is reserved in `shard_for(X)`, and ring
-/// reservations are serialised. `SSL_free` is not a boundary (it only
-/// drops a reference), nor `SSL_clear` or `SSL_dup` (same object).
+/// object's I/O normally comes after `SSL_new` returned, so after this
+/// record; but a creation callback can read or write on X inside
+/// `SSL_new`, before the record. So the entry probe marks the thread
+/// (`TLS_NEW_CALL`), every TLS read or write probe that emits flags it
+/// (`note_tls_io`), and a flagged call, or one whose entry was not seen,
+/// sends no record: the key keeps whatever that I/O latched. Every record
+/// is reserved in `shard_for(X)`, and ring reservations are serialised.
+/// `SSL_free` is not a boundary (it only drops a reference), nor
+/// `SSL_clear` or `SSL_dup` (same object).
 ///
-/// Gated like the data events, per process (no socket I/O yet): a record
-/// carries no data, so an extra one is harmless and a missed one only
-/// leaves the key latched. An out-of-scope one counts no drop.
+/// Gated like the data events, per process (no socket I/O yet). A missed
+/// record only leaves the key latched. An out-of-scope one counts no drop.
+#[uprobe]
+pub fn ssl_new_entry(_ctx: ProbeContext) {
+    let _ = TLS_NEW_CALL.insert(&bpf_get_current_pid_tgid(), &TLS_NEW_CLEAN, 0);
+}
+
+/// A TLS read or write is emitting on this thread: if it is inside
+/// `SSL_new`, that call's TlsNew must not be sent (see `ssl_new_entry`).
+#[inline(always)]
+fn note_tls_io() {
+    if let Some(mark) = TLS_NEW_CALL.get_ptr_mut(&bpf_get_current_pid_tgid()) {
+        // SAFETY: this thread's own entry.
+        unsafe { *mark = TLS_NEW_IO };
+    }
+}
+
 #[uretprobe]
 pub fn ssl_new_ret(ctx: RetProbeContext) {
     let _ = try_ssl_new_ret(&ctx);
@@ -717,11 +738,17 @@ pub fn ssl_new_ret(ctx: RetProbeContext) {
 
 #[inline(always)]
 fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    // SAFETY: a plain u32 copied out at once.
+    let mark = unsafe { TLS_NEW_CALL.get(&pid_tgid) }.copied();
+    let _ = TLS_NEW_CALL.remove(&pid_tgid);
     let ssl = ctx.ret::<u64>();
-    if ssl == 0 || !crate::sock_capture::tls_capture_on() {
+    if ssl == 0
+        || !panopticon_common::tls_new_starts_connection(mark)
+        || !crate::sock_capture::tls_capture_on()
+    {
         return Ok(());
     }
-    let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     // The new object has its own sockets: no address of an earlier one.
     let _ = TLS_CONN_ADDR.remove(&TlsConnKey {
@@ -1142,6 +1169,7 @@ fn emit_tls_event<C: EbpfContext>(
     tls_lib: TlsLibrary,
     call_addr: CallAddr,
 ) -> Result<(), ()> {
+    note_tls_io();
     // Decided here, before any reserve or copy, for every TLS writer.
     if !crate::sock_capture::tls_capture_on() {
         return Ok(());

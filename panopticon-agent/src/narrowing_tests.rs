@@ -1809,6 +1809,8 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
             ]);
             env.wait_for("tlsnew-two", &["json"]).await;
             env.wait_for("tlsnew-four", &["json"]).await;
+            // Every sink drained before it is inspected.
+            env.scope.shutdown().await;
             for sink in ["json", "otlp"] {
                 let out = env
                     .outputs()
@@ -1828,7 +1830,6 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
                 news += (e.event_type == EventType::TlsNew) as usize;
             }
             assert_eq!(news, 3, "TlsNew records in the raw dump");
-            env.scope.shutdown().await;
         },
     );
 }
