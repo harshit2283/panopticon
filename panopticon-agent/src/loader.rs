@@ -544,7 +544,7 @@ fn attach_tls_uprobes_to(
             ssl_read_offset,
             ssl_write_ex_offset,
             ssl_read_ex_offset,
-            ssl_free_offset,
+            ssl_new_offset,
         } => {
             // SSL_write — uprobe (pid=None for system-wide shared lib coverage)
             if write_ret(ebpf, *ssl_write_offset, links)
@@ -598,12 +598,12 @@ fn attach_tls_uprobes_to(
             {
                 attached += 1;
             }
-            // SSL_free: without it a reused SSL* address stays latched
-            // (HTTP/2 headers and bodies withheld) in user space.
-            if let Some(offset) = *ssl_free_offset
-                && attach_uprobe(
+            // SSL_new's return: without it a reused SSL* address stays
+            // latched (HTTP/2 headers and bodies withheld) in user space.
+            if let Some(offset) = *ssl_new_offset
+                && attach_uretprobe(
                     ebpf,
-                    "ssl_free_entry",
+                    "ssl_new_ret",
                     &target.library_path,
                     offset,
                     None,

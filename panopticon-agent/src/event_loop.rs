@@ -1039,12 +1039,21 @@ pub(crate) async fn worker_task(
             // connection's state and reaches no sink. Counted processed (it
             // is consumed here). On TC and in replay a close takes the gated
             // path below, as before.
-            // A TlsClose record (SSL_free, every mode) likewise ends the
-            // TLS key's connection, so a new connection the library gives
-            // the same object address starts with no state.
-            if (ctx.kernel_scope && scratch.event_type == EventType::SockClose)
-                || scratch.event_type == EventType::TlsClose
-            {
+            if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
+                ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+                end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
+                continue;
+            }
+            // A TlsNew record (SSL_new returned the object, every mode):
+            // any earlier object at that address was destroyed, so the key's
+            // connection ends and the next one starts with no state. Kept in
+            // the raw dump, so a replay ends the same connections.
+            if scratch.event_type == EventType::TlsNew {
+                if let Some(raw) = ctx.raw_capture.as_ref()
+                    && ctx.privacy.get() == PrivacyMode::Full
+                {
+                    raw.record(&scratch);
+                }
                 ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
                 end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
                 continue;
@@ -1767,12 +1776,12 @@ fn server_endpoint(
 /// process and unique only within it: it is hashed with the PID under a
 /// per-process random key, so no process can pick a pointer that lands on
 /// another connection's key (F18), and bit 63 is set so a TLS key never
-/// equals a TC cookie. A `TlsClose` record is keyed like the data of the
-/// object it retires. Events without one fall back to a per-thread key.
+/// equals a TC cookie. A `TlsNew` record is keyed like the data of the
+/// object it starts. Events without one fall back to a per-thread key.
 fn connection_key(event: &DataEvent) -> u64 {
     use std::hash::BuildHasher;
     static TLS_KEY: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
-    if !matches!(event.event_type, EventType::TlsData | EventType::TlsClose) {
+    if !matches!(event.event_type, EventType::TlsData | EventType::TlsNew) {
         return event.socket_cookie;
     }
     if event.socket_cookie == 0 {
@@ -2203,30 +2212,23 @@ mod tests {
         e
     }
 
-    /// `SSL_free` of that object, from another thread of the process.
-    fn ssl_free() -> DataEvent {
-        let mut e = ssl_event(Direction::Egress, b"");
-        e.event_type = EventType::TlsClose;
-        e.tgid = 51;
-        e
-    }
-
+    /// `SSL_new` returning that object, on another thread of the process.
     #[test]
-    fn tls_close_is_keyed_like_the_objects_data() {
+    fn tls_new_is_keyed_like_the_objects_data() {
+        let mut born = ssl_event(Direction::Egress, b"");
+        born.event_type = EventType::TlsNew;
+        born.tgid = 51;
         let data = ssl_event(Direction::Ingress, b"x");
-        assert_eq!(connection_key(&ssl_free()), connection_key(&data));
+        assert_eq!(connection_key(&born), connection_key(&data));
     }
 
-    /// Feed events the way worker_task does (a TlsClose ends its key's
-    /// connection before the gate); every completed message.
+    /// Feed events through feed_event (the parsing step of worker_task;
+    /// TlsNew records are the worker loop's, see narrowing_tests); every
+    /// completed message.
     fn run_events(events: &[DataEvent]) -> Vec<crate::protocol::L7Message> {
         let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
         let mut out = vec![];
         for e in events {
-            if e.event_type == EventType::TlsClose {
-                m.close_connection(connection_key(e));
-                continue;
-            }
             for r in feed_event(&m, e, connection_key(e), &stats, 0, false)
                 .into_iter()
                 .flatten()
@@ -2246,8 +2248,9 @@ mod tests {
     /// Codex R8 #1 / R9: TLS writes inside one DATA payload that start with
     /// the client preface (an upload of captured HTTP/2 bytes) must not
     /// restart the connection clean: the second embedded preface is no
-    /// proof either. Nothing but the object's retirement is (R9: not a
-    /// socket seen during a call, which can be another socket's).
+    /// proof either. Only a TlsNew record (`SSL_new`) starts a new
+    /// connection on the key: not a socket seen during a call (R9), nor
+    /// `SSL_free` (R10: it may drop one reference of several).
     #[test]
     fn embedded_prefaces_stay_withheld() {
         // A clean start, then a DATA frame (stream 1) of 4096 bytes whose
@@ -2290,31 +2293,10 @@ mod tests {
         }
     }
 
-    /// The library retired the SSL object: a new connection that gets its
-    /// address starts clean, however the old one ended (here inside a
-    /// frame).
-    #[test]
-    fn reused_ssl_object_after_ssl_free_starts_clean() {
-        let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20]; // ends inside DATA
-        let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
-        first.extend_from_slice(cut);
-        let out = run_events(&[
-            ssl_event(Direction::Egress, &h2_start(&first)),
-            ssl_free(),
-            ssl_event(Direction::Egress, &h2_start(&h2_request(1, CANARY))),
-            ssl_event(Direction::Ingress, &h2_reply(1)),
-        ]);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].path.as_deref(), Some("/"));
-        assert_eq!(out[0].status, Some(200));
-        let dump = format!("{out:?}");
-        assert!(dump.contains("s7Kf"), "body must export: {dump}");
-    }
-
-    /// No retirement seen: a preface on the SSL object is not a new
+    /// No TlsNew record: a preface on the SSL object is not a new
     /// connection, and does not clear a latch.
     #[test]
-    fn preface_without_ssl_free_stays_latched() {
+    fn preface_without_tls_new_stays_latched() {
         let cut = &h2_frame(0x0, 0, 1, &[0; 64])[..20];
         let mut first = h2_frame(0x1, 0x4, 1, &[0x83, 0x84]);
         first.extend_from_slice(cut);
