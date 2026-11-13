@@ -50,8 +50,12 @@ pub struct PostgresParser {
     /// A name being re-Parsed or Closed is removed at once: until the server
     /// confirms, its SQL is unknown and a Bind of it exports no values.
     prepared: HashMap<String, String>,
-    /// The current cycle's named Parse, entered into `prepared` on the
-    /// server's ParseComplete; dropped on ErrorResponse / ReadyForQuery.
+    /// The current cycle's Parse (name, SQL; the name empty for the
+    /// unnamed statement), awaiting its ParseComplete, which enters a
+    /// named one into `prepared`. Dropped when the cycle ends
+    /// (ErrorResponse, ReadyForQuery), is abandoned (a response gap, the
+    /// next query starting) or a Close of that name follows it: a later
+    /// acknowledgement never commits it.
     pending_parse: Option<(String, String)>,
     /// Text-format parameter values from the current cycle's Bind message.
     /// Applications send their data here, not in the SQL text.
@@ -222,6 +226,7 @@ impl PostgresParser {
                     messages.push(msg);
                     self.server_buf.clear();
                     self.resync_server = false;
+                    self.pending_parse = None;
                     self.state = State::Ready;
                 }
                 State::InSimpleQuery | State::InExtendedQuery | State::InResponse => {
@@ -354,10 +359,15 @@ impl PostgresParser {
         }
     }
 
-    /// Close (`C`): `S` + name forgets that statement (`P` is a portal).
+    /// Close (`C`): `S` + name forgets that statement (`P` is a portal),
+    /// and a pending Parse of it.
     fn close(&mut self, payload: &[u8]) {
         if payload.first() == Some(&b'S') {
-            self.prepared.remove(&extract_string(&payload[1..]));
+            let name = extract_string(&payload[1..]);
+            if self.pending_parse.as_ref().is_some_and(|(n, _)| *n == name) {
+                self.pending_parse = None;
+            }
+            self.prepared.remove(&name);
         }
     }
 
@@ -367,6 +377,10 @@ impl PostgresParser {
             None => return false,
         };
         self.client_buf.consume(consumed);
+        if matches!(msg_type, b'Q' | b'P' | b'B') {
+            // A new cycle: the previous one's Parse is answered or lost.
+            self.pending_parse = None;
+        }
 
         match msg_type {
             b'Q' => {
@@ -381,10 +395,8 @@ impl PostgresParser {
                 // Parse (extended query): name\0 + query\0 + param types
                 let name = extract_string(&payload);
                 let query = extract_second_string(&payload);
-                if !name.is_empty() {
-                    self.prepared.remove(&name);
-                    self.pending_parse = Some((name, query.clone()));
-                }
+                self.prepared.remove(&name);
+                self.pending_parse = Some((name, query.clone()));
                 self.query_text = Some(query);
                 self.query_ts = Some(ts);
                 self.state = State::InExtendedQuery;
@@ -448,6 +460,7 @@ impl PostgresParser {
                 b'1' => {
                     // ParseComplete: the server holds the statement now.
                     if let Some((name, sql)) = self.pending_parse.take()
+                        && !name.is_empty()
                         && self.prepared.len() < MAX_PREPARED_STATEMENTS
                     {
                         self.prepared.insert(name, sql);
@@ -597,6 +610,8 @@ impl ProtocolParser for PostgresParser {
             ) => {
                 self.server_buf.clear();
                 self.resync_server = true;
+                // Its ParseComplete may be among the lost bytes.
+                self.pending_parse = None;
                 Some(ParseResult::NeedMoreData)
             }
             (_, State::Encrypted) => Some(ParseResult::NeedMoreData),
@@ -988,6 +1003,64 @@ mod tests {
         );
         p.feed(&insert_done(), Direction::Ingress, 6);
         let out = bound(&mut p, &insert_done());
+        assert!(no_canary(&out), "{out:?}");
+    }
+
+    /// Codex round 5 #7, #11: a ParseComplete commits only the Parse it
+    /// answers. A Parse whose answer was lost, or that a Close in the same
+    /// cycle closed, is never committed by a later acknowledgement.
+    #[test]
+    fn test_parse_complete_commits_only_its_parse() {
+        let bound = |p: &mut PostgresParser| -> Vec<Option<String>> {
+            p.feed(
+                &extended_cycle(None, "s", &["canary-bound"]),
+                Direction::Egress,
+                9,
+            );
+            match p.feed(&insert_done(), Direction::Ingress, 10) {
+                ParseResult::Messages(m) => m.into_iter().map(|m| m.request_text).collect(),
+                _ => vec![],
+            }
+        };
+        let no_canary = |v: &[Option<String>]| v.iter().flatten().all(|t| !t.contains("canary"));
+
+        // #7: duplicate Parse of `s`, its rejection lost; an unnamed Parse's
+        // ParseComplete must not commit `s = SELECT $1`.
+        let mut p = setup_ready_parser();
+        let pw = "INSERT INTO users(password) VALUES ($1)";
+        p.feed(
+            &extended_cycle(Some(("s", pw)), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1")), "s", &["y"]),
+            Direction::Egress,
+            3,
+        );
+        assert!(p.skip(Direction::Ingress, 40, 4).is_some());
+        p.feed(
+            &extended_cycle(Some(("", "SELECT 1")), "", &[]),
+            Direction::Egress,
+            5,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 6);
+        let out = bound(&mut p);
+        assert!(no_canary(&out), "{out:?}");
+
+        // #11: Parse `s`, Close `s`, Sync: the ParseComplete that follows
+        // does not bring `s` back.
+        let mut p = setup_ready_parser();
+        let mut cycle = make_frontend_msg(b'P', b"s\0SELECT $1\0\0\0");
+        cycle.extend(make_frontend_msg(b'C', b"Ss\0"));
+        cycle.extend(make_frontend_msg(b'S', b""));
+        p.feed(&cycle, Direction::Egress, 1);
+        let mut resp = make_backend_msg(b'1', b"");
+        resp.extend(make_backend_msg(b'3', b""));
+        resp.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&resp, Direction::Ingress, 2);
+        let out = bound(&mut p);
         assert!(no_canary(&out), "{out:?}");
     }
 
