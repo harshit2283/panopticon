@@ -2085,6 +2085,8 @@ fn scope_programs_load_attach_and_hold() {
         (Direction::Ingress, c4_port),
         "control: read carries its own address"
     );
+    assert_ne!(e.tls_sock_cookie, 0, "control: read carries its socket");
+    println!("TLS_SOCK_COOKIE OK");
     for (index, what) in stops {
         pre(Some((index, 0)));
         read_once(&mut s4, b"r-stop");
