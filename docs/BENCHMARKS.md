@@ -28,9 +28,14 @@ here has not been measured.
 The figures are from a single VM, so expect variance between runs. Kernel
 per-packet cost in particular moves by ±20% between runs.
 
-Everything in sections 2 to 4 is the default TC backend, except
-[cgroup_skb capture backend](#cgroup_skb-capture-backend-preliminary), which
-states its own rigs.
+**Historical: the TC backend.** Everything in sections 2 to 4 was measured
+with the TC backend, which captured on network interfaces and has since
+been removed ([ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md)); those
+figures are kept as the record of that backend and have not been re-run.
+The exception is [cgroup_skb capture backend](#cgroup_skb-capture-backend-preliminary),
+the only backend now, which states its own rigs. Parser, PII and
+user-space figures do not depend on the backend; kernel cost per packet
+and recall under `pid_filter` do.
 
 ## 2. Capture accuracy (ground truth)
 
@@ -341,11 +346,12 @@ before → after): 4 KB with no PII 6.01 → 5.87 µs, 4 KB with PII 9.25 →
 
 ### Kernel (per captured packet)
 
-The kernel runtime of the TC classifier (the default backend) is measured
+Historical (TC backend, removed; see §1). The kernel runtime of the TC
+classifier is measured
 with `kernel.bpf_stats_enabled=1`, reading `run_time_ns / run_cnt` from the
 program's fdinfo (`tests/oracle/bpf_cost.py`). This is the time the kernel
 spends in Panopticon's eBPF program for each packet on the monitored
-interface. It is not end-to-end latency. The `cgroup_skb` backend runs at
+interface. It is not end-to-end latency. The `cgroup_skb` capture runs at
 every local socket instead, so its cost per request differs; see
 [cgroup_skb capture backend](#cgroup_skb-capture-backend-preliminary).
 
@@ -1011,8 +1017,9 @@ unless noted:
 ### cgroup_skb capture backend (preliminary)
 
 **Preliminary.** Measured on 2026-11-10 on lab VMs on a shared host, against
-the TC backend in the same runs. `[capture] backend = "cgroup_skb"` is not
-the default. Raw per-run outputs are kept with the study notes.
+the TC backend in the same runs (TC was the default then; it has since been
+removed and `cgroup_skb` is the only backend, so the TC columns below are
+historical). Raw per-run outputs are kept with the study notes.
 
 The `cgroup_skb` backend attaches to the root of the cgroup v2 hierarchy, so
 it runs at every local socket on the node: both ends of a node-local
@@ -1421,19 +1428,20 @@ sudo tests/load/run_load.sh 64 30s 0 1
 sudo tests/load/run_load.sh 4096 20s 20000
 sudo NO_AGENT=1 tests/load/run_load.sh 4096 20s 20000
 
-# The cgroup_skb backend: unscoped, scoped to the server (pid_filter), with
-# every packet out of scope, and over loopback (node-local traffic).
+# Capture unscoped, scoped to the server (pid_filter), with every packet
+# out of scope, and over loopback (node-local traffic). These runs used
+# BACKEND=cgroup_skb, which is now the only backend (BACKEND was removed).
 # SCOPE also takes cgroup, head and sample; SERVER_LATE=1 creates the
 # server's listener after the agent starts (add
 # TOML='pid_filter_listener = "creator"' for the recall table above).
-sudo BACKEND=cgroup_skb tests/load/run_load.sh 64 15s 5000
-sudo BACKEND=cgroup_skb SCOPE=server tests/load/run_load.sh 64 15s 5000
-sudo BACKEND=cgroup_skb SCOPE=other tests/load/run_load.sh 64 15s 5000
-sudo BACKEND=cgroup_skb LOOPBACK=1 tests/load/run_load.sh 64 15s 5000
+sudo tests/load/run_load.sh 64 15s 5000
+sudo SCOPE=server tests/load/run_load.sh 64 15s 5000
+sudo SCOPE=other tests/load/run_load.sh 64 15s 5000
+sudo LOOPBACK=1 tests/load/run_load.sh 64 15s 5000
 
 # User-space cost per event, one core: record a capture, then replay it
 # (with your config; add --json-export /dev/null to include export).
-sudo ./target/release/panopticon-agent -i eth0 --privacy-mode full --capture-raw /tmp/load.pncap
+sudo ./target/release/panopticon-agent --privacy-mode full --capture-raw /tmp/load.pncap
 ./target/release/panopticon-agent --replay-bench /tmp/load.pncap
 
 # PII detection accuracy (no root, any OS); prints the per-type table.

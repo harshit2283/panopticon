@@ -43,6 +43,10 @@ Depth varies — see the support matrix in the [README](../README.md).
   arm64 is untested.
 - Root, or the capabilities `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN` (plus
   `CAP_SYS_PTRACE` for TLS library discovery in other processes).
+- The host's cgroup v2 hierarchy (the agent mounts a private one on a cgroup
+  v1 host such as RHEL 8, where `cgroup_filter` / `pod_filter` are then
+  refused) and kernel BTF (`/sys/kernel/btf/vmlinux`). In a container, mount
+  the host's `/sys/fs/cgroup` (the Helm chart does).
 - tracefs mounted at `/sys/kernel/tracing` for process events (most distros
   mount it automatically).
 
@@ -68,9 +72,9 @@ tail -n1 /var/lib/panopticon/events.jsonl | jq .
 curl -s 127.0.0.1:9435/metrics | grep panopticon_
 ```
 
-With no `--interface`, the agent attaches to the interface(s) carrying the
-host's default route (e.g. `eth0`, `ens5`, `bond0`). Use `-i` (repeatable) to
-choose others, e.g. `-i lo` to watch local traffic.
+The agent captures at every socket on the node (cgroup v2 hooks; §4.2,
+"Capture scope"), in every network namespace. Loopback packets are left
+out unless you set `capture_loopback = true`.
 
 Stop it with Ctrl-C or `SIGTERM`; exports are flushed on shutdown.
 
@@ -83,7 +87,6 @@ Settings come from, in increasing priority: built-in defaults, a TOML file
 
 | Flag | Meaning |
 |---|---|
-| `-i, --interface <IF>` | Interface to capture on; repeatable. Default: config `interfaces`, else default-route interface(s). |
 | `--config <FILE>` | TOML config file (also `PANOPTICON_CONFIG`). |
 | `--json-export <FILE>` | Write events as JSONL. **The file is truncated at startup.** |
 | `--pii-audit-log <FILE>` | Write PII audit records as JSONL (appended). |
@@ -103,10 +106,10 @@ All keys are optional. Example with the defaults:
 
 ```toml
 capture_enabled = true
-interfaces = []                     # [] = auto-detect default-route interface(s)
+# cgroup_filter = ["kubepods.slice/..."]  # default: unset; see "Capture scope" below
 # pid_filter = [1234, 5678]         # default: unset (every process); see "Capture scope" below
-# capture_loopback = false          # cgroup_skb backend only; see "Capture scope" below
-# pid_filter_listener = "acceptor"  # cgroup_skb backend only: "acceptor" | "creator"
+# capture_loopback = false          # see "Capture scope" below
+# pid_filter_listener = "acceptor"  # "acceptor" | "creator"
 sampling_mode = "full"              # "full" | "connection_sample" | "head_only"
 # sample_rate = 0.1                 # connection_sample only, and required there
 # head_only_bytes = 4096            # head_only only (default 4096)
@@ -154,141 +157,185 @@ service_name = "panopticon-agent"
 enabled = "auto"       # "auto" = on when running in a pod with a service account token; true; false
 relist_interval_secs = 300  # full re-list of pods and services (min 5)
 watch = true           # stream changes between re-lists; false = refresh only by re-listing
+
+# [[pod_filter]]       # default: unset; this node's pods, see "Capture scope" below
+# namespace = "payments"
+# labels = { app = "checkout" }   # or: name = "checkout-7d9f..."
+
+[capture]
+cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgroup,
+                       # else /sys/fs/cgroup/unified, else a private mount (RHEL 8)
 ```
 
-**Capture scope.** `pid_filter` and `sampling_mode` narrow what is captured
-at all. They apply before anything else: what they drop never reaches the
-parsers, PII scanning, the service graph, the event export, OTLP, the PII
-audit log, the raw dump (and so `--decode-capture` / `--pcap`),
-`--log-events` or the agent's logs. They work the same in every privacy
-mode (§4.3) and only ever reduce what the mode allows. They are
-restart-only: a `SIGHUP` reload that changes them is rejected and the
-running config is kept.
+**Capture scope.** Packets are captured by `cgroup_skb` programs attached
+to the root of the host's cgroup v2 hierarchy, the only capture backend
+(the TC backend and its `interfaces` / `--interface` settings were removed;
+see [ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md)). They see every
+socket on the node, in every network namespace, and nothing the node only
+forwards or bridges. `pid_filter`, `cgroup_filter` / `pod_filter`,
+`sampling_mode`, `capture_loopback` and `pid_filter_listener` narrow what
+is captured at all. Every one of these decisions is made in the kernel,
+per socket, before a byte is copied out: what they drop never reaches the
+agent, so it never reaches the parsers, PII scanning, the service graph,
+the event export, OTLP, the PII audit log, the raw dump (and so
+`--decode-capture` / `--pcap`), `--log-events` or the agent's logs. They
+work the same in every privacy mode (§4.3) and only ever reduce what the
+mode allows. Every rule errs toward not capturing: a socket the kernel
+cannot place (a missing hook, a torn read) is dropped, and so, with any of
+these settings, is every socket that existed before the agent started
+(`uninit`); unscoped `full` captures those too. Every drop is counted in
+`panopticon_scope_dropped_events_total{reason}` (§5.4).
 
+With any selector or sampling set, TLS plaintext (uprobes) is scoped by
+the process making the TLS call (its PID and cgroup), and is captured
+only in `full` sampling
+(never under `connection_sample` or `head_only`). Scoped capture is
+validated on x86_64 only and refused elsewhere.
+
+- `cgroup_filter = ["kubepods.slice/kubepods-burstable.slice/…", ...]`
+  (paths relative to the cgroup2 root) and `[[pod_filter]]` (`namespace`
+  plus `labels = { app = "…" }` or `name = "…"`, matched against this
+  node's pods): capture the sockets of these cgroups and every cgroup
+  below them. A socket's cgroup is fixed when it is created, so this has
+  none of the accept-time gaps of `pid_filter` below and is the primary
+  selector. Pods
+  that start, stop or change labels are followed; a reload may change
+  either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
+  host (RHEL 8's default) the agent mounts a private cgroup2 at
+  `/run/panopticon/cgroup2` to attach at all, every socket is then in its
+  root, and these selectors are refused (use `pid_filter`).
 - `pid_filter = [1234, ...]`: capture only these processes (PIDs as the
   node sees them, i.e. in the host PID namespace; at most 4096, not empty,
-  no 0). TLS plaintext and the connect / accept events of other processes
-  are dropped in the kernel. Packets captured on an interface carry no
-  process: a connection's packets pass only once a listed process has been
-  seen to `connect()` or `accept()` it. So:
-  - Connections that were already open when the agent started, and
-    connections of processes not in the list, are dropped and counted in
-    `panopticon_pid_filter_unknown_owner_connections_total`.
-  - A server's `accept()` can return after the client's first bytes have
-    arrived. Those packets are held (at most 8 per connection and 256 per
-    worker, for about a second) until the accept is seen, and dropped if it
-    is not.
-  - Processes started after the agent, including children a listed process
-    forks later (pre-fork workers, helpers), have new PIDs and are **not**
-    captured. The filter does not follow process trees: list them and
-    restart the agent.
-  - With the `cgroup_skb` backend the decision is made in the kernel, per
-    connection, and differs as follows. A connection a process accepted is
-    selected by `pid_filter_listener`:
-    - `"acceptor"` (the default): only if a listed process `accept()`ed it.
-      A listening socket of a listed process selects nothing that an
-      unlisted process accepts (a worker it forks later, a process it passes
-      the socket to). The connection is captured from the moment the
-      `accept()` returns; bytes that arrive before that are dropped (no
-      packets are held) and counted in
-      `panopticon_scope_dropped_events_total{reason="out_of_scope"}` (or
-      `"no_owner"`). Measured (docs/BENCHMARKS.md, pre-agent listener,
-      which behaves the same): 56.6% of requests captured with a new
-      connection per request, about 100% with keep-alive connections,
-      which lose only those first bytes.
-      The rule governs packet capture only: TLS plaintext (uprobes) is
-      captured when the calling process is listed, whichever process
-      accepted the socket.
+  no 0). A client connection is selected by the process that created its
+  socket; an accepted (server) connection as `pid_filter_listener` says,
+  below. `pid_filter` is the secondary, best-effort selector. Its limits:
+  - It is restart-only (a reload that changes it is rejected), and it
+    names PIDs, not programs: processes started after the agent,
+    including children a listed process forks later (pre-fork workers,
+    helpers) and a listed process that restarts, have new PIDs and are
+    **not** captured. The filter does not follow process trees: list them
+    and restart the agent, or select by cgroup or pod.
+  - A connection a process accepted is selected by `pid_filter_listener`:
+    - `"acceptor"` (the default): only if a listed process `accept()`ed
+      it. A listening socket of a listed process selects nothing that an
+      unlisted process accepts (a worker it forks later, a process it
+      passes the socket to). The connection is captured from the moment
+      the `accept()` returns; **bytes that arrive before that are
+      dropped** (nothing is held) and counted as
+      `reason="out_of_scope"` (or `"no_owner"`). Measured
+      (docs/BENCHMARKS.md, pre-agent listener, which behaves the same):
+      56.6% of requests captured with a new connection per request,
+      about 100% with keep-alive connections, which lose only those first
+      bytes.
     - `"creator"`: also if a listed process created the listening socket
-      while the agent ran. Then it selects every connection accepted on it,
-      from the first byte, whoever accepts it: a worker the listed process
-      forks later, a process that received the socket (`SCM_RIGHTS`,
-      `pidfd_getfd`) or has since exec'd another program, and after the
-      listed process has exited. List only processes whose listening
-      sockets you want captured.
+      while the agent ran. Then it selects every connection accepted on
+      it, from the first byte, whoever accepts it: a worker the listed
+      process forks later, a process that received the socket
+      (`SCM_RIGHTS`, `pidfd_getfd`) or has since exec'd another program,
+      and after the listed process has exited. List only processes whose
+      listening sockets you want captured.
     - On a listening socket that existed before the agent started (any
       server not restarted since the agent was), both rules capture a
-      connection only from the moment a listed process `accept()`s it, with
-      the same drop before that (`no_owner`).
+      connection only from the moment a listed process `accept()`s it,
+      with the same drop before that (`no_owner`); a thread that was
+      already blocked in `accept()` when the agent attached never records
+      its accepts, so those connections are not captured at all.
+    - The rule governs packets only: TLS plaintext (uprobes) is captured
+      when the calling process is listed, whichever process accepted the
+      socket.
     For full recall with connection-per-request servers, select by
-    `cgroup_filter` / `pod_filter`, which has no such gap, or set
-    `pid_filter_listener = "creator"` and restart the server after the
-    agent. Connections a listed process opens
-    (clients) are selected by their creator under both rules.
+    `cgroup_filter` / `pod_filter`, or set `pid_filter_listener =
+    "creator"` and restart the server after the agent.
 - `sampling_mode = "connection_sample"` with `sample_rate = r` (required,
-  0.0 to 1.0): each connection is captured whole or not at all, decided once
-  from a keyed hash of the connection (the key is drawn at agent start, so
-  which connections are kept cannot be predicted or steered from outside).
-  `0.0` captures nothing; `1.0` is the same as `full`. Dropped connections
-  and their events are counted in `panopticon_sampled_out_connections_total`
-  and `panopticon_sampled_out_events_total`. A TLS connection seen through
-  the uprobes and the same connection's packets on the wire have different
-  keys and are sampled independently. Sampled-out traffic is still copied
-  out of the kernel and counts against `max_events_per_sec`; the saving is
-  in parsing and export.
+  0.0 to 1.0): each socket is captured whole or not at all, decided once
+  in the kernel from a random draw when it is set up. `0.0` captures
+  nothing; `1.0` is the same as `full`. The two ends of a connection
+  between two sockets on this node are sampled independently. Dropped
+  packets are counted as `reason="sampled_out"`.
 - `sampling_mode = "head_only"` with `head_only_bytes = N` (default 4096,
   1 to 1073741824): only the first N bytes of each direction of each
-  connection pass; the rest is dropped and counted in
-  `panopticon_head_only_cut_events_total`. An exchange that straddles the
-  limit is exported with the part before it. For TCP the count starts at
-  the connection's SYN, so connections already open when the agent started
-  pass nothing. For TLS (uprobes) and UDP it starts at the first byte the
-  agent sees. A count never starts over: the agent sees no close for TLS
-  and UDP connections, so it remembers them (idle or not) until it
-  restarts. Each worker remembers at most `max_connections_tracked`
-  connections; once full, new connections pass nothing (counted as cut)
-  until TCP connections close or go idle and free room. A TLS connection
-  that reuses the library object of an earlier one in the same process
-  continues that one's count.
+  socket are copied out; the kernel cuts the rest (`reason="head_cut"`).
+  An exchange that straddles the limit is exported with the part before
+  it. For TCP the count is the byte's position in the stream, read from
+  the kernel's own counters, so sockets that existed before the agent
+  started, and restored (TCP repair) sockets, pass nothing
+  (`no_baseline`). For UDP it is the bytes the socket has moved since it
+  was created, whatever was captured, so an unconnected UDP server socket
+  gets N bytes in total, not N per peer.
+- `capture_loopback = false` (the default): packets that stay on the node
+  through the loopback device are not captured. That is `127.0.0.0/8`, and
+  connections to one of the host's own addresses (or, in a pod, the pod's
+  own address), which the kernel also sends over `lo`. Packets on a VRF
+  device are node-local too and dropped: local delivery inside a VRF
+  travels the VRF device, and so does a VRF's incoming remote traffic. A
+  socket is dropped from its first packet seen on a VRF device on; a
+  one-way sender whose packets all leave through a VRF's member interface
+  to a remote peer is captured. The agent recognises a VRF device on each
+  packet from the device's own flags, in every network namespace and
+  whenever it was created; it needs kernel BTF to locate those flags, and
+  without it the agent refuses to start. A packet whose device cannot be
+  read is treated as on a VRF device (dropped while this is off).
+  Multicast or broadcast that a sender on a VRF member interface loops back
+  to local receivers: the sender's looped copy is never seen (the kernel
+  does not run the capture hook for it), the copy that leaves is captured,
+  and the local receiver's copy arrives on the VRF device and is dropped
+  while this is off. A socket that once carried node-local traffic stays
+  dropped (an unconnected UDP socket that talked to a local and a remote
+  peer). Same-node pod-to-pod and host-to-pod traffic over veth, a bridge,
+  ipvlan, macvlan or tun/tap is not loopback and is captured. Dropped
+  packets are counted as `reason="loopback"`. It covers **packets only**:
+  TLS plaintext (uprobes) of a loopback connection is captured per
+  `pid_filter` / cgroup selection like any other (in a scoped mode without
+  its addresses, while loopback packets are dropped). Set it to `true` to
+  capture app-to-local-database and sidecar packets.
+- IPv6 is not captured.
 
-- `capture_loopback = false` (the default, `cgroup_skb` backend only):
-  packets that stay on the node through the loopback device are not
-  captured, as on the TC backend, which never sees them (this is parity
-  for the loopback device only: other same-node traffic, below, is
-  captured, which TC on the node's NIC did not see either). That is
-  `127.0.0.0/8`, and connections to one of the host's own addresses (or,
-  in a pod, the pod's own address), which the kernel also sends over
-  `lo`; IPv6 packets are not captured on either backend. Packets on a
-  VRF device are node-local too and dropped: local delivery inside a VRF
-  travels the VRF device, and so does a VRF's incoming remote traffic.
-  A socket is dropped from its first packet seen on a VRF device on; a
-  one-way sender whose packets all leave through a VRF's member
-  interface to a remote peer is captured. The agent recognises a VRF
-  device on each packet from the device's own flags, in every network
-  namespace and whenever it was created; it needs kernel BTF to locate
-  those flags, and without it the `cgroup_skb` backend refuses to start.
-  A packet whose device cannot be read is treated as on a VRF device
-  (dropped while this is off). Multicast or broadcast that a sender on
-  a VRF member interface loops back to local receivers: the sender's
-  looped copy is never seen (the kernel does not run the capture hook
-  for it), the copy that leaves is captured, and the local receiver's
-  copy arrives on the VRF device and is dropped while this is off. A socket that once carried node-local
-  traffic stays dropped (an unconnected UDP socket that talked to a
-  local and a remote peer). Set `capture_loopback = true` if you need
-  those. Same-node pod-to-pod and host-to-pod traffic over veth, a
-  bridge, ipvlan, macvlan or tun/tap is not loopback and is captured. Dropped
-  packets are counted in
-  `panopticon_scope_dropped_events_total{reason="loopback"}`. It covers
-  packets only: TLS plaintext (uprobes) of a loopback connection is
-  captured per `pid_filter` / cgroup selection like any other, as on TC
-  (in a scoped mode without its addresses, while loopback packets are
-  dropped). Set it to `true` to capture app-to-local-database and
-  sidecar packets.
+**Relayed plaintext.** "No TLS plaintext outside `full` sampling" covers a
+TLS connection's own plaintext: what the TLS library reads and writes, and
+the payload of a socket with kernel TLS keys installed (kTLS payload is
+dropped outside unscoped `full`, `reason="ktls_payload"`). An application
+can take that plaintext and send it out through another socket, as that
+socket's ordinary payload: a TLS-terminating proxy (`recv` then `send`),
+`splice` through a pipe, or its own sockmap redirect program. The receiving
+socket then carries it unencrypted at the TLS layer, as its own cleartext,
+and it is captured according to **that** socket's scope and mode, exactly
+like the backend leg of a TLS-terminating proxy. No per-socket mark
+follows plaintext through an application's own relaying, so none is
+claimed. Encryption below the socket (WireGuard, IPsec, MACsec) is not
+TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
+
+**Trade-offs of this design.** Each one errs toward not capturing:
+
+| What | Effect |
+|---|---|
+| `pid_filter_listener = "acceptor"` (default) | Bytes of an accepted connection that arrive before `accept()` returns are dropped (above). |
+| `capture_loopback = false` (default) | Loopback and VRF packets are not captured; TLS plaintext is not affected (packets only). |
+| Looped multicast / broadcast on a VRF member interface | The sender's looped copy is never seen, whatever `capture_loopback` says. |
+| IPv6 | Not captured. |
+| HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
+| HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
+| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw OpenSSL's `SSL_new` return it (§5.3). |
+| PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
+| Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
 An unknown `sampling_mode`, `sample_rate` without `connection_sample`, and
 `head_only_bytes` without `head_only` stop the agent with an error, and so
-do `capture_loopback` or `pid_filter_listener` with the TC backend.
+do the removed keys `interfaces` and `[capture] backend = "tc"` (`backend =
+"cgroup_skb"` is accepted with a warning; remove it). `--replay-bench`
+refuses every scope setting: a recording holds only what was already in
+scope.
 
 `SIGHUP` re-reads the file but applies only a stricter privacy mode (§4.3)
-and, with the `cgroup_skb` backend, changes to cgroup selection: a reload may
-change `cgroup_filter` / `pod_filter`, switch from one to the other, or
-combine them, but turning cgroup selection on or off altogether (going from
-neither to either, or back) needs a restart. It may also change
-`capture_loopback` and `pid_filter_listener`. A reload that narrows the
-selection (a cgroup or pod removed, `capture_loopback` turned off,
-`pid_filter_listener` from `"creator"` to `"acceptor"`) is reported applied
-only once nothing captured under the old scope can still leave the agent. Restart the agent for anything else. Unknown keys are ignored silently
-(except inside `[privacy]`, where they are an error), so check spelling.
+and changes to cgroup selection: a reload may change `cgroup_filter` /
+`pod_filter`, switch from one to the other, or combine them, but turning
+cgroup selection on or off altogether (going from neither to either, or
+back) needs a restart. It may also change `capture_loopback` and
+`pid_filter_listener`. A reload that narrows the selection (a cgroup or pod
+removed, `capture_loopback` turned off, `pid_filter_listener` from
+`"creator"` to `"acceptor"`) is reported applied only once nothing captured
+under the old scope can still leave the agent. Restart the agent for
+anything else. Unknown keys are ignored silently (except inside
+`[privacy]` and `[capture]`, where they are an error), so check spelling.
 
 ### 4.3 Privacy modes
 
@@ -390,7 +437,6 @@ One JSON object per completed exchange. A real record (body shortened):
 | `dns_answers` | DNS responses: the A records (`name`, `ip` as a 32-bit integer, `ttl_secs`) that answer a query seen on the same flow. They name services in the graph |
 | `src_*`, `dst_*` | Addresses of the packet that completed the exchange (usually the response). Addresses are IPv4 as a 32-bit integer (`2130706433` = `127.0.0.1`). |
 | `pid` | TLS exchanges: the process whose TLS calls were captured |
-| `client_pid`, `server_pid` | Packet-captured TCP exchanges: the local process that opened / accepted the connection, when it runs on this node. `server_pid` needs kprobes; on kernels built without them only `client_pid` is filled |
 | `src_workload`, `dst_workload` | Kubernetes identity of `src_addr` / `dst_addr` (§5.6), e.g. `payments/checkout`. Present only with Kubernetes identity on and the address known to the API. |
 | `pii.entities` | What was found; offsets are relative to the field it was found in |
 | `pii.redacted` | `true` if values were replaced before export |
@@ -719,10 +765,9 @@ acknowledgement. An `EXEC` whose `MULTI` came before capture started has
 its whole result masked.
 
 Replies are paired with commands by order, which is only safe when the
-agent saw both directions of the connection from their first byte. With
-the TC backend that is proved by the connection's SYN and SYN+ACK, with
-`cgroup_skb` by the kernel's stream offset; any bytes lost later (ring
-drops, capture cap) end the proof. Without it Redis replies are exported
+agent saw both directions of the connection from their first byte, which
+the kernel's stream offset proves; any bytes lost later (ring drops,
+capture cap) end the proof. Without it Redis replies are exported
 for the rest of the connection without their text or the command they
 answer (status, timing and sizes only). That covers every connection
 already open when the agent started (pooled clients, until they
@@ -867,11 +912,8 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
 | `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
-| `panopticon_pid_filter_dropped_events_total` | `pid_filter`: events dropped in user space. TLS and connect / accept events of other processes are dropped in the kernel and not counted |
-| `panopticon_pid_filter_unknown_owner_connections_total` | `pid_filter`: packet-captured connections dropped because no listed process was seen to own them (other processes' connections, or opened before the agent started) |
-| `panopticon_sampled_out_connections_total` | `connection_sample`: connections not captured |
-| `panopticon_sampled_out_events_total` | `connection_sample`: events of those connections |
-| `panopticon_head_only_cut_events_total` | `head_only`: events cut or dropped past a direction's first `head_only_bytes` |
+| `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback` |
+| `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
 | `panopticon_active_connections` | Connections being parsed |
@@ -940,7 +982,7 @@ Each decoded line is one captured packet or TLS buffer:
 
 `cgroup_id`, `stream_off` (stream offset of the first byte, 2^64 - 1 when not
 computed), `owner_tgid`, `acceptor_tgid`, `scope_gen` and `role` (1 client,
-2 server) are set by the `cgroup_skb` backend; on TC they are 0 and
+2 server) are set on packet events; on other events they are 0 and
 `stream_off` is 2^64 - 1.
 
 - **Nothing is redacted** — passwords, tokens and personal data are written
@@ -1027,19 +1069,20 @@ real cluster.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `received` stays 0 | Wrong interface: check the "Auto-detected default-route interface(s)" or "TC classifier attached" log lines; pass `-i`. The agent's own metrics/health traffic is captured like any other (no port is exempt, so no peer can hide behind one). |
-| `No --interface given and no IPv4 default route` | Host has no IPv4 default route; pass `-i`. |
+| `received` stays 0 | The scope drops everything: check `panopticon_scope_dropped_events_total{reason}`. Only loopback traffic (`capture_loopback = false`, `reason="loopback"`), sockets opened before the agent started (`uninit`), or an unlisted process (`out_of_scope`, `no_owner`). The agent's own metrics/health traffic is captured like any other (no port is exempt, so no peer can hide behind one). |
+| `unexpected argument '--interface'`, or `` `interfaces` is no longer supported `` | The TC backend was removed: drop the flag or key; capture covers every socket, select with `pid_filter`, `cgroup_filter` or `pod_filter`. |
+| `refusing to start: capture needs cgroup_skb ...` or a refusal naming a program | The kernel lacks a hook the capture needs (§2). |
 | Fails to start with `has no BPF ring buffer` | Kernel older than 5.8 without the RHEL-style backport. Not supported in this release. |
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
-| `Failed to attach kprobe` | Socket lifecycle events unavailable on this kernel/VM; HTTP/DB capture via TC still works. |
+| `Failed to attach kprobe` | A TLS address hook is unavailable on this kernel/VM; TLS events carry no addresses. Packet capture is not affected. |
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, binaries with a symbol table; others are logged at debug level as `Go binary not probed`). Other statically linked TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) and Go binaries built with `-ldflags=-s` appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
-| Each exchange appears twice on `-i lo` | Loopback shows every packet on both directions; capture a real interface instead. |
+| Each exchange appears twice | Both ends of the connection run on this node: each end's socket is captured. Select one side with `pid_filter` or `cgroup_filter`. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
 | `Kubernetes API unavailable` warning, no `src_workload` | `hint` in the log line names the cause: 403 = the ClusterRole lacks `get/list/watch` on pods/services (`rbac.create=true`), 401 = token not mounted or rejected. Endpoints keep IP names meanwhile (§5.6). |
 
 ## 7. Limits worth knowing
 
-IPv4 only; Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
+IPv4 only; the capture-scope trade-offs (§4.2); Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
 OpenSSL/Go; PII detection is regex-based by default; TCP checksums are not
 verified, so a forger who knows a connection's sequence numbers (on path)
 can still slip a segment in; DNS-derived names say what a client asked for

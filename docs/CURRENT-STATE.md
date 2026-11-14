@@ -17,6 +17,14 @@ production-hardened compliance platform.
   and Kafka in the integration harness.
 - Prometheus and OTLP exporter behavior has unit-test coverage.
 - Host-mode TLS E2E exists for local Linux debugging.
+- Capture is by `cgroup_skb` programs on the host's cgroup v2 root, the
+  only backend: every local socket, in every network namespace, with every
+  scope decision made in the kernel per socket
+  ([ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md); its trade-offs are
+  listed in docs/USER-GUIDE.md §4.2, "Capture scope"). The TC backend, which
+  captured on network interfaces, was removed. The ground-truth accuracy,
+  load and overhead figures below were measured with TC unless they say
+  `cgroup_skb` or name the scope tests, and have not been re-run since.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
@@ -41,7 +49,10 @@ production-hardened compliance platform.
   at 0.0, 0.5 and 1.0 kept 0, 47 and 96 of 96 connections, never part of
   one. `head_only` kept no direction past its limit, captured every
   connection's first request, and left none of the values planted past
-  the limit in any sink. Not yet run on 5.15 or the RHEL kernels.
+  the limit in any sink. Not yet run on 5.15 or the RHEL kernels. Measured
+  when TC was the default backend; the kernel scope rules are checked on
+  five kernels by `tests/oracle/run_scope.sh`, `tests/oracle/scope_lab.py`
+  and the `scope_attach` lab test.
 - Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
   connections with 99.99% recall, and 8K new connections/s with 99.98%
   recall and bounded connection state, on 4 vCPUs. On 64 vCPUs (agent
@@ -57,18 +68,20 @@ production-hardened compliance platform.
   requests/s (64 or 4K connections). Kernel-to-worker P99 latency
   (preliminary) is 2-4 ms at 64 connections and at 4K connections up to
   20K requests/s, and 8-10 ms at 4K connections from 50K requests/s
-  (docs/BENCHMARKS.md, scaling study). These figures are for the default TC
-  backend.
-- The `cgroup_skb` backend (not the default) is measured on five kernels
-  (preliminary): scoped by `pid_filter`, it matches TC's throughput, recall
+  (docs/BENCHMARKS.md, scaling study). These figures are for the TC
+  backend (removed; historical).
+- The `cgroup_skb` capture (the only backend) is measured on five kernels
+  (preliminary), against TC in the same runs: scoped by `pid_filter`, it
+  matches TC's throughput, recall
   and agent CPU at 64 keep-alive connections, and at 1K uses slightly less agent CPU
   than TC with no kernel ring drops (records are sized to what they carry),
   at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
   both ends of node-local connections, about twice the events and agent
   CPU; node-local packets (127/8, the host's own address, and sockets
   seen on a VRF device) only with
-  `capture_loopback = true` (default false, as TC never saw them; TLS
-  plaintext over loopback is scoped by process either way, as on TC). `pid_filter` matches TC's
+  `capture_loopback = true` (default false; it covers packets only: TLS
+  plaintext over loopback is scoped by process either way). IPv6 is not
+  captured. `pid_filter` matches TC's
   recall only for a server whose listener was created after the agent
   started, with `pid_filter_listener = "creator"`; under the default
   `"acceptor"` every listener loses the bytes before `accept()`, like a
@@ -82,7 +95,10 @@ production-hardened compliance platform.
   `"creator"`, a listener created by a listed process selects every
   connection accepted on it, also by processes not in the list; under
   `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
-  Both settings change on reload.
+  Both settings change on reload. Replay (`--replay-bench`) refuses every
+  scope setting. The `client_pid` / `server_pid` export fields, filled
+  from TC's connect / accept probes, are gone; packet events in the raw
+  dump carry the kernel's `owner_tgid` / `acceptor_tgid`.
 - All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
   crash after the fixes in this release.
 
@@ -165,26 +181,24 @@ production-hardened compliance platform.
     inlined them (possible with profile-guided optimisation) or that lacks
     their symbols has its reads lost, never wrongly attributed; its writes
     are unaffected.
-- TCP stream integrity (TC capture):
+- TCP stream integrity:
   - Each direction's next expected sequence number is tracked
     (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,
     segments whose sequence or acknowledgment number is far from the stream
     (blind forgeries) are ignored, and an RST counts only at the next
     expected byte. Bytes the agent never saw are skipped as a gap, up to
     8 MiB ahead, or further once the peer acknowledges them.
-  - TCP and IP checksums are not checked: TC ingress runs before the kernel
-    validates them, and with checksum offload the packet's checksum state is
-    not reliable there. A segment with a bad checksum and the right sequence
-    numbers is parsed although the receiver discards it, and the genuine
-    retransmission is then dropped as a duplicate. Forging one needs the
-    connection's current sequence numbers (an on-path attacker).
+  - TCP and IP checksums are not checked by the agent. Whether a segment
+    with a bad checksum reaches the capture hook before the kernel discards
+    it has not been measured on `cgroup_skb` (on TC it did: such a segment
+    was parsed and the genuine retransmission dropped as a duplicate).
+    Forging one needs the connection's current sequence numbers (an
+    on-path attacker).
   - Segments are not reordered: one that arrives before an earlier one is
-    taken as a gap, and the earlier one is then ignored. TC always
-    delivers SYNs: they place each direction's first byte. A bare SYN on a
-    5-tuple whose old state is still held starts a new connection there
-    once a FIN of the old one was seen; without a FIN or RST the old state
-    is kept (a forged SYN cannot reset it) and the new connection is
-    ignored until that state expires (`idle_connection_timeout`, 30 s).
+    taken as a gap, and the earlier one is then ignored. The kernel's
+    stream offset places each direction's first byte. A connection is
+    keyed by its socket, so a new connection on a reused 5-tuple is a new
+    socket with no state from the old one.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
@@ -235,7 +249,7 @@ production-hardened compliance platform.
     boundaries (`users.pwd`). A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.
     Redis reply text is exported only on connections seen from their
-    first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
+    first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
     Bodies with bytes kept after a capture gap (a cut end keeps its
     prefix), HTTP/2 headers after a lost HPACK block or on a connection

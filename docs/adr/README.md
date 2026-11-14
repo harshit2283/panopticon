@@ -22,6 +22,7 @@ Panopticon. Read these as design rationale, then use `README.md` and
 | 011 | [Add Local Host-Mode E2E Harness](ADR-011-host-mode-e2e-harness.md) | Accepted | 2026-03-07 |
 | 012 | [Validate eBPF ELF Object in `xtask`](ADR-012-xtask-ebpf-elf-validation.md) | Accepted | 2026-03-07 |
 | 013 | [MVP Release Scope and Test Contract](ADR-013-mvp-release-scope-and-test-contract.md) | Accepted | 2026-03-07 |
+| 014 | [Capture With `cgroup_skb` and Decide Scope in the Kernel](ADR-014-cgroup-skb-capture-scope.md) | Accepted | 2026-11-14 |
 
 ## ADR Lifecycle
 

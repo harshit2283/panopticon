@@ -13,7 +13,10 @@ hardening work.
 
 ## What Panopticon Does
 
-- Captures cleartext traffic with TC eBPF hooks.
+- Captures cleartext traffic at every socket on the node with `cgroup_skb`
+  eBPF hooks on the host's cgroup v2 root, scoped in the kernel by process,
+  cgroup or Kubernetes pod (see the
+  [capture-scope ADR](docs/adr/ADR-014-cgroup-skb-capture-scope.md)).
 - Captures TLS plaintext through uprobes: OpenSSL (shared `libssl`, including
   the `SSL_read_ex`/`SSL_write_ex` API used by OpenSSL 3 applications) and Go
   `crypto/tls` (reads and writes; gc builds of Go 1.18+, amd64 or arm64, with symbols).
@@ -113,11 +116,11 @@ cargo +nightly-2026-02-17 install bpf-linker --locked --version 0.10.3
 cargo xtask build-ebpf
 cargo build -p panopticon-agent
 # --smoke-test exits 0 on the first captured event, 1 after 30s without one.
-sudo ./target/debug/panopticon-agent --interface lo --log-events --smoke-test
+sudo ./target/debug/panopticon-agent --log-events --smoke-test
 ```
 
-Without `--interface` (and no `interfaces` in the config file) the agent
-attaches to the host's IPv4 default-route interface(s).
+The agent captures at every socket on the node (loopback packets only with
+`capture_loopback = true`); there is no interface to choose.
 
 ### Kubernetes (Helm)
 

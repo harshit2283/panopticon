@@ -15,9 +15,10 @@ For day-to-day usage and output formats see [`USER-GUIDE.md`](USER-GUIDE.md).
 | Kernel | **5.8+** on every node (RingBuf, `bpf_probe_read_{kernel,user}`), or a distro kernel with both backported: RHEL 8 (validated on Rocky Linux 8.10, 4.18) and RHEL 9 (Rocky 9.8, 5.14). Kernels without them fail at load time. |
 | Architecture | x86_64. arm64 builds are not published yet. |
 | Privileges | Root/privileged, or `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE` (+ `CAP_SYS_ADMIN` for some tracefs/debugfs setups). |
-| Host namespaces | Host network (TC hooks on node interfaces) and host PID (finding TLS libraries via `/proc/<pid>/root`). |
-| Mounts | `/sys/fs/bpf`, `/sys/kernel/tracing` (process events), `/sys/kernel/debug` (older kernels' tracefs location). |
-| Resources | Default request 200m CPU / 256Mi, limit 1 CPU / 512Mi. Measured with the default TC backend: ~1.2–2 µs kernel time per captured packet; agent CPU of roughly one core per 60K captured packets/s with JSON export on; 60–120 MiB RSS under load (see [`BENCHMARKS.md`](BENCHMARKS.md)). With `[capture] backend = "cgroup_skb"`, kernel time per request is 1.4–1.8x TC's when scoped, and unscoped it captures both ends of node-local connections, roughly doubling agent CPU on such traffic (BENCHMARKS.md, cgroup_skb capture backend). If `panopticon_kernel_ringbuf_drops_total` or `panopticon_drops_channel_full_total` keep rising, raise the CPU limit. |
+| cgroup v2 and BTF | Capture attaches to the host's cgroup v2 root ([ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md)). On a cgroup v1 host (RHEL 8) the agent mounts a private cgroup2 at `/run/panopticon/cgroup2`; `cgroup_filter` / `pod_filter` are then refused. Kernel BTF (`/sys/kernel/btf/vmlinux`) is required. |
+| Host namespaces | Host network (the metrics endpoint binds the node IP) and host PID (finding TLS libraries via `/proc/<pid>/root`; `pid_filter` names host PIDs). |
+| Mounts | The host's `/sys/fs/cgroup` (a container's own is its cgroup namespace's view, which would capture the agent pod only), `/sys/fs/bpf`, `/run/panopticon` (instance lock, private cgroup2 mount), `/sys/kernel/tracing` (process events), `/sys/kernel/debug` (older kernels' tracefs location). |
+| Resources | Default request 200m CPU / 256Mi, limit 1 CPU / 512Mi. Measured, preliminary (see [`BENCHMARKS.md`](BENCHMARKS.md), cgroup_skb capture backend): scoped by `pid_filter`, kernel time per request is 1.4–1.8x that of the removed TC backend, whose figures were ~1.2–2 µs per captured packet, agent CPU of roughly one core per 60K captured packets/s with JSON export on, and 60–120 MiB RSS under load. Unscoped, capture covers both ends of node-local connections, roughly doubling agent CPU on such traffic. If `panopticon_kernel_ringbuf_drops_total` or `panopticon_drops_channel_full_total` keep rising, raise the CPU limit. |
 
 ## 2. Get the image
 
@@ -63,7 +64,7 @@ helm install panopticon ./helm/panopticon -n panopticon --create-namespace \
 ```bash
 kubectl -n panopticon rollout status ds/panopticon
 kubectl -n panopticon logs -l app.kubernetes.io/name=panopticon --tail=50 | \
-  grep -E 'Auto-detected|TC classifier attached|HTTP server started'
+  grep -E 'eBPF programs loaded and attached|HTTP server started'
 # Events flowing on a node:
 NODE_IP=$(kubectl get node <node> -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
 curl -s "$NODE_IP:9435/metrics" | grep -E 'events_received_total|drops_'
@@ -71,15 +72,16 @@ curl -s "$NODE_IP:9435/metrics" | grep -E 'events_received_total|drops_'
 
 Pods become Ready as soon as the eBPF programs are attached — a quiet node is
 still Ready. If a pod crash-loops, loading the eBPF programs failed (usually a
-kernel without the BPF ring buffer, i.e. older than 5.8 and not RHEL 8/9, or missing privileges). If it runs but captures nothing,
-look for `Failed to attach TC classifier` in its logs.
+kernel without the BPF ring buffer, i.e. older than 5.8 and not RHEL 8/9,
+missing privileges, or a `refusing to start` line naming a program or
+setting). If it runs but captures nothing, check
+`panopticon_scope_dropped_events_total{reason}` (USER-GUIDE §5.4).
 
 ### 3.3 Values
 
 | Value | Default | Notes |
 |---|---|---|
 | `image.repository` / `image.tag` / `image.digest` | `ghcr.io/harshit2283/panopticon` / appVersion / `""` | Set `digest` to pin exactly. |
-| `agent.interfaces` | `[]` | Empty = each node auto-detects its default-route interface. |
 | `agent.logLevel` | `info` | `RUST_LOG` filter. |
 | `agent.logEvents` | `false` | Logs every event to stdout — very verbose. |
 | `agent.config` | `""` | Inline TOML (see USER-GUIDE §4.2), mounted as a ConfigMap. |
@@ -145,15 +147,15 @@ helm uninstall panopticon -n panopticon
 ```
 
 The DaemonSet rolls one node at a time (`maxUnavailable: 1`). On
-`SIGTERM` the agent marks itself not-ready, flushes exports and detaches; on
-kernels before 6.6, classifiers left behind by a crashed agent are removed
-automatically at the next start.
+`SIGTERM` the agent marks itself not-ready, flushes exports and detaches.
 
 ## 4. Single host with Docker
 
 ```bash
 docker run -d --name panopticon --restart unless-stopped \
-  --privileged --network host --pid host \
+  --privileged --network host --pid host --cgroupns host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  -v /run/panopticon:/run/panopticon \
   -v /sys/fs/bpf:/sys/fs/bpf \
   -v /sys/kernel/tracing:/sys/kernel/tracing \
   -v /var/lib/panopticon:/var/lib/panopticon \
@@ -242,6 +244,23 @@ journalctl -u panopticon -f
   `map_pin_path`, remove the old pins before upgrading, as above.
 - Replay capture files (`PNCAP`) are now format version 4 (0.1.0 wrote
   version 2); older files are rejected.
+- **The TC capture backend was removed**: capture is by `cgroup_skb` on the
+  host's cgroup v2 root, the only backend
+  ([ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md)). The `--interface`
+  flag, the `interfaces` key and the Helm value `agent.interfaces` are
+  refused (the agent stops, the chart fails to render) rather than
+  ignored, since capture now covers every socket on the node; select with
+  `pid_filter`, `cgroup_filter` or `[[pod_filter]]` instead. `[capture]
+  backend = "cgroup_skb"` is accepted with a warning, any other value is
+  refused. Loopback packets are captured only with `capture_loopback =
+  true`. The metrics `panopticon_pid_filter_dropped_events`,
+  `panopticon_pid_filter_unknown_owner_connections`,
+  `panopticon_sampled_out_connections`, `panopticon_sampled_out_events` and
+  `panopticon_head_only_cut_events` and the export fields `client_pid` /
+  `server_pid` are gone; scope drops are in
+  `panopticon_scope_dropped_events_total{reason}`. The chart now mounts the
+  host's `/sys/fs/cgroup` read-only. With `map_pin_path`, remove the old
+  pins before upgrading, as above.
 
 ## 8. Releasing (maintainers)
 
