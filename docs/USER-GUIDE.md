@@ -461,9 +461,11 @@ exported:
 - the **method** (including a gRPC method path), the **content type**, the
   **request body** (e.g. POST JSON or form data) and the **response body**
   are scanned and redacted;
-- **credentials**: any field with *credential context* is withheld whole,
-  whatever the protocol, unless every credential in it can be masked with
-  certainty (below).
+- **credentials**: any field with *credential context*, where a
+  credential value could be present, is withheld whole, whatever the
+  protocol, unless every credential in it can be masked with certainty
+  (below). A credential word that is a bare name, with nothing next to it
+  that could be its value, is not context.
 
 **What credential protection promises.** In `metrics_only` no path,
 header or body leaves the agent, so no credential in one can. In
@@ -516,6 +518,42 @@ markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
   `scheme://` and `mailto:` do not count), and any `//` authority whose
   userinfo holds a `:` (RFC 3986: `,` and `;` may be part of the
   password).
+
+A word from the first list is not context when it is a *bare name*: in
+one of the three positions below, where nothing next to it, on either
+side, can be its value. These are recognised on the same normalised view,
+so an encoding or a comment that puts a value next to the word makes it
+context again. Anything that does not fit one of them exactly is context
+(when in doubt, the field is withheld):
+
+- **the whole field** is the word, as in the argument of
+  `CONFIG GET requirepass` or `HGET user:1 password`;
+- **the last segment of a path**: the field starts with `/` and is
+  printable ASCII up to any `?`; the word follows a `/` and is followed by
+  the end, by `/` and the end, or by `?` and then the end or a parameter
+  name and `=`. So `/oauth/token`, `/users/me/password/` and
+  `/oauth/token?scope=read` are bare, while `/reset/token/abc123`,
+  `/token?abc123`, `/oauth/token#x` (`#` is read as a comment marker) and
+  `https://host/oauth/token` are context;
+- **a column of a plain `SELECT` list**: the statement starts with
+  `SELECT` (no leading comment); up to its first `FROM` it holds only
+  column names (plain, `"quoted"` or `` `quoted` ``, qualified by `.`, or
+  `*`) separated by commas; and no `SELECT`, `UNION`, `INTERSECT`,
+  `EXCEPT` or `VALUES` follows that `FROM`, so no other query's values
+  line up with the columns. `SELECT password, email FROM users` and
+  `SELECT pwd, email FROM users` are bare; the same word after `FROM`,
+  after `AS` or a literal, inside parentheses (`INSERT INTO users(password)
+  VALUES …`, `md5(password)`), or after `DISTINCT` is context, and so is
+  `WHERE password = 'x'`.
+
+In the first two positions the word must also end in a whole credential
+part (`token`, `access_token`, `x-api-key`, `passwords`), not have more
+after it or before it in the same word (`token_abc`, `hunterpassword`). In
+all three it must have no digit (`token9f8e` may be a value), and none
+applies when decoding dropped a NUL byte (it may have joined a name to its
+value; UTF-16 text is therefore never a bare name). Prose is never a bare
+position: `token abc123`, `your token expired` and `hunter2 is my
+password` are context.
 
 What is exported then:
 
@@ -580,14 +618,26 @@ What is exported then:
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
   clean only after the agent saw `SSL_new` return it, as above.
-- **DNS answers** whose name has credential context, or matches one of
-  your `[credentials]` patterns, are dropped before export and before the
-  name can reach the service graph.
+- **DNS answers** whose name has credential context, a credential word
+  even as a bare name included (`db.password.internal`), or matches one
+  of your `[credentials]` patterns, are dropped before export and before
+  the name can reach the service graph.
+- **Bare names** are exported as written: `/oauth/token`,
+  `SELECT password, email FROM users` (with its bound values),
+  `CONFIG GET requirepass`, a Kafka topic or header value that is just a
+  credential name. A credential parameter after a bare path is still
+  masked: `/oauth/token?client_secret=x` exports
+  `/oauth/token?client_secret=<REDACTED>`.
 
-The price is more withheld text than a value-level mask would leave: a
-`SELECT` naming a `password` column, a body that mentions a token or a
-secret in prose, a path such as `/oauth/token`, or a Redis
-`CONFIG GET requirepass` command and its reply is withheld whole.
+The price is more withheld text than a value-level mask would leave:
+a `SELECT` that compares a `password` column or names it outside its
+select list, an `INSERT` or `UPDATE` naming one, a body that mentions a
+token or a secret in prose, a path with a segment after a credential
+word (`/reset/token/abc123`), or a Redis reply naming `requirepass`
+(the `CONFIG GET requirepass` reply) is withheld whole. The other side
+of the bare-name rule: a value spelled like a credential name, alone in
+a bare position (a Redis value `my-secret-password`), is exported, like
+any value under a name that is not in the lists.
 
 Redis commands and replies are masked before this rule runs. The
 command's secret is masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`,
@@ -597,12 +647,15 @@ parameters, the whole of `ACL LIST|GETUSER|GENPASS` and the same results
 inside `EXEC`; in any reply the value after a credential-named element and
 `ACL LIST` lines with a password rule are masked too. The rule above then
 applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
-<REDACTED>` stay readable (`auth` is not used as a name there), while a
-command or reply naming `requirepass`, `masterauth` or another word from
-the first list (`CONFIG SET requirepass …`, `CONFIG GET masterauth`) is
-withheld whole. Protocol and subscription state follow the server's
-replies only, and a subscription acknowledgement counts only as the reply
-to the pending subscription command (a script returning an array of the
+<REDACTED>` stay readable (`auth` is not used as a name there), and so
+does a command whose argument is just such a name, a bare name
+(`CONFIG GET requirepass`, `CONFIG GET masterauth`), while an argument
+or reply with a value next to a word from the first list, masked or not
+(`CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
+`requirepass, <REDACTED>`), is withheld whole. Protocol and subscription
+state follow the server's replies only, and a subscription
+acknowledgement counts only as the reply to the pending subscription
+command (a script returning an array of the
 same shape changes nothing). A reply that cannot be matched to its command
 is exported without its text. No reply text is exported for the rest of
 the connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;

@@ -64,8 +64,10 @@ fn is_credential_header(name: &str) -> bool {
 /// command and the values of credential-named headers (HTTP header names
 /// by [`is_credential_header`], any protocol's by
 /// [`crate::protocol::is_credential_name`]); drop DNS answers whose name has
-/// credential context or matches one of the user's patterns (before export
-/// and before the name reaches the service graph's DNS cache).
+/// credential context, a bare name included
+/// ([`crate::protocol::has_any_credential_context`]), or matches one of the
+/// user's patterns (before export and before the name reaches the service
+/// graph's DNS cache).
 fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
     let wipe = |f: &mut String| {
         f.zeroize();
@@ -95,7 +97,7 @@ fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
             wipe(value)
         });
     msg.dns_answers.retain(|a| {
-        !crate::protocol::has_credential_context(&a.name)
+        !crate::protocol::has_any_credential_context(&a.name)
             && decide(rules, &a.name, false) == Decision::Keep
     });
 }

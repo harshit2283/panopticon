@@ -1037,6 +1037,46 @@ mod tests {
         assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
     }
 
+    /// `CONFIG GET requirepass` after the built-in rules (USER-GUIDE 5.3):
+    /// the command names a parameter, a bare name, and is exported; its
+    /// reply, the name then its masked value, stays withheld.
+    #[test]
+    fn test_config_get_credential_after_the_builtin_rules() {
+        let mut parser = RedisParser::new();
+        parser.feed(
+            &resp(&["CONFIG", "GET", "requirepass"]),
+            Direction::Egress,
+            1,
+        );
+        let reply = b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n";
+        let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
+            panic!()
+        };
+        crate::pii::mask_credentials(&mut msgs[0]);
+        assert_eq!(msgs[0].method.as_deref(), Some("CONFIG"));
+        assert_eq!(msgs[0].path.as_deref(), Some("GET"));
+        assert_eq!(msgs[0].request_text.as_deref(), Some("requirepass"));
+        assert_eq!(
+            msgs[0].payload_text.as_deref(),
+            Some(crate::protocol::FIELD_WITHHELD)
+        );
+        // CONFIG SET: the masked value next to the name withholds it.
+        let mut parser = RedisParser::new();
+        parser.feed(
+            &resp(&["CONFIG", "SET", "requirepass", "s3cretpw"]),
+            Direction::Egress,
+            1,
+        );
+        let ParseResult::Messages(mut msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+            panic!()
+        };
+        crate::pii::mask_credentials(&mut msgs[0]);
+        assert_eq!(
+            msgs[0].request_text.as_deref(),
+            Some(crate::protocol::FIELD_WITHHELD)
+        );
+    }
+
     /// Replies that carry a secret: `CONFIG GET` values of secret
     /// parameters, and the hashes or passwords of `ACL LIST|GETUSER|GENPASS`.
     #[test]

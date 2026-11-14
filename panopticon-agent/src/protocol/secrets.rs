@@ -1,10 +1,14 @@
-//! Login-secret protection: withhold any field with credential context.
+//! Login-secret protection: withhold any field where a credential value
+//! could be present.
 //!
 //! Masking a secret means finding where its value starts and ends, and SQL
 //! dialects, string escapes and encodings keep defeating that. So the rule
 //! is: a field whose *normalised view* shows credential context is withheld
 //! whole, unless every credential in it sits in a structure whose value is
 //! delimited with certainty, in which case only those values are masked.
+//! A credential word that is a *bare name*, in a position where nothing
+//! next to it on either side can be a value, is not context (see
+//! [`BareShapes`]); anything not recognised as one is (fail closed).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -23,6 +27,21 @@
 //! - userinfo, `user:password@host`, with or without a scheme (the `:` of
 //!   `scheme://` and of `mailto:` do not count), and any `//` authority
 //!   whose userinfo has a `:` (RFC 3986: `,` and `;` may appear in it).
+//!
+//! A bare name, on a view from which no NUL was dropped, is a word with no
+//! digit that is (a) the whole field, or (b) the last segment of a path
+//! (the field starts with `/`, printable ASCII up to `?`; the word follows
+//! a `/` and is followed by the end, `/` then the end, or `?` then the end
+//! or a parameter name and `=`), both only when the word ends in a whole
+//! credential part (`requirepass`, `access_token`, not `token_abc`); or
+//! (c) a column of the select list of a plain `SELECT` (first word
+//! `select`, then only identifiers and `,` up to `from`, and no `select`,
+//! `union`, `intersect`, `except` or `values` after it). So
+//! `CONFIG GET requirepass`, `/oauth/token` and
+//! `SELECT password, email FROM users` are not context, while
+//! `/reset/token/abc123`, `WHERE password = 'x'`, `token abc123` and
+//! `hunter2 is my password` are. DNS names keep the strict rule
+//! ([`has_any_credential_context`]).
 //!
 //! The certain structures, on the raw text: a query or form parameter
 //! (`name=value` at the start of the text or after `?` or `&`), a JSON
@@ -116,30 +135,42 @@ pub fn is_credential_name(name: &str) -> bool {
     NAMES.contains(&n.trim()) || words(&n).any(|(w, _, _)| strong_word(w) || NAMES.contains(&w))
 }
 
-/// Whether `text` shows credential context (see the module docs).
+/// Whether `text` shows credential context (see the module docs); a bare
+/// name is not context.
 pub fn has_credential_context(text: &str) -> bool {
-    context(text, false)
+    context(text, false, true)
+}
+
+/// [`has_credential_context`] counting bare names too: any credential word
+/// is context. For DNS names, which hold no bare-name position.
+pub fn has_any_credential_context(text: &str) -> bool {
+    context(text, false, false)
 }
 
 /// [`has_credential_context`] for a SQL statement: a short credential name
 /// also counts as a column in a list or assignment (`users(pwd)`,
 /// `SET a = 1, pass = $1`).
 pub fn has_sql_credential_context(sql: &str) -> bool {
-    context(sql, true)
+    context(sql, true, true)
 }
 
-fn context(text: &str, sql: bool) -> bool {
-    let n = normalize(text);
+fn context(text: &str, sql: bool, narrow: bool) -> bool {
+    let (n, nul) = normalize_nul(text);
     let b = n.as_bytes();
     if !has_hint(&n) {
         return has_userinfo(b);
     }
+    // A NUL dropped from the view may have joined a name to its value.
+    let bare = (narrow && !nul).then(|| BareShapes::new(text, &n));
     let mut prev_identified = false;
     for (w, start, end) in words(&n) {
         if prev_identified && matches!(w, "by" | "with" | "via" | "as" | "using") {
             return true;
         }
         prev_identified = w == "identified";
+        if bare.as_ref().is_some_and(|s| s.bare(&n, w, start, end)) {
+            continue;
+        }
         if w != "identified" && strong_word(w) {
             return true;
         }
@@ -148,6 +179,171 @@ fn context(text: &str, sql: bool) -> bool {
         }
     }
     has_userinfo(b)
+}
+
+// ── Bare names ──────────────────────────────────────────────────────────
+
+/// The positions of a normalised field where a credential word is a bare
+/// name: nothing next to it, on either side, can be its value. Each is
+/// recognised whole, and anything else is context (fail closed).
+struct BareShapes {
+    /// The field is one word (`requirepass`, a Redis argument).
+    whole: bool,
+    /// The field is a path (`/...`, printable ASCII up to `?`): the end of
+    /// that path part and of the trimmed field.
+    path: Option<(usize, usize)>,
+    /// The select list of a plain `SELECT` (identifiers, `,` and `*` only,
+    /// up to `FROM`, with no further `SELECT`, `UNION`, `INTERSECT`,
+    /// `EXCEPT` or `VALUES` after it).
+    select: Option<(usize, usize)>,
+}
+
+impl BareShapes {
+    fn new(raw: &str, n: &str) -> Self {
+        let t = n.trim();
+        let lead = n.len() - n.trim_start().len();
+        let tend = lead + t.len();
+        let word_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let whole = !t.is_empty() && t.bytes().all(word_byte);
+        let path = t.starts_with('/').then(|| {
+            let q = t.find('?').map_or(tend, |o| lead + o);
+            n.as_bytes()[lead..q]
+                .iter()
+                .all(u8::is_ascii_graphic)
+                .then_some((q, tend))
+        });
+        let select = (sql_verb(raw) == Some("SELECT"))
+            .then(|| select_list(n.as_bytes(), lead))
+            .flatten();
+        BareShapes {
+            whole,
+            path: path.flatten(),
+            select,
+        }
+    }
+
+    /// Whether the word `w` at `start..end` (its token's bounds) is a bare
+    /// credential name.
+    fn bare(&self, n: &str, w: &str, start: usize, end: usize) -> bool {
+        // A digit: may be a value (`token9f8e`), whatever the position.
+        if w.bytes().any(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        // An identifier: SQL syntax keeps a value out of it.
+        if self.select.is_some_and(|(s, e)| s <= start && end <= e) {
+            return true;
+        }
+        if !ends_in_a_credential_part(w) {
+            return false;
+        }
+        if self.whole {
+            return true;
+        }
+        let Some((q, tend)) = self.path else {
+            return false;
+        };
+        let b = n.as_bytes();
+        // A whole last segment: `/token`, `/token/`, then the end or `?`.
+        if start == 0 || b[start - 1] != b'/' || end > q {
+            return false;
+        }
+        let mut k = end;
+        if b.get(k) == Some(&b'/') {
+            k += 1;
+        }
+        k == tend || k == q && b[k] == b'?' && query_starts_with_a_name(&b[k + 1..tend])
+    }
+}
+
+/// A word spelled as a credential name: it ends in a whole credential
+/// part, plural allowed (`token`, `access_token`, `x_api_key`, `passwords`,
+/// `tls_key_file_pass`), not with more after it (`token_abcdef`,
+/// `canary_secret_value`) or glued to it (`hunterpassword`).
+fn ends_in_a_credential_part(w: &str) -> bool {
+    let ends_in = |w: &str| {
+        PARTS.iter().chain(&["pass", "auth"]).any(|p| {
+            w.strip_suffix(p)
+                .is_some_and(|head| head.is_empty() || head.ends_with('_'))
+        })
+    };
+    ends_in(w) || w.strip_suffix('s').is_some_and(ends_in)
+}
+
+/// After a path's `?`: the end, or (past any `&` and spaces left by
+/// removed parameters) a parameter name and `=`. `/token?abc123` is not.
+fn query_starts_with_a_name(q: &[u8]) -> bool {
+    let q = &q[q
+        .iter()
+        .position(|&c| c != b'&' && !c.is_ascii_whitespace())
+        .unwrap_or(q.len())..];
+    let name = q
+        .iter()
+        .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+        .unwrap_or(q.len());
+    q.is_empty() || name > 0 && q.get(name) == Some(&b'=')
+}
+
+/// The select list of a normalised `SELECT` whose first word is `select`
+/// (no leading comment): byte range from after `select` to `from`, when it
+/// holds only identifiers (word bytes, `"` and `` ` `` quotes in pairs,
+/// `*`) separated by `,`, and no word after `from` starts another query
+/// whose columns line up with it (`UNION SELECT 'x'`, `VALUES`).
+fn select_list(b: &[u8], lead: usize) -> Option<(usize, usize)> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'"' | b'`' | b'*');
+    let run_end = |i: usize| (i..b.len()).find(|&k| !ident(b[k])).unwrap_or(b.len());
+    let skip_ws = |i: usize| {
+        (i..b.len())
+            .find(|&k| !b[k].is_ascii_whitespace())
+            .unwrap_or(b.len())
+    };
+    let first = run_end(lead);
+    if &b[lead..first] != b"select" {
+        return None;
+    }
+    let mut i = first;
+    let mut items = 0;
+    loop {
+        let s = skip_ws(i);
+        let e = run_end(s);
+        if e == s {
+            return None;
+        }
+        let run = &b[s..e];
+        if run == b"from" {
+            if items == 0 {
+                return None;
+            }
+            let rest = std::str::from_utf8(&b[e..]).ok()?;
+            let again = words(rest).any(|(w, _, _)| {
+                matches!(w, "select" | "union" | "intersect" | "except" | "values")
+            });
+            return (!again).then_some((first, s));
+        }
+        // A plain or quoted name, qualified by `.` (read as `_`):
+        // `"users"_"password"`, `t_*`; quotes paired and only around a
+        // part, `*` only last (not `password"x"` nor `*password`).
+        let edge =
+            |k: usize| k == 0 || k + 1 == run.len() || run[k - 1] == b'_' || run[k + 1] == b'_';
+        let marks_ok = run.iter().enumerate().all(|(k, &c)| match c {
+            b'"' | b'`' => edge(k),
+            b'*' => k + 1 == run.len() && (k == 0 || run[k - 1] == b'_'),
+            _ => true,
+        });
+        if !marks_ok
+            || run.iter().filter(|&&c| c == b'"').count() % 2 == 1
+            || run.iter().filter(|&&c| c == b'`').count() % 2 == 1
+        {
+            return None;
+        }
+        items += 1;
+        let after = skip_ws(e);
+        match b.get(after) {
+            Some(b',') => i = after + 1,
+            // The next run must be `from`.
+            Some(_) if run_end(after) > after && &b[after..run_end(after)] == b"from" => i = after,
+            _ => return None,
+        }
+    }
 }
 
 /// `text` with credential values masked where certain, or the field
@@ -417,7 +613,13 @@ pub fn sql_verb(sql: &str) -> Option<&'static str> {
 // ── Normalised view ─────────────────────────────────────────────────────
 
 fn normalize(text: &str) -> String {
-    let mut s = decode(text).unwrap_or_else(|| text.to_string());
+    normalize_nul(text).0
+}
+
+/// The normalised view, and whether decoding dropped a NUL byte.
+fn normalize_nul(text: &str) -> (String, bool) {
+    let (d, nul) = decode_nul(text);
+    let mut s = d.unwrap_or_else(|| text.to_string());
     s.make_ascii_lowercase();
     for delim in ["/*!", "/*", "*/", "--", "#"] {
         if s.contains(delim) {
@@ -427,18 +629,25 @@ fn normalize(text: &str) -> String {
     if s.contains(['-', '.']) {
         s = s.replace(['-', '.'], "_");
     }
-    s
+    (s, nul)
 }
 
 /// The decoded view: NUL bytes dropped, then up to three rounds of JSON
 /// escapes, HTML references and percent-decoding. None when nothing
 /// changes.
 fn decode(text: &str) -> Option<String> {
+    decode_nul(text).0
+}
+
+/// [`decode`], and whether a NUL byte was dropped.
+fn decode_nul(text: &str) -> (Option<String>, bool) {
     let mut s: Option<String> = None;
+    let mut nul = false;
     for _ in 0..3 {
         let mut changed = false;
         let cur = s.as_deref().unwrap_or(text);
         if cur.contains('\0') {
+            nul = true;
             let mut d = cur.to_string();
             d.retain(|c| c != '\0');
             s = Some(d);
@@ -454,10 +663,13 @@ fn decode(text: &str) -> Option<String> {
             break;
         }
     }
-    if let Some(d) = s.as_mut() {
+    if let Some(d) = s.as_mut()
+        && d.contains('\0')
+    {
+        nul = true;
         d.retain(|c| c != '\0');
     }
-    s
+    (s, nul)
 }
 
 /// HTML character references decoded (`&#119;`, `&#x77;`, `&amp;`,
@@ -1152,26 +1364,166 @@ mod tests {
     }
 
     /// Redis text after the parser's own masking (USER-GUIDE 5.3): `AUTH`
-    /// stays readable, a credential parameter's name withholds the field.
+    /// stays readable, and so does a credential parameter's bare name
+    /// (`CONFIG GET masterauth`); with its value next to it, masked or not,
+    /// the field is withheld.
     #[test]
     fn masked_redis_text() {
         for text in [
             "<REDACTED>",
             "3 AUTH default <REDACTED>",
             "default, <REDACTED>",
+            "masterauth",
+            "requirepass",
         ] {
             assert_eq!(protect_text(text), None, "{text}");
         }
         for text in [
             "requirepass <REDACTED>",
-            "masterauth",
             "requirepass, <REDACTED>",
+            "requirepass masterauth",
         ] {
             assert_eq!(
                 protect_text(text).as_deref(),
                 Some(FIELD_WITHHELD),
                 "{text}"
             );
+        }
+    }
+
+    /// The bare names the narrowed rule exports (USER-GUIDE 5.3): a whole
+    /// field, a path's last segment, a column of a plain SELECT list.
+    #[test]
+    fn bare_names_are_exported() {
+        for text in [
+            "/oauth/token",
+            "/oauth/token/",
+            "/api/v1/users/me/password",
+            "/oauth/token?scope=read&state=xyz",
+            "/oauth/token?",
+            "SELECT password, email FROM users",
+            "select id, password_hash, email from users where id = $1",
+            "SELECT pwd, email FROM users",
+            r#"SELECT "users"."password" FROM "users""#,
+            "SELECT password FROM users -- note",
+            "requirepass",
+            "password\n",
+            "access_tokens",
+            "x-api-key",
+            "SELECT id, password_hash FROM users",
+            "SELECT t.*, `password` FROM t",
+        ] {
+            assert!(!has_credential_context(text), "{text}");
+            assert_eq!(protect_text(text), None, "{text}");
+        }
+        assert!(!has_sql_credential_context(
+            "SELECT password, email FROM users"
+        ));
+        assert!(!has_sql_credential_context("SELECT pwd, email FROM users"));
+        // A credential parameter after a bare path is still masked, and a
+        // second pass changes nothing.
+        let once = p("/oauth/token?client_secret=abc&x=1");
+        assert_eq!(once, "/oauth/token?client_secret=<REDACTED>&x=1");
+        assert_eq!(protect_text(&once), None);
+        // DNS names keep the strict rule.
+        assert!(has_any_credential_context("db.password"));
+        assert!(!has_credential_context("db.password"));
+    }
+
+    /// A credential word with anything that could be its value next to
+    /// it, on either side, still withholds the field, encoded, commented,
+    /// split by whitespace or UTF-16 included.
+    #[test]
+    fn values_next_to_a_name_withhold() {
+        for text in [
+            // The decision's examples.
+            "/reset/token/abc123",
+            "SELECT * FROM users WHERE password='x'",
+            // Paths.
+            "/token?abc123",
+            "/token?&abc123",
+            "/token/?abc123",
+            "/oauth/token#abc123",
+            "/oauth/token;abc123",
+            "/oauth/token/abc/",
+            "/oauth/token abc123",
+            "/oauth/token9f8e7d",
+            "/oauth/tokenabcdef",
+            "/oauth/token.json",
+            "token_abcdef",
+            "canary-secret-value",
+            "hunterpassword",
+            "login with alice/hunter2 as username/password",
+            "https://h/oauth/token",
+            // Encodings that reveal a value after a bare-looking name.
+            "/oauth/token%2Fabc123",
+            "/oauth/token%3Fabc123",
+            "/oauth/token%20abc123",
+            "/oauth/token%253Dabc123",
+            "/oauth/token\\u002fabc123",
+            "/oauth/token&#47;abc123",
+            "requirepass%20hunter2",
+            "password%00hunter",
+            "password\\u0000hunter",
+            "password&#0;hunter",
+            "pass\0word\0hunter",
+            // Whitespace, newlines and non-ASCII separators.
+            "password hunter2",
+            "password\nhunter2",
+            "password\thunter",
+            "password\u{a0}hunter",
+            "password\u{2028}hunter",
+            "hunter2 is my password",
+            "your token expired",
+            "token abc123",
+            // UTF-16 (NUL bytes dropped): never a bare name.
+            "p\0a\0s\0s\0w\0o\0r\0d\0",
+            "p\0a\0s\0s\0w\0o\0r\0d\0 \0h\0u\0n\0t\0e\0r\0",
+            "/\0t\0o\0k\0e\0n\0/\0a\0b\0c\0",
+            // SQL: comparisons, literals, positional values, comments.
+            "SELECT email FROM users WHERE password = 'x'",
+            "SELECT 'x' AS password FROM t",
+            "SELECT 'x' password FROM t",
+            "SELECT 'x', password FROM t",
+            "SELECT password = 'x' FROM t",
+            "SELECT password--\n= 'x' FROM t",
+            "SELECT password/**/= 'x' FROM t",
+            "SELECT password /* = 'x' */ FROM t",
+            "SELECT password -- hunter2\n, email FROM t",
+            "/* hunter2 */ SELECT password FROM users",
+            "SELECT password FROM users UNION SELECT 'hunter2'",
+            "SELECT password FROM users WHERE id IN (SELECT 1)",
+            "SELECT password FROM t, (VALUES ('x')) v",
+            "SELECT DISTINCT password FROM users",
+            "SELECT md5(password) FROM users",
+            "SELECT password FROM users WHERE token = 'x'",
+            r#"SELECT "hunter2,password" FROM t"#,
+            r#"SELECT password"hunter2" FROM t"#,
+            "SELECT *password FROM t",
+            "select password, then type hunter2 from the list",
+            "SELECT password",
+            "INSERT INTO users (email, password, name) VALUES ('a', 'x', 'b')",
+            "INSERT INTO users (password) SELECT 'x'",
+            "UPDATE users SET (email, password) = ('a', 'x')",
+            "ALTER ROLE app PASSWORD 'x'",
+            "ALTER USER app IDENTIFIED BY password",
+            "SELECT password FROM users; SET PASSWORD = 'x'",
+            "WITH t AS (SELECT 'x' AS password) SELECT password FROM t",
+            // Prose and the rest.
+            "token=abc 123",
+            "token: abc123",
+            "Authorization: Bearer abc",
+            "requirepass, s3cret",
+        ] {
+            assert!(has_credential_context(text), "{text:?}");
+            assert_eq!(p(text), FIELD_WITHHELD, "{text:?}");
+        }
+        for sql in [
+            "SELECT password FROM users WHERE password = $1",
+            "INSERT INTO users(pwd) VALUES ($1)",
+            "SELECT pwd, email FROM users WHERE pwd = $1",
+        ] {
+            assert!(has_sql_credential_context(sql), "{sql}");
         }
     }
 

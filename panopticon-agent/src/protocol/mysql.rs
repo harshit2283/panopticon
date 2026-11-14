@@ -1122,9 +1122,10 @@ mod tests {
     }
 
     /// Every credential statement, whatever SQL form carries the value,
-    /// exports only its verb; so does a statement merely naming a password
-    /// column (the price of not parsing values). Statements without
-    /// credential context are exported as written.
+    /// exports only its verb; so does one comparing a password column or
+    /// listing it for `VALUES`. Statements without credential context, and
+    /// a `SELECT` whose credential columns are bare names in its select
+    /// list, are exported as written.
     #[test]
     fn test_credential_statement_forms_export_only_the_verb() {
         for sql in [
@@ -1145,7 +1146,9 @@ mod tests {
             "ALTER USER app IDENTIFIED BY 'canary-trunc",
             "CHANGE MASTER TO MASTER_HOST='db1', MASTER_PASSWORD='canary'",
             "CHANGE REPLICATION SOURCE TO SOURCE_USER='repl', SOURCE_PASSWORD = 'canary'",
-            "SELECT password, email FROM users",
+            "SELECT email FROM users WHERE password = 'canary'",
+            "INSERT INTO users (email, password, name) VALUES ('a', 'canary', 'b')",
+            "SELECT password FROM users UNION SELECT 'canary'",
         ] {
             let verb = sql.split_whitespace().next().unwrap();
             assert_eq!(
@@ -1157,6 +1160,8 @@ mod tests {
         for sql in [
             "REPLACE INTO t VALUES (REPLACE(name, 'a', 'b'))",
             "SELECT name, email FROM users WHERE id = 7",
+            "SELECT password, email FROM users",
+            "SELECT pwd, email FROM users",
         ] {
             assert_eq!(exported_query(sql), sql);
         }

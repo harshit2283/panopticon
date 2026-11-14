@@ -219,7 +219,10 @@ production-hardened compliance platform.
     form parameter, a scalar JSON member or URI userinfo, whose value is
     then masked; credential-named headers are masked, and Redis
     credential commands and replies are masked before the same rule (so
-    `AUTH` stays readable but `CONFIG GET requirepass` is withheld).
+    `AUTH` stays readable, as does `CONFIG GET requirepass`, but its reply
+    is withheld). A credential word that is a bare name (the whole field,
+    a path's last segment, a column of a plain `SELECT` list, with nothing
+    next to it that could be a value) is not credential context.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.
