@@ -30,7 +30,8 @@ use crate::config::{PiiConfig, PiiMode};
 use crate::protocol::{L7Message, Protocol};
 
 use crate::protocol::{
-    CredentialRules, Decision, REDACTED_CREDENTIAL, credential_rules, decide, protect_text_in,
+    CredentialRules, Decision, FieldKind, REDACTED_CREDENTIAL, credential_rules, decide, decide_as,
+    protect_text_in,
 };
 
 /// Headers whose values are credentials or session tokens, masked wholesale
@@ -64,10 +65,8 @@ fn is_credential_header(name: &str) -> bool {
 /// command and the values of credential-named headers (HTTP header names
 /// by [`is_credential_header`], any protocol's by
 /// [`crate::protocol::is_credential_name`]); drop DNS answers whose name has
-/// credential context, a bare name included
-/// ([`crate::protocol::has_any_credential_context`]), or matches one of the
-/// user's patterns (before export and before the name reaches the service
-/// graph's DNS cache).
+/// credential context or matches one of the user's patterns (before export
+/// and before the name reaches the service graph's DNS cache).
 fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
     let wipe = |f: &mut String| {
         f.zeroize();
@@ -97,7 +96,7 @@ fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
             wipe(value)
         });
     msg.dns_answers.retain(|a| {
-        !crate::protocol::has_any_credential_context(&a.name)
+        !crate::protocol::has_credential_context(&a.name)
             && decide(rules, &a.name, false) == Decision::Keep
     });
 }
@@ -114,17 +113,17 @@ pub fn mask_credentials(msg: &mut L7Message) {
 /// [`mask_credentials`] under one rule set for the whole message.
 fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
     mask_credential_fields(rules, msg);
-    for field in [
-        &mut msg.method,
-        &mut msg.path,
-        &mut msg.content_type,
-        &mut msg.request_text,
-        &mut msg.payload_text,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        protect_text_in(rules, field, true);
+    let (path_kind, payload_kind) = field_kinds(msg.protocol);
+    for (field, kind) in [
+        (&mut msg.method, FieldKind::Other),
+        (&mut msg.path, path_kind),
+        (&mut msg.content_type, FieldKind::Other),
+        (&mut msg.request_text, FieldKind::Other),
+        (&mut msg.payload_text, payload_kind),
+    ] {
+        if let Some(field) = field {
+            crate::protocol::protect_field_in(rules, field, kind);
+        }
     }
     for (name, value) in msg.headers.iter_mut() {
         // A wiped credential header keeps its name readable; the user's
@@ -136,6 +135,21 @@ fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
         protect_text_in(rules, name, !wiped);
         protect_text_in(rules, value, !wiped);
     }
+}
+
+/// The kinds of a message's `path` and `payload_text` for the bare-name
+/// rule: an HTTP request path, a SQL statement; every other field holds no
+/// bare name.
+fn field_kinds(protocol: Protocol) -> (FieldKind, FieldKind) {
+    let path = match protocol {
+        Protocol::Http1 | Protocol::Http2 => FieldKind::HttpPath,
+        _ => FieldKind::Other,
+    };
+    let payload = match protocol {
+        Protocol::Mysql | Protocol::Postgres => FieldKind::SqlStatement,
+        _ => FieldKind::Other,
+    };
+    (path, payload)
 }
 
 /// Decode `%XX` escapes and `+` (form encoding) for PII scanning.
@@ -565,16 +579,18 @@ impl PiiEngine {
             mask_credential_fields(rules, msg);
         }
 
+        let (path_kind, payload_kind) = field_kinds(msg.protocol);
+        let other = FieldKind::Other;
         if let Some(path) = msg.path.as_mut() {
             // Query strings are usually percent-encoded (alice%40example.com),
             // which the regexes would miss: scan the decoded form.
-            self.scan_field(path, true, redact_enabled, rules, &mut found);
+            self.scan_field(path, true, path_kind, redact_enabled, rules, &mut found);
         }
         for field in [&mut msg.method, &mut msg.content_type]
             .into_iter()
             .flatten()
         {
-            self.scan_field(field, false, redact_enabled, rules, &mut found);
+            self.scan_field(field, false, other, redact_enabled, rules, &mut found);
         }
 
         if redact_enabled {
@@ -590,18 +606,18 @@ impl PiiEngine {
                 protect_text_in(rules, value, false);
                 continue;
             }
-            self.scan_field(value, false, redact_enabled, rules, &mut found);
-            self.scan_field(name, false, redact_enabled, rules, &mut found);
+            self.scan_field(value, false, other, redact_enabled, rules, &mut found);
+            self.scan_field(name, false, other, redact_enabled, rules, &mut found);
         }
 
         if let Some(body) = msg.request_text.as_mut() {
-            self.scan_field(body, false, redact_enabled, rules, &mut found);
+            self.scan_field(body, false, other, redact_enabled, rules, &mut found);
         }
 
         let mut redacted_payload = None;
         if let Some(text) = msg.payload_text.as_mut() {
             let before = found.entities.len();
-            self.scan_field(text, false, redact_enabled, rules, &mut found);
+            self.scan_field(text, false, payload_kind, redact_enabled, rules, &mut found);
             if redact_enabled && found.entities.len() > before {
                 redacted_payload = Some(text.clone());
             }
@@ -630,11 +646,12 @@ impl PiiEngine {
         &self,
         field: &mut String,
         decode: bool,
+        kind: FieldKind,
         redact: bool,
         rules: Option<&CredentialRules>,
         found: &mut Found,
     ) {
-        let decision = rules.map_or(Decision::Keep, |r| decide(r, field, true));
+        let decision = rules.map_or(Decision::Keep, |r| decide_as(r, field, true, kind));
         let protected = decision.apply(field);
         let decoded = decode.then(|| percent_decode(field));
         let text = decoded.as_deref().unwrap_or(field.as_str());
@@ -1256,6 +1273,47 @@ mod tests {
         let mut msg = auth();
         let _ = raw.scan_message_with(&mut msg, false);
         assert_eq!(msg.request_text.as_deref(), Some("r3dis-s3cret"));
+    }
+
+    /// A bare name is exported only from a field of its kind: an HTTP/1 or
+    /// HTTP/2 request path, a MySQL or PostgreSQL statement. The same text
+    /// in another protocol's field is withheld, in both masking paths.
+    #[test]
+    fn test_bare_names_only_in_their_field_kind() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let path = "/oauth/token";
+        let sql = "SELECT password, email FROM users";
+        for protocol in [
+            Protocol::Http1,
+            Protocol::Http2,
+            Protocol::Grpc,
+            Protocol::Redis,
+            Protocol::Mysql,
+            Protocol::Postgres,
+            Protocol::Kafka,
+            Protocol::Amqp,
+        ] {
+            let http = matches!(protocol, Protocol::Http1 | Protocol::Http2);
+            let db = matches!(protocol, Protocol::Mysql | Protocol::Postgres);
+            for engine_path in [false, true] {
+                let mut m = L7Message::new(protocol, Direction::Ingress, 1);
+                m.path = Some(path.into());
+                m.payload_text = Some(sql.into());
+                m.request_text = Some(sql.into());
+                if engine_path {
+                    let _ = engine.scan_message_with(&mut m, true);
+                } else {
+                    mask_credentials(&mut m);
+                }
+                let want_path = if http { Some(path) } else { withheld };
+                let want_sql = if db { Some(sql) } else { withheld };
+                assert_eq!(m.path.as_deref(), want_path, "{protocol:?}");
+                assert_eq!(m.payload_text.as_deref(), want_sql, "{protocol:?}");
+                assert_eq!(m.request_text.as_deref(), withheld, "{protocol:?}");
+            }
+        }
     }
 
     #[test]

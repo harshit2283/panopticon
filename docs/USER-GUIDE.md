@@ -464,9 +464,9 @@ exported:
 - **credentials**: any field with *credential context*, where a
   credential value could be present, is withheld whole, whatever the
   protocol, unless every credential in it can be masked with certainty
-  (below). A credential word that is a bare name, in a position that
-  provably holds a name with nothing next to it that could be its value,
-  is not context.
+  (below). A credential word that is a bare name, in one of two
+  allowlisted positions of an HTTP request path or a SQL statement, is
+  not context.
 
 **What credential protection promises.** In `metrics_only` no path,
 header or body leaves the agent, so no credential in one can. In
@@ -525,15 +525,19 @@ markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
   password).
 
 A word from the first list is not context when it is a *bare name*: in
-one of the two positions below, which a grammar recognises whole and
-which hold a name with nothing next to it, on either side, that can be
-its value. Each is checked on text that no decoding has changed: a path
-on the field as captured, a `SELECT` on the statement as captured and
-only when decoding would change nothing in it, so no encoding can hide a
-value from the check. Anything that does not fit one of them exactly is
-context (when in doubt, the field is withheld):
+one of the two allowlisted positions below, each only in a field of its
+kind, which the protocol parser decides (never the text). Each is
+checked on text that no decoding has changed: a path on the field as
+captured, a `SELECT` on the statement as captured and only when decoding
+would change nothing in it, so no encoding can hide a value from the
+check. Anything outside the allowlist is context (when in doubt, the
+field is withheld). No other field has a bare name: a Redis argument or
+reply, a Kafka topic, an AMQP field, a DNS name, a gRPC path, a header,
+a body or an error message that reads `/oauth/token` or
+`SELECT password FROM users` is withheld.
 
-- **the last segment of a path**, read from the field as captured: the
+- **the last segment of an HTTP request path** (HTTP/1, HTTP/2), read
+  from the field as captured: the
   whole field is printable ASCII (no space or other whitespace, no byte
   outside ASCII, so no `U+00A0` or `U+2028` either); it starts with `/`;
   every segment is a plain name (letters, `-`, `_`, `.`: no digit, `%`,
@@ -545,39 +549,47 @@ context (when in doubt, the field is withheld):
   bare, while `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
   `/oauth/token/`, `/token?abc123`, `/token?scope=read&abc123`,
   `/oauth/token#x` and `https://host/oauth/token` are context;
-- **a column of a simple `SELECT` list**: a statement in this grammar,
-  read on its tokens as captured (`.`, `-` and every operator split
-  them), with no comment marker (`--`, `#`, `/*`) anywhere and nothing
-  decoding would change (no backslash, `%XX`, `+`, `&…;` or NUL byte):
-  `SELECT col, … FROM table [WHERE col op value [AND|OR …]]
-  [ORDER BY col [ASC|DESC], …] [LIMIT n [OFFSET n]] [;]`, where a col is
-  a plain unqualified name or `*`, the table one name, op one of
-  `=` `<>` `!=` `<` `<=` `>` `>=` `LIKE` or `IS [NOT] NULL`, and a value
-  a number, a bound parameter or a `'…'` string without `''`, `(`, `)`,
-  `,`, `{` or `}`. No double quote, backtick or backslash anywhere in the
-  statement as captured, no join, alias, subquery, function, row, cast,
-  `UNION` or `VALUES`, and no `WHERE` column that names the table itself
-  (a PostgreSQL whole-row value): nothing that could line a value up
-  with a column. So `SELECT password, email FROM users` and
-  `SELECT pwd, email FROM users WHERE id = $1` are bare;
-  `SELECT "password", "hunter2" FROM dual`, `SELECT DISTINCT password
-  FROM users`, `WHERE users = $1`, `WHERE profile = '\050alice\054…'`
-  and `WHERE password = 'x'` are context. Such a statement is exported
-  without its bound values, and a server error for it becomes
-  `<statement withheld>` (it may echo a bound value:
-  `malformed record literal: "(alice,hunter2)"`).
+- **a projection item of an allowlisted `SELECT`** (a MySQL or
+  PostgreSQL statement), read on its tokens as captured, with no comment
+  marker (`--`, `#`, `/*`), double quote, backtick or backslash anywhere
+  and nothing decoding would change (no `%XX`, `+`, `&…;` or NUL byte).
+  The statement must be
+  `SELECT item, … FROM table [WHERE col op value [AND|OR …]]
+  [ORDER BY col [ASC|DESC], …] [LIMIT n [OFFSET n]] [;]`:
+  - each item is `*` or a plain identifier (`[a-z_][a-z0-9_]*`, any
+    case): no qualifier, literal, number or hex (`0x68756e74657232`),
+    function or alias;
+  - the table is a plain identifier, and from it to the end of the
+    statement no credential word appears in any form, short or long,
+    whatever splits it (so not `WHERE password = …`, `pwd LIKE 'x'`,
+    `session IN (…)`, a table `user_tokens`): credential words may
+    appear only as projection items;
+  - a `WHERE` column is a plain identifier that is not the table itself
+    (a PostgreSQL whole-row value); op is one of `=` `<>` `!=` `<` `<=`
+    `>` `>=` `LIKE` or `IS [NOT] NULL`; and a value is a number, a bound
+    parameter or a `'…'` string without `''`, `(`, `)`, `,`, `{` or `}`
+    (no join, alias, subquery, function, row, cast, `UNION` or
+    `VALUES`).
 
-A field that is just a credential name is never bare: a Redis argument
-or reply, a Kafka topic or a header value may be a value that reads like
-a name (`swordfish_password`). Redis `CONFIG GET requirepass` is
-therefore withheld whole: with renamed commands and `CLIENT REPLY`, a
-reply cannot be tied to its request, so nothing proves its argument is
-a parameter name.
+  So `SELECT password, email FROM users` and
+  `SELECT password FROM users WHERE id = 1` are bare;
+  `SELECT password, 123456 FROM users`, `SELECT "password", "hunter2"
+  FROM dual`, `SELECT DISTINCT password FROM users`, `WHERE users = $1`,
+  `WHERE profile = '\050alice\054…'` and `WHERE password = 'x'` are
+  context. A value compared with a column that is not a credential word
+  (`WHERE id = 1`) stays exported, as it would without the credential
+  column. Such a statement is exported without its bound values, and a
+  server error for it becomes `<statement withheld>` (it may echo a
+  bound value: `malformed record literal: "(alice,hunter2)"`).
 
-In the path position the word must also end in a whole
-credential part (`token`, `access_token`, `x-api-key`, `passwords`), not
-have more after it or before it in the same word (`token_abc`,
-`hunterpassword`). In both it must have no digit (`token9f8e` may be
+Redis `CONFIG GET requirepass` is withheld whole: with renamed commands
+and `CLIENT REPLY`, a reply cannot be tied to its request, so nothing
+shows its argument is a parameter name rather than a value.
+
+In a path the word must also end in a whole credential part (`token`,
+`access_token`, `x-api-key`, `passwords`), not have more after it or
+before it in the same word (`token_abc`, `hunterpassword`). In both
+positions it must have no digit (`token9f8e` may be
 a value), and none applies when decoding dropped a NUL byte (it may have
 joined a name to its value; UTF-16 text is therefore never a bare name).
 Prose is never a bare position: `token abc123`, `your token expired` and
@@ -646,20 +658,22 @@ What is exported then:
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
   clean only after the agent saw `SSL_new` return it, as above.
-- **DNS answers** whose name has credential context, a credential word
-  even as a bare name included (`db.password.internal`), or matches one
-  of your `[credentials]` patterns, are dropped before export and before
-  the name can reach the service graph.
-- **Bare names** are exported as written: `/oauth/token` and
-  `SELECT password, email FROM users` (without bound values or error
-  text). A credential parameter after a bare path is masked:
+- **DNS answers** whose name has credential context (any credential
+  word: a DNS name holds no bare name, so `db.password.internal`
+  included), or matches one of your `[credentials]` patterns, are
+  dropped before export and before the name can reach the service graph.
+- **Bare names** are exported as written: an HTTP request path
+  `/oauth/token` and a SQL statement `SELECT password, email FROM users`
+  (without bound values or error text). A credential parameter after a
+  bare path is masked:
   `/oauth/token?client_secret=x` exports
   `/oauth/token?client_secret=<REDACTED>`.
 
 The price is more withheld text than a value-level mask would leave:
-a `SELECT` that compares a `password` column, names it outside its
-select list or falls outside the simple grammar above (a comment, a
-join, a quoted name), an `INSERT` or `UPDATE` naming one, a body that
+a `SELECT` that compares a `password` column, names a credential word
+outside its projection or falls outside the allowlist above (a comment,
+a join, a quoted name, a literal item), an `INSERT` or `UPDATE` naming
+one, any field of another kind that reads like a bare name, a body that
 mentions a token or a secret in prose, a path with a digit or a value
 around a credential word (`/v1/token`, `/reset/token/abc123`), a field
 that is just a credential name (a Kafka topic `user.password`, a header
@@ -686,7 +700,7 @@ argument or reply holding a word from the first list, alone or with a
 value next to it, masked or not (`CONFIG GET requirepass`,
 `CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
-whole: no Redis field is a bare name (above). Protocol and subscription
+whole: no Redis field has a bare name (above). Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
 command (a script returning an array of the

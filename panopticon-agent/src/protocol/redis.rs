@@ -1078,6 +1078,15 @@ mod tests {
             b"$18\r\nswordfish_password\r\n",
         );
         assert_eq!(m.payload_text.as_deref(), withheld);
+        // Codex round 4 #2: values shaped like a bare HTTP path or an
+        // allowlisted SELECT are Redis values, not a path or a statement.
+        for value in ["/oauth/token", "SELECT password FROM users"] {
+            let m = exchange(&["SET", "user:alice:password", value], b"+OK\r\n");
+            assert_eq!(m.request_text.as_deref(), withheld, "{value}");
+            let reply = format!("${}\r\n{value}\r\n", value.len());
+            let m = exchange(&["GET", "user:alice:password"], reply.as_bytes());
+            assert_eq!(m.payload_text.as_deref(), withheld, "{value}");
+        }
     }
 
     /// Replies that carry a secret: `CONFIG GET` values of secret

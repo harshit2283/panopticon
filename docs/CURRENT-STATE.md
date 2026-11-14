@@ -222,13 +222,17 @@ production-hardened compliance platform.
     `AUTH` stays readable, while `CONFIG GET requirepass` and its reply
     are withheld: with renamed commands a reply cannot be tied to its
     request). A credential word that is a bare name is not credential
-    context: the last segment of a captured, printable-ASCII path of
-    letters-only segments with only `key=value` query components, or a
-    column of a simple undecoded `SELECT` list read on its raw tokens
-    (exported without bound values or error text); anything not proven
-    a name is withheld as before. Short credential names are also
-    matched with `.` and `-` as boundaries (`users.pwd`). A letters-only
-    segment before the word (`/reset/abcdef/token`) is a known limit.
+    context, by an allowlist tied to the field's kind: in an HTTP/1 or
+    HTTP/2 request path, the last segment of a captured, printable-ASCII
+    path of letters-only segments with only `key=value` query
+    components; in a MySQL or PostgreSQL statement, a projection item of
+    `SELECT item, … FROM table [rest]` read on its raw tokens, each item
+    `*` or a plain identifier and no credential word from the table on
+    (exported without bound values or error text). No other field has a
+    bare name; anything outside the allowlist is withheld as before.
+    Short credential names are also matched with `.` and `-` as
+    boundaries (`users.pwd`). A letters-only segment before the word
+    (`/reset/abcdef/token`) is a known limit.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.

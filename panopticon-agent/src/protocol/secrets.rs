@@ -6,9 +6,9 @@
 //! is: a field whose *normalised view* shows credential context is withheld
 //! whole, unless every credential in it sits in a structure whose value is
 //! delimited with certainty, in which case only those values are masked.
-//! A credential word that is a *bare name*, in a position where nothing
-//! next to it on either side can be a value, is not context (see
-//! [`BareShapes`]); anything not recognised as one is (fail closed).
+//! A credential word that is a *bare name*, in one of two allowlisted
+//! positions of a field of the right kind, is not context (see
+//! [`BareShapes`]); anything outside the allowlist is (fail closed).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -31,29 +31,33 @@
 //!   `scheme://` and of `mailto:` do not count), and any `//` authority
 //!   whose userinfo has a `:` (RFC 3986: `,` and `;` may appear in it).
 //!
-//! A bare name is a word in a position a grammar proves holds a name and
-//! nothing next to it a value, on a view from which no NUL was dropped,
-//! and with no digit: (a) the last segment of a path, read on the raw
-//! field, all printable ASCII, whose every segment is a plain name
-//! (`A`-`Z`, `a`-`z`, `_`, `-`, `.`; no `%` or `+`) and whose query, if
-//! any, is only `key=value` components, decided before its credential
-//! parameters are masked ([`path_last_segment`]); the word must also end
-//! in a whole credential part (`access_token`, not `token_abc`); (b) a
-//! column of the select list of a simple `SELECT`, parsed on the raw
-//! statement's tokens, with no comment marker, no `\`, `"` or backtick,
-//! and nothing decoding would change ([`simple_select`]: columns, one
-//! table, `WHERE` comparisons with numbers, parameters or plain string
-//! literals, `ORDER BY`, `LIMIT`; no join, alias, qualified name,
-//! subquery, row, cast or other query). A field that is just a name is
-//! never bare (a Redis argument may be a value; with renamed commands a
-//! reply cannot be tied to its request, so `CONFIG GET requirepass` is
-//! withheld). So `/oauth/token` and `SELECT password, email FROM users`
-//! are not context, while `/reset/token/abc123`, `/reset/token/++++`,
-//! `WHERE password = 'x'`, `WHERE users.pwd = 'x'`, `token abc123`,
-//! `hunter2 is my password` and a Redis value `swordfish_password` are.
-//! A SQL statement exported this way loses its bound values and its
-//! error text. DNS names keep the strict rule
-//! ([`has_any_credential_context`]).
+//! Bare names are an allowlist tied to the field's kind ([`FieldKind`],
+//! passed in by the caller, never inferred from the text), and none
+//! applies on a view from which a NUL was dropped or to a word with a
+//! digit:
+//! - in an HTTP/1 or HTTP/2 request path: the last segment, when the raw
+//!   field is printable ASCII, every segment a plain name (`A`-`Z`,
+//!   `a`-`z`, `_`, `-`, `.`; no `%` or `+`), the query, if any, only
+//!   `key=value` components (decided before its credential parameters
+//!   are masked), and the word ends in a whole credential part
+//!   (`access_token`, not `token_abc`) ([`path_last_segment`]);
+//! - in a MySQL or PostgreSQL statement: a projection item of
+//!   `SELECT item, ... FROM table [rest]` ([`select_list`]), read on the
+//!   raw tokens with no comment marker, `\`, `"` or backtick and nothing
+//!   decoding would change: each item `*` or a plain identifier (no
+//!   qualifier, literal, number, function or alias), the table a plain
+//!   identifier, no credential word in any form from the table to the
+//!   end, and the rest only `WHERE` comparisons with numbers, parameters
+//!   or plain strings, `ORDER BY` and `LIMIT`.
+//!
+//! Every other field (Redis, Kafka, AMQP, DNS, gRPC, headers, bodies,
+//! error text) has no bare name. So an HTTP path `/oauth/token` and a
+//! statement `SELECT password, email FROM users` are not context, while
+//! `/reset/token/abc123`, `WHERE password = 'x'`, `WHERE pwd LIKE 'x'`,
+//! `SELECT password, 0x68756e74657232`, `token abc123`, `hunter2 is my
+//! password`, `CONFIG GET requirepass` and a Redis value `/oauth/token`
+//! are. A statement exported this way loses its bound values and its
+//! error text ([`has_any_sql_credential_context`]).
 //!
 //! The certain structures, on the raw text: a query or form parameter
 //! (`name=value` at the start of the text or after `?` or `&`), a JSON
@@ -147,42 +151,51 @@ pub fn is_credential_name(name: &str) -> bool {
     NAMES.contains(&n.trim()) || words(&n).any(|(w, _, _)| strong_word(w) || NAMES.contains(&w))
 }
 
-/// Whether `text` shows credential context (see the module docs); a bare
-/// name is not context.
+/// What a field is, as its parser knows it. Only an HTTP request path and
+/// a SQL statement can hold a bare name; every other field (Redis, Kafka,
+/// AMQP, DNS, gRPC, headers, bodies, error text ...) holds none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    Other,
+    /// The path (and query) of an HTTP/1 or HTTP/2 request.
+    HttpPath,
+    /// The statement text of a MySQL or PostgreSQL query.
+    SqlStatement,
+}
+
+/// Whether `text` shows credential context (see the module docs), for a
+/// field that holds no bare name: any credential word is context.
 pub fn has_credential_context(text: &str) -> bool {
-    context(text, false, Slot::Field)
+    context(text, false, Slot::None)
 }
 
-/// [`has_credential_context`] counting bare names too: any credential word
-/// is context. For DNS names, which hold no bare-name position.
-pub fn has_any_credential_context(text: &str) -> bool {
-    context(text, false, Slot::Strict)
-}
-
-/// [`has_credential_context`] for a SQL statement: a short credential name
-/// also counts as a column in a list or assignment (`users(pwd)`,
-/// `SET a = 1, pass = $1`).
+/// Credential context of a SQL statement: a short credential name also
+/// counts as a column in a list or assignment (`users(pwd)`,
+/// `SET a = 1, pass = $1`) or next to an operator; a credential word that
+/// is a column of an allowlisted `SELECT` ([`select_list`]) is not.
 pub fn has_sql_credential_context(sql: &str) -> bool {
-    context(sql, true, Slot::Field)
+    context(sql, true, Slot::Sql)
 }
 
 /// [`has_sql_credential_context`] counting bare names too: a statement
-/// whose bound values cannot be shown to be unrelated to a credential.
+/// whose bound values and error text cannot be shown to be unrelated to a
+/// credential.
 pub fn has_any_sql_credential_context(sql: &str) -> bool {
-    context(sql, true, Slot::Strict)
+    context(sql, true, Slot::None)
 }
 
 /// Which bare names a check allows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     /// None: every credential word is context.
-    Strict,
-    /// A path's last segment or a column of a simple `SELECT` list.
-    Field,
-    /// What is left of a field once its certain clauses are removed: as
-    /// [`Slot::Field`], with the path proved bare (or not) on the field as
-    /// captured, before the masked parameters left blanks in its query.
-    Residual(Option<(usize, usize)>),
+    None,
+    /// An HTTP request path's last segment ([`path_last_segment`]), its
+    /// bounds taken on the field as captured: for what is left once its
+    /// certain clauses are removed too, so the blank a masked parameter
+    /// leaves in the query is not an unkeyed component.
+    Path(Option<(usize, usize)>),
+    /// A column of an allowlisted `SELECT` ([`select_list`]).
+    Sql,
 }
 
 fn context(text: &str, sql: bool, slot: Slot) -> bool {
@@ -193,7 +206,7 @@ fn context(text: &str, sql: bool, slot: Slot) -> bool {
         return has_userinfo(b);
     }
     // A NUL dropped from the view may have joined a name to its value.
-    let bare = (slot != Slot::Strict && !v.nul).then(|| BareShapes::new(text, &v, slot));
+    let bare = (slot != Slot::None && !v.nul).then(|| BareShapes::new(text, &v, slot));
     let is_bare = |w: &str, start, end| bare.as_ref().is_some_and(|s| s.bare(w, start, end));
     // A short name used as a name: followed by `=` or `:` ...; in SQL also
     // a column in a list or assignment, or next to an operator.
@@ -231,16 +244,15 @@ fn context(text: &str, sql: bool, slot: Slot) -> bool {
 
 // ── Bare names ──────────────────────────────────────────────────────────
 
-/// The positions of a normalised field where a credential word is a bare
-/// name: each is recognised whole, by a grammar that admits no value next
-/// to the word, and anything else is context (fail closed). The bounds
-/// are token bounds from [`words`].
+/// The allowlisted positions of a field where a credential word is a bare
+/// name, for the field's kind ([`Slot`]); anything else is context (fail
+/// closed). The bounds are token bounds from [`words`].
 struct BareShapes {
     /// The last segment of a raw path made only of plain name segments,
     /// followed by the end or a query of `key=value` parameters
     /// ([`path_last_segment`]).
     path: Option<(usize, usize)>,
-    /// The select list of a simple `SELECT` ([`simple_select`]).
+    /// The select list of an allowlisted `SELECT` ([`select_list`]).
     select: Option<(usize, usize)>,
 }
 
@@ -253,11 +265,11 @@ impl BareShapes {
         let plain_sql = !v.comment && !v.decoded && !raw.contains(['\\', '"', '`']);
         BareShapes {
             path: match slot {
-                Slot::Residual(path) => path,
-                _ => path_last_segment(raw.as_bytes()),
+                Slot::Path(path) => path,
+                _ => None,
             },
-            select: (plain_sql && sql_verb(raw) == Some("SELECT"))
-                .then(|| simple_select(raw.to_ascii_lowercase().trim_end().as_bytes()))
+            select: (slot == Slot::Sql && plain_sql && sql_verb(raw) == Some("SELECT"))
+                .then(|| select_list(raw.to_ascii_lowercase().trim_end().as_bytes()))
                 .flatten(),
         }
     }
@@ -343,7 +355,7 @@ enum Tok {
     Semi,
 }
 
-/// The tokens of a normalised statement for [`simple_select`], or None at
+/// The tokens of a raw lowercased statement for [`select_list`], or None at
 /// anything else: a double quote, backtick or backslash (identifier or
 /// string syntax that differs by dialect or mode), a string literal with a
 /// doubled quote, `(`, `:`, `.`, `+` ... A string literal is `'...'`.
@@ -393,19 +405,28 @@ fn sql_tokens(b: &[u8]) -> Option<Vec<(Tok, usize, usize)>> {
     Some(out)
 }
 
-/// The select list of a statement in this grammar (on the normalised
-/// view, which holds no comment marker), as a byte range, or None:
+/// The projection of an allowlisted `SELECT`, as a byte range of the raw
+/// lowercased statement `b` (no comment marker, nothing decoded), or None.
+/// The allowlist:
 ///
-/// `SELECT col [, col]* FROM table [WHERE pred [AND|OR pred]*]
+/// `SELECT item [, item]* FROM table [WHERE pred [AND|OR pred]*]
 /// [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n [OFFSET n]] [;]`
 ///
-/// where a col is a word or `*`, the table one word, and a pred
-/// `col op operand`, `col LIKE operand` or `col IS [NOT] NULL`, its col
-/// not the table (whole-row) and its operand a number, a parameter or a
-/// string literal without `(`, `)`, `,`, `{` or `}` (no row or array
-/// value). Nothing here can put a value in a column's place: no other
-/// query, `VALUES`, row constructor, cast, join or alias.
-fn simple_select(b: &[u8]) -> Option<(usize, usize)> {
+/// - an item is `*` or a plain identifier `[a-z_][a-z0-9_]*`: no
+///   qualifier, literal, number (`0x68756e74657232`), function or alias;
+/// - the table is a plain identifier, and from it to the end no credential
+///   word appears in any form: none of the substrings [`HINTS`] (so not
+///   `pwd LIKE 'x'`, `WHERE password = ...`, `session IN ...`), whatever
+///   the boundaries;
+/// - a pred is `col op operand`, `col LIKE operand` or `col IS [NOT] NULL`,
+///   its col an identifier that is not the table (whole-row) and its
+///   operand a number, a parameter or a string literal without `(`, `)`,
+///   `,`, `{` or `}` (no row or array value).
+///
+/// Credential words may appear only as projection items. Nothing here can
+/// put a value in a column's place: no other query, `VALUES`, row
+/// constructor, cast, join or alias.
+fn select_list(b: &[u8]) -> Option<(usize, usize)> {
     let toks = sql_tokens(b)?;
     let text = |k: usize| &b[toks[k].1..toks[k].2];
     let is_word =
@@ -414,9 +435,11 @@ fn simple_select(b: &[u8]) -> Option<(usize, usize)> {
     if !is_word(0, b"select") {
         return None;
     }
+    // A plain identifier: a word not starting with a digit.
+    let ident = |k: usize| kind(k) == Some(Tok::Word) && !text(k)[0].is_ascii_digit();
     let mut k = 1;
     loop {
-        if !matches!(kind(k), Some(Tok::Word | Tok::Star)) || is_word(k, b"from") {
+        if !(ident(k) || kind(k) == Some(Tok::Star)) || is_word(k, b"from") {
             return None;
         }
         k += 1;
@@ -428,20 +451,18 @@ fn simple_select(b: &[u8]) -> Option<(usize, usize)> {
     }
     let list = (toks[0].2, toks[k].1);
     k += 1;
-    if kind(k) != Some(Tok::Word) {
+    if !ident(k) || has_hint(std::str::from_utf8(&b[toks[k].1..]).ok()?) {
         return None;
     }
     let table = text(k);
     k += 1;
     // A column, not the table's row (`users`, or `users` of `public.users`).
     let column = |k: usize| {
-        if kind(k) != Some(Tok::Word) {
+        if !ident(k) {
             return false;
         }
         let c = text(k);
-        !c[0].is_ascii_digit()
-            && table != c
-            && !(table.ends_with(c) && table[table.len() - c.len() - 1] == b'_')
+        table != c && !(table.ends_with(c) && table[table.len() - c.len() - 1] == b'_')
     };
     let operand = |k: usize| match kind(k) {
         Some(Tok::Param) => true,
@@ -564,6 +585,12 @@ impl Decision {
 /// (it cannot be placed in the field), or when it has more than
 /// [`MAX_SPANS`] spans.
 pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
+    decide_as(rules, text, builtin, FieldKind::Other)
+}
+
+/// [`decide`] for a field of a known kind: an HTTP request path or a SQL
+/// statement may hold a bare name ([`FieldKind`]).
+pub fn decide_as(rules: &CredentialRules, text: &str, builtin: bool, kind: FieldKind) -> Decision {
     // A span that already reads exactly `<REDACTED>` would be replaced by
     // itself: dropped as a no-op. Nothing else in captured text is exempt,
     // whatever it reads like.
@@ -584,7 +611,7 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
     }
     if builtin {
         let found = match rules.builtin {
-            Builtin::Full => builtin_full(text),
+            Builtin::Full => builtin_full(text, kind),
             Builtin::NamesOnly => Some(certain_clauses(text).0),
         };
         match found {
@@ -647,16 +674,18 @@ fn user_spans(
 
 /// Every built-in rule: the values to mask where certain, or None (the
 /// field withheld) when any context is left.
-fn builtin_full(text: &str) -> Option<Vec<(usize, usize)>> {
-    if !has_credential_context(text) {
+fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
+    let slot = match kind {
+        FieldKind::Other => Slot::None,
+        FieldKind::HttpPath => Slot::Path(path_last_segment(text.as_bytes())),
+        FieldKind::SqlStatement => Slot::Sql,
+    };
+    if !context(text, false, slot) {
         return Some(Vec::new());
     }
     let (mask, delete) = certain_clauses(text);
     let residual = remove(text, &delete);
-    // A path is bare or not as captured: the blank a masked parameter
-    // leaves in its query is not an unkeyed component.
-    let path = Slot::Residual(path_last_segment(text.as_bytes()));
-    (!context(&residual, false, path)).then_some(mask)
+    (!context(&residual, false, slot)).then_some(mask)
 }
 
 /// Sorted, with overlapping or touching spans joined.
@@ -1319,6 +1348,20 @@ fn replace_spans(text: &str, spans: &[(usize, usize)]) -> String {
 mod tests {
     use super::*;
 
+    /// `s` protected as a field of `kind`.
+    fn pk(s: &str, kind: FieldKind) -> String {
+        let r = super::super::credential_rules::credential_rules();
+        decide_as(&r, s, true, kind)
+            .apply(s)
+            .unwrap_or_else(|| s.to_string())
+    }
+
+    const KINDS: [FieldKind; 3] = [
+        FieldKind::Other,
+        FieldKind::HttpPath,
+        FieldKind::SqlStatement,
+    ];
+
     fn p(s: &str) -> String {
         protect_text(s).unwrap_or_else(|| s.to_string())
     }
@@ -1598,8 +1641,9 @@ mod tests {
         }
     }
 
-    /// The bare names the narrowed rule exports (USER-GUIDE 5.3): a path's
-    /// last segment and a column of a simple SELECT list, in any field.
+    /// The bare names the narrowed rule exports (USER-GUIDE 5.3): an HTTP
+    /// request path's last segment and a projection item of an allowlisted
+    /// SELECT statement, each only in a field of that kind.
     #[test]
     fn bare_names_are_exported() {
         for text in [
@@ -1611,7 +1655,16 @@ mod tests {
             // A named limit (USER-GUIDE 5.3): a letters-only segment
             // before the word cannot be told from a route word.
             "/reset/abcdef/token",
+        ] {
+            assert_eq!(pk(text, FieldKind::HttpPath), text);
+            for kind in [FieldKind::Other, FieldKind::SqlStatement] {
+                assert_eq!(pk(text, kind), FIELD_WITHHELD, "{text} {kind:?}");
+            }
+            assert!(has_credential_context(text), "{text}");
+        }
+        for text in [
             "SELECT password, email FROM users",
+            "SELECT password FROM users WHERE id = 1",
             "SELECT password, email FROM users;",
             "select id, password_hash, email from users where id = $1",
             "SELECT pwd, email FROM users",
@@ -1620,9 +1673,19 @@ mod tests {
             "SELECT password FROM users WHERE deleted_at IS NOT NULL",
             "SELECT password FROM users WHERE name LIKE ? ORDER BY id DESC, name LIMIT 10 OFFSET $2",
         ] {
-            assert!(!has_credential_context(text), "{text}");
             assert!(!has_sql_credential_context(text), "{text}");
-            assert_eq!(protect_text(text), None, "{text}");
+            assert_eq!(pk(text, FieldKind::SqlStatement), text);
+            // In any other field (a Redis value, a body), withheld, as
+            // before (`pwd` there is not used as a name).
+            for kind in [FieldKind::Other, FieldKind::HttpPath] {
+                let want = if text.contains("pwd") {
+                    text
+                } else {
+                    FIELD_WITHHELD
+                };
+                assert_eq!(pk(text, kind), want, "{text} {kind:?}");
+            }
+            assert!(has_any_sql_credential_context(text), "{text}");
         }
         // A credential parameter after a bare path is masked: the path is
         // proved bare on the field as captured, so the blank the masked
@@ -1642,15 +1705,12 @@ mod tests {
                 "/oauth/token?x=1&password=<REDACTED>&y=2",
             ),
         ] {
-            assert_eq!(p(text), want, "{text}");
-            assert_eq!(protect_text(want), None, "{want}");
+            assert_eq!(pk(text, FieldKind::HttpPath), want, "{text}");
+            assert_eq!(pk(want, FieldKind::HttpPath), want, "{want}");
+            assert_eq!(p(text), FIELD_WITHHELD, "{text}");
         }
-        // DNS names keep the strict rule; a SELECT with bare names only is
-        // still seen by the strict rule (its bound values are dropped).
-        assert!(has_any_credential_context("db.password"));
-        assert!(has_any_sql_credential_context(
-            "SELECT password FROM users WHERE id = $1"
-        ));
+        // DNS names: no bare name.
+        assert!(has_credential_context("db.password"));
     }
 
     /// A credential word with anything that could be its value next to
@@ -1823,6 +1883,19 @@ mod tests {
             r#"SELECT password"hunter2" FROM t"#,
             "SELECT `password`, `hunter2` FROM t",
             "SELECT *password FROM t",
+            // Codex round 4: credential words outside the projection, in any
+            // form; projection items that are not plain identifiers.
+            "SELECT password FROM users WHERE pwd LIKE 'hunter2'",
+            "SELECT password FROM users WHERE pwd ILIKE 'x'",
+            "SELECT password FROM users WHERE session IN ('a')",
+            "SELECT password FROM users WHERE Session = 'a'",
+            "SELECT password FROM users WHERE user_pin = 'a'",
+            "SELECT password FROM user_tokens",
+            "SELECT password FROM users ORDER BY token_id",
+            "SELECT password, 0x68756e74657232 FROM users",
+            "SELECT password, 123456 FROM users",
+            "SELECT password, 1e5 FROM users",
+            "SELECT password, _x FROM users WHERE pin = 1",
             // Prose and the rest.
             "token=abc 123",
             "token: abc123",
@@ -1830,9 +1903,16 @@ mod tests {
             "requirepass, s3cret",
         ] {
             assert!(has_credential_context(text), "{text:?}");
-            assert_eq!(p(text), FIELD_WITHHELD, "{text:?}");
+            for kind in KINDS {
+                assert_eq!(pk(text, kind), FIELD_WITHHELD, "{text:?} {kind:?}");
+            }
         }
         for sql in [
+            "SELECT password FROM users WHERE pwd LIKE 'hunter2'",
+            "SELECT password FROM users WHERE pwd ILIKE 'x'",
+            "SELECT password FROM users WHERE session IN ('a')",
+            "SELECT password, 0x68756e74657232 FROM users",
+            "SELECT password, 123456 FROM users",
             "SELECT password FROM users WHERE users.pwd = 'hunter2'",
             "SELECT email FROM users WHERE users.pwd = 'hunter2'",
             "SELECT email FROM users WHERE pwd-0 = 123456",

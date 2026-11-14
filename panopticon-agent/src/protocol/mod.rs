@@ -149,7 +149,7 @@ pub use credential_rules::{
     set_credential_rules,
 };
 pub use secrets::{
-    Decision, FIELD_WITHHELD, STATEMENT_WITHHELD, decide, has_any_credential_context,
+    Decision, FIELD_WITHHELD, FieldKind, STATEMENT_WITHHELD, decide, decide_as,
     has_credential_context, is_credential_name, sql_verb, withheld_statement,
 };
 
@@ -221,7 +221,18 @@ pub fn export_error_text(text: String, error_withheld: bool) -> String {
 /// rules only when `builtin`): credential values masked, or the field
 /// replaced by [`FIELD_WITHHELD`].
 pub fn protect_text_in(rules: &CredentialRules, text: &mut String, builtin: bool) {
-    if let Some(out) = decide(rules, text, builtin).apply(text) {
+    replace_with(text, decide(rules, text, builtin));
+}
+
+/// [`protect_text_in`], built-in rules on, for a field of a known kind
+/// (an HTTP request path or a SQL statement may hold a bare name; see
+/// [`decide_as`]).
+pub fn protect_field_in(rules: &CredentialRules, text: &mut String, kind: FieldKind) {
+    replace_with(text, decide_as(rules, text, true, kind));
+}
+
+fn replace_with(text: &mut String, decision: Decision) {
+    if let Some(out) = decision.apply(text) {
         zeroize::Zeroize::zeroize(text);
         *text = out;
     }
