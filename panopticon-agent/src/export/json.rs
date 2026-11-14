@@ -59,10 +59,6 @@ struct JsonEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    client_pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    server_pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tls_library: Option<TlsLibraryStr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pii: Option<&'a PiiReport>,
@@ -125,11 +121,6 @@ pub struct TransportContext {
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub pid: Option<u32>,
-    /// Local process that opened (client) / accepted (server) the TCP
-    /// connection, for packet-captured exchanges whose endpoints run on
-    /// this node.
-    pub client_pid: Option<u32>,
-    pub server_pid: Option<u32>,
     pub tls_library: Option<TlsLibrary>,
 }
 
@@ -141,8 +132,6 @@ impl TransportContext {
             src_port: (event.src_port != 0).then_some(event.src_port),
             dst_port: (event.dst_port != 0).then_some(event.dst_port),
             pid: (event.pid != 0).then_some(event.pid),
-            client_pid: None,
-            server_pid: None,
             tls_library: match event.tls_library {
                 TlsLibrary::None => None,
                 other => Some(other),
@@ -243,8 +232,6 @@ impl JsonExporter {
             src_workload: src_workload.as_deref(),
             dst_workload: dst_workload.as_deref(),
             pid: context.and_then(|ctx| ctx.pid),
-            client_pid: context.and_then(|ctx| ctx.client_pid),
-            server_pid: context.and_then(|ctx| ctx.server_pid),
             tls_library: context.and_then(|ctx| ctx.tls_library).map(Into::into),
             pii,
         };
@@ -443,8 +430,6 @@ mod tests {
             src_port: Some(54321),
             dst_port: Some(8080),
             pid: Some(1234),
-            client_pid: None,
-            server_pid: None,
             tls_library: None,
         }
     }
@@ -523,8 +508,6 @@ mod tests {
             src_workload: None,
             dst_workload: None,
             pid: Some(1234),
-            client_pid: None,
-            server_pid: None,
             tls_library: None,
             pii: None,
         };
@@ -563,8 +546,6 @@ mod tests {
             src_workload: None,
             dst_workload: None,
             pid: None,
-            client_pid: None,
-            server_pid: None,
             tls_library: None,
             pii: None,
         };
@@ -675,8 +656,6 @@ mod tests {
             src_workload: None,
             dst_workload: None,
             pid: None,
-            client_pid: None,
-            server_pid: None,
             tls_library: Some(TlsLibrary::OpenSsl.into()),
             pii: Some(&report),
         };
@@ -720,8 +699,6 @@ mod tests {
             src_workload: None,
             dst_workload: None,
             pid: None,
-            client_pid: None,
-            server_pid: None,
             tls_library: None,
             pii: None,
         };

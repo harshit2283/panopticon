@@ -8,7 +8,7 @@
 //! `inet_csk_accept` (acceptor, on the child only) and fentry
 //! `sock_common_setsockopt` (sticky KTLS at kTLS key install). Every rule errs toward not capturing: a socket whose state
 //! is missing, not its own, or not computable is dropped and counted in
-//! `SCOPE_DROPS`, except in unscoped `full` mode, which captures as TC did.
+//! `SCOPE_DROPS`, except in unscoped `full` mode, which captures every socket.
 //!
 //! Every program here returns "allow" (1) on every path: a cgroup program
 //! returning 0 would drop the packet or fail the `socket()` call.
@@ -152,15 +152,15 @@ pub(crate) fn armed() -> bool {
 /// Whether the TLS probes may collect anything (DESIGN §3.5, §7): checked
 /// first by every TLS entry, return, address-recording and emission path.
 ///
-/// * `CONFIG_CAPTURE_ENABLED`, on every backend and mode: the user's
+/// * `CONFIG_CAPTURE_ENABLED`, in every mode: the user's
 ///   `capture_enabled = false`, and the fatal stop (`scope_select.rs`
 ///   `AyaAllow::disarm`). The loader writes it from `capture_enabled`
-///   (default true) before any program is attached, as the TC and
-///   cgroup_skb packet paths already honour it.
+///   (default true) before any program is attached, as the
+///   packet path already honours it.
 /// * `CONFIG_SCOPE_ARMED`, in restricted modes only: until arming, the TLS
 ///   scope inputs (`PID_FILTER`) and the socket state the address check
 ///   reads are incomplete, and the fatal stop clears it. Unscoped full
-///   mode (the TC backend included) is never armed, so it does not apply
+///   mode is never armed, so it does not apply
 ///   there. The fatal stop also leaves the mode restricted, so a stopped
 ///   agent fails both conditions.
 #[inline(always)]
@@ -293,7 +293,7 @@ pub(crate) fn sock_addr_checked(sk: *mut c_void) -> Option<(u64, u32, (u32, u32,
     if !before {
         return None;
     }
-    let tuple = crate::sock_monitor::read_sock_tuple(sk as *const u8).ok()?;
+    let tuple = read_sock_tuple(sk as *const u8).ok()?;
     let after = tls_addr_in_scope(
         cookie,
         g1,
@@ -841,7 +841,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         return drop(DROP_NOT_ELIGIBLE);
     }
     if unsafe { (*skb).protocol } != ETH_P_IP_BE {
-        // IPv6 is not captured yet, as on the TC path.
+        // IPv6 is not captured yet.
         if let Some(counter) = IPV6_DROPS.get_ptr_mut(0) {
             unsafe { *counter += 1 };
         }
@@ -853,9 +853,8 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     }
     // ── loopback (§3.7): a data packet on a node-local path (`lo` in any
     // namespace: 127/8, the host's or the pod's own address; a VRF master,
-    // local delivery included; a socket already marked), which TC on the
-    // NIC never saw (IPv6, ::1 included, is not
-    // captured, above). The socket is marked whatever the setting, so
+    // local delivery included; a socket already marked; IPv6, ::1
+    // included, is not captured, above). The socket is marked whatever the setting, so
     // turning capture off later drops it whole and suppresses its close.
     // The generation is read before the setting and the socket's mark, and
     // every event is stamped `g0` (unscoped and restricted alike), so a
@@ -1242,9 +1241,10 @@ fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()>
             (*event).acceptor_tgid = rd!(st, acceptor_tgid);
             (*event).role = role_of(rd!(st, flags));
         }
-        // The verifier needs the length provably in [1, N]; see
-        // tc_capture.rs populate_tc_event for why it is laundered. `take`
-        // is in [1, N] here (the class was chosen by it, and the largest
+        // The verifier needs the length provably in [1, N]. LLVM knows it
+        // is already in range and drops any plain bounds check, so a
+        // volatile read hides the value and the mask + 1 gives the verifier
+        // [1, N] directly. `take` is in [1, N] here (the class was chosen by it, and the largest
         // class is MAX_PAYLOAD_SIZE), so the mask changes nothing at runtime.
         let want = if r.take > N as u32 { N as u32 } else { r.take };
         let opaque = read_volatile(&want);
@@ -1298,3 +1298,31 @@ fn skb_zero(ctx: &SkBuffContext, dst: *mut u8, n: u32) {
 }
 
 const _: () = assert!(MAX_PAYLOAD_SIZE.is_power_of_two() && MAX_PAYLOAD_SIZE > 2048);
+
+/// Reads the IPv4 5-tuple from `struct sock`.
+///
+/// Linux `struct sock` (via `struct sock_common`) field offsets (x86_64):
+/// - `__sk_common.skc_daddr`   (dst IPv4): offset 0   (u32)
+/// - `__sk_common.skc_rcv_saddr` (src IPv4): offset 4 (u32)
+/// - `__sk_common.skc_dport`  (dst port, network byte order): offset 12 (u16)
+/// - `__sk_common.skc_num`    (src port, host byte order): offset 14 (u16)
+#[inline(always)]
+pub(crate) fn read_sock_tuple(sk: *const u8) -> Result<(u32, u32, u16, u16), ()> {
+    // SAFETY: reading from struct sock fields at known offsets.
+    // The sock pointer is provided by the kernel and is valid during kprobe execution.
+    unsafe {
+        let dst_addr: u32 = bpf_probe_read_kernel(sk.add(0) as *const u32).map_err(|_| ())?;
+        let src_addr: u32 = bpf_probe_read_kernel(sk.add(4) as *const u32).map_err(|_| ())?;
+        let dst_port_be: u16 = bpf_probe_read_kernel(sk.add(12) as *const u16).map_err(|_| ())?;
+        let src_port: u16 = bpf_probe_read_kernel(sk.add(14) as *const u16).map_err(|_| ())?;
+
+        let dst_port = u16::from_be(dst_port_be);
+
+        Ok((
+            u32::from_be(src_addr),
+            u32::from_be(dst_addr),
+            src_port,
+            dst_port,
+        ))
+    }
+}

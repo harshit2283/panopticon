@@ -71,7 +71,7 @@ jobs:
             --disable-microvm \
             --verbose \
             --exec \
-            "sh -lc 'set -e; uname -r; ./target/release/panopticon-agent --smoke-test --interface lo'"
+            "sh -lc 'set -e; uname -r; ./target/release/panopticon-agent --smoke-test'"
 
       - name: Verify RingBuf expectation
         if: always()

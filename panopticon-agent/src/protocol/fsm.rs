@@ -236,8 +236,8 @@ pub enum SegmentVerdict {
     Drop,
 }
 
-/// Per-direction TCP sequence tracking for one connection. TC sees every
-/// segment that matches the 5-tuple: retransmissions (parsed twice, they
+/// Per-direction TCP sequence tracking for one connection. The capture sees
+/// every segment of the socket: retransmissions (parsed twice, they
 /// corrupted the stream: AMQP recall fell to 88-97% on RHEL 8), and forged
 /// segments or RSTs the receiver would reject. Only bytes at the next
 /// expected sequence number reach the parser, once each; a FIN counts only
@@ -336,8 +336,8 @@ struct ConnectionEntry {
     fsm: Box<dyn ProtocolFsm>,
     last_seen: Instant,
     /// The server side of the connection, when known. Used to turn capture
-    /// direction (TC ingress/egress, which depends on which node the agent
-    /// runs on) into the client→server / server→client direction parsers
+    /// direction (ingress/egress, which depends on which end the socket
+    /// is) into the client→server / server→client direction parsers
     /// expect.
     server: Option<Endpoint>,
     /// FIN seen from the client / from the server.
@@ -356,7 +356,7 @@ struct ConnectionEntry {
 
 impl ConnectionEntry {
     /// Client→server is `Egress`, server→client is `Ingress`, regardless of
-    /// which TC hook saw the packet (falls back to that when the server
+    /// which hook saw the packet (falls back to that when the server
     /// endpoint is unknown).
     fn direction_of(&self, src: Endpoint, capture_direction: Direction) -> Direction {
         match self.server {

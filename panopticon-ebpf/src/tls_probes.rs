@@ -33,7 +33,7 @@ use crate::maps::{
     TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for,
     shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
 };
-use crate::sock_monitor::read_sock_tuple;
+use crate::sock_capture::read_sock_tuple;
 use panopticon_common::{GoReadCall, GoReadKey};
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
@@ -1182,13 +1182,13 @@ fn emit_tls_event<C: EbpfContext>(
     let mut scope_gen = crate::sock_capture::scope_gen();
     let restricted = !panopticon_common::scope::is_unscoped_full(mode);
     if !restricted {
-        // TC backend (and unscoped full): pid_filter as before, other
-        // processes' plaintext never leaves the kernel.
+        // Unscoped full: no selector is set (pid_filter makes the mode
+        // restricted), so this check passes every process.
         if !pid_allowed(tgid) {
             return Ok(());
         }
     } else {
-        // cgroup_skb backend, restricted (DESIGN §3.5, §3.6): the selector
+        // Restricted (DESIGN §3.5, §3.6): the selector
         // union and the mode alone decide, and every drop is counted.
         match crate::sock_capture::tls_call_scope(mode, tgid) {
             Ok(g) => scope_gen = g,

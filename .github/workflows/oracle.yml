@@ -47,7 +47,7 @@ jobs:
       - name: Build agent (release, with eBPF)
         run: cargo build -p panopticon-agent --release
 
-      - name: HTTP/1.1 (TC capture)
+      - name: HTTP/1.1 (packet capture)
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run.sh 1000 1234 0.99
 
       - name: HTTPS (OpenSSL and Go crypto/tls uprobes)

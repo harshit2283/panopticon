@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lab tests for the cgroup_skb backend's scope rules on a real kernel
+# Lab tests for the cgroup_skb capture's scope rules on a real kernel
 # (DESIGN §10), pass/fail on what leaves the node. Every run has every sink
 # on: the event export, the raw dump, the PII audit log, --log-events at
 # debug level, /metrics and /debug/state. score_scope.py scores each run.
@@ -184,11 +184,11 @@ score() { # score DIR checks...
   [[ ${PIPESTATUS[0]} == 0 ]] || STATUS=1
 }
 
-conf() { # conf DIR SCOPE-LINES: backend cgroup_skb, privacy full, plus SCOPE-LINES
+conf() { # conf DIR SCOPE-LINES: privacy full, plus SCOPE-LINES
   # These checks were written for the creator rule (a listed server's
   # listener selects its children from the first byte); scope_lab.py t15
   # covers both rules.
-  printf '%s\npid_filter_listener = "creator"\n\n[privacy]\nmode = "full"\n\n[capture]\nbackend = "cgroup_skb"\n' "$2" >"$1/agent.toml"
+  printf '%s\npid_filter_listener = "creator"\n\n[privacy]\nmode = "full"\n' "$2" >"$1/agent.toml"
 }
 
 stop_pids() { for p in $PIDS; do kill "$p" 2>/dev/null; done; sleep 0.3; PIDS=""; }

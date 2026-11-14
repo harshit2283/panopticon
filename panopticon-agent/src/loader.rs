@@ -6,28 +6,23 @@ use anyhow::{Context, Result};
 use aya::{
     Ebpf, EbpfLoader,
     maps::Array,
-    programs::{KProbe, ProgramError, SchedClassifier, TracePoint, UProbe, tc::TcAttachType},
+    programs::{KProbe, ProgramError, TracePoint, UProbe},
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{AgentConfig, CaptureBackend, SamplingMode};
+use crate::config::{AgentConfig, SamplingMode};
 use crate::platform::proc_scanner::{TlsTarget, TlsType};
 use crate::scope_loader::{self, ScopeSetup};
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_COOKIE_KEY, CONFIG_HEAD_BYTES,
-    CONFIG_MAX_PAYLOAD, CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON,
-    CONFIG_RING_SHARD_MASK, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN,
-    CONFIG_SCOPE_MODE, CONFIG_TCP_SYN_EVENTS, CONFIG_USE_RINGBUF, DATA_RING_SHARDS,
-    MAX_PAYLOAD_SIZE, MAX_PID_FILTER, scope,
+    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
+    CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK,
+    CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE,
+    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, scope,
 };
 
 /// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
-/// CONFIG_SAMPLE_THRESHOLD, CONFIG_HEAD_BYTES)`. All zero on the TC backend,
-/// where the kernel scope rules stay off and nothing changes.
+/// CONFIG_SAMPLE_THRESHOLD, CONFIG_HEAD_BYTES)`. All zero is unscoped `full`.
 pub fn scope_config(config: &AgentConfig) -> (u64, u64, u64) {
-    if config.capture_backend != CaptureBackend::CgroupSkb {
-        return (0, 0, 0);
-    }
     let mut mode = 0;
     if config.pid_filter.is_some() {
         mode |= scope::SCOPE_SEL_PID;
@@ -120,8 +115,6 @@ pub struct KernelCapabilities {
     pub has_btf: bool,
     /// Cgroup ID helper available (kernel >= 4.18).
     pub has_cgroup_id: bool,
-    /// TC eBPF hooks available (kernel >= 4.15).
-    pub has_tc_ebpf: bool,
 }
 
 /// Holds loaded eBPF programs and their attachment links.
@@ -165,30 +158,19 @@ pub fn detect_kernel_caps() -> Result<KernelCapabilities> {
         has_ringbuf,
         has_btf: Path::new("/sys/kernel/btf/vmlinux").exists(),
         has_cgroup_id: (major, minor) >= (4, 18),
-        has_tc_ebpf: (major, minor) >= (4, 15),
     })
 }
 
-/// Load eBPF programs and attach to the specified interface and kernel hooks.
-///
-/// Each attachment is wrapped in a match — failure logs and continues.
-/// Returns the loaded programs with links kept alive.
+/// Load eBPF programs and attach the capture programs (cgroup_skb and the
+/// scope writers, which refuse to start if one is missing) and the TLS and
+/// process hooks (each failure logs and continues). Returns the loaded
+/// programs with links kept alive.
 pub fn load_and_attach(
-    interfaces: &[String],
     caps: &KernelCapabilities,
     config: &AgentConfig,
     pid_candidates: Option<Vec<scope_loader::Candidate>>,
     pods: &[crate::scope_select::SelectedPod],
 ) -> Result<LoadedPrograms> {
-    if !caps.has_tc_ebpf {
-        anyhow::bail!(
-            "Kernel {}.{}.{} does not support TC eBPF (requires >= 4.15)",
-            caps.version.0,
-            caps.version.1,
-            caps.version.2
-        );
-    }
-
     let mut ebpf = load_ebpf_bytes(config.map_pin_path.as_deref()).map_err(|e| {
         if caps.has_ringbuf {
             e
@@ -206,88 +188,33 @@ pub fn load_and_attach(
     // Write initial config to eBPF CONFIG map
     sync_config_to_ebpf(&mut ebpf, config, caps)?;
 
-    // ── cgroup_skb backend: scope writers, then capture (DESIGN §7) ───
-    let cgroup_backend = config.capture_backend == CaptureBackend::CgroupSkb;
-    let mut exit_tp_attached = false;
-    let mut cgroup_root = None;
-    if cgroup_backend {
-        let setup = ScopeSetup {
-            mode: scope_config(config).0,
-            tls: config.tls_scan_enabled,
-            cgroup2_path: config.cgroup2_path.clone(),
-        };
-        let cgroup_sel = setup.mode & scope::SCOPE_SEL_CGROUP != 0;
-        let paths = config.cgroup_filter.as_deref().unwrap_or_default();
-        // CGROUP_ALLOW is published before anything is attached (and so
-        // before arm); the selector's refusals come first.
-        let select = |ebpf: &mut Ebpf, root: &scope_loader::CgroupRoot| {
-            if cgroup_sel {
-                crate::scope_select::startup_publish(ebpf, root.path(), paths, pods)
-            } else {
-                Ok(())
-            }
-        };
-        let (root, exit_tp) =
-            scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, select, &mut links)?;
-        exit_tp_attached = exit_tp;
-        cgroup_root = Some(root.path().to_path_buf());
-    }
-    let interfaces: &[String] = if cgroup_backend { &[] } else { interfaces };
+    // ── Scope writers, then capture (DESIGN §7) ──────────────────────
+    // No connect/accept owner probes (DESIGN §8): they reported the tuple
+    // and PID of every connection on the node, outside any scope decision;
+    // the kernel stamps owner_tgid / acceptor_tgid into captured events.
+    let setup = ScopeSetup {
+        mode: scope_config(config).0,
+        tls: config.tls_scan_enabled,
+        cgroup2_path: config.cgroup2_path.clone(),
+    };
+    let cgroup_sel = setup.mode & scope::SCOPE_SEL_CGROUP != 0;
+    let paths = config.cgroup_filter.as_deref().unwrap_or_default();
+    // CGROUP_ALLOW is published before anything is attached (and so
+    // before arm); the selector's refusals come first.
+    let select = |ebpf: &mut Ebpf, root: &scope_loader::CgroupRoot| {
+        if cgroup_sel {
+            crate::scope_select::startup_publish(ebpf, root.path(), paths, pods)
+        } else {
+            Ok(())
+        }
+    };
+    let (root, exit_tp_attached) =
+        scope_loader::load_and_attach(&mut ebpf, &setup, pid_candidates, select, &mut links)?;
+    let cgroup_root = Some(root.path().to_path_buf());
 
-    // ── TC classifiers (ingress + egress) per interface ───────────────
-    if !cgroup_backend {
-        ensure_tc_program_loaded(&mut ebpf, "tc_ingress")?;
-        ensure_tc_program_loaded(&mut ebpf, "tc_egress")?;
-    }
-    let mut tc_links_attached = 0usize;
-    for iface in interfaces {
-        if attach_tc_classifier(
-            &mut ebpf,
-            iface,
-            "tc_ingress",
-            TcAttachType::Ingress,
-            &mut links,
-        ) {
-            tc_links_attached += 1;
-        }
-        if attach_tc_classifier(
-            &mut ebpf,
-            iface,
-            "tc_egress",
-            TcAttachType::Egress,
-            &mut links,
-        ) {
-            tc_links_attached += 1;
-        }
-    }
-
-    // ── Connection owners (client/server PIDs) ────────────────────────
-    // kprobes where the kernel has them (both sides), else the
-    // inet_sock_set_state tracepoint (connecting side only). Not on
-    // cgroup_skb (DESIGN §8): they report the tuple and PID of every
-    // connection on the node, outside any kernel scope decision; the
-    // kernel stamps owner_tgid / acceptor_tgid into captured events instead.
-    if !cgroup_backend {
-        let connect_kprobe = attach_kprobe(&mut ebpf, "tcp_connect", "tcp_connect", &mut links);
-        attach_kretprobe(
-            &mut ebpf,
-            "inet_csk_accept_ret",
-            "inet_csk_accept",
-            &mut links,
-        );
-        if !connect_kprobe {
-            attach_tracepoint(
-                &mut ebpf,
-                "sock_state_connect",
-                "sock",
-                "inet_sock_set_state",
-                &mut links,
-            );
-        }
-    }
     let restricted_scope = !scope::is_unscoped_full(scope_config(config).0);
     if config.tls_scan_enabled && restricted_scope {
-        // Restricted modes (cgroup_skb): a socket's tuple is recorded only
+        // Restricted modes: a socket's tuple is recorded only
         // if that socket is itself in scope, which needs its SOCK_STATE.
         // Only fentry can read it; the tracepoint and kprobe variants are
         // never attached here (tls_probes.rs `tls_tcp_sendmsg_scoped`).
@@ -364,29 +291,9 @@ pub fn load_and_attach(
 
     info!(
         probes_attached = links.len(),
-        tc_links_attached,
-        tc_links_expected = interfaces.len() * 2,
         has_cgroup_id = caps.has_cgroup_id,
-        interfaces = ?interfaces,
         "eBPF programs loaded and attached"
     );
-    if cgroup_backend {
-        info!("cgroup_skb backend: TC classifiers not attached");
-    } else if interfaces.is_empty() {
-        info!("No TC interfaces requested; skipping TC degraded-state warnings");
-    } else if tc_links_attached == 0 {
-        warn!(
-            interfaces = ?interfaces,
-            "No TC classifiers attached; socket lifecycle events may still appear, but payload capture will be absent"
-        );
-    } else if tc_links_attached < interfaces.len() * 2 {
-        warn!(
-            interfaces = ?interfaces,
-            tc_links_attached,
-            tc_links_expected = interfaces.len() * 2,
-            "Only a subset of requested TC classifiers attached"
-        );
-    }
 
     Ok(LoadedPrograms {
         ebpf,
@@ -394,17 +301,6 @@ pub fn load_and_attach(
         cgroup_root,
         go_reads,
     })
-}
-
-fn ensure_tc_program_loaded(ebpf: &mut Ebpf, prog_name: &str) -> Result<()> {
-    let prog: &mut SchedClassifier = ebpf
-        .program_mut(prog_name)
-        .context(format!("program '{prog_name}' not found"))?
-        .try_into()?;
-    match prog.load() {
-        Ok(()) | Err(ProgramError::AlreadyLoaded) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
 }
 
 /// Write agent config values into the eBPF CONFIG array map.
@@ -434,13 +330,8 @@ pub fn sync_config_to_ebpf(
             pids.keys().next().is_none(),
             "cannot empty the PID_FILTER map"
         );
-        // The cgroup_skb backend publishes the list itself, only once the
-        // exit tracepoint is attached (scope_loader::arm).
-        let publish = config.capture_backend != CaptureBackend::CgroupSkb;
-        for &pid in config.pid_filter.iter().flatten().filter(|_| publish) {
-            pids.insert(pid, 1, 0)
-                .with_context(|| format!("cannot add PID {pid} to the PID_FILTER map"))?;
-        }
+        // Left empty here: scope_loader::arm publishes the list, only once
+        // the exit tracepoint is attached.
     }
     let mut cfg_map: Array<_, u64> =
         Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
@@ -449,20 +340,12 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
-    // TC delivers SYNs: they locate each side's first byte, which head_only
-    // counts from and which proves a parser saw the stream from its start.
-    cfg_map.set(CONFIG_TCP_SYN_EVENTS, 1, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;
-    // A fresh random key per agent start: flow cookies are not computable
-    // offline. Set before TC is attached (load path), so every cookie of a
-    // run uses the same key.
-    use std::hash::BuildHasher;
-    let cookie_key = std::collections::hash_map::RandomState::new().hash_one(0u8);
-    cfg_map.set(CONFIG_COOKIE_KEY, cookie_key, 0)?;
 
-    // Capture scope (cgroup_skb backend; all zero on TC). Set before any
-    // program is attached. The epoch is random per start so `pid_bits`
-    // never outlive the pid_filter they were computed under (§3.1).
+    // Capture scope. Set before any program is attached. The epoch is
+    // random per start so `pid_bits` never outlive the pid_filter they were
+    // computed under (§3.1).
+    use std::hash::BuildHasher;
     let (mode, threshold, head) = scope_config(config);
     let epoch = (std::collections::hash_map::RandomState::new().hash_one(1u8) as u32).max(1);
     cfg_map.set(CONFIG_PID_EPOCH, epoch as u64, 0)?;
@@ -470,8 +353,8 @@ pub fn sync_config_to_ebpf(
     cfg_map.set(CONFIG_HEAD_BYTES, head, 0)?;
     cfg_map.set(CONFIG_SCOPE_GEN, 1, 0)?;
     cfg_map.set(CONFIG_SCOPE_MODE, mode, 0)?;
-    // capture_loopback and pid_filter_listener (cgroup_skb programs only;
-    // the scope publisher changes them at runtime).
+    // capture_loopback and pid_filter_listener (the scope publisher changes
+    // them at runtime).
     let opts = crate::config::ScopeOptions::of(config);
     cfg_map.set(CONFIG_CAPTURE_LOOPBACK, opts.capture_loopback as u64, 0)?;
     cfg_map.set(CONFIG_PID_CREATOR_RULE, opts.creator_rule as u64, 0)?;
@@ -987,55 +870,6 @@ fn normalize_pin_dir(pin_path: &str) -> std::path::PathBuf {
     }
 }
 
-fn attach_tc_classifier(
-    ebpf: &mut Ebpf,
-    iface: &str,
-    prog_name: &str,
-    direction: TcAttachType,
-    links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) -> bool {
-    match try_attach_tc(ebpf, iface, prog_name, direction) {
-        Ok(link) => {
-            info!(prog = prog_name, iface, "TC classifier attached");
-            links.push(Box::new(link));
-            true
-        }
-        Err(e) => {
-            warn!(prog = prog_name, iface, error = %e, "Failed to attach TC classifier");
-            false
-        }
-    }
-}
-
-fn try_attach_tc(
-    ebpf: &mut Ebpf,
-    iface: &str,
-    prog_name: &str,
-    direction: TcAttachType,
-) -> Result<aya::programs::tc::SchedClassifierLinkId> {
-    let _ = aya::programs::tc::qdisc_add_clsact(iface);
-    // On kernels < 6.6 aya attaches via netlink clsact filters, which outlive
-    // the process. After a crash/SIGKILL the old classifier keeps running, and
-    // a fresh attach would stack a second one (duplicating every packet).
-    // Remove stale filters with our program name first; NotFound is the
-    // normal case (clean start, or TCX links on 6.6+ which die with the fd).
-    match aya::programs::tc::qdisc_detach_program(iface, direction, prog_name) {
-        Ok(()) => warn!(
-            prog = prog_name,
-            iface, "Removed stale TC classifier left by a previous agent instance"
-        ),
-        Err(aya::programs::tc::TcError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-        }
-        Err(e) => warn!(prog = prog_name, iface, error = %e, "Stale TC classifier cleanup failed"),
-    }
-    let prog: &mut SchedClassifier = ebpf
-        .program_mut(prog_name)
-        .context(format!("program '{prog_name}' not found"))?
-        .try_into()?;
-    let link_id = prog.attach(iface, direction)?;
-    Ok(link_id)
-}
-
 /// Attach an fentry program; `false` (logged at debug) if the kernel lacks
 /// BTF or trampoline support, so the caller can fall back to a kprobe.
 fn attach_fentry(
@@ -1099,37 +933,6 @@ fn try_attach_kprobe(
     Ok(link_id)
 }
 
-fn attach_kretprobe(
-    ebpf: &mut Ebpf,
-    prog_name: &str,
-    fn_name: &str,
-    links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) {
-    match try_attach_kretprobe(ebpf, prog_name, fn_name) {
-        Ok(link) => {
-            info!(prog = prog_name, function = fn_name, "kretprobe attached");
-            links.push(Box::new(link));
-        }
-        Err(e) => {
-            warn!(prog = prog_name, function = fn_name, error = %e, "Failed to attach kretprobe")
-        }
-    }
-}
-
-fn try_attach_kretprobe(
-    ebpf: &mut Ebpf,
-    prog_name: &str,
-    fn_name: &str,
-) -> Result<aya::programs::kprobe::KProbeLinkId> {
-    let prog: &mut KProbe = ebpf
-        .program_mut(prog_name)
-        .context(format!("program '{prog_name}' not found"))?
-        .try_into()?;
-    prog.load()?;
-    let link_id = prog.attach(fn_name, 0)?;
-    Ok(link_id)
-}
-
 fn attach_tracepoint(
     ebpf: &mut Ebpf,
     prog_name: &str,
@@ -1167,10 +970,9 @@ fn try_attach_tracepoint(
 }
 
 /// Field offsets the eBPF tracepoint programs read with `read_at`
-/// (tls_probes.rs, sock_monitor.rs). Kernels can lay these records out
-/// differently: RHEL 9 adds `common_preempt_lazy_count` to the common header,
-/// moving every field by 8, and RHEL 8's 4.18 has a `u8` protocol in
-/// `inet_sock_set_state`, moving `saddr`/`daddr` back by one.
+/// (tls_probes.rs). Kernels can lay these records out differently: RHEL 9
+/// adds `common_preempt_lazy_count` to the common header, moving every field
+/// by 8.
 const TRACEPOINT_LAYOUTS: &[(&str, &[(&str, usize)])] = &[
     (
         "sock_send_length",
@@ -1179,20 +981,6 @@ const TRACEPOINT_LAYOUTS: &[(&str, &[(&str, usize)])] = &[
     (
         "sock_recv_length",
         &[("sk", 8), ("family", 16), ("protocol", 18)],
-    ),
-    (
-        "inet_sock_set_state",
-        &[
-            ("skaddr", 8),
-            ("oldstate", 16),
-            ("newstate", 20),
-            ("sport", 24),
-            ("dport", 26),
-            ("family", 28),
-            ("protocol", 30),
-            ("saddr", 32),
-            ("daddr", 36),
-        ],
     ),
 ];
 
@@ -1371,7 +1159,6 @@ mod tests {
     fn test_detect_kernel_caps() {
         let caps = detect_kernel_caps().expect("should detect kernel caps");
         assert!(caps.version.0 >= 4, "kernel major version should be >= 4");
-        assert!(caps.has_tc_ebpf, "modern kernels should have TC eBPF");
     }
 
     // ── Capability parsing ────────────────────────────────────────────

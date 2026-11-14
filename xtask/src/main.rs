@@ -24,10 +24,6 @@ enum Commands {
     },
     /// Test eBPF programs on a Linux system
     TestEbpf {
-        /// Run with a specific interface (default: lo)
-        #[arg(long, default_value = "lo")]
-        interface: String,
-
         /// Duration in seconds to run the smoke test (default: 10)
         #[arg(long, default_value_t = 10)]
         duration: u32,
@@ -39,10 +35,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::BuildEbpf { release } => build_ebpf(release)?,
-        Commands::TestEbpf {
-            interface,
-            duration,
-        } => test_ebpf(&interface, duration)?,
+        Commands::TestEbpf { duration } => test_ebpf(duration)?,
     }
 
     Ok(())
@@ -158,8 +151,7 @@ fn validate_required_sections(sections: &HashSet<String>) -> Result<()> {
     }
 
     let has_program_section = sections.iter().any(|section| {
-        section == "classifier"
-            || section.starts_with("classifier/")
+        section.starts_with("cgroup_skb/")
             || section == "kprobe"
             || section.starts_with("kprobe/")
             || section == "kretprobe"
@@ -183,7 +175,7 @@ fn validate_required_sections(sections: &HashSet<String>) -> Result<()> {
 ///
 /// eBPF programs require a Linux kernel (5.8+).
 /// This command helps developers test on Linux VMs or bare-metal machines.
-fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
+fn test_ebpf(duration: u32) -> Result<()> {
     let workspace_root = workspace_root()?;
     let bpf_toolchain =
         env::var("BPF_TOOLCHAIN").unwrap_or_else(|_| "nightly-2026-02-17".to_string());
@@ -209,9 +201,7 @@ fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
         println!("  3. Build and test:");
         println!("     cargo xtask build-ebpf");
         println!("     cargo build -p panopticon-agent --release");
-        println!(
-            "     sudo ./target/release/panopticon-agent --interface {interface} --log-events --smoke-test"
-        );
+        println!("     sudo ./target/release/panopticon-agent --log-events --smoke-test");
         println!();
         println!("Option 2: Use QEMU with virtme-ng (recommended for CI)");
         println!("  pip install virtme-ng");
@@ -219,7 +209,7 @@ fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
         println!("    cd {} && \\", workspace_root.display());
         println!("    cargo xtask build-ebpf && \\");
         println!("    cargo build -p panopticon-agent --release && \\");
-        println!("    ./target/release/panopticon-agent --interface lo --log-events --smoke-test'");
+        println!("    ./target/release/panopticon-agent --log-events --smoke-test'");
         println!();
         println!("Option 3: Docker with privileged mode");
         println!("  docker run --privileged -v /sys/kernel/debug:/sys/kernel/debug:ro \\");
@@ -231,7 +221,7 @@ fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
         );
         println!("    cd /workspace && cargo xtask build-ebpf && \\");
         println!("    cargo build -p panopticon-agent --release && \\");
-        println!("    ./target/release/panopticon-agent --interface lo --log-events --smoke-test'");
+        println!("    ./target/release/panopticon-agent --log-events --smoke-test'");
         println!();
         println!("Note: The --smoke-test flag makes the agent attach probes, verify events");
         println!("flow through the pipeline, and exit automatically.");
@@ -240,7 +230,6 @@ fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
 
     // On Linux: actually build and run the smoke test
     println!("=== eBPF Smoke Test ===");
-    println!("Interface: {interface}");
     println!("Duration: {duration}s");
     println!();
 
@@ -269,8 +258,6 @@ fn test_ebpf(interface: &str, duration: u32) -> Result<()> {
     cmd.args([
         "-E",
         agent_path.to_str().unwrap(),
-        "--interface",
-        interface,
         "--log-events",
         "--smoke-test",
     ]);
@@ -334,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_validate_required_sections_ok() {
-        let sections: HashSet<String> = ["license", "maps", "classifier"]
+        let sections: HashSet<String> = ["license", "maps", "cgroup_skb/ingress"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -343,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_validate_required_sections_missing_maps() {
-        let sections: HashSet<String> = ["license", "classifier"]
+        let sections: HashSet<String> = ["license", "cgroup_skb/ingress"]
             .iter()
             .map(|s| s.to_string())
             .collect();

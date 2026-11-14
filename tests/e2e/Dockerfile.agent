@@ -33,4 +33,4 @@ RUN if [ "$INCLUDE_MODEL" = "true" ] && [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/
 ENV PANOPTICON_MODEL_PATH=/opt/panopticon/models/distilbert-ner
 
 ENTRYPOINT ["panopticon-agent"]
-CMD ["--interface", "eth0", "--log-events"]
+CMD ["--log-events"]

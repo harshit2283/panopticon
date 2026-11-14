@@ -130,7 +130,7 @@ record_host_debug() {
 print_agent_attach_summary() {
   echo "Agent attach summary:"
   compose logs --no-color agent 2>/dev/null \
-    | grep -E "Kernel capabilities detected|TC classifier attached|Failed to attach TC classifier|eBPF programs loaded and attached|Initial TLS scan complete" \
+    | grep -E "Kernel capabilities detected|eBPF programs loaded and attached|Initial TLS scan complete" \
     || true
 }
 

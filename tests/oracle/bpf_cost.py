@@ -3,9 +3,9 @@
 With kernel.bpf_stats_enabled=1 the kernel accounts run_time_ns / run_cnt
 for every BPF program; they are exposed in /proc/<pid>/fdinfo/<prog fd>.
 Prints total runs, total ns and mean ns per invocation for the packet
-programs (per packet: the TC classifiers, or the cgroup_skb programs of the
-cgroup_skb backend, which run for every packet of every local socket on the
-node, loopback included), then the same per program type for the others:
+programs (per packet: the cgroup_skb programs, which run for every packet
+of every local socket on the node, loopback included; TC classifiers too,
+for older agents), then the same per program type for the others:
 sock_ops and cgroup/sock_create (per connection / socket), tracepoints
 (process lifecycle, and the sock_send/recv_length hooks that give TLS
 connections their addresses, which run on every TCP send/receive),

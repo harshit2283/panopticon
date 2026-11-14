@@ -141,7 +141,7 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
 /// The loopback device's ifindex in every network namespace
 /// (`LOOPBACK_IFINDEX`; `loopback_net_init` registers `lo` first and
 /// checks it got 1). A packet whose device (`__sk_buff.ifindex`) is 1 is
-/// node-local: TC on the node's NIC never saw it.
+/// node-local.
 pub const LOOPBACK_IFINDEX: u32 = 1;
 
 /// `NETDEV_OFFS` indices: where the capture hook finds the device's

@@ -1,4 +1,4 @@
-//! Loader for the cgroup_skb capture backend (DESIGN §7): load-check every
+//! Loader for the cgroup_skb capture programs (DESIGN §7): load-check every
 //! program a mode needs before anything is attached, find the cgroup v2
 //! root, publish the cgroup selectors (`CGROUP_ALLOW`, through the caller's
 //! `select` hook), attach everything while the scope writers are disarmed,
@@ -95,7 +95,7 @@ pub fn mode_settings(mode: u64) -> String {
     s.join(", ")
 }
 
-/// Load one program by name (any type this backend uses). Fentry/fexit
+/// Load one program by name (any type the capture uses). Fentry/fexit
 /// programs attach to `target`.
 pub fn load_program(ebpf: &mut Ebpf, name: &str, target: Option<&str>) -> Result<()> {
     let prog = ebpf
@@ -160,12 +160,12 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
         // §2.2: publication order is validated on x86-64 (TSO) only.
         bail!(
             "refusing {settings}: scoped capture is only validated on x86-64 (DESIGN §2.2); \
-             use unscoped full or capture.backend = \"tc\""
+             use unscoped full"
         );
     }
     for p in [SKB_INGRESS, SKB_EGRESS] {
         load_program(ebpf, p, None).with_context(|| {
-            "refusing to start: capture.backend = \"cgroup_skb\" needs cgroup_skb with \
+            "refusing to start: capture needs cgroup_skb with \
              sk_storage (BPF_F_CLONE), bpf_tcp_sock and BPF_ADD|BPF_FETCH"
         })?;
     }

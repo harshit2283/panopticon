@@ -3,8 +3,8 @@
 # sampling_mode = "connection_sample" and sampling_mode = "head_only".
 #
 # Traffic legs (as run_modes.sh), with planted PII and credentials:
-#   http   http_oracle.py over a veth pair, captured by TC (or, with
-#          BACKEND=cgroup_skb, at both sockets' cgroup hooks)
+#   http   http_oracle.py over a veth pair, captured at both sockets'
+#          cgroup hooks
 #   tls    http_oracle.py over TLS on loopback, captured by the OpenSSL
 #          uprobes in both the client and the server process
 # Runs, each with its own agent, privacy mode full and every sink on (event
@@ -20,31 +20,29 @@
 #                 connection passes more than HEAD bytes, values planted
 #                 beyond them reach no sink, and each connection's first
 #                 request is still captured.
-#   cgroup_filter (BACKEND=cgroup_skb on a unified cgroup2 host only; in the
-#                 default runs there) cgroup_filter = the cgroup both servers
+#   cgroup_filter (on a unified cgroup2 host only; in the default runs
+#                 there) cgroup_filter = the cgroup both servers
 #                 were started in: as pid_servers, selected by cgroup.
-# BACKEND=cgroup_skb ([capture] backend) decides scope in the kernel per
-# socket, so each connection has two views, one per endpoint socket, each
+# Scope is decided in the kernel per socket, so each connection has two
+# views, one per endpoint socket, each
 # scoped and sampled on its own. score_sampling.py scores each run.
 #
 # Usage: sudo tests/oracle/run_sampling.sh [requests=600] [seed=1234] [min_recall=0.99] [runs="..."]
-# Env: BACKEND (tc | cgroup_skb), AGENT, HTTP_PORT, TLS_PORT, METRICS, and
+# Env: AGENT, HTTP_PORT, TLS_PORT, METRICS, and
 # ORACLE_NS / ORACLE_IF / ORACLE_NET (netns.py).
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
 # python3 3.7+ (set PYTHON) linked against a shared libssl, iproute2, nsenter,
 # curl.
 set -euo pipefail
 NS=${ORACLE_NS:-pclient}
-IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-600}
 SEED=${2:-1234}
 MIN_RECALL=${3:-0.99}
-BACKEND=${BACKEND:-tc}
 CGROUP2=/sys/fs/cgroup
-SEL=$CGROUP2/$NS-sel  # cgroup_skb: the servers' cgroup
+SEL=$CGROUP2/$NS-sel  # the servers' cgroup
 UNIFIED=0
-[[ $BACKEND == cgroup_skb && $(stat -fc %T $CGROUP2) == cgroup2fs ]] && UNIFIED=1
+[[ $(stat -fc %T $CGROUP2) == cgroup2fs ]] && UNIFIED=1
 DEFAULT_RUNS="pid_servers pid_other sample_0 sample_50 sample_100 head"
 [[ $UNIFIED == 1 ]] && DEFAULT_RUNS+=" cgroup_filter"
 RUNS=${4:-$DEFAULT_RUNS}
@@ -71,7 +69,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=oracle \
 "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
 "$PY" "$HERE/netns.py" up
 
-# Servers. With BACKEND=cgroup_skb each run starts its own, before the agent
+# Servers. Each run starts its own, before the agent
 # (pid_filter lists their pids) but held until the agent is ready, so their
 # listeners are created under the agent and carry their owner (a listener
 # that predates the agent has none: pid_filter would drop each connection's
@@ -79,13 +77,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=oracle \
 # cgroup, so their sockets carry it for life (cgroup_filter). The hold is a
 # shell that execs the server, so $! stays the server's pid.
 start_servers() {
-  local hold=()
-  if [[ $BACKEND == cgroup_skb ]]; then
-    [[ $UNIFIED == 1 ]] && mkdir -p "$SEL"
-    hold=(sh -c 'if [ -n "$1" ]; then echo $$ >"$1/cgroup.procs"; fi
-      while [ ! -e "$0" ]; do sleep 0.1; done; shift; exec "$@"' "$OUT/go")
-    if [[ $UNIFIED == 1 ]]; then hold+=("$SEL"); else hold+=(""); fi
-  fi
+  local hold
+  [[ $UNIFIED == 1 ]] && mkdir -p "$SEL"
+  hold=(sh -c 'if [ -n "$1" ]; then echo $$ >"$1/cgroup.procs"; fi
+    while [ ! -e "$0" ]; do sleep 0.1; done; shift; exec "$@"' "$OUT/go")
+  if [[ $UNIFIED == 1 ]]; then hold+=("$SEL"); else hold+=(""); fi
   rm -f "$OUT/go"
   "${hold[@]}" env MODE=server HOST=$HOST_IP python3 -I "$HERE/http_oracle.py" "$HTTP_PORT" &
   HTTP_SP=$!
@@ -100,13 +96,11 @@ stop_servers() {
 }
 
 # An idle python3 with libssl loaded, alive for every run: pid_other's pid,
-# and on cgroup_skb (servers start per run) what the agent's start-up TLS
+# and (servers start per run) what the agent's start-up TLS
 # scan finds libssl in (the probes cover every process mapping it).
 python3 -c 'import ssl, time; time.sleep(100000)' &
 OTHER=$!
 SPS=$OTHER
-# Servers first: the agent's initial TLS scan must find the server's libssl.
-[[ $BACKEND != cgroup_skb ]] && start_servers
 sleep 1
 
 status=0
@@ -124,20 +118,14 @@ for run in $RUNS; do
     cgroup_filter) scope="cgroup_filter = [\"${SEL#"$CGROUP2"/}\"]" ;;
     *) echo "unknown run $run"; exit 2 ;;
   esac
-  if [[ $BACKEND == cgroup_skb ]]; then
-    start_servers
-    # The TLS leg runs over 127.0.0.1: capture loopback (off by default).
-    capture=$'capture_loopback = true\n\n[capture]\nbackend = "cgroup_skb"\n\n'
-    iface=()
-  else
-    capture=
-    iface=(-i "$IFACE")
-  fi
+  start_servers
+  # The TLS leg runs over 127.0.0.1: capture loopback (off by default).
+  capture=$'capture_loopback = true\n\n'
   scope=${scope//\$HTTP_SP/$HTTP_SP}
   scope=${scope//\$TLS_SP/$TLS_SP}
   printf '%s\n\n%s[privacy]\nmode = "full"\n' "$scope" "$capture" >"$D/agent.toml"
   echo "==== $run: $(head -c 200 "$D/agent.toml" | tr '\n' ' ')"
-  "$AGENT" -v "${iface[@]}" --config "$D/agent.toml" --log-events --metrics-bind "$METRICS" \
+  "$AGENT" -v --config "$D/agent.toml" --log-events --metrics-bind "$METRICS" \
     --json-export "$D/agent.jsonl" --pii-audit-log "$D/audit.jsonl" \
     --capture-raw "$D/raw.pncap" >"$D/agent.log" 2>&1 &
   AP=$!
@@ -153,10 +141,10 @@ for run in $RUNS; do
   sleep 3
   curl -sf "http://$METRICS/metrics" >"$D/metrics.txt" || echo "metrics scrape failed"
   kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
-  [[ $BACKEND == cgroup_skb ]] && stop_servers
+  stop_servers
   "$AGENT" --privacy-mode full --decode-capture "$D/raw.pncap" >"$D/raw.jsonl"
   "$PY" -I "$HERE/score_sampling.py" "$run" "$D" "$MIN_RECALL" "$HTTP_SP" "$TLS_SP" "$HEAD" \
-    "$BACKEND" "$HTTP_PORT" ||
+    cgroup_skb "$HTTP_PORT" ||
     status=1
 done
 echo "artifacts: $OUT"

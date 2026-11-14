@@ -88,12 +88,14 @@ services:
       - BPF
     network_mode: "service:traffic-gen"
     pid: "service:traffic-gen"
+    # The host's cgroup namespace: capture attaches to the cgroup v2 root and
+    # must see the other containers' sockets, not only its own cgroup.
+    cgroup: host
     volumes:
       - ./output:/output
       - /sys/kernel/debug:/sys/kernel/debug:ro
       - /sys/fs/bpf:/sys/fs/bpf
     command: >
-      --interface eth0
       --log-events
       --json-export /output/events.jsonl
 

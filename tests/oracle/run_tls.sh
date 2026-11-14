@@ -63,7 +63,7 @@ for stack in $STACKS; do
   SP=$!
   SP_PID=$SP
   sleep 1
-  "$AGENT" -i lo --json-export "$D/agent.jsonl" >"$D/agent.log" 2>&1 &
+  "$AGENT" --json-export "$D/agent.jsonl" >"$D/agent.log" 2>&1 &
   AP=$!
   sleep 4
   "${client[@]}" &

@@ -1,7 +1,7 @@
 //! The scope publisher (DESIGN §3, narrowing): one serialised task owns
 //! every runtime write to `CGROUP_ALLOW`, `CONFIG_SCOPE_GEN` and the scope
 //! options (`CONFIG_CAPTURE_LOOPBACK`, `CONFIG_PID_CREATOR_RULE`). It runs
-//! on the cgroup_skb backend whether or not a cgroup selector is set.
+//! whether or not a cgroup selector is set.
 //!
 //! Inputs, processed in order: a `SIGHUP` reload that changes
 //! `cgroup_filter` / `pod_filter`, `capture_loopback` or

@@ -1,7 +1,7 @@
 """Score one run_sampling.sh run: did the capture scope hold in every sink?
 
 Usage: score_sampling.py RUN DIR MIN_RECALL HTTP_SERVER_PID TLS_SERVER_PID HEAD_BYTES
-                         [BACKEND=tc] [HTTP_PORT=18092]
+                         [BACKEND=cgroup_skb] [HTTP_PORT=18092]
 
 DIR holds http/truth.jsonl (and tls/truth.jsonl for runs with the TLS leg)
 from http_oracle.py, and the agent's sinks: agent.jsonl (export),
@@ -24,7 +24,7 @@ import sys
 
 run, d, min_recall = sys.argv[1], sys.argv[2], float(sys.argv[3])
 http_sp, tls_sp, head = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
-cg = (sys.argv[7] if len(sys.argv) > 7 else "tc") == "cgroup_skb"
+cg = (sys.argv[7] if len(sys.argv) > 7 else "cgroup_skb") == "cgroup_skb"
 http_port = int(sys.argv[8]) if len(sys.argv) > 8 else 18092
 failures = []
 KEYS = ("body_pii", "query_pii", "header_pii", "secrets")

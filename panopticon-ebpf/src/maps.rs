@@ -81,9 +81,8 @@ pub fn clear_scope_fields(event: *mut DataEvent) {
 // the CPU count (CONFIG_RING_SHARD_MASK) and resizes every shard at load
 // time so the active ones split a fixed total (loader DATA_RING_TOTAL_BYTES).
 //
-// TC packets are copied in at their captured size (emit_scratch_event),
-// cgroup_skb packets reserved at a size class that holds them, and close and
-// connect/accept records as the header only (SizedEvent), but TLS events keep
+// cgroup_skb packets are reserved at a size class that holds them and close
+// records as the header only (SizedEvent), but TLS events keep
 // fixed 4,192-byte reserves (see EVENT_SCRATCH), so one connection's TLS
 // burst has a single shard to fill: ~250 records at 1 MiB per shard on a
 // 64-CPU node, where the single 16 MiB ring held ~3,900. Every reserved byte
@@ -98,15 +97,6 @@ macro_rules! data_rings {
             #[map]
             pub static $name: RingBuf = RingBuf::with_byte_size(DATA_RING_DECLARED_BYTES, 0);
         )*
-
-        /// Copy `record` into shard `shard`. False if the ring is full.
-        #[inline(always)]
-        fn shard_output(shard: u32, record: &[u8]) -> bool {
-            match shard {
-                $($i => ring_output(&$name, record),)*
-                _ => false,
-            }
-        }
 
         /// Reserve a `T` in shard `shard`.
         #[inline(always)]
@@ -192,41 +182,6 @@ pub fn shard_for(socket_cookie: u64) -> u32 {
     ring_shard(socket_cookie, mask & (DATA_RING_SHARDS as u32 - 1))
 }
 
-/// Send the event built in a scratch DataEvent to its connection's shard,
-/// copying only the header and `payload_len` payload bytes: a typical
-/// packet record is a few hundred bytes instead of 4,192, so a ring holds
-/// many times more of them. Counts a kernel drop if the shard is full.
-#[inline(always)]
-pub fn emit_scratch_event(event: *const DataEvent) {
-    // SAFETY: `event` is the per-CPU scratch map value, valid for a DataEvent.
-    let (cookie, len) = unsafe {
-        (
-            (*event).socket_cookie,
-            core::ptr::read_volatile(&(*event).payload_len),
-        )
-    };
-    // The verifier needs the copy length provably within the map value; the
-    // volatile read keeps LLVM from dropping this check as redundant.
-    let len = if len > MAX_PAYLOAD_SIZE as u32 {
-        MAX_PAYLOAD_SIZE
-    } else {
-        len as usize
-    };
-    let record =
-        unsafe { core::slice::from_raw_parts(event as *const u8, DATA_EVENT_HEADER_LEN + len) };
-    if !shard_output(shard_for(cookie), record) {
-        count_kernel_drop();
-    }
-}
-
-#[inline(always)]
-fn ring_output(ring: &RingBuf, record: &[u8]) -> bool {
-    let len = ring_record_bytes(record.len() as u64);
-    let pending = ring.query(BPF_RB_AVAIL_DATA as u64);
-    ring.output::<[u8]>(record, wakeup_flags(pending, len))
-        .is_ok()
-}
-
 /// Bytes a record takes in a ring: 8-byte header + data, rounded up to 8.
 #[inline(always)]
 const fn ring_record_bytes(data_len: u64) -> u64 {
@@ -241,8 +196,8 @@ const WAKEUP_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// `pending_before` unconsumed bytes.
 ///
 /// A wakeup per record (flags = 0) raises an irq_work self-interrupt on every
-/// event; measured on a VM it was ~90% of the TC program's per-packet cost
-/// (~10.4µs vs ~1.0µs without). Wake the consumer once per
+/// event; measured on a VM it was ~90% of a packet program's cost (~10.4µs
+/// vs ~1.0µs without). Wake the consumer once per
 /// WAKEUP_THRESHOLD_BYTES of new data: when this record makes the pending
 /// bytes cross a multiple of the threshold. Waking on every record while
 /// pending was above the threshold (the earlier rule) did exactly the wrong
@@ -304,8 +259,8 @@ pub static PID_EXITED: HashMap<u32, u8> = HashMap::with_max_entries(MAX_PID_FILT
 #[map]
 pub static PID_EXITED_LOST: Array<u64> = Array::with_max_entries(1, 0);
 
-/// Whether events of process `tgid` may be emitted. TC packets have no
-/// process; user space filters them by their connection's owner.
+/// Whether TLS events of process `tgid` may be emitted (unscoped modes;
+/// packets are scoped per socket in sock_capture.rs).
 #[inline(always)]
 pub fn pid_allowed(tgid: u32) -> bool {
     match CONFIG.get(CONFIG_PID_FILTER_ON) {
@@ -448,12 +403,6 @@ pub static TLS_NEW_CALL: LruHashMap<u64, u32> = LruHashMap::with_max_entries(TLS
 pub static TLS_CONN_ADDR: LruHashMap<TlsConnKey, SockTuple> =
     LruHashMap::with_max_entries(TLS_SCRATCH_SIZE * 2, 0);
 
-/// Sockets between connect() and ESTABLISHED → owning pid_tgid, for the
-/// tracepoint fallback in sock_monitor.rs. LRU: connections that never
-/// complete are reclaimed.
-#[map]
-pub static CONNECTING: LruHashMap<u64, u64> = LruHashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
-
 /// Go `crypto/tls.(*Conn).readRecordOrCCS` calls in flight, by goroutine:
 /// the connection each is reading a record for (tls_probes.rs
 /// `go_tls_rrc_entry`, `go_tls_rrc_ret`, `go_tls_decrypt_ret`). Holds an
@@ -500,12 +449,10 @@ pub static IPV6_DROPS: Array<u64> = Array::with_max_entries(1, 0);
 
 /// Per-CPU scratch DataEvent (~4.2KB, far over the 512-byte BPF stack).
 ///
-/// TC builds every event here, then emit_scratch_event copies its header and
-/// payload to a ring shard; the PerfEventArray fallback sends it whole. Only
-/// TC uses it on the ring path: TC runs with bottom halves disabled, so
-/// nothing else on the CPU can touch the slot mid-event. The uprobes and
-/// kprobes reserve their events in the ring instead, because a uprobe
-/// program can be preempted (or interrupted by TC) on a preemptible kernel
-/// and another program would then overwrite a shared slot.
+/// Only the PerfEventArray branch of the TLS probes (tls_probes.rs) builds
+/// events here; it sends the whole struct. On the ring path every producer
+/// reserves its record in the ring instead: a uprobe program can be
+/// preempted on a preemptible kernel and another program would then
+/// overwrite a shared slot.
 #[map]
 pub static EVENT_SCRATCH: PerCpuArray<DataEvent> = PerCpuArray::with_max_entries(1, 0);

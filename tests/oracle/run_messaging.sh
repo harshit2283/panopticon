@@ -25,7 +25,6 @@ set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.
 NS=${ORACLE_NS:-pclient}
-IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-500}
 SEED=${2:-7}
@@ -105,7 +104,7 @@ wait_ready
 status=0
 for proto in $PROTOS; do
   # shellcheck disable=SC2086  # AGENT_ARGS: extra flags, word-split on purpose
-  "$AGENT" -i "$IFACE" --json-export "$OUT/$proto-agent.jsonl" ${AGENT_ARGS:+${AGENT_ARGS//@PROTO@/$proto}} \
+  "$AGENT" --json-export "$OUT/$proto-agent.jsonl" ${AGENT_ARGS:+${AGENT_ARGS//@PROTO@/$proto}} \
     >"$OUT/$proto-agent.log" 2>&1 &
   AP=$!
   sleep 4

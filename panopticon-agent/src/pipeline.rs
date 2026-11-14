@@ -24,8 +24,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::capture_gate::GateConfig;
-use crate::config::{AgentConfig, CaptureBackend, PrivacyGate};
+use crate::config::{AgentConfig, PrivacyGate, SamplingMode};
 use crate::event_loop::{AdmissionFloor, EventBatch, EventStats, WorkerTaskContext};
 use crate::export::audit::PiiAuditLog;
 use crate::export::json::{JsonExportHandle, JsonExporter};
@@ -48,10 +47,6 @@ pub struct Shared {
     /// The PII engine template: regexes and model, shared by every
     /// pipeline's copy.
     pub pii: Option<PiiEngine>,
-    /// The workers' capture gate settings.
-    pub capture_gate: GateConfig,
-    /// Live cgroup_skb capture: the kernel decided every scope rule.
-    pub kernel_scope: bool,
     pub json: Option<Arc<RecordFile>>,
     pub audit: Option<Arc<RecordFile>>,
     pub raw: Option<Arc<RecordFile>>,
@@ -119,8 +114,6 @@ impl Shared {
             PiiEngine::new(&config.pii, &config.pii_external_url_allowlist)
         });
         Ok(Self {
-            capture_gate: GateConfig::from_config(&config),
-            kernel_scope: config.capture_backend == CaptureBackend::CgroupSkb,
             config,
             stats: Arc::new(EventStats::new()),
             privacy,
@@ -137,10 +130,27 @@ impl Shared {
     }
 
     /// Offline replay of a recording (`--replay-bench`, tests): one worker,
-    /// the JSON export only, and the user-space scope rules always applied
-    /// whatever the backend (no kernel decided anything for these events;
-    /// the rules err toward drop).
+    /// the JSON export only. Capture scope is decided in the kernel only,
+    /// and no kernel decides anything for replayed events, so a config with
+    /// any scope setting (pid_filter, cgroup_filter, pod_filter, sampling) is
+    /// refused rather than replayed unscoped.
     pub fn for_replay(mut config: AgentConfig, privacy: Arc<PrivacyGate>) -> Result<Self> {
+        let sampled = match config.sampling_mode {
+            SamplingMode::Full => false,
+            SamplingMode::ConnectionSample => config.sample_rate < 1.0,
+            SamplingMode::HeadOnly { .. } => true,
+        };
+        if config.pid_filter.is_some()
+            || config.cgroup_filter.is_some()
+            || config.pod_filter.is_some()
+            || sampled
+        {
+            anyhow::bail!(
+                "replay takes no capture-scope settings (pid_filter, cgroup_filter, pod_filter, \
+                 sampling_mode): scope is decided in the kernel at capture time, and a recording \
+                 holds only what was already in scope"
+            );
+        }
         config.max_worker_count = 1;
         config.otlp.enabled = false;
         let json = config
@@ -149,8 +159,6 @@ impl Shared {
             .map(JsonExporter::open)
             .transpose()?;
         Ok(Self {
-            capture_gate: GateConfig::user_space(&config),
-            kernel_scope: false,
             pii: config
                 .pii
                 .enabled
@@ -300,8 +308,6 @@ impl Pipeline {
                 raw_capture: raw.as_ref().map(|(h, _)| h.clone()),
                 max_body_bytes: cfg.max_body_bytes,
                 privacy: Arc::clone(&shared.privacy),
-                capture_gate: shared.capture_gate.clone(),
-                kernel_scope: shared.kernel_scope,
                 io_gate: Arc::clone(&gate),
                 kafka_topics: kafka_topics.clone(),
             };

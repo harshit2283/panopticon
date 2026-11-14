@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// What part of the traffic is captured (`sampling_mode`). Applied by the
-/// workers' capture gate (`capture_gate.rs`) before anything reaches a
-/// parser or a sink.
+/// What part of the traffic is captured (`sampling_mode`). Decided in the
+/// kernel per socket (DESIGN §3.3, §3.4) before anything reaches a parser or
+/// a sink.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SamplingMode {
     /// Every connection, whole.
@@ -19,18 +19,6 @@ pub enum SamplingMode {
 
 impl SamplingMode {
     pub const NAMES: [&'static str; 3] = ["full", "connection_sample", "head_only"];
-}
-
-/// Where packets are captured (`[capture] backend`). Restart-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CaptureBackend {
-    /// TC classifiers on `interfaces` (the current behaviour).
-    #[default]
-    Tc,
-    /// `cgroup_skb` on the cgroup v2 root, with scope decided in the kernel
-    /// from per-socket state (DESIGN: capture scope from socket state).
-    /// Kernel side only so far; off unless chosen.
-    CgroupSkb,
 }
 
 /// `pid_filter_listener`: which process of an accepted (server) connection
@@ -46,7 +34,7 @@ pub enum ListenerRule {
 }
 
 /// The scope settings a reload may change in either direction besides the
-/// cgroup selectors (cgroup_skb backend): kernel `CONFIG` values, applied
+/// cgroup selectors: kernel `CONFIG` values, applied
 /// by the scope publisher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScopeOptions {
@@ -197,30 +185,26 @@ pub struct AgentConfig {
     // ── Capture control ────────────────────────────
     /// Master switch — disables all capture when false.
     pub capture_enabled: bool,
-    /// Network interfaces to attach TC classifiers to.
-    pub interfaces: Vec<String>,
     /// If set, only capture traffic of these processes (PIDs, i.e. kernel
     /// tgids): at most `MAX_PID_FILTER`, none 0. Restart-only.
     pub pid_filter: Option<Vec<u32>>,
     /// `cgroup_filter`: cgroup v2 paths, relative to the cgroup2 root (a
     /// leading `/` is allowed and means the same, as in `/proc/<pid>/cgroup`).
     /// Their sockets and those of every descendant cgroup are captured
-    /// (DESIGN §3.2). cgroup_skb backend only. Restart-only for now.
+    /// (DESIGN §3.2). Restart-only for now.
     pub cgroup_filter: Option<Vec<String>>,
     /// `[[pod_filter]]`: pods on this node whose pod-level cgroup is
-    /// captured (DESIGN §3.2). cgroup_skb backend only. Restart-only for now.
+    /// captured (DESIGN §3.2). Restart-only for now.
     pub pod_filter: Option<Vec<PodFilter>>,
     /// `capture_loopback` (default false): capture packets on node-local
     /// paths (`lo`, VRF; DESIGN §3.7). TLS plaintext is scoped by process regardless.
-    /// cgroup_skb backend only. A reload may change it.
+    /// A reload may change it.
     pub capture_loopback: bool,
-    /// `pid_filter_listener` (default `"acceptor"`, DESIGN §3.1). cgroup_skb
-    /// backend only. A reload may change it.
+    /// `pid_filter_listener` (default `"acceptor"`, DESIGN §3.1). A reload
+    /// may change it.
     pub pid_filter_listener: ListenerRule,
-    /// `[capture] backend`. Restart-only.
-    pub capture_backend: CaptureBackend,
-    /// `[capture] cgroup2_path`: the cgroup v2 root the cgroup_skb backend
-    /// attaches to, or `"auto"`. Restart-only.
+    /// `[capture] cgroup2_path`: the cgroup v2 root the capture programs
+    /// attach to, or `"auto"`. Restart-only.
     pub cgroup2_path: String,
 
     // ── Resource budgets ───────────────────────────
@@ -330,14 +314,11 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             capture_enabled: true,
-            // Empty = auto-detect default-route interface(s) at startup.
-            interfaces: Vec::new(),
             pid_filter: None,
             cgroup_filter: None,
             pod_filter: None,
             capture_loopback: false,
             pid_filter_listener: ListenerRule::Acceptor,
-            capture_backend: CaptureBackend::Tc,
             cgroup2_path: "auto".into(),
 
             max_events_per_sec: 500_000,
@@ -525,6 +506,7 @@ fn num_cpus() -> usize {
 #[serde(default)]
 pub struct AgentConfigFile {
     pub capture_enabled: Option<bool>,
+    /// Removed with the TC capture: refused (see `merge_into`).
     pub interfaces: Option<Vec<String>>,
     pub pid_filter: Option<Vec<u32>>,
     pub cgroup_filter: Option<Vec<String>>,
@@ -673,7 +655,8 @@ pub fn cgroup_filter_rel(path: &str) -> anyhow::Result<&str> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfigFile {
-    /// `"tc"` (default) or `"cgroup_skb"`.
+    /// Removed: `"cgroup_skb"`, the only backend, is accepted with a
+    /// warning; anything else is refused (see `merge_into`).
     pub backend: Option<String>,
     /// `"auto"` or a cgroup v2 mount point.
     pub cgroup2_path: Option<String>,
@@ -735,8 +718,15 @@ impl AgentConfigFile {
         if let Some(v) = self.capture_enabled {
             base.capture_enabled = v;
         }
-        if let Some(v) = self.interfaces {
-            base.interfaces = v;
+        // Removed keys. `interfaces` narrowed TC capture to some devices;
+        // cgroup_skb sees every local socket, so ignoring it would widen
+        // what is captured: refused. `backend = "tc"` likewise.
+        if self.interfaces.is_some() {
+            anyhow::bail!(
+                "`interfaces` is no longer supported: the TC backend was removed and capture \
+                 now covers every socket in the cgroup v2 hierarchy; remove the key and select \
+                 traffic with pid_filter, cgroup_filter or pod_filter"
+            );
         }
         if let Some(v) = self.pid_filter {
             base.pid_filter = Some(v);
@@ -753,10 +743,14 @@ impl AgentConfigFile {
         }
         if let Some(capture) = self.capture {
             match capture.backend.as_deref() {
-                None | Some("tc") => base.capture_backend = CaptureBackend::Tc,
-                Some("cgroup_skb") => base.capture_backend = CaptureBackend::CgroupSkb,
+                None => {}
+                Some("cgroup_skb") => tracing::warn!(
+                    "[capture] backend = \"cgroup_skb\" is no longer needed (the only backend); \
+                     remove it"
+                ),
                 Some(other) => anyhow::bail!(
-                    "[capture] backend = \"{other}\" is not valid; use \"tc\" or \"cgroup_skb\""
+                    "[capture] backend = \"{other}\" is not supported: the TC backend was \
+                     removed and cgroup_skb is the only backend; remove the key"
                 ),
             }
             if let Some(path) = capture.cgroup2_path {
@@ -773,14 +767,6 @@ impl AgentConfigFile {
             Some(other) => anyhow::bail!(
                 "pid_filter_listener = \"{other}\" is not valid; use \"acceptor\" or \"creator\""
             ),
-        }
-        if (self.capture_loopback.is_some() || self.pid_filter_listener.is_some())
-            && base.capture_backend != CaptureBackend::CgroupSkb
-        {
-            anyhow::bail!(
-                "capture_loopback and pid_filter_listener need [capture] backend = \"cgroup_skb\"; \
-                 they are kernel scope settings of that backend"
-            );
         }
         if let Some(v) = self.max_events_per_sec {
             base.max_events_per_sec = v;
@@ -1050,16 +1036,8 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
             "pod_filter = [] would capture nothing; add [[pod_filter]] entries, or remove it"
         );
     }
-    if config.cgroup_filter.is_some() || config.pod_filter.is_some() {
-        if config.capture_backend != CaptureBackend::CgroupSkb {
-            anyhow::bail!(
-                "cgroup_filter and pod_filter need [capture] backend = \"cgroup_skb\"; \
-                 the tc backend cannot select by cgroup"
-            );
-        }
-        if config.pod_filter.is_some() && config.kubernetes.mode == KubernetesMode::Disabled {
-            anyhow::bail!("pod_filter needs Kubernetes metadata, but [kubernetes] enabled = false");
-        }
+    if config.pod_filter.is_some() && config.kubernetes.mode == KubernetesMode::Disabled {
+        anyhow::bail!("pod_filter needs Kubernetes metadata, but [kubernetes] enabled = false");
     }
     if config.kubernetes.relist_interval < Duration::from_secs(5) {
         return Err(anyhow::anyhow!(
@@ -1094,8 +1072,8 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
                 .into(),
         );
     }
-    if running.capture_backend != new.capture_backend || running.cgroup2_path != new.cgroup2_path {
-        return Err("changing [capture] backend or cgroup2_path needs a restart".into());
+    if running.cgroup2_path != new.cgroup2_path {
+        return Err("changing [capture] cgroup2_path needs a restart".into());
     }
     if running.sampling_mode != new.sampling_mode || running.sample_rate != new.sample_rate {
         return Err(
@@ -1239,7 +1217,6 @@ mod tests {
     fn test_load_config_full_toml() {
         let toml = r#"
             capture_enabled = false
-            interfaces = ["wlan0", "eth1"]
             max_events_per_sec = 100000
             max_worker_count = 8
             worker_channel_capacity = 2048
@@ -1285,7 +1262,6 @@ mod tests {
         apply_privacy(&mut config).unwrap();
         assert_eq!(config.privacy_mode, PrivacyMode::Full);
         assert!(!config.capture_enabled);
-        assert_eq!(config.interfaces, vec!["wlan0", "eth1"]);
         assert_eq!(config.max_events_per_sec, 100_000);
         assert_eq!(config.max_worker_count, 8);
         assert_eq!(config.worker_channel_capacity, 2048);
@@ -1338,7 +1314,6 @@ mod tests {
         assert_eq!(config.metrics_bind.as_deref(), Some("127.0.0.1:8080"));
         // Defaults preserved
         assert!(config.capture_enabled);
-        assert!(config.interfaces.is_empty());
         assert_eq!(config.max_worker_count, num_cpus());
         assert!(!config.otlp.enabled);
         assert!(config.pii.enabled);
@@ -1373,7 +1348,6 @@ mod tests {
         assert!(!config.capture_enabled);
         // Everything else untouched
         assert_eq!(config.max_events_per_sec, 500_000);
-        assert!(config.interfaces.is_empty());
         assert!(config.pii.enabled);
     }
 
@@ -1526,24 +1500,39 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_backend_config() {
+    fn test_capture_config_and_removed_keys() {
         let load = |toml: &str| load_config_from_str(toml).unwrap();
-        let tc = load("");
-        assert_eq!(tc.capture_backend, CaptureBackend::Tc); // off by default
-        assert_eq!(tc.cgroup2_path, "auto");
-        let cg = load("[capture]\nbackend = \"cgroup_skb\"\ncgroup2_path = \"/x\"\n");
-        assert_eq!(cg.capture_backend, CaptureBackend::CgroupSkb);
-        assert_eq!(cg.cgroup2_path, "/x");
-        let err = load_config_from_str("[capture]\nbackend = \"xdp\"\n").unwrap_err();
-        assert!(err.to_string().contains("not valid"), "{err}");
+        let d = load("");
+        assert_eq!(d.cgroup2_path, "auto");
+        let x = load("[capture]\ncgroup2_path = \"/x\"\n");
+        assert_eq!(x.cgroup2_path, "/x");
+        // The only backend, named: accepted (a warning is logged).
+        assert_eq!(
+            load("[capture]\nbackend = \"cgroup_skb\"\n").cgroup2_path,
+            "auto"
+        );
+        // The removed TC backend and its interface list are refused, never
+        // ignored: ignoring `interfaces` would widen capture.
+        for (toml, what) in [
+            ("[capture]\nbackend = \"tc\"\n", "TC backend was removed"),
+            ("[capture]\nbackend = \"xdp\"\n", "not supported"),
+            (
+                "interfaces = [\"eth0\"]\n",
+                "`interfaces` is no longer supported",
+            ),
+            ("interfaces = []\n", "`interfaces` is no longer supported"),
+        ] {
+            let e = load_config_from_str(toml).unwrap_err().to_string();
+            assert!(e.contains(what), "{toml}: {e}");
+        }
         assert!(load_config_from_str("[capture]\nbogus = 1\n").is_err());
-        let err = check_restart_only(&tc, &cg).unwrap_err();
-        assert!(err.contains("[capture] backend"), "{err}");
+        let err = check_restart_only(&d, &x).unwrap_err();
+        assert!(err.contains("cgroup2_path"), "{err}");
     }
 
     #[test]
     fn test_cgroup_and_pod_filter_config() {
-        const CG: &str = "[capture]\nbackend = \"cgroup_skb\"\n";
+        const CG: &str = "";
         let ok = |toml: &str| load_config_from_str(&format!("{toml}{CG}")).unwrap();
         let err = |toml: &str| {
             load_config_from_str(&format!("{toml}{CG}"))
@@ -1616,15 +1605,6 @@ mod tests {
             assert!(e.contains(what), "{toml}: {e}");
         }
 
-        // Refused with the tc backend.
-        for toml in [
-            "cgroup_filter = [\"a\"]\n",
-            "[[pod_filter]]\nnamespace = \"n\"\nname = \"x\"\n",
-        ] {
-            let e = load_config_from_str(toml).unwrap_err().to_string();
-            assert!(e.contains("cgroup_skb"), "{e}");
-        }
-
         // The selectors change at runtime (the scope publisher applies
         // them), including switching from one form to the other or
         // combining them; turning cgroup selection on or off needs a
@@ -1656,7 +1636,7 @@ mod tests {
 
     #[test]
     fn scope_options_config() {
-        const CG: &str = "[capture]\nbackend = \"cgroup_skb\"\n";
+        const CG: &str = "";
         let load = |toml: &str| load_config_from_str(&format!("{toml}{CG}"));
         // Defaults: loopback dropped, acceptor rule.
         let d = load("").unwrap();
@@ -1678,14 +1658,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("acceptor") && e.contains("creator"), "{e}");
-        // Refused with the tc backend, even at their defaults.
-        for toml in [
-            "capture_loopback = false\n",
-            "pid_filter_listener = \"acceptor\"\n",
-        ] {
-            let e = load_config_from_str(toml).unwrap_err().to_string();
-            assert!(e.contains("cgroup_skb"), "{toml}: {e}");
-        }
         // Both reload; turning either off is a narrowing, on a widening.
         assert_eq!(check_restart_only(&d, &c), Ok(()));
         assert!(!ScopeOptions::default().narrows_to(wide));

@@ -31,11 +31,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "TLS_KEY",
         "a random hash key drawn at start, never derived from traffic",
     ),
-    (
-        "capture_gate.rs",
-        "KEY",
-        "a random hash key drawn at start, never derived from traffic",
-    ),
     ("scope_loader.rs", "LOCK", "the agent's lock file handle"),
     (
         "platform/proc_scanner.rs",

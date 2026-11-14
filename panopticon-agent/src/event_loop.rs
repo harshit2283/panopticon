@@ -61,11 +61,6 @@ pub(crate) struct WorkerTaskContext {
     pub raw_capture: Option<crate::export::raw_capture::RawCaptureHandle>,
     pub max_body_bytes: usize,
     pub privacy: Arc<PrivacyGate>,
-    /// pid_filter / sampling settings for the worker's capture gate.
-    pub capture_gate: crate::capture_gate::GateConfig,
-    /// Live cgroup_skb capture: the kernel made every scope decision, and
-    /// its close records only free state.
-    pub kernel_scope: bool,
     /// The pipeline's I/O gate (test pause points key on it).
     pub io_gate: Arc<IoGate>,
     /// The pipeline's Kafka topic ID map.
@@ -87,63 +82,6 @@ struct MessageContext<'a> {
     /// Whether this event's sender is the connection's server, when known.
     sender_is_server: Option<bool>,
     max_body_bytes: usize,
-    /// Local processes that opened / accepted the connection, if seen.
-    owners: Option<ConnOwners>,
-}
-
-/// PIDs of the local processes on either end of a TCP connection, from the
-/// connect / accept hooks (sock_monitor.rs).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ConnOwners {
-    client: Option<u32>,
-    server: Option<u32>,
-}
-
-/// Per-worker connection → owners map. Bounded: owners arrive for every TCP
-/// connection on the node, not only captured ones, so the map is cleared
-/// when it reaches its cap rather than growing without limit.
-#[derive(Default)]
-struct OwnerTable {
-    owners: fxhash::FxHashMap<u64, ConnOwners>,
-    cap: usize,
-}
-
-impl OwnerTable {
-    fn new(cap: usize) -> Self {
-        Self {
-            owners: Default::default(),
-            cap: cap.max(1),
-        }
-    }
-
-    /// Record a SockConnect / SockAccept event; ignores other events.
-    fn observe(&mut self, event: &DataEvent) {
-        let is_client = match event.event_type {
-            EventType::SockConnect => true,
-            EventType::SockAccept => false,
-            _ => return,
-        };
-        if event.pid == 0 {
-            return;
-        }
-        if self.owners.len() >= self.cap && !self.owners.contains_key(&event.socket_cookie) {
-            self.owners.clear();
-        }
-        let entry = self.owners.entry(event.socket_cookie).or_default();
-        if is_client {
-            entry.client = Some(event.pid);
-        } else {
-            entry.server = Some(event.pid);
-        }
-    }
-
-    fn get(&self, cookie: u64) -> Option<ConnOwners> {
-        self.owners.get(&cookie).copied()
-    }
-
-    fn remove(&mut self, cookie: u64) {
-        self.owners.remove(&cookie);
-    }
 }
 
 // ── Event Statistics ──────────────────────────────────────────────────────
@@ -178,19 +116,7 @@ pub struct EventStats {
     /// TCP segments ignored whole: retransmissions of bytes already parsed,
     /// or outside the connection's window (forged, or a stale RST / FIN).
     pub tcp_segments_ignored: AtomicU64,
-    /// `pid_filter`: events dropped in user space (not counted: TLS and
-    /// socket events of other processes, which the kernel drops).
-    pub pid_filter_dropped_events: AtomicU64,
-    /// `pid_filter`: TC connections dropped because no listed process was
-    /// seen to own them (other processes' connections, connections opened
-    /// before the agent started).
-    pub pid_filter_unknown_owner_connections: AtomicU64,
-    /// `connection_sample`: connections and events sampled out.
-    pub sampled_out_connections: AtomicU64,
-    pub sampled_out_events: AtomicU64,
-    /// `head_only`: events cut or dropped past the per-direction limit.
-    pub head_only_cut_events: AtomicU64,
-    /// cgroup_skb: events dropped at the ring read because their scope
+    /// Events dropped at the ring read because their scope
     /// generation is below the admission floor (a narrowing came after it).
     pub drops_stale_scope_gen: AtomicU64,
     /// Events dropped at the ring read because no capture pipeline is
@@ -224,11 +150,6 @@ impl EventStats {
             drops_export_full: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
             tcp_segments_ignored: AtomicU64::new(0),
-            pid_filter_dropped_events: AtomicU64::new(0),
-            pid_filter_unknown_owner_connections: AtomicU64::new(0),
-            sampled_out_connections: AtomicU64::new(0),
-            sampled_out_events: AtomicU64::new(0),
-            head_only_cut_events: AtomicU64::new(0),
             drops_stale_scope_gen: AtomicU64::new(0),
             drops_no_pipeline: AtomicU64::new(0),
             capture_stopped: AtomicBool::new(false),
@@ -240,7 +161,7 @@ impl EventStats {
 // ── Admission floor (cgroup_skb, DESIGN §3 narrowing) ─────────────────────
 
 /// The lowest scope generation the ring readers admit, shared by all of
-/// them. Only ever raised. Stays 0 on TC, whose events carry generation 0.
+/// them. Only ever raised. Capture starts at generation 1.
 #[derive(Clone, Default)]
 pub struct AdmissionFloor(Arc<AtomicU32>);
 
@@ -989,8 +910,6 @@ pub(crate) async fn worker_task(
     mut rx: mpsc::Receiver<EventBatch>,
     ctx: WorkerTaskContext,
 ) {
-    use crate::capture_gate::{CaptureGate, Verdict};
-
     let manager = TrackedConnections {
         manager: ConnectionFsmManager::with_topics(
             ctx.max_connections_tracked,
@@ -998,8 +917,6 @@ pub(crate) async fn worker_task(
         ),
         stats: Arc::clone(&ctx.stats),
     };
-    let mut owners = OwnerTable::new(ctx.max_connections_tracked);
-    let mut gate = CaptureGate::new(ctx.capture_gate.clone(), ctx.max_connections_tracked);
     let mut last_sweep = Instant::now();
     // Never longer than the idle timeout itself (5 s at most), and on a
     // timer, not only when a batch arrives: a connection whose close never
@@ -1032,73 +949,34 @@ pub(crate) async fn worker_task(
                 continue;
             }
             let cookie = connection_key(&scratch);
-            // Live cgroup_skb: a close record (sockops STATE_CB, the header
-            // only) is sent for a socket the kernel emitted a packet record
-            // for and that is in scope when it closes, stamped with that
-            // generation (admitted like any record): it frees the
-            // connection's state and reaches no sink. Counted processed (it
-            // is consumed here). On TC and in replay a close takes the gated
-            // path below, as before.
-            if ctx.kernel_scope && scratch.event_type == EventType::SockClose {
-                ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
-                end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
-                continue;
-            }
+            // A close record (sockops STATE_CB, the header only) is sent for
+            // a socket the kernel emitted a packet record for and that is in
+            // scope when it closes, stamped with that generation (admitted
+            // like any record): it frees the connection's state and reaches
+            // no sink. Counted processed (it is consumed here).
+            //
             // A TlsNew record (SSL_new returned the object, every mode):
             // any earlier object at that address was destroyed, so the key's
             // connection ends and the next one starts with no state. Kept in
             // the raw dump, so a replay ends the same connections.
-            if scratch.event_type == EventType::TlsNew {
-                if let Some(raw) = ctx.raw_capture.as_ref()
-                    && ctx.privacy.get() == PrivacyMode::Full
-                {
-                    raw.record(&scratch);
-                }
-                ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
-                end_connection(&ctx, &manager, &mut owners, &mut gate, cookie);
-                continue;
-            }
-            // Owners first: they decide whether the connection's TC packets
-            // pass pid_filter. Only a listed process may name one.
-            if gate.pid_allowed(scratch.pid) {
-                owners.observe(&scratch);
-            }
-            let known = owners
-                .get(cookie)
-                .map_or([None; 2], |o| [o.client, o.server]);
-            // The capture gate (pid_filter, sampling) comes before every
-            // sink: nothing it drops is dumped, logged, parsed or exported.
-            if gate.admit(&mut scratch, cookie, known, &ctx.stats) == Verdict::Process {
-                process_event(
-                    worker_id,
-                    &ctx,
-                    &manager,
-                    &mut owners,
-                    &mut gate,
-                    &scratch,
-                    cookie,
-                );
-            }
-            // An accept / connect may name the owner of packets the gate
-            // was holding: they follow, in order.
-            if gate.has_held() {
-                for mut held in gate.release(cookie, known) {
-                    if gate.cut_head(&mut held, cookie, &ctx.stats) == Verdict::Process {
-                        process_event(
-                            worker_id,
-                            &ctx,
-                            &manager,
-                            &mut owners,
-                            &mut gate,
-                            &held,
-                            cookie,
-                        );
+            match scratch.event_type {
+                EventType::SockClose => {}
+                EventType::TlsNew => {
+                    if let Some(raw) = ctx.raw_capture.as_ref()
+                        && ctx.privacy.get() == PrivacyMode::Full
+                    {
+                        raw.record(&scratch);
                     }
                 }
+                // The kernel made every scope decision (DESIGN §8): nothing
+                // is filtered, held or cut here.
+                _ => {
+                    process_event(worker_id, &ctx, &manager, &scratch, cookie);
+                    continue;
+                }
             }
-        }
-        if gate.has_held() {
-            gate.expire_held(crate::util::monotonic_now_ns(), &ctx.stats);
+            ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+            end_connection(&ctx, &manager, cookie);
         }
 
         // Periodic idle connection sweep
@@ -1113,11 +991,6 @@ pub(crate) async fn worker_task(
                     .fetch_add(evicted as u64, Ordering::Relaxed);
                 debug!(worker_id, evicted, "Evicted idle connections");
             }
-            gate.sweep(
-                crate::util::monotonic_now_ns(),
-                ctx.idle_timeout.as_nanos() as u64,
-                &ctx.stats,
-            );
             last_sweep = Instant::now();
         }
     }
@@ -1125,14 +998,11 @@ pub(crate) async fn worker_task(
     debug!(worker_id, "Worker shutting down");
 }
 
-/// Everything after the capture gate: raw dump, logging, parsing, PII,
-/// graph and export of one admitted event.
+/// Raw dump, logging, parsing, PII, graph and export of one admitted event.
 fn process_event(
     worker_id: usize,
     ctx: &WorkerTaskContext,
     manager: &ConnectionFsmManager,
-    owners: &mut OwnerTable,
-    gate: &mut crate::capture_gate::CaptureGate,
     event: &DataEvent,
     cookie: u64,
 ) {
@@ -1197,7 +1067,6 @@ fn process_event(
                             sender_is_server,
                             max_body_bytes: ctx.max_body_bytes,
                             privacy,
-                            owners: owners.get(cookie),
                         },
                     );
                 }
@@ -1218,7 +1087,6 @@ fn process_event(
                             sender_is_server,
                             max_body_bytes: ctx.max_body_bytes,
                             privacy,
-                            owners: owners.get(cookie),
                         },
                     );
                 }
@@ -1239,10 +1107,9 @@ fn process_event(
         }
     }
 
-    // Handle connection close: socket close (TC and replay), TCP RST, or
-    // FIN from both sides (after this packet's payload was parsed).
+    // Handle connection close: TCP RST, or FIN from both sides (after this
+    // packet's payload was parsed).
     let closed = match event.event_type {
-        EventType::SockClose => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_RST != 0 => true,
         EventType::TcPacket if event.tcp_flags & TCP_FLAG_FIN != 0 => {
             manager.note_fin(cookie, sender_endpoint(event), event.direction)
@@ -1250,20 +1117,12 @@ fn process_event(
         _ => false,
     };
     if closed {
-        end_connection(ctx, manager, owners, gate, cookie);
+        end_connection(ctx, manager, cookie);
     }
 }
 
 /// Free everything a worker holds for connection `cookie`.
-fn end_connection(
-    ctx: &WorkerTaskContext,
-    manager: &ConnectionFsmManager,
-    owners: &mut OwnerTable,
-    gate: &mut crate::capture_gate::CaptureGate,
-    cookie: u64,
-) {
-    owners.remove(cookie);
-    gate.forget(cookie);
+fn end_connection(ctx: &WorkerTaskContext, manager: &ConnectionFsmManager, cookie: u64) {
     if manager.close_connection(cookie) {
         ctx.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
@@ -1286,7 +1145,7 @@ fn guarded<T>(stats: &EventStats, worker_id: usize, f: impl FnOnce() -> T) -> Op
     }
 }
 
-/// The sequence fields of a TC TCP packet; None for other events (UDP,
+/// The sequence fields of a TCP packet; None for other events (UDP,
 /// TLS plaintext, socket events), which have no sequence to check.
 fn tcp_segment(event: &DataEvent) -> Option<crate::protocol::fsm::TcpSegment> {
     use panopticon_common::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN};
@@ -1322,9 +1181,10 @@ fn feed_event(
     let payload = event.payload_bytes();
     let src = sender_endpoint(event);
     let seg = tcp_segment(event);
-    // TC: a SYN locates its side's first byte (before the parser exists,
-    // which is created on the first payload); a bare SYN on a tracked key
-    // is a new connection.
+    // A SYN (only in recordings made with the removed TC capture: cgroup_skb
+    // sends `stream_off` instead) locates its side's first byte (before the
+    // parser exists, which is created on the first payload); a bare SYN on a
+    // tracked key is a new connection.
     if let Some(s) = seg.filter(|s| s.syn)
         && manager.note_syn(cookie, src, s.ack.is_some(), s.seq)
     {
@@ -1555,11 +1415,7 @@ fn handle_messages(
             && !handle.try_send(
                 msg,
                 pii_report,
-                crate::export::json::TransportContext {
-                    client_pid: ctx.owners.and_then(|o| o.client),
-                    server_pid: ctx.owners.and_then(|o| o.server),
-                    ..crate::export::json::TransportContext::from_data_event(ctx.event)
-                },
+                crate::export::json::TransportContext::from_data_event(ctx.event),
                 ctx.privacy,
             )
         {
@@ -1770,13 +1626,13 @@ fn server_endpoint(
 
 /// Key identifying the connection an event belongs to.
 ///
-/// TC and socket events carry the flow cookie, which has bit 63 clear
-/// (`panopticon_common::tc_flow_cookie`). TLS events carry the library's
+/// Packet and close records carry the kernel socket cookie, a counter with
+/// bit 63 clear. TLS events carry the library's
 /// connection object pointer (`SSL*`, `*tls.Conn`), chosen by the traced
 /// process and unique only within it: it is hashed with the PID under a
 /// per-process random key, so no process can pick a pointer that lands on
 /// another connection's key (F18), and bit 63 is set so a TLS key never
-/// equals a TC cookie. A `TlsNew` record is keyed like the data of the
+/// equals a socket cookie. A `TlsNew` record is keyed like the data of the
 /// object it starts. Events without one fall back to a per-thread key.
 fn connection_key(event: &DataEvent) -> u64 {
     use std::hash::BuildHasher;
@@ -2040,14 +1896,14 @@ mod tests {
     #[test]
     fn test_tls_synthetic_cookie_high_bit_set() {
         let cookie = tls_synthetic_cookie(1, 1);
-        // Bit 63 set: outside the TC flow cookie space (bit 63 clear).
+        // Bit 63 set: outside the socket cookie space (bit 63 clear).
         assert!(cookie & TLS_KEY_BIT != 0);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn test_tls_synthetic_cookie_no_collision_with_real() {
-        // TC flow cookies have bit 63 clear, so small ones included
+        // Socket cookies have bit 63 clear, so small ones included
         for real_cookie in 1u64..10_000 {
             for pid in [1u32, 100, 1000, 65535] {
                 assert_ne!(
@@ -2081,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_keys_are_keyed_and_disjoint_from_tc_cookies() {
+    fn tls_keys_are_keyed_and_disjoint_from_socket_cookies() {
         // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
         let mut tls: DataEvent = unsafe { std::mem::zeroed() };
         tls.event_type = EventType::TlsData;
@@ -2096,12 +1952,11 @@ mod tests {
             TLS_KEY_BIT | fxhash::hash64(&(tls.pid, tls.socket_cookie))
         );
         assert_eq!(key, connection_key(&tls), "stable within the process");
-        // A TC flow cookie (bit 63 clear by construction) is used as is and
-        // can never equal a TLS key.
+        // A socket cookie (bit 63 clear) is used as is and can never equal
+        // a TLS key.
         let mut tc = tls;
         tc.event_type = EventType::TcPacket;
-        tc.socket_cookie =
-            panopticon_common::tc_flow_cookie(9, 0x0A00_0001, 0x0A00_0002, 40000, 80, 6);
+        tc.socket_cookie = 0x0000_0000_0042_1234;
         assert_eq!(connection_key(&tc), tc.socket_cookie);
         assert_eq!(connection_key(&tc) & TLS_KEY_BIT, 0);
     }
@@ -2109,8 +1964,13 @@ mod tests {
     const CLI: (u32, u16) = (0x0A63_0002, 51000);
     const SRV: (u32, u16) = (0x0A63_0001, 18090);
 
-    /// A TC TCP packet from `from` to the other end, as tc_capture.rs
-    /// builds it.
+    /// One key for both directions of a test connection (bit 63 clear).
+    pub(crate) fn flow_cookie(a: (u32, u16), b: (u32, u16), proto: u8) -> u64 {
+        fxhash::hash64(&(a.min(b), a.max(b), proto)) >> 1
+    }
+
+    /// A TCP packet from `from` to the other end (both directions keyed
+    /// alike, as one connection).
     fn tcp_pkt(from: (u32, u16), seq: u32, ack: u32, flags: u8, payload: &[u8]) -> DataEvent {
         // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
         let mut e: DataEvent = unsafe { std::mem::zeroed() };
@@ -2123,11 +1983,11 @@ mod tests {
         };
         (e.src_addr, e.src_port, e.dst_addr, e.dst_port) = (from.0, from.1, to.0, to.1);
         e.ip_proto = 6;
-        e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, 6);
+        e.socket_cookie = flow_cookie(from, to, 6);
         e.tcp_seq = seq;
         e.tcp_ack = ack;
         e.tcp_flags = flags | panopticon_common::TCP_FLAG_ACK;
-        e.stream_off = STREAM_OFF_UNKNOWN; // TC computes none
+        e.stream_off = STREAM_OFF_UNKNOWN;
         e.payload[..payload.len()].copy_from_slice(payload);
         (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
         e
@@ -2164,7 +2024,7 @@ mod tests {
         } else {
             Direction::Egress
         };
-        e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, 6);
+        e.socket_cookie = flow_cookie(from, to, 6);
         e
     }
 
@@ -2355,8 +2215,8 @@ mod tests {
     }
 
     /// Redis replies line up with commands only when the parser saw each
-    /// direction from its first byte: proved by the SYN (TC) or by the
-    /// kernel's stream offset (cgroup_skb). A connection joined mid-pipeline,
+    /// direction from its first byte: proved by the SYN (TC recordings) or
+    /// by the kernel's stream offset. A connection joined mid-pipeline,
     /// or with bytes lost later, exports no reply text: the reply to an
     /// `ACL GENPASS` sent before capture started is not exported under the
     /// first command captured.
@@ -2515,39 +2375,6 @@ mod tests {
             tcp_pkt(SRV, 900, next, rst, b""),
         ]);
         assert_eq!(ignored, vec![false, false]);
-    }
-
-    fn sock_event(kind: EventType, cookie: u64, pid: u32) -> DataEvent {
-        // SAFETY: all-zero is valid for DataEvent (all enums have a 0 variant)
-        let mut event: DataEvent = unsafe { std::mem::zeroed() };
-        event.event_type = kind;
-        event.socket_cookie = cookie;
-        event.pid = pid;
-        event
-    }
-
-    #[test]
-    fn owner_table_tracks_both_ends_and_stays_bounded() {
-        let mut t = OwnerTable::new(2);
-        t.observe(&sock_event(EventType::SockConnect, 1, 100));
-        t.observe(&sock_event(EventType::SockAccept, 1, 200));
-        t.observe(&sock_event(EventType::SockAccept, 2, 0)); // no pid: ignored
-        t.observe(&sock_event(EventType::TcPacket, 2, 300)); // not an owner event
-        assert_eq!(
-            t.get(1),
-            Some(ConnOwners {
-                client: Some(100),
-                server: Some(200)
-            })
-        );
-        assert_eq!(t.get(2), None);
-        t.observe(&sock_event(EventType::SockConnect, 2, 101));
-        // Full: a third connection resets the table instead of growing it.
-        t.observe(&sock_event(EventType::SockConnect, 3, 102));
-        assert_eq!(t.owners.len(), 1);
-        assert_eq!(t.get(3).and_then(|o| o.client), Some(102));
-        t.remove(3);
-        assert_eq!(t.get(3), None);
     }
 
     #[test]
@@ -2789,12 +2616,12 @@ mod tests {
         // SAFETY: all-zero is a valid DataEvent.
         let mut e: DataEvent = unsafe { std::mem::zeroed() };
         e.event_type = EventType::TcPacket;
-        // TC: generation 0 under the floor that never moves off 0.
+        // Generation 0 under the floor that never moves off 0.
         let floor = AdmissionFloor::default();
         assert_eq!(floor.get(), 0);
         assert!(!below_floor(&e, floor.get()));
 
-        // cgroup_skb starts at generation 1; a narrowing to 3 drops 1 and 2.
+        // Capture starts at generation 1; a narrowing to 3 drops 1 and 2.
         floor.raise(3);
         floor.raise(2); // never lowered
         assert_eq!(floor.get(), 3);

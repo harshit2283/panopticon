@@ -36,18 +36,15 @@ pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
 pub const CONFIG_USE_RINGBUF: u32 = 2;
 pub const CONFIG_PID_FILTER_ON: u32 = 3;
-// Index 4 was CONFIG_IGNORE_PORT (a port TC skipped); removed, see
-// tc_capture.rs try_tc_capture.
+// Index 4 was CONFIG_IGNORE_PORT (a port the TC capture skipped); removed.
 /// Active DATA_EVENTS ring shards minus one (a power of two minus one).
 /// 0, the default, sends every event to DATA_EVENTS_0.
 pub const CONFIG_RING_SHARD_MASK: u32 = 5;
-/// Per-boot random key mixed into TC flow cookies ([`tc_flow_cookie`]),
-/// so a peer cannot compute another flow's cookie offline.
-pub const CONFIG_COOKIE_KEY: u32 = 6;
-/// Non-zero: TC also emits payload-less SYN segments (each TCP direction's
-/// stream starts after its SYN: head_only counts from it, and parsers that
-/// pair replies by order need it). The agent always sets it.
-pub const CONFIG_TCP_SYN_EVENTS: u32 = 7;
+// Indices 6 (CONFIG_COOKIE_KEY) and 7 (CONFIG_TCP_SYN_EVENTS) belonged to
+// the removed TC capture. Not reused: CONFIG may be pinned, and an earlier
+// run's values stay in it.
+/// Last CONFIG index not available to new settings.
+pub const CONFIG_RESERVED_MAX: u32 = 7;
 /// Capture-scope generation (`scope::verdict_word`). User space updates
 /// `CGROUP_ALLOW` first, then increments this.
 pub const CONFIG_SCOPE_GEN: u32 = 8;
@@ -65,7 +62,7 @@ pub const CONFIG_SCOPE_MODE: u32 = 12;
 pub const CONFIG_SCOPE_ARMED: u32 = 13;
 /// `capture_loopback`: non-zero captures packets on a node-local path
 /// (`scope::DROP_LOOPBACK`). 0, the default and what an unwritten entry
-/// reads as, drops them (cgroup_skb backend; TC never sees loopback). TLS
+/// reads as, drops them. TLS
 /// plaintext does not read it: it is scoped by process.
 pub const CONFIG_CAPTURE_LOOPBACK: u32 = 14;
 /// `pid_filter_listener = "creator"`: non-zero lets a listener's listed
@@ -75,7 +72,8 @@ pub const CONFIG_PID_CREATOR_RULE: u32 = 15;
 const _: () = assert!(CONFIG_PID_CREATOR_RULE < CONFIG_ENTRIES);
 
 /// Bit 63 of a connection key: set for TLS connection keys (user space),
-/// clear for TC flow cookies, so the two key spaces never overlap.
+/// clear for kernel socket cookies (a counter), so the two key spaces never
+/// overlap.
 pub const TLS_KEY_BIT: u64 = 1 << 63;
 
 /// DATA_EVENTS ring buffer shards declared in the eBPF object
@@ -92,7 +90,9 @@ pub enum EventType {
     TlsData = 1,
     ProcessExec = 2,
     ProcessExit = 3,
+    /// No longer emitted (the TC owner probes were removed); kept for the ABI.
     SockConnect = 4,
+    /// No longer emitted; kept for the ABI.
     SockAccept = 5,
     SockClose = 6,
     UdpSend = 7,
@@ -181,7 +181,7 @@ impl TlsLibrary {
 // kernel probes and the user-space agent — do NOT reorder fields without
 // updating both sides and the ABI tests.
 
-/// Network data event (TC capture or TLS intercept).
+/// Network data event (cgroup_skb packet capture or TLS intercept).
 ///
 /// At 4192 bytes this MUST be allocated via RingBuf reserve in eBPF,
 /// never on the 512-byte BPF stack.
@@ -214,12 +214,12 @@ impl core::fmt::Debug for DataEvent {
 pub struct DataEvent {
     // 8-byte aligned fields first
     pub timestamp_ns: u64,
-    /// Kernel socket cookie for TC/socket events. For `TlsData` events, which
+    /// Kernel socket cookie for packet and close events. For `TlsData` events, which
     /// have no socket in uprobe context, the address of the library's
     /// per-connection object (OpenSSL `SSL*`, Go `*tls.Conn`): unique per live
     /// connection within the process and shared by its reads and writes.
     pub socket_cookie: u64,
-    /// cgroup v2 id of the socket (cgroup_skb backend); 0 otherwise.
+    /// cgroup v2 id of the socket (packet events); 0 otherwise.
     pub cgroup_id: u64,
     /// Stream offset of the first captured byte (TCP), or the UDP budget
     /// reservation's start; `scope::STREAM_OFF_UNKNOWN` if not computed.
@@ -239,7 +239,7 @@ pub struct DataEvent {
     /// bytes they never saw instead of silently losing stream sync.
     pub orig_len: u32,
     pub tls_library: TlsLibrary,
-    /// TCP sequence number of a TC packet's first byte (SEG.SEQ), and its
+    /// TCP sequence number of a packet's first byte (SEG.SEQ), and its
     /// acknowledgment number (SEG.ACK, valid with `TCP_FLAG_ACK`); 0 for
     /// other events. User space uses them to drop retransmitted and
     /// out-of-window segments (protocol/fsm.rs `TcpTracker`).
@@ -256,7 +256,7 @@ pub struct DataEvent {
     pub dst_port: u16,
     // 1-byte aligned fields
     pub ip_proto: u8,
-    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
+    /// TCP flags of a packet (FIN, SYN, RST...); 0 for other events.
     pub tcp_flags: u8,
     /// `scope::ROLE_*`.
     pub role: u8,
@@ -398,7 +398,7 @@ struct RawDataEvent {
     pub src_port: u16,
     pub dst_port: u16,
     pub ip_proto: u8,
-    /// TCP flags of a TC packet (FIN, SYN, RST...); 0 for other events.
+    /// TCP flags of a packet (FIN, SYN, RST...); 0 for other events.
     pub tcp_flags: u8,
     pub role: u8,
     pub _pad: [u8; 1],
@@ -459,67 +459,15 @@ pub const DATA_EVENT_HEADER_LEN: usize = core::mem::offset_of!(DataEvent, payloa
 /// Keyed by connection, not by CPU: a connection's packets are produced on
 /// whichever CPUs its threads and softirqs run on, so CPU shards would let
 /// user space see a response before its request, or a body's packets out of
-/// order. With this key every event of one connection (both directions,
-/// its SockConnect/SockAccept owner events and its FIN/RST, which all carry
-/// the same 5-tuple cookie; or one TLS connection object) lands in the same
-/// ring, so the order user space sees per connection is that ring's reserve
+/// order. With this key every event of one socket (both directions and its
+/// close record, which all carry the socket cookie; or of one TLS
+/// connection object) lands in the same ring, so the order user space sees per connection is that ring's reserve
 /// order, as it was with a single ring. The multiply takes the high bits so
 /// that cookies with constant low bits (16-byte aligned SSL* pointers) still
 /// spread over the shards.
 #[inline(always)]
 pub fn ring_shard(socket_cookie: u64, mask: u32) -> u32 {
     ((socket_cookie.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as u32) & mask
-}
-
-/// Bidirectional flow cookie for a TC packet's 5-tuple: FNV-1a over the
-/// tuple, ordered so both directions get the same cookie, starting from a
-/// basis mixed with the per-boot `key` (CONFIG_COOKIE_KEY). Bit 63 is
-/// always clear: TLS connection keys (user space) have it set, so a TLS
-/// connection object can never alias a TC flow (F18). The socket owner
-/// events (sock_monitor.rs) use the same cookie, which keeps a connection's
-/// events on one ring shard ([`ring_shard`]).
-#[inline(always)]
-pub fn tc_flow_cookie(
-    key: u64,
-    src_addr: u32,
-    dst_addr: u32,
-    src_port: u16,
-    dst_port: u16,
-    ip_proto: u8,
-) -> u64 {
-    let (a_addr, a_port, b_addr, b_port) = if (src_addr, src_port) <= (dst_addr, dst_port) {
-        (src_addr, src_port, dst_addr, dst_port)
-    } else {
-        (dst_addr, dst_port, src_addr, src_port)
-    };
-
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = FNV_OFFSET ^ key;
-    let bytes: [u8; 13] = [
-        (a_addr >> 24) as u8,
-        (a_addr >> 16) as u8,
-        (a_addr >> 8) as u8,
-        a_addr as u8,
-        (a_port >> 8) as u8,
-        a_port as u8,
-        (b_addr >> 24) as u8,
-        (b_addr >> 16) as u8,
-        (b_addr >> 8) as u8,
-        b_addr as u8,
-        (b_port >> 8) as u8,
-        b_port as u8,
-        ip_proto,
-    ];
-
-    let mut i = 0;
-    while i < 13 {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    hash & !TLS_KEY_BIT
 }
 
 /// Length of the DataEvent record at the start of `bytes` (header plus
@@ -781,7 +729,6 @@ mod tests {
         assert!(CONFIG_USE_RINGBUF < CONFIG_ENTRIES);
         assert!(CONFIG_PID_FILTER_ON < CONFIG_ENTRIES);
         assert!(CONFIG_RING_SHARD_MASK < CONFIG_ENTRIES);
-        assert!(CONFIG_COOKIE_KEY < CONFIG_ENTRIES);
         let scope = [
             CONFIG_SCOPE_GEN,
             CONFIG_PID_EPOCH,
@@ -794,7 +741,7 @@ mod tests {
         ];
         for (i, &idx) in scope.iter().enumerate() {
             assert!(idx < CONFIG_ENTRIES);
-            assert!(idx > CONFIG_TCP_SYN_EVENTS, "scope index {idx} reuses one");
+            assert!(idx > CONFIG_RESERVED_MAX, "scope index {idx} reuses one");
             assert!(!scope[..i].contains(&idx), "duplicate index {idx}");
         }
         assert!(DATA_RING_SHARDS.is_power_of_two());
@@ -872,20 +819,6 @@ mod record_tests {
                 .all(|&n| n > 0 && n < 2 * 4096 / DATA_RING_SHARDS as u32),
             "{seen:?}"
         );
-    }
-
-    #[test]
-    fn tc_flow_cookie_is_symmetric_keyed_and_outside_the_tls_key_space() {
-        let (a, b) = (0x0A00_0001, 0x0A00_0002);
-        let mut keyed_differs = 0;
-        for port in 0..4096u16 {
-            let c = tc_flow_cookie(7, a, b, 40000 + port, 80, 6);
-            assert_eq!(c, tc_flow_cookie(7, b, a, 80, 40000 + port, 6));
-            // F18: a TLS key (bit 63 set) can never equal a TC cookie.
-            assert_eq!(c & TLS_KEY_BIT, 0);
-            keyed_differs += (c != tc_flow_cookie(8, a, b, 40000 + port, 80, 6)) as u32;
-        }
-        assert_eq!(keyed_differs, 4096, "the boot key changes every cookie");
     }
 
     #[test]

@@ -551,7 +551,8 @@ fn packet(from: (u32, u16), to: (u32, u16), proto: u8, payload: &[u8], gen_: u32
     };
     (e.src_addr, e.src_port, e.dst_addr, e.dst_port) = (from.0, from.1, to.0, to.1);
     e.ip_proto = proto;
-    e.socket_cookie = panopticon_common::tc_flow_cookie(0, from.0, to.0, from.1, to.1, proto);
+    // One key for both directions (bit 63 clear), as one connection.
+    e.socket_cookie = fxhash::hash64(&(from.min(to), from.max(to), proto)) >> 1;
     e.payload[..payload.len()].copy_from_slice(payload);
     (e.payload_len, e.orig_len) = (payload.len() as u32, payload.len() as u32);
     e.scope_gen = gen_;
@@ -1450,25 +1451,34 @@ async fn replay_once(dir: &Path, toml: &str) -> String {
     std::fs::read_to_string(dir.join("replay.jsonl")).unwrap()
 }
 
-/// Replaying a recording applies the user-space scope rules even with the
-/// cgroup_skb backend (no kernel decided them): rate 0 exports nothing.
+/// Replay refuses every capture-scope setting: scope is decided only in
+/// the kernel, and nothing would apply it to replayed events.
 #[test]
-fn replay_with_cgroup_skb_applies_user_space_scope() {
-    t2(
-        "replay_with_cgroup_skb_applies_user_space_scope",
-        2,
-        async {
-            let dir = tmpdir("replay");
-            let cg = "[capture]\nbackend = \"cgroup_skb\"\n";
-            let sampled = format!("sampling_mode = \"connection_sample\"\nsample_rate = 0.0\n{cg}");
-            let out = replay_once(&dir, &sampled).await;
-            assert!(!out.contains("replayed"), "{out}");
-            // Positive control: the same recording unscoped is exported.
-            let out = replay_once(&dir, cg).await;
-            assert!(out.contains("replayed"), "{out}");
-            std::fs::remove_dir_all(&dir).ok();
-        },
-    );
+fn replay_refuses_scope_settings() {
+    t2("replay_refuses_scope_settings", 2, async {
+        let dir = tmpdir("replay");
+        for scope in [
+            "sampling_mode = \"connection_sample\"\nsample_rate = 0.0\n",
+            "sampling_mode = \"head_only\"\nhead_only_bytes = 10\n",
+            "pid_filter = [1]\n",
+            "cgroup_filter = [\"a\"]\n",
+        ] {
+            let cfg = replay_config(&dir, scope);
+            let err = Shared::for_replay(cfg, Arc::new(PrivacyGate::new(PrivacyMode::Redacted)))
+                .err()
+                .expect(scope)
+                .to_string();
+            assert!(
+                err.contains("replay takes no capture-scope settings"),
+                "{err}"
+            );
+        }
+        // Positive control: unscoped (rate 1 is `full`) replays and exports.
+        let full = "sampling_mode = \"connection_sample\"\nsample_rate = 1.0\n";
+        assert!(replay_once(&dir, full).await.contains("replayed"));
+        assert!(replay_once(&dir, "").await.contains("replayed"));
+        std::fs::remove_dir_all(&dir).ok();
+    });
 }
 
 /// `[privacy] mask_credentials` (default on) does not depend on the PII
@@ -1511,7 +1521,7 @@ fn full_mode_without_pii_engine_masks_login_secrets() {
     );
 }
 
-/// Live cgroup_skb close records free state, count as processed and reach
+/// Close records free state, count as processed and reach
 /// no output.
 #[test]
 fn live_close_records_are_counted_and_reach_no_output() {
@@ -1521,8 +1531,7 @@ fn live_close_records_are_counted_and_reach_no_output() {
         async {
             let dir = tmpdir("close");
             let collector = collector(Reply::Accept).await;
-            let mut cfg = config(&dir, &collector.endpoint);
-            cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
+            let cfg = config(&dir, &collector.endpoint);
             let shared = Arc::new(
                 Shared::open(
                     cfg,
@@ -1567,7 +1576,6 @@ fn idle_connections_are_evicted_without_further_traffic() {
             let dir = tmpdir("idle");
             let collector = collector(Reply::Accept).await;
             let mut cfg = config(&dir, &collector.endpoint);
-            cfg.capture_backend = crate::config::CaptureBackend::CgroupSkb;
             cfg.idle_connection_timeout = Duration::from_millis(200);
             let shared = Arc::new(
                 Shared::open(
@@ -1915,12 +1923,12 @@ mod publisher {
 
     fn app_filter(app: &str) -> crate::config::PodFilter {
         crate::config::load_config_from_str(&format!(
-        "[capture]\nbackend = \"cgroup_skb\"\n[[pod_filter]]\nnamespace = \"pay\"\nlabels = {{ app = \"{app}\" }}\n"
-    ))
-    .unwrap()
-    .pod_filter
-    .unwrap()
-    .remove(0)
+            "[[pod_filter]]\nnamespace = \"pay\"\nlabels = {{ app = \"{app}\" }}\n"
+        ))
+        .unwrap()
+        .pod_filter
+        .unwrap()
+        .remove(0)
     }
 
     /// Stage A6 review, HIGH 1: a pod whose labels stop matching leaves

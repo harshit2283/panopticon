@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end lab oracle for the cgroup_skb capture backend: the socket and
+"""End-to-end lab oracle for the cgroup_skb capture: the socket and
 packet tests of the capture-scope design (DESIGN §10): T-1, T-3, T-4, T-7,
 T-8, T-9, T-11, T-12, T-13, T-14, T-15, T-17, T-20 and T-22.
 
-Each test runs its own agent(s) ([capture] backend = "cgroup_skb", privacy
+Each test runs its own agent(s) (privacy
 mode full) with every sink on: the JSON export, the raw capture, the PII
 audit log, --log-events at debug level and /metrics. It passes or fails on
 what those sinks hold. Traffic carries unique markers and position-coded
@@ -177,7 +177,7 @@ class Agent:
         if "pid_filter_listener" not in scope:
             extra += 'pid_filter_listener = "creator"\n'
         with open(self.cfg, "w") as f:
-            f.write(scope + extra + '\n[capture]\nbackend = "cgroup_skb"\n\n[privacy]\nmode = "full"\n')
+            f.write(scope + extra + '\n[privacy]\nmode = "full"\n')
 
     def start(self):
         for f in ("agent.jsonl", "audit.jsonl", "raw.pncap"):

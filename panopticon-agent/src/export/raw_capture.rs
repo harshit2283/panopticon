@@ -230,7 +230,7 @@ pub fn decode_to_jsonl<R: io::Read, W: Write>(input: R, mut out: W) -> Result<u6
             "truncated": event.truncated_bytes() > 0,
             "tcp_seq": event.tcp_seq,
             "tcp_flags": event.tcp_flags,
-            // Capture-scope fields (cgroup_skb backend; 0 / u64::MAX otherwise).
+            // Capture-scope fields (packet events; 0 / u64::MAX otherwise).
             "cgroup_id": event.cgroup_id,
             "stream_off": event.stream_off,
             "owner_tgid": event.owner_tgid,

@@ -1,4 +1,4 @@
-//! Lab test for the cgroup_skb backend: every program in the eBPF object
+//! Lab test for the cgroup_skb capture: every program in the eBPF object
 //! passes the verifier, every scope program attaches, and the kernel scope
 //! rules hold on loopback traffic. Needs root on a Linux lab kernel:
 //!
@@ -2133,7 +2133,7 @@ fn scope_programs_load_attach_and_hold() {
         "restricted, not armed"
     );
     set(&mut ebpf, CONFIG_SCOPE_ARMED, 1);
-    // Unscoped full (as on TC): the address cache path, and arming does not
+    // Unscoped full: the address cache path, and arming does not
     // apply there.
     let full_link = {
         let p: &mut aya::programs::FEntry = ebpf

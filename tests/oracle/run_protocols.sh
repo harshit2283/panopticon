@@ -22,7 +22,6 @@ set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.
 NS=${ORACLE_NS:-pclient}
-IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-500}
 SEED=${2:-7}
@@ -84,7 +83,7 @@ for run in redis postgres mysql mysql-prepared; do
   proto=${run%-prepared}
   mode=; [[ $run == *-prepared ]] && mode=prepared
   echo "== $run"
-  "$AGENT" -i "$IFACE" --json-export "$OUT/$run-agent.jsonl" >"$OUT/$run-agent.log" 2>&1 &
+  "$AGENT" --json-export "$OUT/$run-agent.jsonl" >"$OUT/$run-agent.log" 2>&1 &
   AP=$!
   sleep 4
   MYSQL_MODE=$mode nsenter --net=/var/run/netns/$NS "$PY" "$HERE/db_oracle.py" \
@@ -98,7 +97,7 @@ done
 # gRPC on a non-standard port: identified by the HTTP/2 preface, not the port.
 "$PY" "$HERE/grpc_oracle.py" server "$HOST_IP:9443" >"$OUT/grpc-server.log" 2>&1 &
 GP=$!
-"$AGENT" -i "$IFACE" --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
+"$AGENT" --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
 AP=$!
 sleep 4
 nsenter --net=/var/run/netns/$NS "$PY" "$HERE/grpc_oracle.py" \

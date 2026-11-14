@@ -61,18 +61,23 @@ services:
       dockerfile: tests/e2e/Dockerfile.agent
     command:
       [
-        "--interface",
-        "lo",
+        "--config",
+        "/etc/panopticon/agent.toml",
         "--log-events",
         "--json-export",
         "/output/events.jsonl",
       ]
     privileged: true
     network_mode: host
+    # The host's cgroup namespace: capture attaches to the cgroup v2 root and
+    # must see the other containers' sockets, not only its own cgroup.
+    cgroup: host
     volumes:
       - /sys/kernel/debug:/sys/kernel/debug:ro
       - /proc:/proc:ro
       - ./output:/output
+      # capture_loopback = true: the test traffic runs over 127.0.0.1.
+      - ./agent.toml:/etc/panopticon/agent.toml:ro
     environment:
       - RUST_LOG=debug
     depends_on:

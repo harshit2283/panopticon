@@ -244,8 +244,9 @@ TLS_PID="$!"
 wait_for_http "http://127.0.0.1:${HTTP_PORT}/" || fail "HTTP server failed to become ready"
 wait_for_https_insecure "https://127.0.0.1:${TLS_PORT}/" || fail "TLS server failed to become ready"
 
-log "Starting agent on loopback with JSON export"
-sudo -E bash -c "echo \$\$ > '${AGENT_PID_FILE}'; exec '${AGENT_BIN}' --interface lo --json-export '${JSON_OUT}' --log-events" \
+log "Starting agent (loopback capture on) with JSON export"
+printf 'capture_loopback = true\n' >"${TMP_DIR}/agent.toml"
+sudo -E bash -c "echo \$\$ > '${AGENT_PID_FILE}'; exec '${AGENT_BIN}' --config '${TMP_DIR}/agent.toml' --json-export '${JSON_OUT}' --log-events" \
     >"${AGENT_LOG}" 2>&1 &
 AGENT_SUDO_PID="$!"
 

@@ -5,8 +5,6 @@
 mod maps;
 mod process_monitor;
 mod sock_capture;
-mod sock_monitor;
-mod tc_capture;
 mod tls_probes;
 
 // SAFETY: Required by #![no_std] + #![no_main]. The BPF verifier prevents

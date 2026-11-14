@@ -16,11 +16,10 @@
 #      KEEP=1 to keep the (large) export and id list, NO_EXPORT=1 to run
 #      without the JSON export (no recall score; isolates its cost),
 #      NO_AGENT=1 to run the same load with no agent (application baseline),
-#      BACKEND=tc|cgroup_skb ([capture] backend; default tc),
 #      SCOPE= (unscoped) | server (pid_filter = the server) | other
 #        (pid_filter = an idle process: every packet out of scope) | cgroup
-#        (cgroup_filter = a cgroup holding only the server; cgroup_skb on a
-#        cgroup2 host) | head (head_only, HEAD_BYTES, default 4096) |
+#        (cgroup_filter = a cgroup holding only the server; on a cgroup2
+#        host) | head (head_only, HEAD_BYTES, default 4096) |
 #        sample (connection_sample, SAMPLE_RATE, default 0.5),
 #      TOML= extra top-level config lines (e.g. max_events_per_sec = 100000000),
 #      SERVER_LATE=1 to start the server's listener after the agent (the
@@ -28,12 +27,10 @@
 #        owner until accept() returns),
 #      LOADGEN= a prebuilt loadgen binary (no Go needed on the host),
 #      LOOPBACK=1 to run client and server over 127.0.0.1 in the host
-#        namespace: node-local traffic, which TC on an interface never sees
-#        and the cgroup_skb backend sees at both sockets.
-# The cgroup_skb backend captures every local socket: unscoped, it sees
-# both the client's and the server's socket of each exchange (two views,
-# about twice the events of TC on the veth, which sees each packet once).
-# SCOPE=server is the comparable server-only view.
+#        namespace (node-local traffic; sets capture_loopback = true).
+# Capture covers every local socket: unscoped, it sees both the client's
+# and the server's socket of each exchange (two views). SCOPE=server is the
+# server-only view.
 # With rate>0 the client holds a fixed rate and reports achieved vs target
 # (a miss over 2% marks the run invalid) and client latency percentiles.
 # Needs: root, go (or LOADGEN), a built agent, python3, iproute2.
@@ -41,7 +38,6 @@ set -euo pipefail
 # Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
 # run several oracles at once.
 NS=${ORACLE_NS:-pclient}
-IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
 [[ ${LOOPBACK:-0} == 1 ]] && HOST_IP=127.0.0.1
 CONC=${1:-64}
@@ -83,8 +79,8 @@ SP=$!
 CONF=$OUT/load.toml
 {
   [[ -n ${TOML:-} ]] && printf '%s\n' "$TOML"
-  # Loopback is dropped by default on cgroup_skb (capture_loopback).
-  [[ ${LOOPBACK:-0} == 1 && ${BACKEND:-} == cgroup_skb ]] && echo "capture_loopback = true"
+  # Loopback is dropped by default (capture_loopback).
+  [[ ${LOOPBACK:-0} == 1 ]] && echo "capture_loopback = true"
   case ${SCOPE:-} in
     "") ;;
     server) echo "pid_filter = [$SP]" ;;
@@ -94,16 +90,15 @@ CONF=$OUT/load.toml
     sample) echo 'sampling_mode = "connection_sample"'; echo "sample_rate = ${SAMPLE_RATE:-0.5}" ;;
     *) echo "unknown SCOPE=$SCOPE" >&2; exit 2 ;;
   esac
-  printf '[capture]\nbackend = "%s"\n' "${BACKEND:-tc}"
 } >"$CONF"
 # Only when asked for: AGENT_ARGS may carry its own --config.
 CONFARG=()
-[[ -n ${BACKEND:-}${SCOPE:-}${TOML:-} ]] && CONFARG=(--config "$CONF")
+[[ -n ${LOOPBACK:-}${SCOPE:-}${TOML:-} ]] && CONFARG=(--config "$CONF")
 EXPORT=(--json-export "$OUT/agent.jsonl")
 [[ ${NO_EXPORT:-0} == 1 ]] && EXPORT=()
 if [[ ${NO_AGENT:-0} != 1 ]]; then
   # shellcheck disable=SC2086
-  "$AGENT" -i "$IFACE" ${CONFARG[@]+"${CONFARG[@]}"} "${EXPORT[@]}" --metrics-bind "$METRICS" \
+  "$AGENT" ${CONFARG[@]+"${CONFARG[@]}"} "${EXPORT[@]}" --metrics-bind "$METRICS" \
     ${AGENT_ARGS:-} >"$OUT/agent.log" 2>&1 &
   AP=$!
 fi

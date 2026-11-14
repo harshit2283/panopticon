@@ -26,7 +26,6 @@
 # curl.
 set -euo pipefail
 NS=${ORACLE_NS:-pclient}
-IFACE=${ORACLE_IF:-pv0}
 HOST_IP=10.99.${ORACLE_NET:-0}.1
 N=${1:-300}
 SEED=${2:-1234}
@@ -67,7 +66,7 @@ status=0
 for mode in $MODES; do
   D=$OUT/$mode
   mkdir -p "$D/http" "$D/tls" "$D/proto"
-  args=(-v -i "$IFACE" --privacy-mode "$mode" --metrics-bind "$METRICS"
+  args=(-v --privacy-mode "$mode" --metrics-bind "$METRICS"
         --pii-audit-log "$D/audit.jsonl")
   [[ $mode != metrics_only ]] && args+=(--json-export "$D/agent.jsonl")
   [[ $mode == full ]] && args+=(--capture-raw "$D/raw.pncap")

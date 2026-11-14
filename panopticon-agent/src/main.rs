@@ -3,7 +3,6 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod capture_gate;
 #[cfg(feature = "compression")]
 mod compression;
 mod config;
@@ -46,11 +45,6 @@ mod util;
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Network interfaces to attach TC classifiers to (repeatable, e.g. -i eth0 -i wlan0).
-    /// Default: the config file's `interfaces`, else the default-route interface(s).
-    #[arg(short, long)]
-    interface: Vec<String>,
-
     /// Enable verbose (debug-level) logging
     #[arg(short, long)]
     verbose: bool,
@@ -193,7 +187,6 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        interfaces = ?args.interface,
         "Panopticon Agent starting"
     );
 
@@ -226,9 +219,6 @@ async fn main() -> Result<()> {
             }
             None => config::AgentConfig::default(),
         };
-        if !args.interface.is_empty() {
-            agent_config.interfaces = args.interface.clone();
-        }
         if args.log_events {
             agent_config.log_events = true;
         }
@@ -300,26 +290,11 @@ async fn main() -> Result<()> {
         if let Some(ref path) = args.replay_bench {
             return replay_bench(&agent_config, path).await;
         }
-        if agent_config.interfaces.is_empty()
-            && agent_config.capture_backend == config::CaptureBackend::Tc
-        {
-            let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
-            agent_config.interfaces = util::default_route_interfaces(&route);
-            if agent_config.interfaces.is_empty() {
-                anyhow::bail!(
-                    "No --interface given and no IPv4 default route found in /proc/net/route; \
-                     pass --interface or set `interfaces` in the config file"
-                );
-            }
-            info!(interfaces = ?agent_config.interfaces, "Auto-detected default-route interface(s)");
-        }
-
         let caps = loader::detect_kernel_caps()?;
         info!(
             kernel = %format!("{}.{}.{}", caps.version.0, caps.version.1, caps.version.2),
             ringbuf = caps.has_ringbuf,
             btf = caps.has_btf,
-            tc_ebpf = caps.has_tc_ebpf,
             "Kernel capabilities detected"
         );
 
@@ -349,25 +324,15 @@ async fn main() -> Result<()> {
             ),
         };
 
-        let mut programs = loader::load_and_attach(
-            &agent_config.interfaces,
-            &caps,
-            &agent_config,
-            pid_candidates,
-            &selected_pods,
-        )?;
+        let mut programs =
+            loader::load_and_attach(&caps, &agent_config, pid_candidates, &selected_pods)?;
 
         // 1. Extract EventSource (RingBuf or PerfEventArray) BEFORE wrapping Ebpf in Arc<Mutex>.
         //    This breaks the borrow chain — event loop no longer needs &mut Ebpf.
         let event_source = loader::take_event_source(&mut programs.ebpf, &caps)
             .context("Failed to initialize event source from eBPF maps")?;
         let kernel_drops = loader::take_per_cpu_counters(&mut programs.ebpf, "KERNEL_DROPS");
-        let cgroup_backend = agent_config.capture_backend == config::CaptureBackend::CgroupSkb;
-        let scope_drops = if cgroup_backend {
-            loader::take_per_cpu_counters(&mut programs.ebpf, "SCOPE_DROPS")
-        } else {
-            None
-        };
+        let scope_drops = loader::take_per_cpu_counters(&mut programs.ebpf, "SCOPE_DROPS");
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
@@ -448,7 +413,7 @@ async fn main() -> Result<()> {
             admission_floor,
         );
 
-        // 7b. The scope publisher (cgroup_skb backend): reloads of the
+        // 7b. The scope publisher: reloads of the
         //     cgroup selectors and the scope options, Kubernetes pod changes
         //     and (cgroup selector only) the net_cls watch.
         let cgroup_selector =
@@ -514,9 +479,7 @@ async fn main() -> Result<()> {
         }
         let http_handle = if let Some(ref bind) = agent_config.metrics_bind {
             let (mut metrics, mut registry) = export::metrics::AgentMetrics::new();
-            if cgroup_backend {
-                metrics.register_scope_drops(&mut registry);
-            }
+            metrics.register_scope_drops(&mut registry);
             let state = export::http_server::AppState {
                 registry: Arc::new(registry),
                 stats: Arc::clone(&shared.stats),
@@ -595,9 +558,7 @@ async fn main() -> Result<()> {
                             // pid_filter_listener: the scope publisher
                             // applies the change (a narrowing revokes the
                             // capture pipeline) and replies once applied; it
-                            // rejects selectors that do not resolve. The
-                            // options can only differ on cgroup_skb (they
-                            // are refused on tc), where it runs.
+                            // rejects selectors that do not resolve.
                             let running = config_swap.load_full();
                             let options = config::ScopeOptions::of(&new_config);
                             let rescope = running.cgroup_filter != new_config.cgroup_filter
@@ -840,17 +801,10 @@ mod tests {
     #[test]
     fn test_cli_default_args() {
         let args = Args::parse_from(["panopticon-agent"]);
-        assert!(args.interface.is_empty());
         assert!(!args.verbose);
         assert!(!args.log_events);
         assert!(args.json_export.is_none());
         assert!(!args.smoke_test);
-    }
-
-    #[test]
-    fn test_cli_custom_interface() {
-        let args = Args::parse_from(["panopticon-agent", "--interface", "wlan0"]);
-        assert_eq!(args.interface, vec!["wlan0"]);
     }
 
     #[test]
@@ -861,23 +815,11 @@ mod tests {
 
     #[test]
     fn test_cli_short_flags() {
-        let args = Args::parse_from(["panopticon-agent", "-i", "lo", "-v"]);
-        assert_eq!(args.interface, vec!["lo"]);
+        let args = Args::parse_from(["panopticon-agent", "-v"]);
         assert!(args.verbose);
-    }
-
-    #[test]
-    fn test_cli_multi_interface() {
-        let args = Args::parse_from([
-            "panopticon-agent",
-            "-i",
-            "eth0",
-            "-i",
-            "wlan0",
-            "-i",
-            "docker0",
-        ]);
-        assert_eq!(args.interface, vec!["eth0", "wlan0", "docker0"]);
+        // The TC interface flag was removed: refused, never ignored.
+        assert!(Args::try_parse_from(["panopticon-agent", "-i", "lo"]).is_err());
+        assert!(Args::try_parse_from(["panopticon-agent", "--interface", "lo"]).is_err());
     }
 
     #[test]

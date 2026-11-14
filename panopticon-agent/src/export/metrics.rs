@@ -37,16 +37,11 @@ pub struct AgentMetrics {
     pub drops_export_full: Counter<u64>,
     pub worker_panics: Counter<u64>,
     pub tcp_segments_ignored: Counter<u64>,
-    pub pid_filter_dropped_events: Counter<u64>,
-    pub pid_filter_unknown_owner_connections: Counter<u64>,
-    pub sampled_out_connections: Counter<u64>,
-    pub sampled_out_events: Counter<u64>,
-    pub head_only_cut_events: Counter<u64>,
     /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
     pub credential_matches_user: Counter<u64>,
     pub credential_matches_builtin: Counter<u64>,
-    /// cgroup_skb only ([`Self::register_scope_drops`]): kernel scope drops,
-    /// one per `SCOPE_DROP_NAMES` entry in that order; empty on TC.
+    /// Kernel scope drops ([`Self::register_scope_drops`]), one per
+    /// `SCOPE_DROP_NAMES` entry in that order; empty until registered.
     pub scope_drops: Vec<Counter<u64>>,
     pub drops_stale_scope_gen: Option<Counter<u64>>,
     // Self-telemetry (6.6)
@@ -132,39 +127,6 @@ impl AgentMetrics {
             tcp_segments_ignored.clone(),
         );
 
-        let register = |registry: &mut Registry, name: &str, help: &str| {
-            let counter = Counter::<u64>::default();
-            registry.register(name, help, counter.clone());
-            counter
-        };
-        let pid_filter_dropped_events = register(
-            &mut registry,
-            "panopticon_pid_filter_dropped_events",
-            "Events dropped by pid_filter in user space (TLS and socket events of \
-             unlisted processes are dropped in the kernel and not counted)",
-        );
-        let pid_filter_unknown_owner_connections = register(
-            &mut registry,
-            "panopticon_pid_filter_unknown_owner_connections",
-            "Packet-captured connections dropped by pid_filter because no listed \
-             process was seen to own them (other processes, or opened before the agent)",
-        );
-        let sampled_out_connections = register(
-            &mut registry,
-            "panopticon_sampled_out_connections",
-            "Connections not captured by connection_sample",
-        );
-        let sampled_out_events = register(
-            &mut registry,
-            "panopticon_sampled_out_events",
-            "Events of connections not captured by connection_sample",
-        );
-        let head_only_cut_events = register(
-            &mut registry,
-            "panopticon_head_only_cut_events",
-            "Events cut or dropped by head_only past a direction's first head_only_bytes",
-        );
-
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -238,11 +200,6 @@ impl AgentMetrics {
             drops_export_full,
             worker_panics,
             tcp_segments_ignored,
-            pid_filter_dropped_events,
-            pid_filter_unknown_owner_connections,
-            sampled_out_connections,
-            sampled_out_events,
-            head_only_cut_events,
             credential_matches_user,
             credential_matches_builtin,
             scope_drops: Vec::new(),
@@ -254,7 +211,7 @@ impl AgentMetrics {
         (metrics, registry)
     }
 
-    /// Register the cgroup_skb backend's scope counters:
+    /// Register the capture-scope counters:
     /// `panopticon_scope_dropped_events_total{reason}` (the kernel's
     /// `SCOPE_DROPS`, labels only from the fixed `SCOPE_DROP_NAMES`) and
     /// `panopticon_drops_stale_scope_gen_total` (the ring readers' floor).
@@ -344,26 +301,6 @@ impl AgentMetrics {
             stats.tcp_segments_ignored.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        for (counter, value) in [
-            (
-                &self.pid_filter_dropped_events,
-                &stats.pid_filter_dropped_events,
-            ),
-            (
-                &self.pid_filter_unknown_owner_connections,
-                &stats.pid_filter_unknown_owner_connections,
-            ),
-            (
-                &self.sampled_out_connections,
-                &stats.sampled_out_connections,
-            ),
-            (&self.sampled_out_events, &stats.sampled_out_events),
-            (&self.head_only_cut_events, &stats.head_only_cut_events),
-        ] {
-            counter
-                .inner()
-                .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
         let (user, builtin) = crate::protocol::credential_matches();
         self.credential_matches_user
             .inner()
@@ -518,9 +455,9 @@ mod tests {
             .drops_stale_scope_gen
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
-        // TC: not registered.
-        let (tc, registry) = AgentMetrics::new();
-        tc.sync_from_stats(&stats);
+        // Not registered: nothing.
+        let (bare, registry) = AgentMetrics::new();
+        bare.sync_from_stats(&stats);
         let out = encode_metrics(&registry);
         assert!(!out.contains("scope"), "{out}");
 
