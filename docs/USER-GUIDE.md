@@ -543,7 +543,8 @@ a body or an error message that reads `/oauth/token` or
   every segment is a plain name (letters, `-`, `_`, `.`: no digit, `%`,
   `+` or anything else value-like); the word is the last segment (no
   trailing `/`); and the query, if any, is only `key=value` components,
-  each with a non-empty key (no blank or unkeyed component), made only of
+  each with a non-empty key and a non-empty value without `=` (no blank
+  or unkeyed component, no base64 padding), made only of
   letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=` and `&` (no `#`,
   `;`, `,` or other delimiter that could end or split the query). This is
   decided before any credential parameter in the query is masked. So

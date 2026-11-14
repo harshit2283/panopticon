@@ -8,7 +8,9 @@
 //! delimited with certainty, in which case only those values are masked.
 //! A credential word that is a *bare name*, in one of two allowlisted
 //! positions of a field of the right kind, is not context (see
-//! [`BareShapes`]); anything outside the allowlist is (fail closed).
+//! [`BareShapes`]); anything outside the allowlist is (fail closed). The
+//! bare name is exempt only from the residual check: the certain
+//! structures beside it are still masked ([`builtin_full`]).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -338,21 +340,21 @@ fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
 
 /// A raw query of only letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=`
 /// and `&`, whose every `&` component is `key=value` with a non-empty key
-/// (a blank component or unkeyed text is not). No other byte, so no other
+/// and a non-empty value with no `=` (a blank component, unkeyed text or
+/// base64 padding such as `aHVudGVyMg==` is not). No other byte, so no other
 /// separator (`;`, `,`), fragment (`#`) or delimiter can hide an unkeyed
 /// component. A value may also be exactly [`REDACTED_CREDENTIAL`], so a
 /// masked path is decided the same way again.
 fn query_is_keyed(q: &[u8]) -> bool {
     let plain = |s: &[u8]| {
-        s.iter()
-            .all(|c| c.is_ascii_alphanumeric() || b"-._~%+=".contains(c))
+        !s.is_empty()
+            && s.iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"-._~%+".contains(c))
     };
     q.split(|&c| c == b'&').all(|part| {
         part.iter().position(|&c| c == b'=').is_some_and(|eq| {
             let value = &part[eq + 1..];
-            eq > 0
-                && plain(&part[..eq])
-                && (plain(value) || value == REDACTED_CREDENTIAL.as_bytes())
+            plain(&part[..eq]) && (plain(value) || value == REDACTED_CREDENTIAL.as_bytes())
         })
     })
 }
@@ -727,14 +729,17 @@ fn user_spans(
 }
 
 /// Every built-in rule: the values to mask where certain, or None (the
-/// field withheld) when any context is left.
+/// field withheld) when any context is left. The certain structures are
+/// masked whenever the strict scan sees context; the bare name of the
+/// field's kind is exempt only in the residual check, so exempting it
+/// never skips a credential parameter beside it (`?pwd%5B%5D=hunter2`).
 fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     let slot = match kind {
         FieldKind::Other => Slot::None,
         FieldKind::HttpPath => Slot::Path(path_last_segment(text.as_bytes())),
         FieldKind::SqlStatement => Slot::Sql,
     };
-    if !context(text, false, slot) {
+    if !context(text, false, Slot::None) {
         return Some(Vec::new());
     }
     let (mask, delete) = certain_clauses(text);
@@ -1759,6 +1764,20 @@ mod tests {
                 "/oauth/token?x=1&password=a&y=2",
                 "/oauth/token?x=1&password=<REDACTED>&y=2",
             ),
+            // Codex round 9: a credential parameter the residual scan does
+            // not read as a name is still masked beside a bare path.
+            (
+                "/reset/token?pwd%5B%5D=hunter2",
+                "/reset/token?pwd%5B%5D=<REDACTED>",
+            ),
+            (
+                "/reset/token?session%5Bid%5D=abc123",
+                "/reset/token?session%5Bid%5D=<REDACTED>",
+            ),
+            (
+                "/reset/token?pin%5B%5D=739204",
+                "/reset/token?pin%5B%5D=<REDACTED>",
+            ),
         ] {
             assert_eq!(pk(text, FieldKind::HttpPath), want, "{text}");
             assert_eq!(pk(want, FieldKind::HttpPath), want, "{want}");
@@ -1829,6 +1848,10 @@ mod tests {
             "/reset/token?hunter2;x=y",
             "/reset/token?scope=read;hunter2",
             "/reset/token?scope=read,hunter2",
+            // Codex round 9: base64 padding is not a key=value component.
+            "/reset/token?aHVudGVyMg==",
+            "/reset/token?aHVudGVyMg=",
+            "/reset/token?scope=",
             "/reset/token?x=y/hunter2",
             "/oauth/token;abc123",
             "/oauth/token/abc/",
