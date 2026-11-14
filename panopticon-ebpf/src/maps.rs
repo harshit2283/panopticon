@@ -11,7 +11,7 @@ use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
     DATA_RING_SHARDS, DataEvent, MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE,
     MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
-    scope::{MAX_VRF_MASTERS, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN, VRF_EVENT_KINDS},
+    scope::{NETDEV_OFFS_LEN, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
 /// Events lost because a DATA_EVENTS shard was full (user space not keeping
@@ -47,43 +47,12 @@ pub fn count_scope_drop(reason: u32) {
 #[map]
 pub static CGROUP_ALLOW: HashMap<u64, u8> = HashMap::with_max_entries(MAX_CGROUP_ALLOW, 0);
 
-/// VRF masters by ifindex, in any network namespace, found by the loader's
-/// startup scan (DESIGN §3.7); read by the capture hooks. Never removed: a
-/// stale entry over-drops (fails closed). Masters created later are in
-/// `VRF_LIVE`.
+/// Where the capture hook reads the packet device's `IFF_L3MDEV_MASTER`
+/// bit (`scope::NETDEV_*`), from the kernel's BTF, written by the loader
+/// before the capture hooks attach. A zero mask means unwritten: every
+/// packet then counts as on a VRF master (fails closed).
 #[map]
-pub static VRF_MASTERS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_VRF_MASTERS, 0);
-
-/// Offsets `scope_vrf_register` reads, from the kernel's BTF, written by
-/// the loader before it attaches: 0 `net_device.ifindex`, 1
-/// `net_device.rtnl_link_ops`, 2 `rtnl_link_ops.kind`. Index 0 unset (0)
-/// means unwritten; the hook then records nothing.
-#[map]
-pub static NETDEV_OFFS: Array<u32> = Array::with_max_entries(3, 0);
-
-/// Live VRF masters by ifindex, counted by the hooks (DESIGN §3.7): +1 at
-/// `register_netdevice`, -1 at `unregister_netdevice_queue` of a device in
-/// `VRF_DEVS`, removed at 0. Both hooks run under RTNL, so updates are
-/// serialised.
-#[map]
-pub static VRF_LIVE: HashMap<u32, u32> = HashMap::with_max_entries(MAX_VRF_MASTERS, 0);
-
-/// The VRF devices the register hook counted (`net_device` address →
-/// ifindex): only these are uncounted at unregistration, so a VRF the hook
-/// never saw cannot uncount another namespace's master of the same ifindex.
-#[map]
-pub static VRF_DEVS: HashMap<u64, u32> = HashMap::with_max_entries(MAX_VRF_MASTERS, 0);
-
-/// Index 0: non-zero once VRF classification failed (a read failed with
-/// valid offsets, or a map was full). Never cleared by the kernel: while
-/// set and `capture_loopback = false`, every data packet is dropped
-/// (`vrf_unknown`).
-#[map]
-pub static VRF_FAILED: Array<u32> = Array::with_max_entries(1, 0);
-
-/// The VRF hooks' counters (`scope::VRF_EV_*`).
-#[map]
-pub static VRF_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(VRF_EVENT_KINDS, 0);
+pub static NETDEV_OFFS: Array<u32> = Array::with_max_entries(NETDEV_OFFS_LEN, 0);
 
 /// Zero the DataEvent fields only the cgroup_skb backend fills, so other
 /// producers never leak a previous event's values (ring memory and the

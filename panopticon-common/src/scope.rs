@@ -121,11 +121,7 @@ pub const DROP_KTLS_PAYLOAD: u32 = 10;
 /// `capture_loopback = false`: a data packet on a node-local path
 /// ([`local_packet`]). Packets only: TLS plaintext is scoped by process.
 pub const DROP_LOOPBACK: u32 = 11;
-/// `capture_loopback = false` and VRF classification failed (`VRF_FAILED`
-/// latched: a VRF master could not be recorded): every data packet, since
-/// none can be shown not to be VRF-local (DESIGN §3.7).
-pub const DROP_VRF_UNKNOWN: u32 = 12;
-pub const SCOPE_DROP_REASONS: u32 = 13;
+pub const SCOPE_DROP_REASONS: u32 = 12;
 /// Metric label of each `DROP_*` index.
 pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
     "not_eligible",
@@ -140,7 +136,6 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
     "tls_out_of_scope",
     "ktls_payload",
     "loopback",
-    "vrf_unknown",
 ];
 
 /// The loopback device's ifindex in every network namespace
@@ -149,29 +144,23 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
 /// node-local: TC on the node's NIC never saw it.
 pub const LOOPBACK_IFINDEX: u32 = 1;
 
-/// Capacity of `VRF_MASTERS` (the startup scan's ifindexes), `VRF_LIVE`
-/// (live VRF masters by ifindex, counted by the hooks) and `VRF_DEVS`
-/// (the devices the hooks counted). A full map latches `VRF_FAILED`.
-pub const MAX_VRF_MASTERS: u32 = 4096;
-
-/// `VRF_EVENTS` indices (per-CPU counters of the VRF hooks).
-pub const VRF_EV_RECORDED: u32 = 0;
-pub const VRF_EV_REMOVED: u32 = 1;
-/// A kernel read failed with valid offsets (latches `VRF_FAILED`).
-pub const VRF_EV_READ_FAILED: u32 = 2;
-/// A map insert failed (latches `VRF_FAILED`).
-pub const VRF_EV_MAP_FULL: u32 = 3;
-pub const VRF_EVENT_KINDS: u32 = 4;
-/// Metric label of each `VRF_EV_*` index.
-pub const VRF_EVENT_NAMES: [&str; VRF_EVENT_KINDS as usize] =
-    ["recorded", "removed", "read_failed", "map_full"];
+/// `NETDEV_OFFS` indices: where the capture hook finds the device's
+/// `IFF_L3MDEV_MASTER` bit (DESIGN §3.7), written by the loader from the
+/// kernel's BTF before the capture hooks attach.
+/// `sk_buff.dev` byte offset.
+pub const NETDEV_SKB_DEV: u32 = 0;
+/// Byte offset in `net_device` of the `priv_flags` byte holding the bit.
+pub const NETDEV_L3M_BYTE: u32 = 1;
+/// The bit's mask within that byte; 0 means not written (fails closed).
+pub const NETDEV_L3M_MASK: u32 = 2;
+pub const NETDEV_OFFS_LEN: u32 = 3;
 
 /// Whether a data packet travels a node-local path (DESIGN §3.7), from
 /// what the cgroup hook sees, never from addresses:
 /// * its device is `lo` (`ifindex`, either direction);
-/// * its device is a VRF master (`vrf`: the ifindex is in `VRF_MASTERS` or
-///   `VRF_LIVE`, keyed by ifindex alone, so a device with the same ifindex
-///   in another namespace matches too: fails closed). VRF local delivery
+/// * its device is a VRF master (`vrf`: the packet's own device has
+///   `IFF_L3MDEV_MASTER` in `priv_flags`, read at the hook; an unreadable
+///   device counts as one: fails closed). VRF local delivery
 ///   leaves and arrives on the master, bound or not; so does a VRF's remote
 ///   ingress, which is dropped with it. A socket is excluded from its first
 ///   packet seen on a master on (sticky); a one-way sender whose packets
