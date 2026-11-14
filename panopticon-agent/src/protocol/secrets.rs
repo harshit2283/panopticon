@@ -8,11 +8,9 @@
 //! delimited with certainty, in which case only those values are masked.
 //! A credential word that is a *bare name*, in one of two allowlisted
 //! positions of a field of the right kind, is not context (see
-//! [`BareShapes`]); anything outside the allowlist is (fail closed). The
-//! bare name is exempt only from the residual check: the certain
-//! structures beside it are still masked, and beside a bare path every
-//! query component with a credential hint in its key or decoded value
-//! must have its value among them ([`builtin_full`]).
+//! [`BareShapes`]); anything outside the allowlist is (fail closed). A
+//! bare path's query and fragment are never exported: the path part is
+//! followed by [`QUERY_WITHHELD`] ([`decide_as`]).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -39,14 +37,10 @@
 //! passed in by the caller, never inferred from the text), and none
 //! applies on a view from which a NUL was dropped or to a word with a
 //! digit:
-//! - in an HTTP/1 or HTTP/2 request path: the last segment, when the raw
-//!   field is printable ASCII, every segment a plain name (`A`-`Z`,
-//!   `a`-`z`, `_`, `-`, `.`; no `%` or `+`), the query, if any, only
-//!   `key=value` components of letters, digits, `-._~%+` (no `%` or `+`
-//!   in a key; every component with a hint in its key or decoded value
-//!   masked; decided before
-//!   its credential parameters are masked; no `#`, `;` or other
-//!   delimiter), and the word ends in a whole credential part
+//! - in an HTTP/1 or HTTP/2 request path: the last segment of the path
+//!   part (the raw text before any `?` or `#`), when every segment is a
+//!   plain name (`A`-`Z`, `a`-`z`, `_`, `-`, `.`: no `%`, `+`, space or
+//!   other byte) and the word ends in a whole credential part
 //!   (`access_token`, not `token_abc`) ([`path_last_segment`]);
 //! - in a MySQL or PostgreSQL statement: a projection item of
 //!   `SELECT item, ... FROM table [rest]` ([`select_list`]), read on the
@@ -80,6 +74,11 @@ use super::credential_rules::{Builtin, CredentialRules, count_builtin, count_use
 /// What a field with credential context that cannot be masked with
 /// certainty is replaced with. Holds no word that is credential context.
 pub const FIELD_WITHHELD: &str = "<field withheld>";
+
+/// What replaces the query and fragment of an HTTP request path whose
+/// path part ends in a bare credential name (`/oauth/token?<query
+/// withheld>`): no byte of either is exported.
+pub const QUERY_WITHHELD: &str = "?<query withheld>";
 
 /// What follows the verb of a SQL statement with credential context.
 pub const STATEMENT_WITHHELD: &str = "<statement withheld>";
@@ -197,10 +196,9 @@ pub fn has_any_sql_credential_context(sql: &str) -> bool {
 enum Slot {
     /// None: every credential word is context.
     None,
-    /// An HTTP request path's last segment ([`path_last_segment`]), its
-    /// bounds taken on the field as captured: for what is left once its
-    /// certain clauses are removed too, so the blank a masked parameter
-    /// leaves in the query is not an unkeyed component.
+    /// The last segment of an HTTP request path part
+    /// ([`path_last_segment`]), its bounds taken on the path part as
+    /// captured.
     Path(Option<(usize, usize)>),
     /// A column of an allowlisted `SELECT` ([`select_list`]).
     Sql,
@@ -256,9 +254,8 @@ fn context(text: &str, sql: bool, slot: Slot) -> bool {
 /// name, for the field's kind ([`Slot`]); anything else is context (fail
 /// closed). The bounds are token bounds from [`words`].
 struct BareShapes {
-    /// The last segment of a raw path made only of plain name segments,
-    /// followed by the end or a query of plain `key=value` parameters
-    /// ([`path_last_segment`]).
+    /// The last segment of a raw path part made only of plain name
+    /// segments ([`path_last_segment`]).
     path: Option<(usize, usize)>,
     /// The select list of an allowlisted `SELECT` ([`select_list`]).
     select: Option<(usize, usize)>,
@@ -310,22 +307,16 @@ fn ends_in_a_credential_part(w: &str) -> bool {
     ends_in(w) || w.strip_suffix('s').is_some_and(ends_in)
 }
 
-/// On the RAW field, printable ASCII only (no space, no other whitespace,
+/// On the RAW path part (the text before any `?` or `#`, cut off by
+/// [`decide_as`]), printable ASCII only (no space, no other whitespace,
 /// no byte past 0x7E): a path `/seg/.../seg` whose every segment is a
-/// plain name (`A`-`Z`, `a`-`z`, `_`, `.`, `-`: no digit, `%` or `+`,
-/// nothing value-like), then the end or `?` and a query of only
-/// [`query_is_keyed`] components: the bounds of the last segment. Nothing in the path part is decoded, so the bounds are those
-/// of its word in the normalised view. `/oauth/token` and
-/// `/oauth/token?scope=read` qualify; `/reset/abc123/token`, `/v1/token`,
-/// `/reset/token/++++`, `/token/`, `/token?abc123`, `/token?x=1&abc123`,
-/// `/token?x=1&`, `/token?abc123#x=y`, `/token?abc123;x=y` and
-/// `/token?x=a\u{a0}b` do not.
+/// plain name (`A`-`Z`, `a`-`z`, `_`, `.`, `-`: no digit, `%`, `+`, `?`
+/// or `#`, nothing value-like): the bounds of the last segment. Nothing in
+/// it is decoded, so the bounds are those of its word in the normalised
+/// view. `/oauth/token` qualifies; `/reset/abc123/token`, `/v1/token`,
+/// `/reset/token/++++`, `/token/` and `/oauth\u{a0}/token` do not.
 fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
-    if !b.iter().all(u8::is_ascii_graphic) {
-        return None;
-    }
-    let q = b.iter().position(|&c| c == b'?').unwrap_or(b.len());
-    let p = b[..q].strip_prefix(b"/")?;
+    let p = b.strip_prefix(b"/")?;
     let mut start = 1;
     let mut last = None;
     for seg in p.split(|&c| c == b'/') {
@@ -336,62 +327,7 @@ fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
         last = Some((start, start + seg.len()));
         start += seg.len() + 1;
     }
-    if q < b.len() && !query_is_keyed(&b[q + 1..]) {
-        return None;
-    }
     last
-}
-
-/// A raw query of only letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=`
-/// and `&`, whose every `&` component is `key=value` with a non-empty key
-/// and a non-empty value with no `=` (a blank component, unkeyed text or
-/// base64 padding such as `aHVudGVyMg==` is not). No other byte, so no other
-/// separator (`;`, `,`), fragment (`#`) or delimiter can hide an unkeyed
-/// component. A key is never encoded (no `%` or `+`), so it reads the same
-/// raw and decoded. A value may also be exactly [`REDACTED_CREDENTIAL`], so
-/// a masked path is decided the same way again.
-fn query_is_keyed(q: &[u8]) -> bool {
-    let plain = |s: &[u8], extra: &[u8]| {
-        !s.is_empty()
-            && s.iter()
-                .all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(c) || extra.contains(c))
-    };
-    q.split(|&c| c == b'&').all(|part| {
-        part.iter().position(|&c| c == b'=').is_some_and(|eq| {
-            let value = &part[eq + 1..];
-            plain(&part[..eq], b"")
-                && (plain(value, b"%+") || value == REDACTED_CREDENTIAL.as_bytes())
-        })
-    })
-}
-
-/// Under a bare path, whether every query component whose key or value,
-/// raw or decoded, contains a credential hint ([`HINTS`], any form:
-/// `pwd.x`, `keyword`, `next=%2Flogin%3Fpwd%3Dx`), or still holds a `%`
-/// once decoded, has its value in `mask` (or already masked). Otherwise a
-/// value the masking rules do not cover could be exported beside the
-/// exempt name.
-fn hinted_values_masked(text: &str, mask: &[(usize, usize)]) -> bool {
-    let Some(q) = text.find('?') else {
-        return true;
-    };
-    // A hint raw or decoded, or a `%` decoding left (more rounds of
-    // encoding than the normalised view reads).
-    let hinted = |s: &str| {
-        let d = decode(s)
-            .unwrap_or_else(|| s.to_string())
-            .to_ascii_lowercase();
-        has_hint(&s.to_ascii_lowercase()) || has_hint(&d) || d.contains('%')
-    };
-    let mut at = q + 1;
-    text[at..].split('&').all(|part| {
-        let eq = part.find('=').unwrap_or(part.len());
-        let (vs, ve) = (at + eq + 1, at + part.len());
-        at += part.len() + 1;
-        !hinted(part)
-            || part[eq..].strip_prefix('=') == Some(REDACTED_CREDENTIAL)
-            || mask.iter().any(|&(s, e)| s <= vs && ve <= e)
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -653,6 +589,10 @@ pub enum Decision {
     Mask(Vec<(usize, usize)>),
     /// Replace the field by [`FIELD_WITHHELD`].
     Withhold,
+    /// Keep `text[..at]` with these spans masked, and replace everything
+    /// from `at` (a query or fragment beside a bare path) by
+    /// [`QUERY_WITHHELD`].
+    Cut(usize, Vec<(usize, usize)>),
 }
 
 impl Decision {
@@ -662,6 +602,7 @@ impl Decision {
             Decision::Keep => None,
             Decision::Withhold => Some(FIELD_WITHHELD.to_string()),
             Decision::Mask(spans) => Some(replace_spans(text, spans)),
+            Decision::Cut(at, spans) => Some(replace_spans(&text[..*at], spans) + QUERY_WITHHELD),
         }
     }
 }
@@ -680,8 +621,26 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
 }
 
 /// [`decide`] for a field of a known kind: an HTTP request path or a SQL
-/// statement may hold a bare name ([`FieldKind`]).
+/// statement may hold a bare name ([`FieldKind`]). An HTTP path with a
+/// query or fragment whose path part (before the first `?` or `#`) has
+/// credential context is decided on its path part alone: withheld unless
+/// that part is bare, else the path part exported followed by
+/// [`QUERY_WITHHELD`], no byte of the query or fragment kept. A path part
+/// with no credential word leaves the whole field to the usual rules
+/// (keyed parameters masked).
 pub fn decide_as(rules: &CredentialRules, text: &str, builtin: bool, kind: FieldKind) -> Decision {
+    if kind == FieldKind::HttpPath
+        && builtin
+        && rules.builtin == Builtin::Full
+        && let Some(at) = text.find(['?', '#'])
+        && has_credential_context(&text[..at])
+    {
+        return match decide_as(rules, &text[..at], builtin, kind) {
+            Decision::Keep => Decision::Cut(at, Vec::new()),
+            Decision::Mask(spans) => Decision::Cut(at, spans),
+            Decision::Withhold | Decision::Cut(..) => Decision::Withhold,
+        };
+    }
     // A span that already reads exactly `<REDACTED>` would be replaced by
     // itself: dropped as a no-op. Nothing else in captured text is exempt,
     // whatever it reads like.
@@ -764,25 +723,17 @@ fn user_spans(
 }
 
 /// Every built-in rule: the values to mask where certain, or None (the
-/// field withheld) when any context is left. The certain structures are
-/// masked whenever the strict scan sees context; the bare name of the
-/// field's kind is exempt only in the residual check, so exempting it
-/// never skips a credential parameter beside it. Beside a bare path, an
-/// unmasked query component with a hint in its key or decoded value
-/// withholds the field ([`hinted_values_masked`]).
+/// field withheld) when any context is left.
 fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     let slot = match kind {
         FieldKind::Other => Slot::None,
         FieldKind::HttpPath => Slot::Path(path_last_segment(text.as_bytes())),
         FieldKind::SqlStatement => Slot::Sql,
     };
-    if !context(text, false, Slot::None) {
+    if !context(text, false, slot) {
         return Some(Vec::new());
     }
     let (mask, delete) = certain_clauses(text);
-    if matches!(slot, Slot::Path(Some(_))) && !hinted_values_masked(text, &mask) {
-        return None;
-    }
     let residual = remove(text, &delete);
     (!context(&residual, false, slot)).then_some(mask)
 }
@@ -1749,8 +1700,6 @@ mod tests {
             "/oauth/token",
             "/users/me/password",
             "/account/reset-password",
-            "/oauth/token?scope=read&state=xyz",
-            "/oauth/token?scope=a%20b",
             // A named limit (USER-GUIDE 5.3): a letters-only segment
             // before the word cannot be told from a route word.
             "/reset/abcdef/token",
@@ -1787,30 +1736,89 @@ mod tests {
             }
             assert!(has_any_sql_credential_context(text), "{text}");
         }
-        // A credential parameter after a bare path is masked: the path is
-        // proved bare on the field as captured, so the blank the masked
-        // parameter leaves is not an unkeyed component. A second pass
-        // changes nothing.
-        for (text, want) in [
-            (
-                "/oauth/token?client_secret=x",
-                "/oauth/token?client_secret=<REDACTED>",
-            ),
-            (
-                "/oauth/token?client_secret=abc&x=1",
-                "/oauth/token?client_secret=<REDACTED>&x=1",
-            ),
-            (
-                "/oauth/token?x=1&password=a&y=2",
-                "/oauth/token?x=1&password=<REDACTED>&y=2",
-            ),
-        ] {
-            assert_eq!(pk(text, FieldKind::HttpPath), want, "{text}");
-            assert_eq!(pk(want, FieldKind::HttpPath), want, "{want}");
-            assert_eq!(p(text), FIELD_WITHHELD, "{text}");
-        }
         // DNS names: no bare name.
         assert!(has_credential_context("db.password"));
+    }
+
+    /// A query or fragment beside a bare path is never exported, whatever
+    /// it holds: the path part is followed by [`QUERY_WITHHELD`]. Every
+    /// query input Codex raised from round 6 on, and the earlier ones,
+    /// included. In any other field kind, withheld as before.
+    #[test]
+    fn query_beside_a_bare_path_is_cut() {
+        for text in [
+            "/oauth/token?scope=read&state=xyz",
+            "/oauth/token?scope=a%20b",
+            "/oauth/token?client_secret=x",
+            "/oauth/token?client_secret=abc&x=1",
+            "/oauth/token?x=1&password=a&y=2",
+            "/oauth/token#",
+            "/token?abc123",
+            "/token?&abc123",
+            "/oauth/token?",
+            "/oauth/token?x=1&",
+            "/oauth/token?=x",
+            "/token?x=1& ",
+            "/oauth/token?client_secret=x&",
+            "/oauth/token?client_secret=x&&y=1",
+            "/oauth/token?client_secret=x&abc123",
+            "/oauth/token?scope=read\u{a0}hunter2",
+            "/oauth/token?scope=read\u{2003}hunter2",
+            "/oauth/token?scope=read\u{2028}hunter2",
+            "/oauth/token?scope=read\thunter2",
+            "/oauth/token?user.pwd=hunter2",
+            "/oauth/token?user-pin=739204",
+            "/reset/token?scope=read&++++&password=x",
+            "/token?x=1&abc123",
+            "/token?x=a b",
+            "/reset/token?scope=read&abc123&password=x",
+            "/oauth/token#abc123",
+            "/reset/token?hunter2#x=y",
+            "/reset/token?scope=read#hunter2",
+            "/reset/token?hunter2;x=y",
+            "/reset/token?scope=read;hunter2",
+            "/reset/token?scope=read,hunter2",
+            "/reset/token?aHVudGVyMg==",
+            "/reset/token?aHVudGVyMg=",
+            "/reset/token?scope=",
+            "/reset/token?pwd%5Baccount%20name%5D=hunter2",
+            "/reset/token?pwd%5B%2A%5D=hunter2",
+            "/reset/token?%70wd=hunter2",
+            "/reset/token?pwd.x=hunter2",
+            "/oauth/token?keyword=hunter2",
+            "/reset/token?next=%2Flogin%3Fpwd%5Baccount%20name%5D%3Dhunter2",
+            "/reset/token?next=%252570wd%253Dhunter2",
+            "/reset/token?next=x%25252570wd",
+            "/reset/token?pwd%5B%5D=hunter2",
+            "/reset/token?session%5Bid%5D=abc123",
+            "/reset/token?pin%5B%5D=739204",
+            "/reset/token?x=y/hunter2",
+        ] {
+            let at = text.find(['?', '#']).unwrap();
+            let want = format!("{}{QUERY_WITHHELD}", &text[..at]);
+            assert_eq!(pk(text, FieldKind::HttpPath), want, "{text}");
+            // A second pass changes nothing.
+            assert_eq!(pk(&want, FieldKind::HttpPath), want, "{want}");
+            for kind in [FieldKind::Other, FieldKind::SqlStatement] {
+                assert_eq!(pk(text, kind), FIELD_WITHHELD, "{text} {kind:?}");
+            }
+        }
+        // A path part that is not bare: the whole field is withheld.
+        for text in [
+            "/reset/token/abc123?x=1",
+            "/token/?abc123",
+            "/reset/%74oken?x=1",
+            "/oauth\u{a0}/token?x=1",
+            "/v1/token#x",
+        ] {
+            assert_eq!(pk(text, FieldKind::HttpPath), FIELD_WITHHELD, "{text}");
+        }
+        // No credential word in the path part: keyed parameters are masked
+        // as before, the rest of the query kept.
+        assert_eq!(
+            pk("/login?password=x&q=1", FieldKind::HttpPath),
+            "/login?password=<REDACTED>&q=1"
+        );
     }
 
     /// A credential word with anything that could be its value next to
@@ -1822,31 +1830,16 @@ mod tests {
             // The decision's examples.
             "/reset/token/abc123",
             "SELECT * FROM users WHERE password='x'",
-            // Paths: every segment a plain name, the query all `name=value`.
+            // Paths: every segment a plain name.
             "/reset/abc123/token",
             "/api/v1/token",
             "/oauth2/token",
             "/a//token",
-            "/token?abc123",
-            "/token?&abc123",
             "/oauth/token/",
-            "/oauth/token?",
-            "/oauth/token?x=1&",
-            "/oauth/token?=x",
-            "/token?x=1& ",
-            "/oauth/token?client_secret=x&",
-            "/oauth/token?client_secret=x&&y=1",
-            "/oauth/token?client_secret=x&abc123",
             // Codex round 3 #3: printable ASCII only.
-            "/oauth/token?scope=read\u{a0}hunter2",
-            "/oauth/token?scope=read\u{2003}hunter2",
-            "/oauth/token?scope=read\u{2028}hunter2",
-            "/oauth/token?scope=read\thunter2",
             "/oauth\u{a0}/token",
             // Codex round 3 #1: `.` and `-` split a short name from its
             // neighbour; next to a SQL operator it is a value position.
-            "/oauth/token?user.pwd=hunter2",
-            "/oauth/token?user-pin=739204",
             "SELECT password FROM users WHERE users.pwd = 'hunter2'",
             "SELECT password FROM users WHERE users.pin = 739204",
             "SELECT password FROM users WHERE pwd-0 = 123456",
@@ -1858,42 +1851,10 @@ mod tests {
             // Codex round 2 #1: decoding must not erase a segment or a
             // component (`+` is a space once decoded).
             "/reset/token/++++",
-            "/reset/token?scope=read&++++&password=x",
             "/reset/token/%20",
             "/reset/%74oken",
             "/reset/x+y/token",
             "/token/?abc123",
-            "/token?x=1&abc123",
-            "/token?x=a b",
-            "/reset/token?scope=read&abc123&password=x",
-            "/oauth/token#abc123",
-            // Codex round 7: a fragment ends the query.
-            "/reset/token?hunter2#x=y",
-            "/reset/token?scope=read#hunter2",
-            // Codex round 8: any other separator or delimiter in the query.
-            "/reset/token?hunter2;x=y",
-            "/reset/token?scope=read;hunter2",
-            "/reset/token?scope=read,hunter2",
-            // Codex round 9: base64 padding is not a key=value component.
-            "/reset/token?aHVudGVyMg==",
-            "/reset/token?aHVudGVyMg=",
-            "/reset/token?scope=",
-            // Codex round 10: an encoded key, or a hinted key whose value
-            // the masking rules do not cover.
-            "/reset/token?pwd%5Baccount%20name%5D=hunter2",
-            "/reset/token?pwd%5B%2A%5D=hunter2",
-            "/reset/token?%70wd=hunter2",
-            "/reset/token?pwd.x=hunter2",
-            "/oauth/token?keyword=hunter2",
-            // Codex round 11: a credential pair encoded inside a value.
-            "/reset/token?next=%2Flogin%3Fpwd%5Baccount%20name%5D%3Dhunter2",
-            "/reset/token?next=%252570wd%253Dhunter2",
-            "/reset/token?next=x%25252570wd",
-            // Codex round 9: an encoded key is not a bare path's query.
-            "/reset/token?pwd%5B%5D=hunter2",
-            "/reset/token?session%5Bid%5D=abc123",
-            "/reset/token?pin%5B%5D=739204",
-            "/reset/token?x=y/hunter2",
             "/oauth/token;abc123",
             "/oauth/token/abc/",
             "/oauth/token abc123",

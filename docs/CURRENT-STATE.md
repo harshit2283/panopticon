@@ -223,11 +223,9 @@ production-hardened compliance platform.
     are withheld: with renamed commands a reply cannot be tied to its
     request). A credential word that is a bare name is not credential
     context, by an allowlist tied to the field's kind: in an HTTP/1 or
-    HTTP/2 request path, the last segment of a captured, printable-ASCII
-    path of letters-only segments with only plain `key=value` query
-    components (no `#`, `;` or other delimiter, no encoded key, and every
-    component whose key or decoded value holds a credential word
-    masked); in a MySQL or PostgreSQL statement, a projection item of
+    HTTP/2 request path, the last segment of a captured path part
+    (before any `?` or `#`) of ASCII letters-only segments, any query or
+    fragment after it replaced by `?<query withheld>`; in a MySQL or PostgreSQL statement, a projection item of
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on

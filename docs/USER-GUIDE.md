@@ -537,27 +537,20 @@ a body or an error message that reads `/oauth/token` or
 `SELECT password FROM users` is withheld.
 
 - **the last segment of an HTTP request path** (HTTP/1, HTTP/2), read
-  from the field as captured: the
-  whole field is printable ASCII (no space or other whitespace, no byte
-  outside ASCII, so no `U+00A0` or `U+2028` either); it starts with `/`;
-  every segment is a plain name (letters, `-`, `_`, `.`: no digit, `%`,
-  `+` or anything else value-like); the word is the last segment (no
-  trailing `/`); and the query, if any, is only `key=value` components,
-  each with a non-empty key and a non-empty value without `=` (no blank
-  or unkeyed component, no base64 padding), made only of
-  letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=` and `&` (no `#`,
-  `;`, `,` or other delimiter that could end or split the query), with
-  no `%` or `+` in a key. This is decided before any credential parameter
-  in the query is masked, and every component whose key or decoded value
-  holds a credential word in any form, or still holds a `%` once decoded,
-  must then have its value masked, or the field is withheld (so
-  `/oauth/token?client_secret=x` is exported masked, while
-  `/oauth/token?keyword=x`, `/reset/token?pwd%5B%5D=x` and
-  `/reset/token?next=%2Flogin%3Fpwd%3Dx` are withheld). So
-  `/oauth/token`, `/users/me/password` and `/oauth/token?scope=read` are
-  bare, while `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
-  `/oauth/token/`, `/token?abc123`, `/token?scope=read&abc123`,
-  `/oauth/token#x` and `https://host/oauth/token` are context;
+  on the path part as captured (the text before the first `?` or `#`):
+  it starts with `/`; every segment is a plain name (ASCII letters, `-`,
+  `_`, `.`: no digit, `%`, `+`, space, `U+00A0` or anything else); and
+  the word is the last segment (no trailing `/`). A query or fragment
+  after a bare path is never exported, whatever it holds: the path part
+  is followed by `?<query withheld>` (so `/oauth/token?client_secret=x`
+  and `/oauth/token?scope=read` both export as
+  `/oauth/token?<query withheld>`, and so does `/oauth/token#x`). So
+  `/oauth/token` and `/users/me/password` are bare, while
+  `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
+  `/oauth/token/` and `https://host/oauth/token` are context, and a
+  field whose path part is context is withheld whole, query included. A
+  path with no credential word keeps its query, with credential
+  parameters masked (`/login?password=<REDACTED>&q=1`);
 - **a projection item of an allowlisted `SELECT`** (a MySQL or
   PostgreSQL statement), read on its tokens as captured, with no comment
   marker (`--`, `#`, `/*`), double quote, backtick or backslash anywhere
@@ -675,10 +668,9 @@ What is exported then:
   dropped before export and before the name can reach the service graph.
 - **Bare names** are exported as written: an HTTP request path
   `/oauth/token` and a SQL statement `SELECT password, email FROM users`
-  (without bound values or error text). A credential parameter after a
-  bare path is masked:
-  `/oauth/token?client_secret=x` exports
-  `/oauth/token?client_secret=<REDACTED>`.
+  (without bound values or error text). The query or fragment after a
+  bare path is dropped: `/oauth/token?client_secret=x` exports
+  `/oauth/token?<query withheld>`.
 
 The price is more withheld text than a value-level mask would leave:
 a `SELECT` that compares a `password` column, names a credential word

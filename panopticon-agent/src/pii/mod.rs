@@ -670,7 +670,7 @@ impl PiiEngine {
         };
         field.zeroize();
         *field = protected;
-        if redact && matches!(decision, Decision::Mask(_)) {
+        if redact && matches!(decision, Decision::Mask(_) | Decision::Cut(..)) {
             let decoded = decode.then(|| percent_decode(field));
             let text = decoded.as_deref().unwrap_or(field.as_str());
             let redacted = self
