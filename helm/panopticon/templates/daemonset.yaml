@@ -63,7 +63,7 @@ spec:
           image: {{ include "panopticon.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            {{- if .Values.agent.interfaces }}
+            {{- if hasKey .Values.agent "interfaces" }}
             {{- fail "agent.interfaces was removed with the TC backend: capture covers every socket in the host's cgroup v2 hierarchy; select traffic with pid_filter, cgroup_filter or pod_filter in agent.config" }}
             {{- end }}
             - "--metrics-bind"
