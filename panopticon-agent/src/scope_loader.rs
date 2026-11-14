@@ -1356,6 +1356,7 @@ mod tests {
             Self {
                 strs: vec![0],
                 types: Vec::new(),
+                n: 0,
             }
         }
 
