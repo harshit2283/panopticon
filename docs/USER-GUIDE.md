@@ -543,8 +543,9 @@ a body or an error message that reads `/oauth/token` or
   every segment is a plain name (letters, `-`, `_`, `.`: no digit, `%`,
   `+` or anything else value-like); the word is the last segment (no
   trailing `/`); and the query, if any, is only `key=value` components,
-  each with a non-empty key (no blank or unkeyed component), and no `#`
-  appears anywhere (a fragment ends the query). This is
+  each with a non-empty key (no blank or unkeyed component), made only of
+  letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=` and `&` (no `#`,
+  `;`, `,` or other delimiter that could end or split the query). This is
   decided before any credential parameter in the query is masked. So
   `/oauth/token`, `/users/me/password` and `/oauth/token?scope=read` are
   bare, while `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,

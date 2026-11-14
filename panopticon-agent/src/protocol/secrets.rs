@@ -38,8 +38,9 @@
 //! - in an HTTP/1 or HTTP/2 request path: the last segment, when the raw
 //!   field is printable ASCII, every segment a plain name (`A`-`Z`,
 //!   `a`-`z`, `_`, `-`, `.`; no `%` or `+`), the query, if any, only
-//!   `key=value` components (decided before its credential parameters
-//!   are masked), no `#` anywhere, and the word ends in a whole credential part
+//!   `key=value` components of letters, digits, `-._~%+` (decided before
+//!   its credential parameters are masked; no `#`, `;` or other
+//!   delimiter), and the word ends in a whole credential part
 //!   (`access_token`, not `token_abc`) ([`path_last_segment`]);
 //! - in a MySQL or PostgreSQL statement: a projection item of
 //!   `SELECT item, ... FROM table [rest]` ([`select_list`]), read on the
@@ -250,8 +251,8 @@ fn context(text: &str, sql: bool, slot: Slot) -> bool {
 /// closed). The bounds are token bounds from [`words`].
 struct BareShapes {
     /// The last segment of a raw path made only of plain name segments,
-    /// followed by the end or a query of `key=value` parameters, with no
-    /// `#` ([`path_last_segment`]).
+    /// followed by the end or a query of plain `key=value` parameters
+    /// ([`path_last_segment`]).
     path: Option<(usize, usize)>,
     /// The select list of an allowlisted `SELECT` ([`select_list`]).
     select: Option<(usize, usize)>,
@@ -304,19 +305,17 @@ fn ends_in_a_credential_part(w: &str) -> bool {
 }
 
 /// On the RAW field, printable ASCII only (no space, no other whitespace,
-/// no byte past 0x7E) and no `#` anywhere: a path `/seg/.../seg` whose every segment is a
+/// no byte past 0x7E): a path `/seg/.../seg` whose every segment is a
 /// plain name (`A`-`Z`, `a`-`z`, `_`, `.`, `-`: no digit, `%` or `+`,
-/// nothing value-like), then the end or `?` and a query whose every `&`
-/// component is `key=value` with a non-empty key: the bounds of the last
-/// segment. Nothing in the path part is decoded, so the bounds are those
+/// nothing value-like), then the end or `?` and a query of only
+/// [`query_is_keyed`] components: the bounds of the last segment. Nothing in the path part is decoded, so the bounds are those
 /// of its word in the normalised view. `/oauth/token` and
 /// `/oauth/token?scope=read` qualify; `/reset/abc123/token`, `/v1/token`,
 /// `/reset/token/++++`, `/token/`, `/token?abc123`, `/token?x=1&abc123`,
-/// `/token?x=1&`, `/token?abc123#x=y` and `/token?x=a\u{a0}b` do not.
+/// `/token?x=1&`, `/token?abc123#x=y`, `/token?abc123;x=y` and
+/// `/token?x=a\u{a0}b` do not.
 fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
-    // No `#` anywhere: a fragment ends the query, so `?abc123#x=y` is not
-    // a keyed query.
-    if !b.iter().all(u8::is_ascii_graphic) || b.contains(&b'#') {
+    if !b.iter().all(u8::is_ascii_graphic) {
         return None;
     }
     let q = b.iter().position(|&c| c == b'?').unwrap_or(b.len());
@@ -337,13 +336,24 @@ fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
     last
 }
 
-/// Every `&` component of a raw query is `key=value` with a non-empty key
-/// (a blank component or unkeyed text is not).
+/// A raw query of only letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=`
+/// and `&`, whose every `&` component is `key=value` with a non-empty key
+/// (a blank component or unkeyed text is not). No other byte, so no other
+/// separator (`;`, `,`), fragment (`#`) or delimiter can hide an unkeyed
+/// component. A value may also be exactly [`REDACTED_CREDENTIAL`], so a
+/// masked path is decided the same way again.
 fn query_is_keyed(q: &[u8]) -> bool {
+    let plain = |s: &[u8]| {
+        s.iter()
+            .all(|c| c.is_ascii_alphanumeric() || b"-._~%+=".contains(c))
+    };
     q.split(|&c| c == b'&').all(|part| {
-        part.iter()
-            .position(|&c| c == b'=')
-            .is_some_and(|eq| eq > 0)
+        part.iter().position(|&c| c == b'=').is_some_and(|eq| {
+            let value = &part[eq + 1..];
+            eq > 0
+                && plain(&part[..eq])
+                && (plain(value) || value == REDACTED_CREDENTIAL.as_bytes())
+        })
     })
 }
 
@@ -1815,6 +1825,11 @@ mod tests {
             // Codex round 7: a fragment ends the query.
             "/reset/token?hunter2#x=y",
             "/reset/token?scope=read#hunter2",
+            // Codex round 8: any other separator or delimiter in the query.
+            "/reset/token?hunter2;x=y",
+            "/reset/token?scope=read;hunter2",
+            "/reset/token?scope=read,hunter2",
+            "/reset/token?x=y/hunter2",
             "/oauth/token;abc123",
             "/oauth/token/abc/",
             "/oauth/token abc123",
