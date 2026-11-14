@@ -25,7 +25,7 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 13] = [
+const TARGETS: [(&str, &str); 15] = [
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -39,6 +39,8 @@ const TARGETS: [(&str, &str); 13] = [
     ("tls_tcp_recvmsg_fentry", "tcp_recvmsg"),
     ("tls_tcp_sendmsg_scoped", "tcp_sendmsg"),
     ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
+    ("scope_mc_output", "ip_mc_output"),
+    ("scope_mc_output_ret", "ip_mc_output"),
 ];
 
 fn state(ebpf: &Ebpf, fd: &impl AsRawFd) -> Option<SockState> {
@@ -1777,6 +1779,92 @@ fn scope_programs_load_attach_and_hold() {
                     && closing.contains(&e.socket_cookie)),
             "no VRF close record once loopback is off"
         );
+
+        // Looped multicast and broadcast (§3.7, Codex VRF R3 finding 1): a
+        // sender on the slave (pvd0) with multicast loop on; ip_mc_output
+        // clones the packet for local delivery and the clone passes the
+        // egress hook on the slave before it is looped back. Off: the looped
+        // copy is not captured, the remote copy (multicast TTL > 0, or
+        // broadcast) is, the sender is not marked local, and the receiver
+        // (bound to the master; delivery on the master) is not captured.
+        // TTL 0 multicast has no remote copy. Broadcast is always looped and
+        // has no TTL-0 rule. On: every copy captured.
+        let hooked = {
+            let a: Array<&MapData, u32> =
+                Array::try_from(ebpf.map("NETDEV_OFFS").unwrap()).unwrap();
+            a.get(&NETDEV_MC_HOOKED, 0).unwrap()
+        };
+        assert_eq!(hooked, 1, "ip_mc_output fentry/fexit attached");
+        assert!(ip_cmd("link set pvd0 multicast on"));
+        let group = std::net::Ipv4Addr::new(224, 0, 0, 123);
+        let local = std::net::Ipv4Addr::new(10, 212, 0, 1);
+        let mrx = {
+            let s = bound(libc::SOCK_DGRAM, Some("pvrf"));
+            s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())
+                .unwrap();
+            s.join_multicast_v4(&group, &local).unwrap();
+            s.set_broadcast(true).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            UdpSocket::from(s)
+        };
+        let mport = mrx.local_addr().unwrap().port();
+        let mc_send = |to: std::net::Ipv4Addr, ttl: u32, msg: &[u8]| -> UdpSocket {
+            let s = bound(libc::SOCK_DGRAM, Some("pvd0"));
+            s.set_multicast_if_v4(&local).unwrap();
+            s.set_multicast_loop_v4(true).unwrap();
+            s.set_multicast_ttl_v4(ttl).unwrap();
+            s.set_broadcast(true).unwrap();
+            s.send_to(msg, &std::net::SocketAddr::from((to, mport)).into())
+                .unwrap();
+            let mut b = [0u8; 64];
+            let n = mrx.recv(&mut b).expect("the looped copy is delivered");
+            assert_eq!(&b[..n], msg);
+            UdpSocket::from(s)
+        };
+        let bcast = std::net::Ipv4Addr::new(10, 212, 0, 255);
+        let count = |ev: &[(u64, Direction, u64, Vec<u8>)], c: u64, m: &[u8]| {
+            ev.iter().filter(|e| e.0 == c && e.3 == m).count()
+        };
+        let cases: [(std::net::Ipv4Addr, u32, &[u8], usize); 3] = [
+            (group, 0, b"mc-ttl0", 0),
+            (group, 1, b"mc-ttl1", 1),
+            (bcast, 1, b"bcast", 1),
+        ];
+        for on in [false, true] {
+            set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, u64::from(on));
+            bump(&mut ebpf);
+            let _ = drain(&mut ring);
+            for (to, ttl, m, remote) in cases {
+                let msg = [m, if on { &b"-on"[..] } else { b"-off" }].concat();
+                let tx = mc_send(to, ttl, &msg);
+                let ev = drain(&mut ring);
+                let sent = count(&ev, cookie(&tx), &msg);
+                let rcvd = count(&ev, cookie(&mrx), &msg);
+                println!("MCLOOP {to} ttl={ttl} loopback={on}: sender {sent} receiver {rcvd}");
+                if on {
+                    // the looped copy and the remote one, and the receiver
+                    assert_eq!(
+                        sent,
+                        remote + 1,
+                        "{to} ttl {ttl}: every copy captured: {ev:?}"
+                    );
+                    assert_eq!(rcvd, 1, "{to} ttl {ttl}: receiver captured");
+                } else {
+                    assert_eq!(sent, remote, "{to} ttl {ttl}: only the remote copy: {ev:?}");
+                    assert_eq!(rcvd, 0, "{to} ttl {ttl}: receiver not captured");
+                    assert_eq!(
+                        crate::state(&ebpf, &tx).map(|s| s.local),
+                        Some(0),
+                        "{to} ttl {ttl}: sender not marked local"
+                    );
+                }
+            }
+        }
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+        bump(&mut ebpf);
+        drop(mrx);
+        println!("LOOPBACK VRF MCLOOP OK");
         set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
         bump(&mut ebpf);
         std::fs::write("/proc/sys/net/ipv4/udp_l3mdev_accept", l3_accept.trim()).unwrap();

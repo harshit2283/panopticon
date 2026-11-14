@@ -38,17 +38,19 @@ use panopticon_common::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
         DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE,
         FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY,
-        NETDEV_L3M_BYTE, NETDEV_L3M_MASK, NETDEV_SKB_DEV, OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE,
-        SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict, drop_reason,
-        head_take, in_sample, is_initialised, is_unscoped_full, local_packet, pid_inputs,
-        reserved_take, role_of, skb_stamp, stream_offset, tls_addr_in_scope, udp_should_reserve,
-        verdict, verdict_cacheable, verdict_word,
+        NETDEV_L3M_BYTE, NETDEV_L3M_MASK, NETDEV_L3S_BYTE, NETDEV_L3S_MASK, NETDEV_MC_HOOKED,
+        NETDEV_RT_FLAGS, NETDEV_SKB_DEV, NETDEV_SKB_HEAD, NETDEV_SKB_REFDST, OWNER_LISTED,
+        RTCF_MC_BC, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState,
+        VERDICT_IN, cached_verdict, drop_reason, head_take, in_sample, is_initialised,
+        is_unscoped_full, local_packet, pid_inputs, reserved_take, role_of, skb_stamp,
+        stream_offset, tls_addr_in_scope, udp_should_reserve, verdict, verdict_cacheable,
+        verdict_word,
     },
 };
 
 use crate::maps::{
-    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, count_kernel_drop,
-    count_scope_drop, shard_for, shard_reserve_as, shard_submit_flags_for,
+    CGROUP_ALLOW, CONFIG, IPV6_DROPS, MC_LOOP, MC_ORIG, NETDEV_OFFS, PID_FILTER, SizedEvent,
+    count_kernel_drop, count_scope_drop, shard_for, shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -575,11 +577,24 @@ fn on_tcp_close(ctx: &SockOpsContext) {
 /// and 4.18.
 #[inline(always)]
 fn on_vrf_master(skb: *const u8) -> bool {
-    let off = |i| NETDEV_OFFS.get(i).copied().unwrap_or(0);
+    dev_flag(skb, NETDEV_L3M_BYTE, NETDEV_L3M_MASK)
+}
+
+/// `NETDEV_OFFS` entry `i`, 0 if unreadable.
+#[inline(always)]
+fn netdev_off(i: u32) -> u32 {
+    NETDEV_OFFS.get(i).copied().unwrap_or(0)
+}
+
+/// Whether the packet's device has the `priv_flags` bit at `NETDEV_OFFS`
+/// entries `byte_i` and `mask_i`; a failed read, no device or an unwritten
+/// mask count as set (fails closed). Branch-free, see [`on_vrf_master`].
+#[inline(always)]
+fn dev_flag(skb: *const u8, byte_i: u32, mask_i: u32) -> bool {
     let (dev_off, byte_off, mask) = (
-        off(NETDEV_SKB_DEV),
-        off(NETDEV_L3M_BYTE),
-        off(NETDEV_L3M_MASK),
+        netdev_off(NETDEV_SKB_DEV),
+        netdev_off(byte_i),
+        netdev_off(mask_i),
     );
     let mut dev: u64 = 0;
     let mut b: u8 = 0;
@@ -603,6 +618,105 @@ fn on_vrf_master(skb: *const u8) -> bool {
     let unwritten = u64::from(mask.wrapping_sub(1) >> 31); // mask 0 (masks are 1..=128)
     let hit = u64::from(((u32::from(b) & mask) + 255) >> 8);
     (failed | null | unwritten | hit) != 0
+}
+
+/// Read `size` bytes at `src` into `dst`; the helper's return (negative on
+/// failure, the destination then zeroed).
+#[inline(always)]
+fn kread(dst: *mut c_void, size: u32, src: *const c_void) -> i64 {
+    unsafe { bpf_probe_read_kernel_raw(dst, size, src) }
+}
+
+/// Whether an egress packet is a looped copy of multicast or broadcast sent
+/// on a VRF slave (`IFF_L3MDEV_SLAVE`): local delivery inside the VRF that
+/// never reaches the master on its way out (§3.7). `ip_mc_output` clones
+/// the packet for local delivery and the clone passes this hook
+/// (`ip_mc_finish_output`) before it is looped back; the original, if it
+/// leaves (multicast TTL > 0, or broadcast), passes it too and is remote.
+/// With the `ip_mc_output` fentry/fexit pair attached (`NETDEV_MC_HOOKED`),
+/// the clone is the packet whose `head` is an in-flight call's original's
+/// (`MC_LOOP`) and which is not that original. Without it, every
+/// multicast/broadcast packet on a VRF slave counts (its route's
+/// `RTCF_BROADCAST | RTCF_MULTICAST`; fails closed, the remote copy too).
+/// A failed read counts as looped.
+#[inline(always)]
+fn looped_vrf_copy(skb: *const u8) -> bool {
+    if !dev_flag(skb, NETDEV_L3S_BYTE, NETDEV_L3S_MASK) {
+        return false;
+    }
+    if netdev_off(NETDEV_MC_HOOKED) == 0 {
+        let mut refdst: u64 = 0;
+        let mut flags: u32 = 0;
+        let r1 = kread(
+            &mut refdst as *mut u64 as *mut c_void,
+            8,
+            skb.wrapping_add(netdev_off(NETDEV_SKB_REFDST) as usize) as *const c_void,
+        );
+        // The low bit of `_skb_refdst` is SKB_DST_NOREF; `rtable.dst` is at 0.
+        let r2 = kread(
+            &mut flags as *mut u32 as *mut c_void,
+            4,
+            ((refdst & !1) as usize).wrapping_add(netdev_off(NETDEV_RT_FLAGS) as usize)
+                as *const c_void,
+        );
+        return (r1 | r2) < 0 || flags & RTCF_MC_BC != 0;
+    }
+    let mut head: u64 = 0;
+    let r = kread(
+        &mut head as *mut u64 as *mut c_void,
+        8,
+        skb.wrapping_add(netdev_off(NETDEV_SKB_HEAD) as usize) as *const c_void,
+    );
+    if r < 0 {
+        return true;
+    }
+    // This skb's own address as a number (the context pointer itself cannot
+    // be used as a map value or compared with one).
+    let me_ptr = skb;
+    let mut me: u64 = 0;
+    if kread(
+        &mut me as *mut u64 as *mut c_void,
+        8,
+        &me_ptr as *const *const u8 as *const c_void,
+    ) < 0
+    {
+        return true;
+    }
+    match unsafe { MC_LOOP.get(&head) } {
+        Some(&orig) => orig != me,
+        None => false,
+    }
+}
+
+/// `ip_mc_output(net, sk, skb)` entry: record the original's `head` while
+/// the call runs, so its looped clone is recognised at the egress hook.
+#[fentry(function = "ip_mc_output")]
+pub fn scope_mc_output(ctx: FEntryContext) -> i32 {
+    let skb: u64 = unsafe { ctx.arg(2) };
+    let mut head: u64 = 0;
+    if kread(
+        &mut head as *mut u64 as *mut c_void,
+        8,
+        (skb as usize).wrapping_add(netdev_off(NETDEV_SKB_HEAD) as usize) as *const c_void,
+    ) >= 0
+    {
+        let _ = MC_LOOP.insert(&head, &skb, 0);
+        let _ = MC_ORIG.insert(&skb, &head, 0);
+    }
+    0
+}
+
+/// `ip_mc_output` return: forget the call's entry (only if still its own).
+#[fexit(function = "ip_mc_output")]
+pub fn scope_mc_output_ret(ctx: FExitContext) -> i32 {
+    let skb: u64 = unsafe { ctx.arg(2) };
+    if let Some(&head) = unsafe { MC_ORIG.get(&skb) } {
+        if unsafe { MC_LOOP.get(&head) } == Some(&skb) {
+            let _ = MC_LOOP.remove(&head);
+        }
+        let _ = MC_ORIG.remove(&skb);
+    }
+    0
 }
 
 // ── accept: the acceptor, on the child only ────────────────────────────────
@@ -876,6 +990,16 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     // `local` flag (set by a concurrent packet) can change after it, so the
     // event is stamped `g0`, below.
     if lo && !capture_loopback() {
+        return drop(DROP_LOOPBACK);
+    }
+    // A looped multicast/broadcast copy on a VRF slave is VRF-local
+    // delivery too, but only that copy: the socket is not marked, so its
+    // remote copies stay captured.
+    if !lo
+        && direction == Direction::Egress
+        && !capture_loopback()
+        && looped_vrf_copy(skb as *const u8)
+    {
         return drop(DROP_LOOPBACK);
     }
     let mode = scope_mode();

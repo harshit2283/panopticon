@@ -48,11 +48,25 @@ pub fn count_scope_drop(reason: u32) {
 pub static CGROUP_ALLOW: HashMap<u64, u8> = HashMap::with_max_entries(MAX_CGROUP_ALLOW, 0);
 
 /// Where the capture hook reads the packet device's `IFF_L3MDEV_MASTER`
-/// bit (`scope::NETDEV_*`), from the kernel's BTF, written by the loader
-/// before the capture hooks attach. A zero mask means unwritten: every
-/// packet then counts as on a VRF master (fails closed).
+/// and `IFF_L3MDEV_SLAVE` bits and the fields that identify a looped
+/// multicast/broadcast copy (`scope::NETDEV_*`), from the kernel's BTF,
+/// written by the loader before the capture hooks attach. A zero mask
+/// means unwritten: every packet then counts as on a VRF master (fails
+/// closed).
 #[map]
 pub static NETDEV_OFFS: Array<u32> = Array::with_max_entries(NETDEV_OFFS_LEN, 0);
+
+/// In-flight `ip_mc_output` calls (DESIGN §3.7): the original skb's
+/// `head` (shared with the clone it loops back) → the original skb's
+/// address. Written at fentry, removed at fexit through [`MC_ORIG`]. An
+/// entry lives for one call, so the map never fills in practice; LRU
+/// evicts the oldest (a stale one) if it ever does.
+#[map]
+pub static MC_LOOP: LruHashMap<u64, u64> = LruHashMap::with_max_entries(16384, 0);
+
+/// The original skb's address → its `head` key in [`MC_LOOP`].
+#[map]
+pub static MC_ORIG: LruHashMap<u64, u64> = LruHashMap::with_max_entries(16384, 0);
 
 /// Zero the DataEvent fields only the cgroup_skb backend fills, so other
 /// producers never leak a previous event's values (ring memory and the
