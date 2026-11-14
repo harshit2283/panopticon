@@ -254,9 +254,11 @@ running config is kept.
   namespace and whenever it was created; it needs kernel BTF to locate
   those flags, and without it the `cgroup_skb` backend refuses to start.
   A packet whose device cannot be read is treated as on a VRF device
-  (dropped while this is off). Not covered: multicast or broadcast that
-  a sender inside a VRF loops back to local receivers is captured on
-  the sending side (the receiving side is dropped). A socket that once carried node-local
+  (dropped while this is off). Multicast or broadcast that a sender on
+  a VRF member interface loops back to local receivers: the sender's
+  looped copy is never seen (the kernel does not run the capture hook
+  for it), the copy that leaves is captured, and the local receiver's
+  copy arrives on the VRF device and is dropped while this is off. A socket that once carried node-local
   traffic stays dropped (an unconnected UDP socket that talked to a
   local and a remote peer). Set `capture_loopback = true` if you need
   those. Same-node pod-to-pod and host-to-pod traffic over veth, a
