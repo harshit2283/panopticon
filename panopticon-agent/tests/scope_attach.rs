@@ -1837,17 +1837,26 @@ fn scope_programs_load_attach_and_hold() {
             let _ = drain(&mut ring);
             for (to, ttl, m, remote) in cases {
                 let msg = [m, if on { &b"-on"[..] } else { b"-off" }].concat();
+                let all_drops =
+                    |e: &Ebpf| (0..SCOPE_DROP_REASONS).map(|r| drops(e, r)).sum::<u64>();
+                let d0 = all_drops(&ebpf);
                 let tx = mc_send(to, ttl, &msg);
                 let ev = drain(&mut ring);
+                let dropped = all_drops(&ebpf) - d0;
                 let sent = count(&ev, cookie(&tx), &msg);
                 let rcvd = count(&ev, cookie(&mrx), &msg);
-                println!("MCLOOP {to} ttl={ttl} loopback={on}: sender {sent} receiver {rcvd}");
+                println!(
+                    "MCLOOP {to} ttl={ttl} loopback={on}: sender {sent} receiver {rcvd} \
+                     scope_drops {dropped}"
+                );
                 if on {
-                    // the looped copy and the remote one, and the receiver
+                    // Measured: the looped clone never reaches the program
+                    // (skb_clone leaves skb->sk NULL; the egress runner
+                    // requires the skb's socket), so only the original.
+                    assert_eq!(sent, remote, "{to} ttl {ttl}: the original only: {ev:?}");
                     assert_eq!(
-                        sent,
-                        remote + 1,
-                        "{to} ttl {ttl}: every copy captured: {ev:?}"
+                        dropped, 0,
+                        "{to} ttl {ttl}: nothing dropped with loopback on"
                     );
                     assert_eq!(rcvd, 1, "{to} ttl {ttl}: receiver captured");
                 } else {
