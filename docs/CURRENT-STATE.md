@@ -225,7 +225,8 @@ production-hardened compliance platform.
     context, by an allowlist tied to the field's kind: in an HTTP/1 or
     HTTP/2 request path, the last segment of a captured, printable-ASCII
     path of letters-only segments with only plain `key=value` query
-    components (no `#`, `;` or other delimiter); in a MySQL or PostgreSQL statement, a projection item of
+    components (no `#`, `;` or other delimiter, no encoded key, and every
+    value under a key holding a credential word masked); in a MySQL or PostgreSQL statement, a projection item of
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on

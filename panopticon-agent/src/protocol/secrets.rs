@@ -10,7 +10,9 @@
 //! positions of a field of the right kind, is not context (see
 //! [`BareShapes`]); anything outside the allowlist is (fail closed). The
 //! bare name is exempt only from the residual check: the certain
-//! structures beside it are still masked ([`builtin_full`]).
+//! structures beside it are still masked, and beside a bare path every
+//! query value under a key with a credential hint must be one of them
+//! ([`builtin_full`]).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -40,7 +42,8 @@
 //! - in an HTTP/1 or HTTP/2 request path: the last segment, when the raw
 //!   field is printable ASCII, every segment a plain name (`A`-`Z`,
 //!   `a`-`z`, `_`, `-`, `.`; no `%` or `+`), the query, if any, only
-//!   `key=value` components of letters, digits, `-._~%+` (decided before
+//!   `key=value` components of letters, digits, `-._~%+` (no `%` or `+`
+//!   in a key; every value under a hinted key masked; decided before
 //!   its credential parameters are masked; no `#`, `;` or other
 //!   delimiter), and the word ends in a whole credential part
 //!   (`access_token`, not `token_abc`) ([`path_last_segment`]);
@@ -343,19 +346,40 @@ fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
 /// and a non-empty value with no `=` (a blank component, unkeyed text or
 /// base64 padding such as `aHVudGVyMg==` is not). No other byte, so no other
 /// separator (`;`, `,`), fragment (`#`) or delimiter can hide an unkeyed
-/// component. A value may also be exactly [`REDACTED_CREDENTIAL`], so a
-/// masked path is decided the same way again.
+/// component. A key is never encoded (no `%` or `+`), so it reads the same
+/// raw and decoded. A value may also be exactly [`REDACTED_CREDENTIAL`], so
+/// a masked path is decided the same way again.
 fn query_is_keyed(q: &[u8]) -> bool {
-    let plain = |s: &[u8]| {
+    let plain = |s: &[u8], extra: &[u8]| {
         !s.is_empty()
             && s.iter()
-                .all(|c| c.is_ascii_alphanumeric() || b"-._~%+".contains(c))
+                .all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(c) || extra.contains(c))
     };
     q.split(|&c| c == b'&').all(|part| {
         part.iter().position(|&c| c == b'=').is_some_and(|eq| {
             let value = &part[eq + 1..];
-            plain(&part[..eq]) && (plain(value) || value == REDACTED_CREDENTIAL.as_bytes())
+            plain(&part[..eq], b"")
+                && (plain(value, b"%+") || value == REDACTED_CREDENTIAL.as_bytes())
         })
+    })
+}
+
+/// Under a bare path, whether every query component whose key contains a
+/// credential hint ([`HINTS`], any form: `pwd.x`, `keyword`) has its value
+/// in `mask` (or already masked). Otherwise a value the masking rules do
+/// not cover could be exported beside the exempt name.
+fn hinted_values_masked(text: &str, mask: &[(usize, usize)]) -> bool {
+    let Some(q) = text.find('?') else {
+        return true;
+    };
+    let mut at = q + 1;
+    text[at..].split('&').all(|part| {
+        let eq = part.find('=').unwrap_or(part.len());
+        let (vs, ve) = (at + eq + 1, at + part.len());
+        at += part.len() + 1;
+        !has_hint(&part[..eq].to_ascii_lowercase())
+            || part[eq..].strip_prefix('=') == Some(REDACTED_CREDENTIAL)
+            || mask.iter().any(|&(s, e)| s <= vs && ve <= e)
     })
 }
 
@@ -732,7 +756,9 @@ fn user_spans(
 /// field withheld) when any context is left. The certain structures are
 /// masked whenever the strict scan sees context; the bare name of the
 /// field's kind is exempt only in the residual check, so exempting it
-/// never skips a credential parameter beside it (`?pwd%5B%5D=hunter2`).
+/// never skips a credential parameter beside it. Beside a bare path, a
+/// value under a hinted key that is not masked withholds the field
+/// ([`hinted_values_masked`]).
 fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     let slot = match kind {
         FieldKind::Other => Slot::None,
@@ -743,6 +769,9 @@ fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
         return Some(Vec::new());
     }
     let (mask, delete) = certain_clauses(text);
+    if matches!(slot, Slot::Path(Some(_))) && !hinted_values_masked(text, &mask) {
+        return None;
+    }
     let residual = remove(text, &delete);
     (!context(&residual, false, slot)).then_some(mask)
 }
@@ -1764,20 +1793,6 @@ mod tests {
                 "/oauth/token?x=1&password=a&y=2",
                 "/oauth/token?x=1&password=<REDACTED>&y=2",
             ),
-            // Codex round 9: a credential parameter the residual scan does
-            // not read as a name is still masked beside a bare path.
-            (
-                "/reset/token?pwd%5B%5D=hunter2",
-                "/reset/token?pwd%5B%5D=<REDACTED>",
-            ),
-            (
-                "/reset/token?session%5Bid%5D=abc123",
-                "/reset/token?session%5Bid%5D=<REDACTED>",
-            ),
-            (
-                "/reset/token?pin%5B%5D=739204",
-                "/reset/token?pin%5B%5D=<REDACTED>",
-            ),
         ] {
             assert_eq!(pk(text, FieldKind::HttpPath), want, "{text}");
             assert_eq!(pk(want, FieldKind::HttpPath), want, "{want}");
@@ -1852,6 +1867,17 @@ mod tests {
             "/reset/token?aHVudGVyMg==",
             "/reset/token?aHVudGVyMg=",
             "/reset/token?scope=",
+            // Codex round 10: an encoded key, or a hinted key whose value
+            // the masking rules do not cover.
+            "/reset/token?pwd%5Baccount%20name%5D=hunter2",
+            "/reset/token?pwd%5B%2A%5D=hunter2",
+            "/reset/token?%70wd=hunter2",
+            "/reset/token?pwd.x=hunter2",
+            "/oauth/token?keyword=hunter2",
+            // Codex round 9: an encoded key is not a bare path's query.
+            "/reset/token?pwd%5B%5D=hunter2",
+            "/reset/token?session%5Bid%5D=abc123",
+            "/reset/token?pin%5B%5D=739204",
             "/reset/token?x=y/hunter2",
             "/oauth/token;abc123",
             "/oauth/token/abc/",
