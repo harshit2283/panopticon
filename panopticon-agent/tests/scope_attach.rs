@@ -25,7 +25,7 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 15] = [
+const TARGETS: [(&str, &str); 13] = [
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -39,8 +39,6 @@ const TARGETS: [(&str, &str); 15] = [
     ("tls_tcp_recvmsg_fentry", "tcp_recvmsg"),
     ("tls_tcp_sendmsg_scoped", "tcp_sendmsg"),
     ("tls_tcp_recvmsg_scoped", "tcp_recvmsg"),
-    ("scope_mc_output", "ip_mc_output"),
-    ("scope_mc_output_ret", "ip_mc_output"),
 ];
 
 fn state(ebpf: &Ebpf, fd: &impl AsRawFd) -> Option<SockState> {
@@ -245,7 +243,7 @@ fn ifindex_of(dev: &str) -> u32 {
 /// The devices and namespaces this test creates. Removed at start (a run
 /// that panicked may have left them) and by [`LabGuard`] at the end, panic
 /// included.
-const LAB_LINKS: [&str; 4] = ["pvd0", "pvrf", "pnlo0", "pvfull"];
+const LAB_LINKS: [&str; 5] = ["pvd0", "pvrf", "pnlo0", "pvfull", "pmc0"];
 const LAB_NETNS: [&str; 4] = ["pnlo", "pnvrf", "pntask", "pnprobe"];
 
 fn lab_cleanup() {
@@ -1781,20 +1779,16 @@ fn scope_programs_load_attach_and_hold() {
         );
 
         // Looped multicast and broadcast (§3.7, Codex VRF R3 finding 1): a
-        // sender on the slave (pvd0) with multicast loop on; ip_mc_output
-        // clones the packet for local delivery and the clone passes the
-        // egress hook on the slave before it is looped back. Off: the looped
-        // copy is not captured, the remote copy (multicast TTL > 0, or
-        // broadcast) is, the sender is not marked local, and the receiver
-        // (bound to the master; delivery on the master) is not captured.
-        // TTL 0 multicast has no remote copy. Broadcast is always looped and
-        // has no TTL-0 rule. On: every copy captured.
-        let hooked = {
-            let a: Array<&MapData, u32> =
-                Array::try_from(ebpf.map("NETDEV_OFFS").unwrap()).unwrap();
-            a.get(&NETDEV_MC_HOOKED, 0).unwrap()
-        };
-        assert_eq!(hooked, 1, "ip_mc_output fentry/fexit attached");
+        // sender on the slave (pvd0) with multicast loop on. ip_mc_output
+        // clones the packet for local delivery, but the clone has no socket
+        // (skb_clone), so the egress runner does not run the program for it
+        // (BPF_CGROUP_RUN_PROG_INET_EGRESS requires the skb's socket): the
+        // sender has only the copy that leaves (multicast TTL > 0, or
+        // broadcast), loopback on or off, and is not marked local; nothing
+        // is dropped as loopback with it on. The receiver (bound to the
+        // master; delivery on the master) is dropped while off, captured
+        // while on. TTL 0 multicast has no leaving copy; broadcast is always
+        // looped and has no TTL-0 rule.
         assert!(ip_cmd("link set pvd0 multicast on"));
         let group = std::net::Ipv4Addr::new(224, 0, 0, 123);
         let local = std::net::Ipv4Addr::new(10, 212, 0, 1);
@@ -1891,6 +1885,68 @@ fn scope_programs_load_attach_and_hold() {
         let _ = ip("link del pvd0");
         assert!(ip("link del pvrf"));
         println!("LOOPBACK VRF OK");
+    }
+
+    // Looped multicast without a VRF (all five kernels): the same clone,
+    // on a plain dummy device. The sender has only the copy that leaves,
+    // loopback on or off (the clone never reaches the program); the looped
+    // copy's receive is on pmc0, not node-local, so it is captured.
+    {
+        assert!(
+            ip_cmd("link add pmc0 type dummy")
+                && ip_cmd("link set pmc0 multicast on")
+                && ip_cmd("addr add 10.213.0.1/24 dev pmc0")
+                && ip_cmd("link set pmc0 up"),
+            "dummy pmc0"
+        );
+        let group = std::net::Ipv4Addr::new(224, 0, 0, 124);
+        let local = std::net::Ipv4Addr::new(10, 213, 0, 1);
+        let prx = {
+            let s = bound(libc::SOCK_DGRAM, None);
+            s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())
+                .unwrap();
+            s.join_multicast_v4(&group, &local).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            UdpSocket::from(s)
+        };
+        let pport = prx.local_addr().unwrap().port();
+        for on in [false, true] {
+            set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, u64::from(on));
+            bump(&mut ebpf);
+            let _ = drain(&mut ring);
+            for (ttl, remote) in [(0u32, 0usize), (1, 1)] {
+                let msg = format!("plain-mc-ttl{ttl}-{on}").into_bytes();
+                let s = bound(libc::SOCK_DGRAM, Some("pmc0"));
+                s.set_multicast_if_v4(&local).unwrap();
+                s.set_multicast_loop_v4(true).unwrap();
+                s.set_multicast_ttl_v4(ttl).unwrap();
+                s.send_to(&msg, &std::net::SocketAddr::from((group, pport)).into())
+                    .unwrap();
+                let mut b = [0u8; 64];
+                let n = prx.recv(&mut b).expect("the looped copy is delivered");
+                assert_eq!(&b[..n], &msg[..]);
+                let tx = UdpSocket::from(s);
+                let ev = drain(&mut ring);
+                let sent = ev
+                    .iter()
+                    .filter(|e| e.0 == cookie(&tx) && e.3 == msg)
+                    .count();
+                let rcvd = ev
+                    .iter()
+                    .filter(|e| e.0 == cookie(&prx) && e.3 == msg)
+                    .count();
+                println!("MCPLAIN ttl={ttl} loopback={on}: sender {sent} receiver {rcvd}");
+                assert_eq!(
+                    sent, remote,
+                    "plain ttl {ttl}: the leaving copy only: {ev:?}"
+                );
+                assert_eq!(rcvd, 1, "plain ttl {ttl}: the receive on pmc0 captured");
+            }
+        }
+        drop(prx);
+        assert!(ip_cmd("link del pmc0"));
+        println!("LOOPBACK MCPLAIN OK");
     }
 
     // On again (a widening): loopback captured, TLS on it too.

@@ -145,32 +145,15 @@ pub const SCOPE_DROP_NAMES: [&str; SCOPE_DROP_REASONS as usize] = [
 pub const LOOPBACK_IFINDEX: u32 = 1;
 
 /// `NETDEV_OFFS` indices: where the capture hook finds the device's
-/// `IFF_L3MDEV_MASTER` and `IFF_L3MDEV_SLAVE` bits and what identifies a
-/// looped multicast/broadcast copy (DESIGN §3.7), written by the loader
-/// from the kernel's BTF before the capture hooks attach.
+/// `IFF_L3MDEV_MASTER` bit (DESIGN §3.7), written by the loader from the
+/// kernel's BTF before the capture hooks attach.
 /// `sk_buff.dev` byte offset.
 pub const NETDEV_SKB_DEV: u32 = 0;
-/// Byte offset in `net_device` of the `priv_flags` byte holding
-/// `IFF_L3MDEV_MASTER`.
+/// Byte offset in `net_device` of the `priv_flags` byte holding the bit.
 pub const NETDEV_L3M_BYTE: u32 = 1;
 /// The bit's mask within that byte; 0 means not written (fails closed).
 pub const NETDEV_L3M_MASK: u32 = 2;
-/// The same for `IFF_L3MDEV_SLAVE` (a VRF slave).
-pub const NETDEV_L3S_BYTE: u32 = 3;
-pub const NETDEV_L3S_MASK: u32 = 4;
-/// `sk_buff.head` byte offset (shared by a clone and its original).
-pub const NETDEV_SKB_HEAD: u32 = 5;
-/// `sk_buff._skb_refdst` byte offset (the `dst_entry`, low bit a flag).
-pub const NETDEV_SKB_REFDST: u32 = 6;
-/// `rtable.rt_flags` byte offset (`rtable.dst` is at 0).
-pub const NETDEV_RT_FLAGS: u32 = 7;
-/// 1 once the `ip_mc_output` fentry/fexit pair is attached, so looped
-/// copies are recognised exactly; 0: every multicast/broadcast egress on a
-/// VRF slave counts as looped (fails closed).
-pub const NETDEV_MC_HOOKED: u32 = 8;
-pub const NETDEV_OFFS_LEN: u32 = 9;
-/// `RTCF_BROADCAST | RTCF_MULTICAST` (uapi `linux/in_route.h`).
-pub const RTCF_MC_BC: u32 = 0x1000_0000 | 0x2000_0000;
+pub const NETDEV_OFFS_LEN: u32 = 3;
 
 /// Whether a data packet travels a node-local path (DESIGN §3.7), from
 /// what the cgroup hook sees, never from addresses:

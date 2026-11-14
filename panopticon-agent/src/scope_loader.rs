@@ -17,9 +17,7 @@ use aya::{
     programs::{CgroupAttachMode, CgroupSkbAttachType, ProgramError},
 };
 use panopticon_common::CONFIG_SCOPE_ARMED;
-use panopticon_common::scope::{
-    NETDEV_L3S_BYTE, NETDEV_MC_HOOKED, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, SCOPE_SEL_PID,
-};
+use panopticon_common::scope::{SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, SCOPE_SEL_PID};
 use tracing::{info, warn};
 
 /// What the configured mode needs from the kernel.
@@ -39,9 +37,6 @@ pub const SOCK_CREATE: &str = "scope_sock_create";
 pub const SOCKOPS: &str = "scope_sockops";
 pub const ACCEPT4: &str = "scope_accept4";
 pub const ACCEPT2: &str = "scope_accept2";
-/// The `ip_mc_output` fentry/fexit pair that identifies a looped
-/// multicast/broadcast copy (DESIGN §3.7).
-pub const MC_LOOP_PROGRAMS: [&str; 2] = ["scope_mc_output", "scope_mc_output_ret"];
 /// The kTLS key-install markers (DESIGN §3.5), `(function, variants)`:
 /// `sock_common_setsockopt` (and `compat_sock_common_setsockopt` where the
 /// kernel has it, before 5.9 with CONFIG_COMPAT), each with the one variant
@@ -321,16 +316,8 @@ fn lists_symbol(r: impl std::io::BufRead, name: &str) -> bool {
 pub fn write_netdev_offsets(ebpf: &mut Ebpf) -> Result<[u32; 3]> {
     let raw = std::fs::read("/sys/kernel/btf/vmlinux").context("kernel BTF")?;
     let offs = netdev_offsets(&raw).context("IFF_L3MDEV_MASTER location from kernel BTF")?;
-    let mc =
-        mc_offsets(&raw).context("VRF slave flag and multicast loop fields from kernel BTF")?;
     let mut a: aya::maps::Array<_, u32> =
         aya::maps::Array::try_from(ebpf.map_mut("NETDEV_OFFS").context("NETDEV_OFFS map")?)?;
-    // NETDEV_MC_HOOKED (8) stays 0 here: the looped-copy fallback (fails
-    // closed) until `attach_mc_loop` attaches the ip_mc_output pair.
-    a.set(NETDEV_MC_HOOKED, 0, 0)?;
-    for (i, o) in mc.into_iter().enumerate() {
-        a.set(NETDEV_L3S_BYTE + i as u32, o, 0)?;
-    }
     for (i, o) in offs.into_iter().enumerate() {
         a.set(i as u32, o, 0)?;
     }
@@ -338,55 +325,9 @@ pub fn write_netdev_offsets(ebpf: &mut Ebpf) -> Result<[u32; 3]> {
         skb_dev = offs[0],
         flag_byte = offs[1],
         flag_mask = offs[2],
-        slave_byte = mc[0],
-        slave_mask = mc[1],
-        skb_head = mc[2],
-        skb_refdst = mc[3],
-        rt_flags = mc[4],
-        "VRF master and slave flags located"
+        "VRF master flag located"
     );
     Ok(offs)
-}
-
-/// Attach the `ip_mc_output` fentry/fexit pair that identifies a looped
-/// multicast/broadcast copy exactly (§3.7), then set `NETDEV_MC_HOOKED`.
-/// Called after [`write_netdev_offsets`] and before the capture hooks.
-/// If either program does not load or attach, the flag stays 0 and the
-/// capture hook drops every multicast/broadcast egress on a VRF slave while
-/// loopback is off (fails closed, on this host only), which is logged.
-/// Returns whether the pair is attached.
-pub fn attach_mc_loop(ebpf: &mut Ebpf, cgroup: &File, links: &mut Links) -> bool {
-    let mut attach = || -> Result<()> {
-        for p in MC_LOOP_PROGRAMS {
-            load_program(ebpf, p, Some("ip_mc_output"))?;
-        }
-        for p in MC_LOOP_PROGRAMS {
-            attach_program(ebpf, p, cgroup, links)?;
-        }
-        let mut a: aya::maps::Array<_, u32> =
-            aya::maps::Array::try_from(ebpf.map_mut("NETDEV_OFFS").context("NETDEV_OFFS map")?)?;
-        a.set(NETDEV_MC_HOOKED, 1, 0)?;
-        Ok(())
-    };
-    match attach() {
-        Ok(()) => {
-            // A call already inside ip_mc_output when the pair attached has
-            // no entry; let such calls finish before the capture hooks
-            // attach (ponytail: a bounded wait, not a proof; see §3.7).
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            info!("ip_mc_output hooks attached: looped VRF multicast/broadcast copies recognised");
-            true
-        }
-        Err(e) => {
-            warn!(
-                error = %format!("{e:#}"),
-                "ip_mc_output hooks unavailable: while capture_loopback = false, every \
-                 multicast/broadcast packet sent on a VRF slave is dropped (counted \
-                 loopback), remote copies included"
-            );
-            false
-        }
-    }
 }
 
 /// `[sk_buff.dev byte offset, byte offset in net_device of the priv_flags
@@ -438,76 +379,6 @@ fn netdev_offsets(raw: &[u8]) -> Result<[u32; 3]> {
     }
     let mask = 1u32 << (bit % 8);
     Ok([dev_bits / 8, bit / 8, mask])
-}
-
-/// `[byte and mask of IFF_L3MDEV_SLAVE in net_device (as for the master
-/// bit), sk_buff.head, sk_buff._skb_refdst, rtable.rt_flags]` byte offsets
-/// (`scope::NETDEV_L3S_BYTE` on), with the same strictness as
-/// [`netdev_offsets`]: `head` a byte-aligned pointer, `_skb_refdst` an
-/// 8-byte and `rt_flags` a 4-byte full-width integer, `rtable.dst` a
-/// `struct dst_entry` at offset 0, each member unique.
-fn mc_offsets(raw: &[u8]) -> Result<[u32; 5]> {
-    let btf = RawBtf::parse(raw)?;
-    netdev_offsets(raw)?; // the same sk_buff.dev -> net_device checks
-    let skb = btf.struct_by_name("sk_buff").context("struct sk_buff")?;
-    let (_, _, dev_t) = btf.member(skb, "dev", 0).context("member sk_buff.dev")?;
-    let nd = btf.pointee(dev_t).context("sk_buff.dev is not a pointer")?;
-    let (slave_byte, slave_mask) = flag_bit(&btf, nd, "IFF_L3MDEV_SLAVE")?;
-    let (head_bits, head_bf, head_t) = btf.member(skb, "head", 0).context("member sk_buff.head")?;
-    if head_bf != 0 || head_bits % 8 != 0 || btf.pointee(head_t).is_none() {
-        bail!("sk_buff.head is not a byte-aligned pointer");
-    }
-    let refdst = int_member(&btf, skb, "_skb_refdst", 8)?;
-    let rt = btf.struct_by_name("rtable").context("struct rtable")?;
-    let (dst_bits, dst_bf, dst_t) = btf.member(rt, "dst", 0).context("member rtable.dst")?;
-    let dst_s = btf.strip(dst_t).context("rtable.dst type")?;
-    let (dk, dn, ..) = &btf.types[dst_s as usize];
-    if dst_bits != 0 || dst_bf != 0 || *dk != BTF_STRUCT || btf.name(*dn) != b"dst_entry" {
-        bail!("rtable.dst is not a struct dst_entry at offset 0");
-    }
-    let rt_flags = int_member(&btf, rt, "rt_flags", 4)?;
-    Ok([slave_byte, slave_mask, head_bits / 8, refdst, rt_flags])
-}
-
-/// (byte, mask) of enumerator `name`'s bit in `net_device.priv_flags`
-/// (`nd`), checked as in [`netdev_offsets`].
-fn flag_bit(btf: &RawBtf, nd: u32, name: &str) -> Result<(u32, u32)> {
-    let (pf_bits, pf_bf, pf_t) = btf
-        .member(nd, "priv_flags", 0)
-        .context("member net_device.priv_flags")?;
-    let (int_size, int_off, int_bits) = btf
-        .int_info(pf_t)
-        .context("net_device.priv_flags is not an integer")?;
-    if int_off != 0 || int_bits != int_size * 8 || pf_bf > int_bits {
-        bail!("net_device.priv_flags has an unsupported integer encoding");
-    }
-    let width = if pf_bf != 0 { pf_bf } else { int_bits };
-    let val = btf
-        .enumerator(name)
-        .with_context(|| format!("enumerator {name}"))?;
-    if !val.is_power_of_two() || val.trailing_zeros() >= width {
-        bail!("{name} ({val:#x}) is not a single bit of priv_flags");
-    }
-    let bit = pf_bits + val.trailing_zeros();
-    if bit / 8 >= btf.types[nd as usize].3 {
-        bail!("{name} byte lies outside struct net_device");
-    }
-    Ok((bit / 8, 1u32 << (bit % 8)))
-}
-
-/// Byte offset of `name`, a byte-aligned full-width `size`-byte integer
-/// member (not a bitfield) of struct `id`.
-fn int_member(btf: &RawBtf, id: u32, name: &str, size: u32) -> Result<u32> {
-    let (bits, bf, t) = btf
-        .member(id, name, 0)
-        .with_context(|| format!("member {name}"))?;
-    let (isz, ioff, ibits) = btf
-        .int_info(t)
-        .with_context(|| format!("{name} is not an integer"))?;
-    if bf != 0 || bits % 8 != 0 || isz != size || ioff != 0 || ibits != size * 8 {
-        bail!("{name} is not a byte-aligned {size}-byte integer");
-    }
-    Ok(bits / 8)
 }
 
 const BTF_INT: u32 = 1;
@@ -957,7 +828,6 @@ pub fn attach_disarmed(
     // The capture hooks classify VRF masters from the packet's device
     // (§3.7): its flag's location is written before they attach.
     write_netdev_offsets(ebpf).context("refusing to start")?;
-    attach_mc_loop(ebpf, &cgroup, links);
     let mut exit_attached = false;
     for (p, required) in order {
         match attach_program(ebpf, p, &cgroup, links) {
@@ -1738,68 +1608,6 @@ mod tests {
         b.ty(4, "net_device", false, 64, &[pf, 1, 64, 0, 3, 192], 2); // 4
         let blob = skb_btf(&mut b, 4, 1 << 18);
         assert!(netdev_offsets(&blob).is_err(), "direct and promoted");
-    }
-
-    /// sk_buff { *net_device dev @16; u8 *head @24; u64 _skb_refdst @32 },
-    /// net_device { u32 priv_flags @8 }, rtable { dst_entry dst @`dst_at`;
-    /// u32 rt_flags @20 }, IFF_L3MDEV_MASTER = 1 << 18, IFF_L3MDEV_SLAVE =
-    /// 1 << 21; `head_ptr = false` makes `head` an integer.
-    fn mc_btf(dst_at: u32, head_ptr: bool) -> Vec<u8> {
-        let mut b = BtfBuilder::new();
-        let (dev, head, rd, pf, x) = (
-            b.s("dev"),
-            b.s("head"),
-            b.s("_skb_refdst"),
-            b.s("priv_flags"),
-            b.s("x"),
-        );
-        let (dst, rtf, im, is) = (
-            b.s("dst"),
-            b.s("rt_flags"),
-            b.s("IFF_L3MDEV_MASTER"),
-            b.s("IFF_L3MDEV_SLAVE"),
-        );
-        b.ty(1, "int", false, 4, &[32], 0); // 1
-        b.ty(1, "u64", false, 8, &[64], 0); // 2
-        b.ty(1, "u8", false, 1, &[8], 0); // 3
-        b.ty(4, "net_device", false, 16, &[pf, 1, 64], 1); // 4
-        b.ty(2, "", false, 4, &[], 0); // 5: *net_device
-        b.ty(2, "", false, 3, &[], 0); // 6: *u8
-        let head_t = if head_ptr { 6 } else { 2 };
-        b.ty(
-            4,
-            "sk_buff",
-            false,
-            64,
-            &[dev, 5, 128, head, head_t, 192, rd, 2, 256],
-            3,
-        ); // 7
-        b.ty(4, "dst_entry", false, 16, &[x, 1, 0], 1); // 8
-        b.ty(4, "rtable", false, 32, &[dst, 8, dst_at, rtf, 1, 160], 2); // 9
-        b.ty(
-            6,
-            "netdev_priv_flags",
-            false,
-            4,
-            &[im, 1 << 18, is, 1 << 21],
-            2,
-        ); // 10
-        b.build(1)
-    }
-
-    #[test]
-    fn btf_mc_loop_offsets() {
-        // slave bit 64 + 21 = 85: byte 10, mask 1 << 5.
-        assert_eq!(mc_offsets(&mc_btf(0, true)).unwrap(), [10, 32, 24, 32, 20]);
-        assert_eq!(netdev_offsets(&mc_btf(0, true)).unwrap(), [16, 10, 4]);
-        assert!(
-            mc_offsets(&mc_btf(64, true)).is_err(),
-            "rtable.dst not at 0"
-        );
-        assert!(
-            mc_offsets(&mc_btf(0, false)).is_err(),
-            "sk_buff.head not a pointer"
-        );
     }
 
     #[test]
