@@ -221,10 +221,12 @@ production-hardened compliance platform.
     credential commands and replies are masked before the same rule (so
     `AUTH` stays readable, as does `CONFIG GET requirepass`, but its reply
     is withheld). A credential word that is a bare name is not credential
-    context: the last segment of a path of plain name segments, a column
-    of a simple `SELECT` list (exported without bound values), or a
-    `CONFIG GET` parameter; anything not proven a name is withheld as
-    before.
+    context: the last segment of a captured path of letters-only segments
+    with only `key=value` query components, a column of a simple
+    undecoded `SELECT` list (exported without bound values or error
+    text), or a `CONFIG GET` parameter whose reply proves it a name;
+    anything not proven a name is withheld as before. A letters-only
+    segment before the word (`/reset/abcdef/token`) is a known limit.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):
     not on connections open before the agent started, nor over TLS.

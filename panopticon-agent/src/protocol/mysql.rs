@@ -109,8 +109,9 @@ pub struct MysqlParser {
     skip_defs: VecDeque<DefSkip>,
     /// Bound parameter values of the EXECUTE in flight.
     param_text: Option<String>,
-    /// The last statement built had credential context and was withheld.
-    statement_withheld: bool,
+    /// The last statement built names a credential (bare names included):
+    /// its error text is withheld ([`super::export_error_text`]).
+    error_withheld: bool,
 }
 
 impl MysqlParser {
@@ -130,7 +131,7 @@ impl MysqlParser {
             preparing: None,
             skip_defs: VecDeque::new(),
             param_text: None,
-            statement_withheld: false,
+            error_withheld: false,
         }
     }
 
@@ -563,7 +564,7 @@ impl MysqlParser {
                 if payload.len() > text_at {
                     // A parse error (1064) echoes the statement, secret included.
                     let text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
-                    m.payload_text = Some(super::export_error_text(text, self.statement_withheld));
+                    m.payload_text = Some(super::export_error_text(text, self.error_withheld));
                 }
                 Some(m)
             }
@@ -636,14 +637,14 @@ impl MysqlParser {
         let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
         let bound = self.param_text.take();
-        self.statement_withheld = false;
+        self.error_withheld = false;
         match self.query_text.take() {
             Some(q) => {
                 let (verb, shown, bound, withheld) = super::export_statement(q, bound);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(shown);
                 msg.request_text = bound;
-                self.statement_withheld = withheld;
+                self.error_withheld = withheld;
             }
             None => msg.request_text = bound,
         }

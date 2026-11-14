@@ -30,22 +30,24 @@
 //!
 //! A bare name is a word in a position a grammar proves holds a name and
 //! nothing next to it a value, on a view from which no NUL was dropped,
-//! and with no digit: (a) the last segment of a path whose every segment
-//! is a plain name (`a`-`z`, `_`, `-`, `.`) and whose query, if any, is
-//! only `name=value` parameters ([`path_last_segment`]); (b) a column of
-//! the select list of a simple `SELECT` with no comment marker
-//! ([`simple_select`]: columns, one table, `WHERE` comparisons with
-//! numbers, parameters or plain string literals, `ORDER BY`, `LIMIT`; no
-//! quotes but `'`, no join, alias, subquery, row, cast or other query);
-//! (c) a field its parser proved holds a name, not a value, when it is one
-//! word (a Redis `CONFIG GET` parameter: [`decide_name`]). In (a) and (c)
-//! the word must also end in a whole credential part (`access_token`, not
-//! `token_abc`). So `/oauth/token`, `SELECT password, email FROM users`
-//! and `CONFIG GET requirepass` are not context, while
-//! `/reset/token/abc123`, `WHERE password = 'x'`, `token abc123`,
-//! `hunter2 is my password` and a Redis value `swordfish_password` are.
-//! A SQL statement exported this way loses its bound values. DNS names
-//! keep the strict rule ([`has_any_credential_context`]).
+//! and with no digit: (a) the last segment of a path, read on the raw
+//! field, whose every segment is a plain name (`A`-`Z`, `a`-`z`, `_`,
+//! `-`, `.`; no `%` or `+`) and whose query, if any, is only `key=value`
+//! components ([`path_last_segment`]); (b) a column of the select list of
+//! a simple `SELECT` with no comment marker, no `\`, `"` or backtick, and
+//! nothing decoding would change ([`simple_select`]: columns, one table,
+//! `WHERE` comparisons with numbers, parameters or plain string literals,
+//! `ORDER BY`, `LIMIT`; no join, alias, subquery, row, cast or other
+//! query); (c) a one-word field its parser proved holds a name, not a
+//! value (a Redis `CONFIG GET` parameter its reply confirms:
+//! [`decide_name`]). In (a) and (c) the word must also end in a whole
+//! credential part (`access_token`, not `token_abc`). So `/oauth/token`,
+//! `SELECT password, email FROM users` and `CONFIG GET requirepass` are
+//! not context, while `/reset/token/abc123`, `/reset/token/++++`,
+//! `WHERE password = 'x'`, `token abc123`, `hunter2 is my password` and a
+//! Redis value `swordfish_password` are. A SQL statement exported this
+//! way loses its bound values and its error text. DNS names keep the
+//! strict rule ([`has_any_credential_context`]).
 //!
 //! The certain structures, on the raw text: a query or form parameter
 //! (`name=value` at the start of the text or after `?` or `&`), a JSON
@@ -173,7 +175,8 @@ enum Slot {
     /// of a simple `SELECT` list.
     Field,
     /// A field its parser proved holds a name, not a value (a Redis
-    /// `CONFIG GET` parameter): also a bare name when it is one word.
+    /// `CONFIG GET` parameter its reply confirms): also a bare name when it
+    /// is one word.
     Name,
 }
 
@@ -214,8 +217,9 @@ fn context(text: &str, sql: bool, slot: Slot) -> bool {
 struct BareShapes {
     /// A one-word field in a [`Slot::Name`].
     name: Option<(usize, usize)>,
-    /// The last segment of a path made only of plain name segments,
-    /// followed by nothing, `/`, or a query of `name=value` parameters.
+    /// The last segment of a raw path made only of plain name segments,
+    /// followed by the end or a query of `key=value` parameters
+    /// ([`path_last_segment`]).
     path: Option<(usize, usize)>,
     /// The select list of a simple `SELECT` ([`simple_select`]).
     select: Option<(usize, usize)>,
@@ -229,10 +233,14 @@ impl BareShapes {
         let tend = n.trim_end().len().max(lead);
         let t = &b[lead..tend];
         let word = !t.is_empty() && t.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_');
+        // The SQL grammar reads the decoded view: only when it is the raw
+        // statement (case and `-` `.` aside), with no string or identifier
+        // syntax that differs by dialect or setting.
+        let plain_sql = !v.comment && !v.decoded && !raw.contains(['\\', '"', '`']);
         BareShapes {
             name: (slot == Slot::Name && word).then_some((lead, tend)),
-            path: path_last_segment(b, lead, tend),
-            select: (!v.comment && sql_verb(raw) == Some("SELECT"))
+            path: path_last_segment(raw.as_bytes()),
+            select: (plain_sql && sql_verb(raw) == Some("SELECT"))
                 .then(|| simple_select(&b[..tend]))
                 .flatten(),
         }
@@ -266,51 +274,42 @@ fn ends_in_a_credential_part(w: &str) -> bool {
     ends_in(w) || w.strip_suffix('s').is_some_and(ends_in)
 }
 
-/// A path whose every segment is a plain name (`a`-`z`, `_`; `-` and `.`
-/// read as `_`, so no digit and nothing value-like), optionally ending in
-/// `/`, then the end or `?` and a query whose every `&` component is
-/// `name=value` (value without spaces) or blank (a parameter the masking
-/// removed): the bounds of its last segment. `/oauth/token` and
+/// On the RAW field: a path `/seg/.../seg` whose every segment is a plain
+/// name (`A`-`Z`, `a`-`z`, `_`, `.`, `-`: no digit, `%` or `+`, nothing
+/// value-like), then the end or `?` and a query whose every `&` component
+/// is `key=value` with a non-empty key and no whitespace: the bounds of the
+/// last segment. Nothing in the path part is decoded, so the bounds are
+/// those of its word in the normalised view. `/oauth/token` and
 /// `/oauth/token?scope=read` qualify; `/reset/abc123/token`, `/v1/token`,
-/// `/token?abc123` and `/token?x=1&abc123` do not.
-fn path_last_segment(b: &[u8], lead: usize, tend: usize) -> Option<(usize, usize)> {
-    let q = b[lead..tend]
-        .iter()
-        .position(|&c| c == b'?')
-        .map_or(tend, |o| lead + o);
-    let mut p = &b[lead..q];
-    p = p.strip_prefix(b"/")?;
-    p = p.strip_suffix(b"/").unwrap_or(p);
-    let mut start = lead + 1;
+/// `/reset/token/++++`, `/token/`, `/token?abc123`, `/token?x=1&abc123`
+/// and `/token?x=1&` do not.
+fn path_last_segment(b: &[u8]) -> Option<(usize, usize)> {
+    let q = b.iter().position(|&c| c == b'?').unwrap_or(b.len());
+    let p = b[..q].strip_prefix(b"/")?;
+    let mut start = 1;
     let mut last = None;
     for seg in p.split(|&c| c == b'/') {
-        if seg.is_empty() || !seg.iter().all(|&c| c.is_ascii_lowercase() || c == b'_') {
+        let plain = |c: &u8| c.is_ascii_alphabetic() || matches!(c, b'_' | b'.' | b'-');
+        if seg.is_empty() || !seg.iter().all(plain) {
             return None;
         }
         last = Some((start, start + seg.len()));
         start += seg.len() + 1;
     }
-    if q < tend && !query_is_certain(&b[q + 1..tend]) {
+    if q < b.len() && !query_is_keyed(&b[q + 1..]) {
         return None;
     }
     last
 }
 
-/// Every `&` component of a query is `name=value` (name of word bytes,
-/// value without whitespace) or blank.
-fn query_is_certain(q: &[u8]) -> bool {
+/// Every `&` component of a raw query is `key=value`: a non-empty key and
+/// no whitespace (a blank component, unkeyed text or a space is not).
+fn query_is_keyed(q: &[u8]) -> bool {
     q.split(|&c| c == b'&').all(|part| {
-        if part.iter().all(u8::is_ascii_whitespace) {
-            return true;
-        }
-        let Some(eq) = part.iter().position(|&c| c == b'=') else {
-            return false;
-        };
-        eq > 0
-            && part[..eq]
-                .iter()
-                .all(|&c| c.is_ascii_alphanumeric() || c == b'_')
-            && !part[eq + 1..].iter().any(u8::is_ascii_whitespace)
+        part.iter()
+            .position(|&c| c == b'=')
+            .is_some_and(|eq| eq > 0)
+            && !part.iter().any(u8::is_ascii_whitespace)
     })
 }
 
@@ -417,9 +416,11 @@ fn simple_select(b: &[u8]) -> Option<(usize, usize)> {
     k += 1;
     // A column, not the table's row (`users`, or `users` of `public.users`).
     let column = |k: usize| {
+        if kind(k) != Some(Tok::Word) {
+            return false;
+        }
         let c = text(k);
-        kind(k) == Some(Tok::Word)
-            && !c[0].is_ascii_digit()
+        !c[0].is_ascii_digit()
             && table != c
             && !(table.ends_with(c) && table[table.len() - c.len() - 1] == b'_')
     };
@@ -548,8 +549,8 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
 }
 
 /// [`decide`] with the built-in rules, for a field its parser proved holds
-/// a name, not a value (a Redis `CONFIG GET` parameter): a one-word field
-/// is then a bare name.
+/// a name, not a value (a Redis `CONFIG GET` parameter its reply
+/// confirms): a one-word field is then a bare name.
 pub fn decide_name(rules: &CredentialRules, text: &str) -> Decision {
     decide_in(rules, text, Some(Slot::Name))
 }
@@ -778,6 +779,9 @@ fn normalize(text: &str) -> String {
 /// The normalised view of a field.
 struct View {
     text: String,
+    /// Decoding changed the text (escapes, entities, percent-encoding,
+    /// `+` or NUL bytes).
+    decoded: bool,
     /// Decoding dropped a NUL byte.
     nul: bool,
     /// A SQL comment marker was blanked.
@@ -786,6 +790,7 @@ struct View {
 
 fn normalize_flagged(text: &str) -> View {
     let (d, nul) = decode_nul(text);
+    let decoded = d.is_some();
     let mut s = d.unwrap_or_else(|| text.to_string());
     s.make_ascii_lowercase();
     let mut comment = false;
@@ -800,6 +805,7 @@ fn normalize_flagged(text: &str) -> View {
     }
     View {
         text: s,
+        decoded,
         nul,
         comment,
     }
@@ -1578,11 +1584,13 @@ mod tests {
     fn bare_names_are_exported() {
         for text in [
             "/oauth/token",
-            "/oauth/token/",
             "/users/me/password",
             "/account/reset-password",
             "/oauth/token?scope=read&state=xyz",
-            "/oauth/token?",
+            "/oauth/token?scope=a%20b",
+            // A named limit (USER-GUIDE 5.3): a letters-only segment
+            // before the word cannot be told from a route word.
+            "/reset/abcdef/token",
             "SELECT password, email FROM users",
             "SELECT password, email FROM users;",
             "select id, password_hash, email from users where id = $1",
@@ -1597,11 +1605,10 @@ mod tests {
             assert!(!has_sql_credential_context(text), "{text}");
             assert_eq!(protect_text(text), None, "{text}");
         }
-        // A credential parameter after a bare path is still masked, and a
-        // second pass changes nothing.
-        let once = p("/oauth/token?client_secret=abc&x=1");
-        assert_eq!(once, "/oauth/token?client_secret=<REDACTED>&x=1");
-        assert_eq!(protect_text(&once), None);
+        // A credential parameter after a bare path is masked, and the path
+        // is then checked without it: a blank query component is not a
+        // keyed one, so the field is withheld.
+        assert_eq!(p("/oauth/token?client_secret=abc&x=1"), FIELD_WITHHELD);
         // DNS names keep the strict rule; a SELECT with bare names only is
         // still seen by the strict rule (its bound values are dropped).
         assert!(has_any_credential_context("db.password"));
@@ -1626,6 +1633,18 @@ mod tests {
             "/a//token",
             "/token?abc123",
             "/token?&abc123",
+            "/oauth/token/",
+            "/oauth/token?",
+            "/oauth/token?x=1&",
+            "/oauth/token?=x",
+            "/token?x=1& ",
+            // Codex round 2 #1: decoding must not erase a segment or a
+            // component (`+` is a space once decoded).
+            "/reset/token/++++",
+            "/reset/token?scope=read&++++&password=x",
+            "/reset/token/%20",
+            "/reset/%74oken",
+            "/reset/x+y/token",
             "/token/?abc123",
             "/token?x=1&abc123",
             "/token?x=a b",
@@ -1656,7 +1675,6 @@ mod tests {
             "/oauth/token%253Dabc123",
             "/oauth/token\\u002fabc123",
             "/oauth/token&#47;abc123",
-            "/oauth/token?x=%26abc123",
             "requirepass%20hunter2",
             "password%00hunter",
             "password\\u0000hunter",
@@ -1711,6 +1729,21 @@ mod tests {
             "SELECT password FROM users WHERE creds = '(alice,hunter2)'",
             "SELECT password FROM users WHERE tags = '{hunter2}'",
             "SELECT password FROM users WHERE id = $1abc",
+            // Codex round 2 #2: escapes the decoded view would hide
+            // (PostgreSQL octal escapes with standard_conforming_strings
+            // off), and any decoding at all.
+            "SELECT password FROM users WHERE profile = '\\050alice\\054hunter2\\051'",
+            "SELECT password FROM users WHERE profile = '\\(alice'",
+            "SELECT password FROM users WHERE profile = '%28alice%2Chunter2%29'",
+            "SELECT password FROM users WHERE profile = '&#40;alice&#44;hunter2&#41;'",
+            "SELECT password FROM users WHERE id = 1+1",
+            r#"SELECT password FROM users WHERE name = 'a"b'"#,
+            // Codex round 2 #5: truncated statements (no panic).
+            "SELECT password FROM users WHERE",
+            "SELECT password FROM users WHERE id = 1 AND",
+            "SELECT password FROM users ORDER BY",
+            "SELECT password FROM users ORDER BY id,",
+            "SELECT password FROM users LIMIT",
             "SELECT password FROM users WHERE id = $$hunter2$$",
             "SELECT password FROM users WHERE name = 'it''s'",
             "SELECT password FROM users WHERE name = 'a\\' OR users = $1 -- '",

@@ -76,8 +76,9 @@ pub struct PostgresParser {
     binds: VecDeque<BindSql>,
     /// Id of the next Parse read.
     next_parse: u64,
-    /// The last statement built had credential context and was withheld.
-    statement_withheld: bool,
+    /// The last statement built names a credential (bare names included):
+    /// its error text is withheld ([`super::export_error_text`]).
+    error_withheld: bool,
 }
 
 /// Max named statements remembered per connection.
@@ -178,7 +179,7 @@ impl PostgresParser {
             bind_params: None,
             binds: VecDeque::new(),
             next_parse: 0,
-            statement_withheld: false,
+            error_withheld: false,
             query_ts: None,
             query_text: None,
             pending_error: None,
@@ -647,8 +648,7 @@ impl PostgresParser {
                     if let Some(err) = self.pending_error.take() {
                         // Error message takes precedence over query text in
                         // payload_text; it may quote the statement.
-                        msg.payload_text =
-                            Some(super::export_error_text(err, self.statement_withheld));
+                        msg.payload_text = Some(super::export_error_text(err, self.error_withheld));
                     }
                     return Some(msg);
                 }
@@ -692,14 +692,14 @@ impl PostgresParser {
                 && bind.sql.as_deref() == self.query_text.as_deref())
             .then_some(values)
         });
-        self.statement_withheld = false;
+        self.error_withheld = false;
         match self.query_text.take() {
             Some(q) => {
                 let (verb, shown, bound, withheld) = super::export_statement(q, bound);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(shown);
                 msg.request_text = bound;
-                self.statement_withheld = withheld;
+                self.error_withheld = withheld;
             }
             None => msg.request_text = None,
         }
