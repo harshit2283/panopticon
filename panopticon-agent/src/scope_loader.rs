@@ -586,11 +586,11 @@ impl<'a> RawBtf<'a> {
             } else {
                 (off, 0)
             };
-            if bits % 8 != 0 {
-                continue;
-            }
             if *kind == BTF_UNION && bits != 0 {
                 return None; // malformed: a union member starts at 0
+            }
+            if bits % 8 != 0 {
+                continue;
             }
             let extent = if bitfield != 0 {
                 bitfield
