@@ -557,8 +557,9 @@ a body or an error message that reads `/oauth/token` or
   `SELECT item, … FROM table [WHERE col op value [AND|OR …]]
   [ORDER BY col [ASC|DESC], …] [LIMIT n [OFFSET n]] [;]`:
   - each item is `*` or a plain identifier (`[a-z_][a-z0-9_]*`, any
-    case): no qualifier, literal, number or hex (`0x68756e74657232`),
-    function or alias;
+    case) that is not a value keyword (`TRUE`, `FALSE`, `NULL`,
+    `CURRENT_USER` and the other niladic value keywords): no qualifier,
+    literal, number or hex (`0x68756e74657232`), function or alias;
   - the table is a plain identifier, and from it to the end of the
     statement no credential word appears in any form, short or long,
     whatever splits it (so not `WHERE password = …`, `pwd LIKE 'x'`,
@@ -566,7 +567,8 @@ a body or an error message that reads `/oauth/token` or
     appear only as projection items;
   - a `WHERE` column is a plain identifier that is not the table itself
     (a PostgreSQL whole-row value); op is one of `=` `<>` `!=` `<` `<=`
-    `>` `>=` `LIKE` or `IS [NOT] NULL`; and a value is a number, a bound
+    `>` `>=` `LIKE` or `IS [NOT] NULL`; and a value is a number (digits,
+    each `_` between two digits: `1_000`), a bound
     parameter or a `'…'` string without `''`, `(`, `)`, `,`, `{` or `}`
     (no join, alias, subquery, function, row, cast, `UNION` or
     `VALUES`).

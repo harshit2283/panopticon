@@ -227,7 +227,8 @@ production-hardened compliance platform.
     path of letters-only segments with only `key=value` query
     components; in a MySQL or PostgreSQL statement, a projection item of
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
-    `*` or a plain identifier and no credential word from the table on
+    `*` or a plain identifier (not a value keyword such as `TRUE`) and
+    no credential word from the table on
     (exported without bound values or error text). No other field has a
     bare name; anything outside the allowlist is withheld as before.
     Short credential names are also matched with `.` and `-` as

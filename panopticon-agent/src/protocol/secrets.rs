@@ -45,7 +45,8 @@
 //!   `SELECT item, ... FROM table [rest]` ([`select_list`]), read on the
 //!   raw tokens with no comment marker, `\`, `"` or backtick and nothing
 //!   decoding would change: each item `*` or a plain identifier (no
-//!   qualifier, literal, number, function or alias), the table a plain
+//!   qualifier, literal, value keyword such as `TRUE`, number, function
+//!   or alias), the table a plain
 //!   identifier, no credential word in any form from the table to the
 //!   end, and the rest only `WHERE` comparisons with numbers, parameters
 //!   or plain strings, `ORDER BY` and `LIMIT`.
@@ -412,20 +413,53 @@ fn sql_tokens(b: &[u8]) -> Option<Vec<(Tok, usize, usize)>> {
 /// `SELECT item [, item]* FROM table [WHERE pred [AND|OR pred]*]
 /// [ORDER BY col [ASC|DESC] [, ...]] [LIMIT n [OFFSET n]] [;]`
 ///
-/// - an item is `*` or a plain identifier `[a-z_][a-z0-9_]*`: no
-///   qualifier, literal, number (`0x68756e74657232`), function or alias;
+/// - an item is `*` or a plain identifier `[a-z_][a-z0-9_]*` that is not
+///   a value keyword ([`VALUE_WORDS`]: `TRUE`, `NULL`, `CURRENT_USER`, ...):
+///   no qualifier, literal, number (`0x68756e74657232`), function or alias;
 /// - the table is a plain identifier, and from it to the end no credential
 ///   word appears in any form: none of the substrings [`HINTS`] (so not
 ///   `pwd LIKE 'x'`, `WHERE password = ...`, `session IN ...`), whatever
 ///   the boundaries;
 /// - a pred is `col op operand`, `col LIKE operand` or `col IS [NOT] NULL`,
 ///   its col an identifier that is not the table (whole-row) and its
-///   operand a number, a parameter or a string literal without `(`, `)`,
+///   operand a number ([`number`]), a parameter or a string literal without `(`, `)`,
 ///   `,`, `{` or `}` (no row or array value).
 ///
 /// Credential words may appear only as projection items. Nothing here can
 /// put a value in a column's place: no other query, `VALUES`, row
 /// constructor, cast, join or alias.
+/// Niladic SQL value keywords: these are SQL value literals, not columns
+/// (`SELECT password, TRUE FROM users` projects `1` in MySQL), so none is
+/// a plain identifier in [`select_list`].
+const VALUE_WORDS: &[&[u8]] = &[
+    b"true",
+    b"false",
+    b"null",
+    b"unknown",
+    b"default",
+    b"current_user",
+    b"current_role",
+    b"session_user",
+    b"user",
+    b"system_user",
+    b"current_date",
+    b"current_time",
+    b"current_timestamp",
+    b"localtime",
+    b"localtimestamp",
+    b"current_catalog",
+    b"current_schema",
+];
+
+/// A decimal number: it starts and ends with a digit, and each `_` sits
+/// between two digits (`1_000`, not `_123456`, `__` or `1_`).
+fn number(w: &[u8]) -> bool {
+    w.first().is_some_and(u8::is_ascii_digit)
+        && w.last().is_some_and(u8::is_ascii_digit)
+        && w.iter().all(|c| c.is_ascii_digit() || *c == b'_')
+        && !w.windows(2).any(|p| p == b"__")
+}
+
 fn select_list(b: &[u8]) -> Option<(usize, usize)> {
     let toks = sql_tokens(b)?;
     let text = |k: usize| &b[toks[k].1..toks[k].2];
@@ -435,8 +469,13 @@ fn select_list(b: &[u8]) -> Option<(usize, usize)> {
     if !is_word(0, b"select") {
         return None;
     }
-    // A plain identifier: a word not starting with a digit.
-    let ident = |k: usize| kind(k) == Some(Tok::Word) && !text(k)[0].is_ascii_digit();
+    // A plain identifier: a word not starting with a digit and not a
+    // value keyword.
+    let ident = |k: usize| {
+        kind(k) == Some(Tok::Word)
+            && !text(k)[0].is_ascii_digit()
+            && !VALUE_WORDS.contains(&text(k))
+    };
     let mut k = 1;
     loop {
         if !(ident(k) || kind(k) == Some(Tok::Star)) || is_word(k, b"from") {
@@ -467,7 +506,7 @@ fn select_list(b: &[u8]) -> Option<(usize, usize)> {
     let operand = |k: usize| match kind(k) {
         Some(Tok::Param) => true,
         Some(Tok::Str) => !text(k).iter().any(|c| b"(),{}".contains(c)),
-        Some(Tok::Word) => text(k).iter().all(|c| c.is_ascii_digit() || *c == b'_'),
+        Some(Tok::Word) => number(text(k)),
         _ => false,
     };
     if is_word(k, b"where") {
@@ -1665,6 +1704,7 @@ mod tests {
         for text in [
             "SELECT password, email FROM users",
             "SELECT password FROM users WHERE id = 1",
+            "SELECT password FROM users WHERE id = 1_000",
             "SELECT password, email FROM users;",
             "select id, password_hash, email from users where id = $1",
             "SELECT pwd, email FROM users",
@@ -1896,6 +1936,11 @@ mod tests {
             "SELECT password, 123456 FROM users",
             "SELECT password, 1e5 FROM users",
             "SELECT password, _x FROM users WHERE pin = 1",
+            // Codex round 5: keyword literals are values, not columns.
+            "SELECT password, TRUE FROM users",
+            "SELECT password, FALSE FROM users",
+            "SELECT password, NULL FROM users",
+            "SELECT password, CURRENT_USER FROM users",
             // Prose and the rest.
             "token=abc 123",
             "token: abc123",
@@ -1913,6 +1958,13 @@ mod tests {
             "SELECT password FROM users WHERE session IN ('a')",
             "SELECT password, 0x68756e74657232 FROM users",
             "SELECT password, 123456 FROM users",
+            "SELECT password, TRUE FROM users",
+            "SELECT password, FALSE FROM users",
+            "SELECT password, NULL FROM users",
+            "SELECT password, CURRENT_USER FROM users",
+            "SELECT password FROM users WHERE id = _123456",
+            "SELECT password FROM users WHERE id = __",
+            "SELECT password FROM users WHERE id = 1_",
             "SELECT password FROM users WHERE users.pwd = 'hunter2'",
             "SELECT email FROM users WHERE users.pwd = 'hunter2'",
             "SELECT email FROM users WHERE pwd-0 = 123456",
