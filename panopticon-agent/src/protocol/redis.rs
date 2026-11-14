@@ -1037,6 +1037,58 @@ mod tests {
         assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
     }
 
+    /// Redis fields after the built-in rules (USER-GUIDE 5.3): no Redis
+    /// argument or reply is a bare name, since with renamed commands and
+    /// `CLIENT REPLY` a reply cannot be tied to its request. So
+    /// `CONFIG GET requirepass`, its reply, `CONFIG SET`, and a value or
+    /// reply that reads like a credential name (Codex rounds 1-3) are all
+    /// withheld.
+    #[test]
+    fn test_config_get_credential_after_the_builtin_rules() {
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let exchange = |args: &[&str], reply: &[u8]| {
+            let mut parser = RedisParser::new();
+            parser.feed(&resp(args), Direction::Egress, 1);
+            let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
+                panic!("{args:?}")
+            };
+            crate::pii::mask_credentials(&mut msgs[0]);
+            msgs.remove(0)
+        };
+        let m = exchange(
+            &["CONFIG", "GET", "requirepass"],
+            b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n",
+        );
+        assert_eq!(m.method.as_deref(), Some("CONFIG"));
+        assert_eq!(m.path.as_deref(), Some("GET"));
+        assert_eq!(m.request_text.as_deref(), withheld);
+        assert_eq!(m.payload_text.as_deref(), withheld);
+        // Under `rename-command SET CONFIG`, a SET answered `+OK`.
+        let m = exchange(&["CONFIG", "GET", "swordfish_password"], b"+OK\r\n");
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(&["CONFIG", "SET", "requirepass", "s3cretpw"], b"+OK\r\n");
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(
+            &["SET", "user:alice:password", "swordfish_password"],
+            b"+OK\r\n",
+        );
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(
+            &["GET", "user:alice:password"],
+            b"$18\r\nswordfish_password\r\n",
+        );
+        assert_eq!(m.payload_text.as_deref(), withheld);
+        // Codex round 4 #2: values shaped like a bare HTTP path or an
+        // allowlisted SELECT are Redis values, not a path or a statement.
+        for value in ["/oauth/token", "SELECT password FROM users"] {
+            let m = exchange(&["SET", "user:alice:password", value], b"+OK\r\n");
+            assert_eq!(m.request_text.as_deref(), withheld, "{value}");
+            let reply = format!("${}\r\n{value}\r\n", value.len());
+            let m = exchange(&["GET", "user:alice:password"], reply.as_bytes());
+            assert_eq!(m.payload_text.as_deref(), withheld, "{value}");
+        }
+    }
+
     /// Replies that carry a secret: `CONFIG GET` values of secret
     /// parameters, and the hashes or passwords of `ACL LIST|GETUSER|GENPASS`.
     #[test]

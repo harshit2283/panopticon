@@ -460,9 +460,12 @@ exported:
 - the **method** (including a gRPC method path), the **content type**, the
   **request body** (e.g. POST JSON or form data) and the **response body**
   are scanned and redacted;
-- **credentials**: any field with *credential context* is withheld whole,
-  whatever the protocol, unless every credential in it can be masked with
-  certainty (below).
+- **credentials**: any field with *credential context*, where a
+  credential value could be present, is withheld whole, whatever the
+  protocol, unless every credential in it can be masked with certainty
+  (below). A credential word that is a bare name, in one of two
+  allowlisted positions of an HTTP request path or a SQL statement, is
+  not context.
 
 **What credential protection promises.** In `metrics_only` no path,
 header or body leaves the agent, so no credential in one can. In
@@ -509,12 +512,92 @@ markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
   or `pin` used as a name: followed by `=` or `:`, a form or HTML field
   name (`name="pwd"`, as in multipart form data), or an XML element
   (`<pwd>`); in SQL also a column in a list or assignment (`users(pwd)`,
-  `SET a = 1, pass = $1`). So `/api/auth/login`, a Redis `AUTH` command
-  name or "press any key" are not context;
+  `SET a = 1, pass = $1`) or next to an operator (`pwd - 0`, `pin+1`).
+  These names are also looked for with `-` and `.` as word boundaries,
+  as in the field, so a qualified name is still one (`users.pwd = …`,
+  `?user.pwd=…`, `pwd-0`), and in SQL on the statement as captured too.
+  So `/api/auth/login`, a Redis `AUTH` command name or "press any key"
+  are not context;
 - userinfo, `user:password@host`, with or without a scheme (the `:` of
   `scheme://` and `mailto:` do not count), and any `//` authority whose
   userinfo holds a `:` (RFC 3986: `,` and `;` may be part of the
   password).
+
+A word from the first list is not context when it is a *bare name*: in
+one of the two allowlisted positions below, each only in a field of its
+kind, which the protocol parser decides (never the text). Each is
+checked on text that no decoding has changed: a path on the field as
+captured, a `SELECT` on the statement as captured and only when decoding
+would change nothing in it, so no encoding can hide a value from the
+check. Anything outside the allowlist is context (when in doubt, the
+field is withheld). No other field has a bare name: a Redis argument or
+reply, a Kafka topic, an AMQP field, a DNS name, a gRPC path, a header,
+a body or an error message that reads `/oauth/token` or
+`SELECT password FROM users` is withheld.
+
+- **the last segment of an HTTP request path** (HTTP/1, HTTP/2), read
+  on the path part as captured (the text before the first `?` or `#`):
+  it starts with `/`; every segment is a plain name (ASCII letters, `-`,
+  `_`, `.`: no digit, `%`, `+`, space, `U+00A0` or anything else); and
+  the word is the last segment (no trailing `/`). A query or fragment
+  after a bare path is never exported, whatever it holds: the path part
+  is followed by `?<query withheld>` (so `/oauth/token?client_secret=x`
+  and `/oauth/token?scope=read` both export as
+  `/oauth/token?<query withheld>`, and so does `/oauth/token#x`; one of
+  your patterns matching across the `?` or `#` withholds the field). So
+  `/oauth/token` and `/users/me/password` are bare, while
+  `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
+  `/oauth/token/` and `https://host/oauth/token` are context, and a
+  field whose path part is context is withheld whole, query included. A
+  path with no credential word keeps its query, with credential
+  parameters masked (`/login?password=<REDACTED>&q=1`);
+- **a projection item of an allowlisted `SELECT`** (a MySQL or
+  PostgreSQL statement), read on its tokens as captured, with no comment
+  marker (`--`, `#`, `/*`), double quote, backtick or backslash anywhere
+  and nothing decoding would change (no `%XX`, `+`, `&…;` or NUL byte).
+  The statement must be
+  `SELECT item, … FROM table [WHERE col op value [AND|OR …]]
+  [ORDER BY col [ASC|DESC], …] [LIMIT n [OFFSET n]] [;]`:
+  - each item is `*` or a plain identifier (`[a-z_][a-z0-9_]*`, any
+    case) that is not a value keyword (`TRUE`, `FALSE`, `NULL`,
+    `CURRENT_USER`, `UTC_TIME` and the other niladic value keywords): no qualifier,
+    literal, number or hex (`0x68756e74657232`), function or alias;
+  - the table is a plain identifier, and from it to the end of the
+    statement no credential word appears in any form, short or long,
+    whatever splits it (so not `WHERE password = …`, `pwd LIKE 'x'`,
+    `session IN (…)`, a table `user_tokens`): credential words may
+    appear only as projection items;
+  - a `WHERE` column is a plain identifier that is not the table itself
+    (a PostgreSQL whole-row value); op is one of `=` `<>` `!=` `<` `<=`
+    `>` `>=` `LIKE` or `IS [NOT] NULL`; and a value is a number (digits,
+    each `_` between two digits: `1_000`), a bound
+    parameter or a `'…'` string without `''`, `(`, `)`, `,`, `{` or `}`
+    (no join, alias, subquery, function, row, cast, `UNION` or
+    `VALUES`).
+
+  So `SELECT password, email FROM users` and
+  `SELECT password FROM users WHERE id = 1` are bare;
+  `SELECT password, 123456 FROM users`, `SELECT "password", "hunter2"
+  FROM dual`, `SELECT DISTINCT password FROM users`, `WHERE users = $1`,
+  `WHERE profile = '\050alice\054…'` and `WHERE password = 'x'` are
+  context. A value compared with a column that is not a credential word
+  (`WHERE id = 1`) stays exported, as it would without the credential
+  column. Such a statement is exported without its bound values, and a
+  server error for it becomes `<statement withheld>` (it may echo a
+  bound value: `malformed record literal: "(alice,hunter2)"`).
+
+Redis `CONFIG GET requirepass` is withheld whole: with renamed commands
+and `CLIENT REPLY`, a reply cannot be tied to its request, so nothing
+shows its argument is a parameter name rather than a value.
+
+In a path the word must also end in a whole credential part (`token`,
+`access_token`, `x-api-key`, `passwords`), not have more after it or
+before it in the same word (`token_abc`, `hunterpassword`). In both
+positions it must have no digit (`token9f8e` may be
+a value), and none applies when decoding dropped a NUL byte (it may have
+joined a name to its value; UTF-16 text is therefore never a bare name).
+Prose is never a bare position: `token abc123`, `your token expired` and
+`hunter2 is my password` are context.
 
 What is exported then:
 
@@ -579,14 +662,33 @@ What is exported then:
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
   clean only after the agent saw `SSL_new` return it, as above.
-- **DNS answers** whose name has credential context, or matches one of
-  your `[credentials]` patterns, are dropped before export and before the
-  name can reach the service graph.
+- **DNS answers** whose name has credential context (any credential
+  word: a DNS name holds no bare name, so `db.password.internal`
+  included), or matches one of your `[credentials]` patterns, are
+  dropped before export and before the name can reach the service graph.
+- **Bare names** are exported as written: an HTTP request path
+  `/oauth/token` and a SQL statement `SELECT password, email FROM users`
+  (without bound values or error text). The query or fragment after a
+  bare path is dropped: `/oauth/token?client_secret=x` exports
+  `/oauth/token?<query withheld>`.
 
-The price is more withheld text than a value-level mask would leave: a
-`SELECT` naming a `password` column, a body that mentions a token or a
-secret in prose, a path such as `/oauth/token`, or a Redis
-`CONFIG GET requirepass` command and its reply is withheld whole.
+The price is more withheld text than a value-level mask would leave:
+a `SELECT` that compares a `password` column, names a credential word
+outside its projection or falls outside the allowlist above (a comment,
+a join, a quoted name, a literal item), an `INSERT` or `UPDATE` naming
+one, any field of another kind that reads like a bare name, a body that
+mentions a token or a secret in prose, a path with a digit or a value
+around a credential word (`/v1/token`, `/reset/token/abc123`), a field
+that is just a credential name (a Kafka topic `user.password`, a header
+value `Authorization`), or a Redis command or reply naming
+`requirepass` (`CONFIG GET requirepass` and its reply) is withheld
+whole.
+
+A known limit of the path position: a segment of letters only before a
+credential word is exported, as in `/reset/abcdef/token`. With no route
+table, a letters-only code there cannot be told apart from a route word
+such as `oauth` in `/oauth/token`; it is exposed as much as any
+letters-only path segment with no credential word nearby.
 
 Redis commands and replies are masked before this rule runs. The
 command's secret is masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`,
@@ -596,12 +698,15 @@ parameters, the whole of `ACL LIST|GETUSER|GENPASS` and the same results
 inside `EXEC`; in any reply the value after a credential-named element and
 `ACL LIST` lines with a password rule are masked too. The rule above then
 applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
-<REDACTED>` stay readable (`auth` is not used as a name there), while a
-command or reply naming `requirepass`, `masterauth` or another word from
-the first list (`CONFIG SET requirepass …`, `CONFIG GET masterauth`) is
-withheld whole. Protocol and subscription state follow the server's
-replies only, and a subscription acknowledgement counts only as the reply
-to the pending subscription command (a script returning an array of the
+<REDACTED>` stay readable (`auth` is not used as a name there), while an
+argument or reply holding a word from the first list, alone or with a
+value next to it, masked or not (`CONFIG GET requirepass`,
+`CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
+`requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
+whole: no Redis field has a bare name (above). Protocol and subscription
+state follow the server's replies only, and a subscription
+acknowledgement counts only as the reply to the pending subscription
+command (a script returning an array of the
 same shape changes nothing). A reply that cannot be matched to its command
 is exported without its text. No reply text is exported for the rest of
 the connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;

@@ -149,8 +149,8 @@ pub use credential_rules::{
     set_credential_rules,
 };
 pub use secrets::{
-    Decision, FIELD_WITHHELD, STATEMENT_WITHHELD, decide, has_credential_context,
-    is_credential_name, sql_verb, withheld_statement,
+    Decision, FIELD_WITHHELD, FieldKind, STATEMENT_WITHHELD, decide, decide_as,
+    has_credential_context, is_credential_name, sql_verb, withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -172,13 +172,22 @@ pub fn set_mask_credentials(on: bool) {
 }
 
 /// A SQL statement (query text and its bound values) as a parser exports
-/// it. With credential context and `mask_credentials` on: only its verb as
-/// method and `VERB <statement withheld>` as text, no bound value, and
-/// `true` (its error text is withheld too). The query is wiped.
+/// it, and whether its error text must be withheld. With credential
+/// context and `mask_credentials` on: only its verb as method and
+/// `VERB <statement withheld>` as text, no bound value, and `true`. The
+/// query is wiped. A statement whose credential words are all bare names
+/// is exported as written but without its bound values (nothing ties them
+/// to a column), and its error text is withheld too: the server may echo
+/// a bound value in it (`malformed record literal: "(alice,hunter2)"`).
 pub fn export_statement(
     mut query: String,
-    bound: Option<String>,
+    mut bound: Option<String>,
 ) -> (Option<String>, String, Option<String>, bool) {
+    let names_credential =
+        mask_credentials_enabled() && secrets::has_any_sql_credential_context(&query);
+    if names_credential && let Some(mut b) = bound.take() {
+        zeroize::Zeroize::zeroize(&mut b);
+    }
     if mask_credentials_enabled() && secrets::has_sql_credential_context(&query) {
         count_builtin();
         let shown = withheld_statement(&query);
@@ -191,13 +200,15 @@ pub fn export_statement(
     }
     let verb = sql_verb(&query).map(str::to_string);
     let shown = truncate_utf8(&query, 4096).to_string();
-    (verb, shown, bound, false)
+    (verb, shown, bound, names_credential)
 }
 
 /// A server error message as a SQL parser exports it: withheld when its
-/// statement was, or when it shows credential context itself.
-pub fn export_error_text(text: String, statement_withheld: bool) -> String {
-    if mask_credentials_enabled() && (statement_withheld || has_credential_context(&text)) {
+/// statement names a credential (`error_withheld`, from
+/// [`export_statement`]), bare names included, or when it shows credential
+/// context itself.
+pub fn export_error_text(text: String, error_withheld: bool) -> String {
+    if mask_credentials_enabled() && (error_withheld || has_credential_context(&text)) {
         let mut text = text;
         zeroize::Zeroize::zeroize(&mut text);
         STATEMENT_WITHHELD.to_string()
@@ -210,7 +221,18 @@ pub fn export_error_text(text: String, statement_withheld: bool) -> String {
 /// rules only when `builtin`): credential values masked, or the field
 /// replaced by [`FIELD_WITHHELD`].
 pub fn protect_text_in(rules: &CredentialRules, text: &mut String, builtin: bool) {
-    if let Some(out) = decide(rules, text, builtin).apply(text) {
+    replace_with(text, decide(rules, text, builtin));
+}
+
+/// [`protect_text_in`], built-in rules on, for a field of a known kind
+/// (an HTTP request path or a SQL statement may hold a bare name; see
+/// [`decide_as`]).
+pub fn protect_field_in(rules: &CredentialRules, text: &mut String, kind: FieldKind) {
+    replace_with(text, decide_as(rules, text, true, kind));
+}
+
+fn replace_with(text: &mut String, decision: Decision) {
+    if let Some(out) = decision.apply(text) {
         zeroize::Zeroize::zeroize(text);
         *text = out;
     }
@@ -307,6 +329,43 @@ pub fn create_parser(proto: Protocol, topics: &kafka::KafkaTopics) -> Box<dyn Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex round 1 #3: a SELECT exported because its credential columns
+    /// are bare names drops its bound values, which nothing ties to a
+    /// column (`WHERE users = $1` binding `(alice,hunter2)`); a SELECT
+    /// without a credential word keeps them.
+    #[test]
+    fn test_bare_select_drops_bound_values() {
+        let (verb, shown, bound, withheld) = export_statement(
+            "SELECT password, email FROM users WHERE id = $1".into(),
+            Some("(alice,hunter2)".into()),
+        );
+        assert_eq!(verb.as_deref(), Some("SELECT"));
+        assert_eq!(shown, "SELECT password, email FROM users WHERE id = $1");
+        // Its error text is withheld: the server may echo a bound value.
+        assert_eq!((bound, withheld), (None, true));
+        assert_eq!(
+            export_error_text(
+                "malformed record literal: \"(alice,hunter2,extra)\"".into(),
+                withheld
+            ),
+            STATEMENT_WITHHELD
+        );
+        let (_, shown, bound, withheld) = export_statement(
+            "SELECT password FROM users WHERE users = $1::users".into(),
+            Some("(alice,hunter2)".into()),
+        );
+        assert_eq!(
+            (shown.as_str(), bound, withheld),
+            ("SELECT <statement withheld>", None, true)
+        );
+        let (_, _, bound, withheld) = export_statement(
+            "SELECT email FROM users WHERE id = $1".into(),
+            Some("7".into()),
+        );
+        assert_eq!((bound.as_deref(), withheld), (Some("7"), false));
+        assert_eq!(export_error_text("bad value".into(), withheld), "bad value");
+    }
 
     #[test]
     fn test_protocol_display() {
