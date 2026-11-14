@@ -11,8 +11,8 @@
 //! [`BareShapes`]); anything outside the allowlist is (fail closed). The
 //! bare name is exempt only from the residual check: the certain
 //! structures beside it are still masked, and beside a bare path every
-//! query value under a key with a credential hint must be one of them
-//! ([`builtin_full`]).
+//! query component with a credential hint in its key or decoded value
+//! must have its value among them ([`builtin_full`]).
 //!
 //! The normalised view (used for detection only, never exported): NUL
 //! bytes dropped (UTF-16 text of ASCII), then up to three rounds of JSON
@@ -43,7 +43,8 @@
 //!   field is printable ASCII, every segment a plain name (`A`-`Z`,
 //!   `a`-`z`, `_`, `-`, `.`; no `%` or `+`), the query, if any, only
 //!   `key=value` components of letters, digits, `-._~%+` (no `%` or `+`
-//!   in a key; every value under a hinted key masked; decided before
+//!   in a key; every component with a hint in its key or decoded value
+//!   masked; decided before
 //!   its credential parameters are masked; no `#`, `;` or other
 //!   delimiter), and the word ends in a whole credential part
 //!   (`access_token`, not `token_abc`) ([`path_last_segment`]);
@@ -364,20 +365,30 @@ fn query_is_keyed(q: &[u8]) -> bool {
     })
 }
 
-/// Under a bare path, whether every query component whose key contains a
-/// credential hint ([`HINTS`], any form: `pwd.x`, `keyword`) has its value
-/// in `mask` (or already masked). Otherwise a value the masking rules do
-/// not cover could be exported beside the exempt name.
+/// Under a bare path, whether every query component whose key or value,
+/// raw or decoded, contains a credential hint ([`HINTS`], any form:
+/// `pwd.x`, `keyword`, `next=%2Flogin%3Fpwd%3Dx`), or still holds a `%`
+/// once decoded, has its value in `mask` (or already masked). Otherwise a
+/// value the masking rules do not cover could be exported beside the
+/// exempt name.
 fn hinted_values_masked(text: &str, mask: &[(usize, usize)]) -> bool {
     let Some(q) = text.find('?') else {
         return true;
+    };
+    // A hint raw or decoded, or a `%` decoding left (more rounds of
+    // encoding than the normalised view reads).
+    let hinted = |s: &str| {
+        let d = decode(s)
+            .unwrap_or_else(|| s.to_string())
+            .to_ascii_lowercase();
+        has_hint(&s.to_ascii_lowercase()) || has_hint(&d) || d.contains('%')
     };
     let mut at = q + 1;
     text[at..].split('&').all(|part| {
         let eq = part.find('=').unwrap_or(part.len());
         let (vs, ve) = (at + eq + 1, at + part.len());
         at += part.len() + 1;
-        !has_hint(&part[..eq].to_ascii_lowercase())
+        !hinted(part)
             || part[eq..].strip_prefix('=') == Some(REDACTED_CREDENTIAL)
             || mask.iter().any(|&(s, e)| s <= vs && ve <= e)
     })
@@ -756,9 +767,9 @@ fn user_spans(
 /// field withheld) when any context is left. The certain structures are
 /// masked whenever the strict scan sees context; the bare name of the
 /// field's kind is exempt only in the residual check, so exempting it
-/// never skips a credential parameter beside it. Beside a bare path, a
-/// value under a hinted key that is not masked withholds the field
-/// ([`hinted_values_masked`]).
+/// never skips a credential parameter beside it. Beside a bare path, an
+/// unmasked query component with a hint in its key or decoded value
+/// withholds the field ([`hinted_values_masked`]).
 fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     let slot = match kind {
         FieldKind::Other => Slot::None,
@@ -1874,6 +1885,10 @@ mod tests {
             "/reset/token?%70wd=hunter2",
             "/reset/token?pwd.x=hunter2",
             "/oauth/token?keyword=hunter2",
+            // Codex round 11: a credential pair encoded inside a value.
+            "/reset/token?next=%2Flogin%3Fpwd%5Baccount%20name%5D%3Dhunter2",
+            "/reset/token?next=%252570wd%253Dhunter2",
+            "/reset/token?next=x%25252570wd",
             // Codex round 9: an encoded key is not a bare path's query.
             "/reset/token?pwd%5B%5D=hunter2",
             "/reset/token?session%5Bid%5D=abc123",

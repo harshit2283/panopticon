@@ -226,7 +226,8 @@ production-hardened compliance platform.
     HTTP/2 request path, the last segment of a captured, printable-ASCII
     path of letters-only segments with only plain `key=value` query
     components (no `#`, `;` or other delimiter, no encoded key, and every
-    value under a key holding a credential word masked); in a MySQL or PostgreSQL statement, a projection item of
+    component whose key or decoded value holds a credential word
+    masked); in a MySQL or PostgreSQL statement, a projection item of
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on

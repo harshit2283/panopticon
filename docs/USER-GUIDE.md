@@ -548,10 +548,12 @@ a body or an error message that reads `/oauth/token` or
   letters, digits, `-`, `.`, `_`, `~`, `%`, `+`, `=` and `&` (no `#`,
   `;`, `,` or other delimiter that could end or split the query), with
   no `%` or `+` in a key. This is decided before any credential parameter
-  in the query is masked, and every value whose key holds a credential
-  word in any form must then be masked, or the field is withheld (so
+  in the query is masked, and every component whose key or decoded value
+  holds a credential word in any form, or still holds a `%` once decoded,
+  must then have its value masked, or the field is withheld (so
   `/oauth/token?client_secret=x` is exported masked, while
-  `/oauth/token?keyword=x` and `/reset/token?pwd%5B%5D=x` are withheld). So
+  `/oauth/token?keyword=x`, `/reset/token?pwd%5B%5D=x` and
+  `/reset/token?next=%2Flogin%3Fpwd%3Dx` are withheld). So
   `/oauth/token`, `/users/me/password` and `/oauth/token?scope=read` are
   bare, while `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
   `/oauth/token/`, `/token?abc123`, `/token?scope=read&abc123`,
