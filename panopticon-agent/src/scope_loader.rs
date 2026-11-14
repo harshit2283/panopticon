@@ -574,10 +574,11 @@ impl<'a> RawBtf<'a> {
     /// (bit offset, bitfield size or 0, type) of member `m` of struct/union
     /// `id`, searching anonymous members up to [`BTF_ANON_DEPTH`] deep. The
     /// member found, and every anonymous member on the way, must lie inside
-    /// its container; a bitfield must start on a byte boundary; an anonymous
+    /// its container; a bitfield must start on a byte boundary; a union
+    /// member must start at 0 (the BTF is refused otherwise); an anonymous
     /// aggregate encoded as a bitfield is not searched.
     fn member(&self, id: u32, m: &str, depth: u32) -> Option<(u32, u32, u32)> {
-        let (_, _, kflag, size, members) = self.types.get(id as usize)?;
+        let (kind, _, kflag, size, members) = self.types.get(id as usize)?;
         let container_bits = size.checked_mul(8)?;
         for &(name, ty, off) in members {
             let (bits, bitfield) = if *kflag {
@@ -587,6 +588,9 @@ impl<'a> RawBtf<'a> {
             };
             if bits % 8 != 0 {
                 continue;
+            }
+            if *kind == BTF_UNION && bits != 0 {
+                return None; // malformed: a union member starts at 0
             }
             let extent = if bitfield != 0 {
                 bitfield
@@ -1518,6 +1522,28 @@ mod tests {
         b.ty(4, "net_device", false, 10, &[pf, 1, 64], 1); // 3: 4-byte int at 8 overflows
         let blob = skb_btf(&mut b, 3, 1 << 18);
         assert!(netdev_offsets(&blob).is_err());
+    }
+
+    #[test]
+    fn btf_union_member_offset_is_refused() {
+        // Codex VRF R4: net_device { anon union @8 { u32 priv_flags @bit 64 } }.
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(5, "", false, 16, &[pf, 1, 64], 1); // 3: union, member at bit 64
+        b.ty(4, "net_device", false, 64, &[0, 3, 64], 1); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
+        // the same union with the member at 0 is accepted: byte 8 + 2
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0);
+        b.ty(1, "u64", false, 8, &[64], 0);
+        b.ty(5, "", false, 16, &[pf, 1, 0], 1);
+        b.ty(4, "net_device", false, 64, &[0, 3, 64], 1);
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert_eq!(netdev_offsets(&blob).unwrap(), [16, 10, 4]);
     }
 
     #[test]
