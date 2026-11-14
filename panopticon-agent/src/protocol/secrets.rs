@@ -625,7 +625,8 @@ pub fn decide(rules: &CredentialRules, text: &str, builtin: bool) -> Decision {
 /// query or fragment whose path part (before the first `?` or `#`) has
 /// credential context is decided on its path part alone: withheld unless
 /// that part is bare, else the path part exported followed by
-/// [`QUERY_WITHHELD`], no byte of the query or fragment kept. A path part
+/// [`QUERY_WITHHELD`], no byte of the query or fragment kept (withheld too
+/// when one of the user's patterns matches across the cut). A path part
 /// with no credential word leaves the whole field to the usual rules
 /// (keyed parameters masked).
 pub fn decide_as(rules: &CredentialRules, text: &str, builtin: bool, kind: FieldKind) -> Decision {
@@ -635,6 +636,14 @@ pub fn decide_as(rules: &CredentialRules, text: &str, builtin: bool, kind: Field
         && let Some(at) = text.find(['?', '#'])
         && has_credential_context(&text[..at])
     {
+        // The user's patterns also run on the whole field: a match across
+        // the cut (`acme_token?`) cannot be masked in the path part.
+        if let Some(user) = &rules.user
+            && user_spans(user, text).is_none_or(|f| f.iter().any(|&(s, e)| s < at && at < e))
+        {
+            count_user(1);
+            return Decision::Withhold;
+        }
         return match decide_as(rules, &text[..at], builtin, kind) {
             Decision::Keep => Decision::Cut(at, Vec::new()),
             Decision::Mask(spans) => Decision::Cut(at, spans),
@@ -1818,6 +1827,28 @@ mod tests {
         assert_eq!(
             pk("/login?password=x&q=1", FieldKind::HttpPath),
             "/login?password=<REDACTED>&q=1"
+        );
+        // Codex round 13: a user pattern's match across the cut withholds.
+        let r = rules(&["acme_[a-z]+[?#]"], Builtin::Full);
+        for text in ["/oauth/acme_token?scope=read", "/oauth/acme_token#x"] {
+            assert_eq!(
+                decide_as(&r, text, true, FieldKind::HttpPath),
+                Decision::Withhold,
+                "{text}"
+            );
+        }
+        // A match inside the path part is masked, the query still cut.
+        let r = rules(&["acme_[a-z]+"], Builtin::Full);
+        assert_eq!(
+            decide_as(
+                &r,
+                "/oauth/acme_token?scope=read",
+                true,
+                FieldKind::HttpPath
+            )
+            .apply("/oauth/acme_token?scope=read")
+            .as_deref(),
+            Some("/oauth/<REDACTED>?<query withheld>")
         );
     }
 

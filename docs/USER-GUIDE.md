@@ -544,7 +544,8 @@ a body or an error message that reads `/oauth/token` or
   after a bare path is never exported, whatever it holds: the path part
   is followed by `?<query withheld>` (so `/oauth/token?client_secret=x`
   and `/oauth/token?scope=read` both export as
-  `/oauth/token?<query withheld>`, and so does `/oauth/token#x`). So
+  `/oauth/token?<query withheld>`, and so does `/oauth/token#x`; one of
+  your patterns matching across the `?` or `#` withholds the field). So
   `/oauth/token` and `/users/me/password` are bare, while
   `/reset/token/abc123`, `/reset/token/++++`, `/v1/token`,
   `/oauth/token/` and `https://host/oauth/token` are context, and a
