@@ -558,7 +558,7 @@ a body or an error message that reads `/oauth/token` or
   [ORDER BY col [ASC|DESC], …] [LIMIT n [OFFSET n]] [;]`:
   - each item is `*` or a plain identifier (`[a-z_][a-z0-9_]*`, any
     case) that is not a value keyword (`TRUE`, `FALSE`, `NULL`,
-    `CURRENT_USER` and the other niladic value keywords): no qualifier,
+    `CURRENT_USER`, `UTC_TIME` and the other niladic value keywords): no qualifier,
     literal, number or hex (`0x68756e74657232`), function or alias;
   - the table is a plain identifier, and from it to the end of the
     statement no credential word appears in any form, short or long,

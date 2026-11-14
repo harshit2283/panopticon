@@ -449,6 +449,9 @@ const VALUE_WORDS: &[&[u8]] = &[
     b"localtimestamp",
     b"current_catalog",
     b"current_schema",
+    b"utc_date",
+    b"utc_time",
+    b"utc_timestamp",
 ];
 
 /// A decimal number: it starts and ends with a digit, and each `_` sits
@@ -1941,6 +1944,10 @@ mod tests {
             "SELECT password, FALSE FROM users",
             "SELECT password, NULL FROM users",
             "SELECT password, CURRENT_USER FROM users",
+            "SELECT password, UTC_TIME FROM users",
+            "SELECT password, UTC_DATE FROM users",
+            "SELECT password, UTC_TIMESTAMP FROM users",
+            "SELECT password FROM users WHERE utc_time = 1",
             // Prose and the rest.
             "token=abc 123",
             "token: abc123",
@@ -1962,6 +1969,10 @@ mod tests {
             "SELECT password, FALSE FROM users",
             "SELECT password, NULL FROM users",
             "SELECT password, CURRENT_USER FROM users",
+            "SELECT password, UTC_TIME FROM users",
+            "SELECT password, UTC_DATE FROM users",
+            "SELECT password, UTC_TIMESTAMP FROM users",
+            "SELECT password FROM users WHERE utc_time = 1",
             "SELECT password FROM users WHERE id = _123456",
             "SELECT password FROM users WHERE id = __",
             "SELECT password FROM users WHERE id = 1_",
