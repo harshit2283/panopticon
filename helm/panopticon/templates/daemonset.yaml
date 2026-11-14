@@ -35,8 +35,10 @@ spec:
       # The token is only needed for Kubernetes identity (pod/service
       # metadata); don't hand a privileged pod an API token it never uses.
       automountServiceAccountToken: {{ or .Values.kubernetes.enabled .Values.serviceAccount.automountToken }}
-      # hostNetwork: TC classifiers attach to the node's interfaces.
-      # hostPID: /proc/<pid>/root is used to find TLS libraries in other containers.
+      # hostNetwork: the metrics endpoint binds the pod IP, which is then the
+      # node IP Prometheus and the kubelet probes reach.
+      # hostPID: /proc/<pid>/root is used to find TLS libraries in other
+      # containers, and pid_filter names host PIDs.
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -61,9 +63,8 @@ spec:
           image: {{ include "panopticon.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            {{- range .Values.agent.interfaces }}
-            - "--interface"
-            - {{ . | quote }}
+            {{- if .Values.agent.interfaces }}
+            {{- fail "agent.interfaces was removed with the TC backend: capture covers every socket in the host's cgroup v2 hierarchy; select traffic with pid_filter, cgroup_filter or pod_filter in agent.config" }}
             {{- end }}
             - "--metrics-bind"
             - "{{ .Values.metrics.bindAddress }}:{{ .Values.metrics.port }}"
@@ -162,8 +163,16 @@ spec:
               mountPath: /sys/kernel/tracing
             - name: debugfs
               mountPath: /sys/kernel/debug
-            # Host inode for the cgroup_skb backend's instance lock
-            # (/run/panopticon/scope.lock), shared by every agent on the node.
+            # The host's cgroup v2 root, where the capture programs attach
+            # (a container's own /sys/fs/cgroup is its cgroup namespace's
+            # view: attaching there would capture the agent pod only).
+            # Read-only: attaching opens the directory, never writes it.
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            # Host inode for the capture's instance lock
+            # (/run/panopticon/scope.lock), shared by every agent on the node,
+            # and the private cgroup2 mount on cgroup v1 hosts (RHEL 8).
             - name: run-panopticon
               mountPath: /run/panopticon
             {{- if .Values.agent.config }}
@@ -188,6 +197,10 @@ spec:
           hostPath:
             path: /sys/kernel/debug
             type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
         - name: run-panopticon
           hostPath:
             path: /run/panopticon

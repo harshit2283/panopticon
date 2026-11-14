@@ -12,9 +12,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 agent:
-  # Network interfaces to attach TC classifiers to. Empty = the agent
-  # auto-detects the node's IPv4 default-route interface(s) (ens5, enp*, bond0...).
-  interfaces: []
+  # Capture attaches to the host's cgroup v2 root (mounted from
+  # /sys/fs/cgroup) and sees every local socket; select what is captured
+  # with pid_filter, cgroup_filter or [[pod_filter]] in agent.config
+  # (docs/USER-GUIDE.md §4). The TC backend and its `interfaces` list were
+  # removed; setting agent.interfaces fails the render.
   # Log level (RUST_LOG filter).
   logLevel: info
   # Log every captured event to stdout (very verbose; development only).

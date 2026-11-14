@@ -195,6 +195,8 @@ jobs:
       - uses: azure/setup-helm@v4
       - name: Lint
         run: helm lint helm/panopticon
+      - name: Render (fails if the chart does not render)
+        run: helm template panopticon helm/panopticon/ >/dev/null
       - name: Validate rendered manifests (default + all options)
         run: |
           go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
@@ -203,6 +205,5 @@ jobs:
             helm template t helm/panopticon \
               --set agent.config='max_events_per_sec = 1000' \
               --set export.hostPath=/var/lib/panopticon \
-              --set 'agent.interfaces={ens5}' \
               --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
           } | "$(go env GOPATH)/bin/kubeconform" -strict -summary -
