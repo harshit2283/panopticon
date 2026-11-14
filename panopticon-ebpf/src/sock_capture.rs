@@ -22,9 +22,10 @@ use aya_ebpf::{
     helpers::bpf_probe_read_kernel,
     helpers::generated::{
         bpf_get_current_ancestor_cgroup_id, bpf_get_current_pid_tgid, bpf_get_prandom_u32,
-        bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_ancestor_cgroup_id, bpf_sk_cgroup_id,
-        bpf_sk_fullsock, bpf_sk_storage_get, bpf_skb_load_bytes, bpf_sock_ops_cb_flags_set,
-        bpf_tcp_sock,
+        bpf_get_socket_cookie, bpf_ktime_get_ns,
+        bpf_probe_read_kernel as bpf_probe_read_kernel_raw, bpf_sk_ancestor_cgroup_id,
+        bpf_sk_cgroup_id, bpf_sk_fullsock, bpf_sk_storage_get, bpf_skb_load_bytes,
+        bpf_sock_ops_cb_flags_set, bpf_tcp_sock,
     },
     macros::{cgroup_skb, cgroup_sock, fentry, fexit, sock_ops},
     programs::{FEntryContext, FExitContext, SkBuffContext, SockContext, SockOpsContext},
@@ -35,20 +36,19 @@ use panopticon_common::{
     CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary,
     scope::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
-        DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, DROP_VRF_UNKNOWN,
-        FLAG_BASELINE, FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER,
-        FLAGS_STICKY, OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN,
-        SockState, VERDICT_IN, VRF_EV_MAP_FULL, VRF_EV_READ_FAILED, VRF_EV_RECORDED,
-        VRF_EV_REMOVED, cached_verdict, drop_reason, head_take, in_sample, is_initialised,
-        is_unscoped_full, local_packet, pid_inputs, reserved_take, role_of, stream_offset,
-        tls_addr_in_scope, udp_should_reserve, verdict, verdict_cacheable, verdict_word,
+        DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE,
+        FLAG_KTLS, FLAG_REPAIRED, FLAG_REUSED, FLAG_ROLE_CLIENT, FLAG_ROLE_SERVER, FLAGS_STICKY,
+        NETDEV_L3M_BYTE, NETDEV_L3M_MASK, NETDEV_SKB_DEV, OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE,
+        SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict, drop_reason,
+        head_take, in_sample, is_initialised, is_unscoped_full, local_packet, pid_inputs,
+        reserved_take, role_of, skb_stamp, stream_offset, tls_addr_in_scope, udp_should_reserve,
+        verdict, verdict_cacheable, verdict_word,
     },
 };
 
 use crate::maps::{
-    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, VRF_DEVS, VRF_EVENTS,
-    VRF_FAILED, VRF_LIVE, VRF_MASTERS, count_kernel_drop, count_scope_drop, shard_for,
-    shard_reserve_as, shard_submit_flags_for,
+    CGROUP_ALLOW, CONFIG, IPV6_DROPS, NETDEV_OFFS, PID_FILTER, SizedEvent, count_kernel_drop,
+    count_scope_drop, shard_for, shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -561,115 +561,48 @@ fn on_tcp_close(ctx: &SockOpsContext) {
 
 // ── VRF masters (§3.7) ─────────────────────────────────────────────────────
 
-/// fexit `register_netdevice(dev) -> ret`: a new device, in any namespace.
-/// A VRF master is counted before it can carry a packet (the ifindex is
-/// assigned inside; the link ops are set before, by `rtnl_create_link`). A
-/// VRF cannot change namespace (`NETIF_F_NETNS_LOCAL`), so its ifindex is
-/// final. A failed registration counts nothing.
-#[fexit(function = "register_netdevice")]
-pub fn scope_vrf_register(ctx: FExitContext) -> i32 {
-    let ret: i32 = ctx.arg(1);
-    if ret == 0 {
-        on_netdev(ctx.arg(0), true);
-    }
-    0
-}
-
-/// fentry `unregister_netdevice_queue(dev, head)`: every unregistration
-/// (a delete, a namespace teardown) goes through it, under RTNL.
-#[fentry(function = "unregister_netdevice_queue")]
-pub fn scope_vrf_unregister(ctx: FEntryContext) -> i32 {
-    on_netdev(ctx.arg(0), false);
-    0
-}
-
+/// Whether the packet's device is a VRF master (`IFF_L3MDEV_MASTER` in its
+/// `priv_flags`), read from the `sk_buff` itself: the hook's context is the
+/// kernel's `struct sk_buff`, and `skb->dev` is the output device on egress
+/// and the VRF master on VRF ingress. No inventory, so nothing to keep in
+/// sync with device creation or deletion. Unwritten offsets (mask 0), a
+/// failed read or no device count as a master (fails closed: dropped while
+/// loopback is off).
+///
+/// Branch-free on purpose: both reads always run and every failure is folded
+/// in arithmetically, so the verifier sees one path. Early returns here
+/// multiplied the states of `try_skb` past the 1M-instruction limit on 5.15
+/// and 4.18.
 #[inline(always)]
-fn vrf_event(i: u32) {
-    if let Some(n) = VRF_EVENTS.get_ptr_mut(i) {
-        unsafe { *n += 1 };
-    }
-}
-
-/// Classification failed: from now on, while loopback is dropped, so is
-/// every packet (`vrf_unknown`).
-#[inline(always)]
-fn vrf_fail(event: u32) {
-    vrf_event(event);
-    if let Some(f) = VRF_FAILED.get_ptr_mut(0) {
-        unsafe { *f = 1 };
-    }
-}
-
-#[inline(always)]
-pub(crate) fn vrf_failed() -> bool {
-    VRF_FAILED.get(0).is_some_and(|&f| f != 0)
-}
-
-/// Count (`register`) or uncount `dev` if its link kind is "vrf". With
-/// valid offsets, a failed read latches the failure (the device might be a
-/// VRF); a device without link ops or with another kind is not a VRF.
-#[inline(always)]
-fn on_netdev(dev: *const u8, register: bool) {
-    let (Some(&ifx_off), Some(&ops_off), Some(&kind_off)) =
-        (NETDEV_OFFS.get(0), NETDEV_OFFS.get(1), NETDEV_OFFS.get(2))
-    else {
-        return vrf_fail(VRF_EV_READ_FAILED);
+fn on_vrf_master(skb: *const u8) -> bool {
+    let off = |i| NETDEV_OFFS.get(i).copied().unwrap_or(0);
+    let (dev_off, byte_off, mask) = (
+        off(NETDEV_SKB_DEV),
+        off(NETDEV_L3M_BYTE),
+        off(NETDEV_L3M_MASK),
+    );
+    let mut dev: u64 = 0;
+    let mut b: u8 = 0;
+    // A failed read zeroes its destination and returns a negative errno.
+    let r1 = unsafe {
+        bpf_probe_read_kernel_raw(
+            &mut dev as *mut u64 as *mut c_void,
+            8,
+            skb.wrapping_add(dev_off as usize) as *const c_void,
+        )
     };
-    if ifx_off == 0 {
-        return; // not written yet: the loader writes before attaching
-    }
-    if dev.is_null() {
-        return vrf_fail(VRF_EV_READ_FAILED);
-    }
-    let read_ptr = |p: *const u8| unsafe { bpf_probe_read_kernel(p as *const *const u8) };
-    let Ok(ops) = read_ptr(unsafe { dev.add(ops_off as usize) }) else {
-        return vrf_fail(VRF_EV_READ_FAILED);
+    let r2 = unsafe {
+        bpf_probe_read_kernel_raw(
+            &mut b as *mut u8 as *mut c_void,
+            1,
+            (dev as usize).wrapping_add(byte_off as usize) as *const c_void,
+        )
     };
-    if ops.is_null() {
-        return; // no rtnetlink link ops: not created as a VRF
-    }
-    let (Ok(kind), Ok(ifindex)) = (read_ptr(unsafe { ops.add(kind_off as usize) }), unsafe {
-        bpf_probe_read_kernel(dev.add(ifx_off as usize) as *const u32)
-    }) else {
-        return vrf_fail(VRF_EV_READ_FAILED);
-    };
-    if kind.is_null() {
-        return vrf_fail(VRF_EV_READ_FAILED);
-    }
-    let Ok(k) = (unsafe { bpf_probe_read_kernel(kind as *const [u8; 4]) }) else {
-        return vrf_fail(VRF_EV_READ_FAILED);
-    };
-    if k != *b"vrf\0" {
-        return;
-    }
-    if ifindex == 0 {
-        return vrf_fail(VRF_EV_READ_FAILED);
-    }
-    let key = dev as u64;
-    if register {
-        // Serialised by RTNL: no concurrent update of these entries.
-        let counted = match VRF_LIVE.get_ptr_mut(&ifindex) {
-            Some(n) => {
-                unsafe { *n += 1 };
-                true
-            }
-            None => VRF_LIVE.insert(&ifindex, &1, 0).is_ok(),
-        };
-        if !counted || VRF_DEVS.insert(&key, &ifindex, 0).is_err() {
-            return vrf_fail(VRF_EV_MAP_FULL);
-        }
-        vrf_event(VRF_EV_RECORDED);
-    } else if unsafe { VRF_DEVS.get(&key) }.is_some() {
-        let _ = VRF_DEVS.remove(&key);
-        if let Some(n) = VRF_LIVE.get_ptr_mut(&ifindex) {
-            if unsafe { *n } <= 1 {
-                let _ = VRF_LIVE.remove(&ifindex);
-            } else {
-                unsafe { *n -= 1 };
-            }
-        }
-        vrf_event(VRF_EV_REMOVED);
-    }
+    let failed = ((r1 | r2) as u64) >> 63;
+    let null = !(dev | dev.wrapping_neg()) >> 63;
+    let unwritten = u64::from(mask.wrapping_sub(1) >> 31); // mask 0 (masks are 1..=128)
+    let hit = u64::from(((u32::from(b) & mask) + 255) >> 8);
+    (failed | null | unwritten | hit) != 0
 }
 
 // ── accept: the acceptor, on the child only ────────────────────────────────
@@ -924,26 +857,26 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     // NIC never saw (IPv6, ::1 included, is not
     // captured, above). The socket is marked whatever the setting, so
     // turning capture off later drops it whole and suppresses its close.
-    // The generation is read before the setting: an event carries `g0`
-    // (unscoped) or is dropped if its verdict's generation is not `g0`
-    // (restricted), so a packet that passed this check before a narrowing
-    // is refused at the ring read.
+    // The generation is read before the setting and the socket's mark, and
+    // every event is stamped `g0` (unscoped and restricted alike), so a
+    // packet whose loopback decision predates a narrowing (the setting
+    // turned off, or another packet marking the socket meanwhile) is refused
+    // at the ring read.
     let sk = sk as *mut c_void;
     let st = state_of(sk, false);
     let g0 = scope_gen();
     let marked = !st.is_null() && rd!(st, local) != 0;
     let ifindex = unsafe { (*skb).ifindex };
-    let vrf = unsafe { VRF_MASTERS.get(&ifindex).is_some() || VRF_LIVE.get(&ifindex).is_some() };
+    let vrf = on_vrf_master(skb as *const u8);
     let lo = local_packet(ifindex, vrf, marked);
     if lo && !marked && !st.is_null() {
         wr!(st, local, 1);
     }
-    // VRF classification failed: no packet can be shown not VRF-local.
-    // Only `excl` is carried past this point (another carried value, even
-    // the drop reason, splits the verifier's states past RHEL 8's limit).
-    let excl = lo || vrf_failed();
-    if excl && !capture_loopback() {
-        return drop(if lo { DROP_LOOPBACK } else { DROP_VRF_UNKNOWN });
+    // The decision is valid for `g0` only: the setting and the socket's
+    // `local` flag (set by a concurrent packet) can change after it, so the
+    // event is stamped `g0`, below.
+    if lo && !capture_loopback() {
+        return drop(DROP_LOOPBACK);
     }
     let mode = scope_mode();
 
@@ -1005,17 +938,10 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Ok(g) => g,
         Err(reason) => return drop(reason),
     };
-    // The loopback setting was read under `g0`; a later generation may
-    // have turned it off.
-    // The reason is re-derived from the latch: with it set, a loopback
-    // packet caught only here is counted vrf_unknown (both are dropped).
-    if excl && g != g0 {
-        return drop(if vrf_failed() {
-            DROP_VRF_UNKNOWN
-        } else {
-            DROP_LOOPBACK
-        });
-    }
+    // The verdict is of generation `g` >= `g0`, but the loopback decision
+    // above is of `g0`: the event is stamped `g0` (`scope::skb_stamp`), so
+    // any narrowing since `g0` refuses it at the ring read, whatever `lo` was.
+    let stamp = skb_stamp(g0, g);
 
     // ── kTLS: the payload may be plaintext at this hook (§3.5). After the
     // verdict, so an in-scope kTLS socket has its IN verdict cached (its TLS
@@ -1060,7 +986,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
             pkt: &pkt,
             take,
             stream_off: off,
-            scope_gen: g,
+            scope_gen: stamp,
         },
     )
 }

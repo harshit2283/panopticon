@@ -15,7 +15,7 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 
 use crate::event_loop::EventStats;
-use panopticon_common::scope::{SCOPE_DROP_NAMES, VRF_EVENT_NAMES};
+use panopticon_common::scope::SCOPE_DROP_NAMES;
 
 /// Agent metrics backed by prometheus-client.
 ///
@@ -48,8 +48,6 @@ pub struct AgentMetrics {
     /// cgroup_skb only ([`Self::register_scope_drops`]): kernel scope drops,
     /// one per `SCOPE_DROP_NAMES` entry in that order; empty on TC.
     pub scope_drops: Vec<Counter<u64>>,
-    /// cgroup_skb only: the VRF hooks' events, one per `VRF_EVENT_NAMES`.
-    pub vrf_events: Vec<Counter<u64>>,
     pub drops_stale_scope_gen: Option<Counter<u64>>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
@@ -248,7 +246,6 @@ impl AgentMetrics {
             credential_matches_user,
             credential_matches_builtin,
             scope_drops: Vec::new(),
-            vrf_events: Vec::new(),
             drops_stale_scope_gen: None,
             parse_latency,
             ringbuf_approx_pending,
@@ -271,18 +268,6 @@ impl AgentMetrics {
         self.scope_drops = SCOPE_DROP_NAMES
             .iter()
             .map(|&reason| family.get_or_create(&[("reason", reason)]).clone())
-            .collect();
-        let vrf = Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
-        registry.register(
-            "panopticon_vrf_hook_events",
-            "VRF device hook events: VRF masters recorded and removed, and failures \
-             (read_failed, map_full) that make every packet count as vrf_unknown while \
-             capture_loopback is false",
-            vrf.clone(),
-        );
-        self.vrf_events = VRF_EVENT_NAMES
-            .iter()
-            .map(|&event| vrf.get_or_create(&[("event", event)]).clone())
             .collect();
         let stale = Counter::<u64>::default();
         registry.register(
@@ -386,12 +371,7 @@ impl AgentMetrics {
         self.credential_matches_builtin
             .inner()
             .store(builtin, Ordering::Relaxed);
-        for (counter, value) in self
-            .scope_drops
-            .iter()
-            .zip(&stats.scope_drops)
-            .chain(self.vrf_events.iter().zip(&stats.vrf_events))
-        {
+        for (counter, value) in self.scope_drops.iter().zip(&stats.scope_drops) {
             counter
                 .inner()
                 .store(value.load(Ordering::Relaxed), Ordering::Relaxed);

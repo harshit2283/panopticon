@@ -29,9 +29,7 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 15] = [
-    (VRF_REGISTER, "register_netdevice"),
-    (VRF_UNREGISTER, "unregister_netdevice_queue"),
+const TARGETS: [(&str, &str); 13] = [
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -260,28 +258,46 @@ fn ifindex_of(dev: &str) -> u32 {
     i
 }
 
-/// Recorded by the startup scan (`VRF_MASTERS`).
-fn vrf_scanned(ebpf: &Ebpf, ifindex: u32) -> bool {
-    let m: HashMap<&MapData, u32, u8> =
-        HashMap::try_from(ebpf.map("VRF_MASTERS").unwrap()).unwrap();
-    m.get(&ifindex, 0).is_ok()
+/// The devices and namespaces this test creates. Removed at start (a run
+/// that panicked may have left them) and by [`LabGuard`] at the end, panic
+/// included.
+const LAB_LINKS: [&str; 5] = ["pvd0", "pvrf", "pnlo0", "pvfull", "pmc0"];
+const LAB_NETNS: [&str; 4] = ["pnlo", "pnvrf", "pntask", "pnprobe"];
+
+fn lab_cleanup() {
+    for l in LAB_LINKS {
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", l])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    for n in LAB_NETNS {
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", n])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
-/// Counted live by the hooks (`VRF_LIVE`).
-fn vrf_live(ebpf: &Ebpf, ifindex: u32) -> bool {
-    let m: HashMap<&MapData, u32, u32> = HashMap::try_from(ebpf.map("VRF_LIVE").unwrap()).unwrap();
-    m.get(&ifindex, 0).is_ok()
+const L3MDEV_ACCEPT: &str = "/proc/sys/net/ipv4/udp_l3mdev_accept";
+
+/// Cleans up on drop, panic included, and restores `udp_l3mdev_accept`.
+struct LabGuard(Option<String>);
+
+impl LabGuard {
+    fn new() -> Self {
+        lab_cleanup();
+        Self(std::fs::read_to_string(L3MDEV_ACCEPT).ok())
+    }
 }
 
-fn forget_vrf_master(ebpf: &mut Ebpf, ifindex: u32) {
-    let mut m: HashMap<&mut MapData, u32, u8> =
-        HashMap::try_from(ebpf.map_mut("VRF_MASTERS").unwrap()).unwrap();
-    let _ = m.remove(&ifindex);
-}
-
-fn vrf_failed_latch(ebpf: &Ebpf) -> u32 {
-    let a: Array<&MapData, u32> = Array::try_from(ebpf.map("VRF_FAILED").unwrap()).unwrap();
-    a.get(&0, 0).unwrap()
+impl Drop for LabGuard {
+    fn drop(&mut self) {
+        lab_cleanup();
+        if let Some(v) = &self.0 {
+            let _ = std::fs::write(L3MDEV_ACCEPT, v.trim());
+        }
+    }
 }
 
 /// An IPv4 socket of `ty`, bound to `dev` if given.
@@ -451,6 +467,22 @@ fn spawn_with_pid(pid: u32, port: u16, payload: &str) -> bool {
 #[ignore = "needs root on a Linux lab kernel"]
 fn scope_programs_load_attach_and_hold() {
     let _lab = LAB.lock().unwrap_or_else(|e| e.into_inner());
+    let _links = LabGuard::new();
+    // A VRF that exists before the programs load: classification is per
+    // packet, from the device it is on, so when the VRF was created does
+    // not matter (§3.7). A kernel without the vrf module (Ubuntu cloud
+    // kernels without modules-extra) skips the VRF cases, saying so.
+    let vrf_ok = ip_cmd("link add pvrf type vrf table 211");
+    if vrf_ok {
+        assert!(
+            ip_cmd("link set pvrf up")
+                && ip_cmd("link add pvd0 type dummy")
+                && ip_cmd("link set pvd0 master pvrf")
+                && ip_cmd("addr add 10.212.0.1/24 dev pvd0")
+                && ip_cmd("link set pvd0 up"),
+            "VRF pvrf with pvd0"
+        );
+    }
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");
 
@@ -582,23 +614,6 @@ fn scope_programs_load_attach_and_hold() {
     }
     let mut q = spawn_sleep_at(p_pid).expect("Q reuses P's pid");
 
-    // A VRF that predates the attach, in another namespace: the startup
-    // scan records it (§3.7).
-    let _ = ip_cmd("netns del pnvrf");
-    let pre_vrf = (ip_cmd("netns add pnvrf")
-        && ip_cmd("-n pnvrf link add pvpre type vrf table 212"))
-    .then(|| {
-        let out = std::process::Command::new("ip")
-            .args(["-n", "pnvrf", "-o", "link", "show", "pvpre"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .split(':')
-            .next()
-            .and_then(|n| n.trim().parse::<u32>().ok())
-            .expect("pvpre ifindex")
-    });
-
     // ── production attach, disarmed
     let mut links = Vec::new();
     let (_, exit_attached) = attach_disarmed(
@@ -610,26 +625,6 @@ fn scope_programs_load_attach_and_hold() {
     )
     .expect("attach");
     assert!(exit_attached);
-    match pre_vrf {
-        Some(i) => {
-            assert!(
-                vrf_scanned(&ebpf, i),
-                "startup scan recorded pvpre in pnvrf"
-            );
-            // Its ifindex may equal a host device's (no namespace in the key):
-            // forget it so the sections below are not over-dropped.
-            forget_vrf_master(&mut ebpf, i);
-            // A VRF cannot change namespace (NETIF_F_NETNS_LOCAL), so its
-            // ifindex is final at registration: no move hook is needed.
-            assert!(
-                !ip_cmd("-n pnvrf link set pvpre netns 1"),
-                "a VRF moved between namespaces"
-            );
-            let _ = ip_cmd("netns del pnvrf");
-            println!("VRF_SCAN OK ifindex={i}");
-        }
-        None => println!("VRF_SCAN SKIP (no vrf device type)"),
-    }
     for p in pids {
         assert!(in_map(&ebpf, "PID_CANDIDATES", p), "candidate {p} written");
         assert!(!pid_listed(&ebpf, p), "nothing published before arm");
@@ -1653,40 +1648,19 @@ fn scope_programs_load_attach_and_hold() {
     );
     set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_SEL_PID);
 
-    // VRF (§3.7): a VRF master's ifindex, recorded by fexit register_netdevice
-    // when it is created (pre-existing ones by the startup scan, checked at
-    // attach), marks every packet on it local: local delivery leaves and
-    // arrives on the master whether the socket is bound to the master, to a
-    // slave, or not at all. Cases: TCP both ends bound to the master; TCP
-    // with the client bound to the slave; UDP from an unbound sender that
-    // picks the VRF per datagram (IP_PKTINFO), first datagram; UDP to an
-    // unbound receiver (udp_l3mdev_accept = 1). Off: none exported, counted,
-    // every socket marked. On: captured. TCP: no close record once off (UDP
-    // has none).
-    let _ = ip("link del pvrf");
-    let _ = ip("link del pvd0");
-    // A kernel without the vrf module (Ubuntu cloud kernels without
-    // modules-extra) skips this case, saying so.
-    if !ip("link add pvrf type vrf table 211") {
+    // VRF (§3.7): every packet on a VRF master's device (`IFF_L3MDEV_MASTER`,
+    // read from the packet's own `skb->dev`) is local: local delivery leaves
+    // and arrives on the master whether the socket is bound to the master, to a
+    // slave, or not at all. pvrf was created before the programs loaded.
+    // Cases: TCP both ends bound to the master; TCP with the client bound to
+    // the slave; UDP from an unbound sender that picks the VRF per datagram
+    // (IP_PKTINFO), first datagram; UDP to an unbound receiver
+    // (udp_l3mdev_accept = 1). Off: none exported, counted, every socket
+    // marked. On: captured. TCP: no close record once off (UDP has none).
+    if !vrf_ok {
         println!("LOOPBACK VRF SKIP (no vrf device type)");
     } else {
-        assert!(
-            ip("link set pvrf up")
-                && ip("link add pvd0 type dummy")
-                && ip("link set pvd0 master pvrf")
-                && ip("addr add 10.212.0.1/24 dev pvd0")
-                && ip("link set pvd0 up"),
-            "VRF pvrf with pvd0"
-        );
         let vrf_ifx = ifindex_of("pvrf");
-        assert!(
-            vrf_live(&ebpf, vrf_ifx),
-            "fexit register_netdevice recorded pvrf"
-        );
-        assert!(
-            !vrf_live(&ebpf, ifindex_of("pvd0")),
-            "a slave is not a master"
-        );
         let vaddr = |port: u16| std::net::SocketAddr::from(([10, 212, 0, 1], port));
         let vrf_l = {
             let s = bound(libc::SOCK_STREAM, Some("pvrf"));
@@ -1822,112 +1796,176 @@ fn scope_programs_load_attach_and_hold() {
                     && closing.contains(&e.socket_cookie)),
             "no VRF close record once loopback is off"
         );
+
+        // Looped multicast and broadcast (§3.7, Codex VRF R3 finding 1): a
+        // sender on the slave (pvd0) with multicast loop on. ip_mc_output
+        // clones the packet for local delivery, but the clone has no socket
+        // (skb_clone), so the egress runner does not run the program for it
+        // (BPF_CGROUP_RUN_PROG_INET_EGRESS requires the skb's socket): the
+        // sender has only the copy that leaves (multicast TTL > 0, or
+        // broadcast), loopback on or off, and is not marked local; nothing
+        // is dropped as loopback with it on. The receiver (bound to the
+        // master; delivery on the master) is dropped while off, captured
+        // while on. TTL 0 multicast has no leaving copy; broadcast is always
+        // looped and has no TTL-0 rule.
+        assert!(ip_cmd("link set pvd0 multicast on"));
+        let group = std::net::Ipv4Addr::new(224, 0, 0, 123);
+        let local = std::net::Ipv4Addr::new(10, 212, 0, 1);
+        let mrx = {
+            let s = bound(libc::SOCK_DGRAM, Some("pvrf"));
+            s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())
+                .unwrap();
+            s.join_multicast_v4(&group, &local).unwrap();
+            s.set_broadcast(true).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            UdpSocket::from(s)
+        };
+        let mport = mrx.local_addr().unwrap().port();
+        let mc_send = |to: std::net::Ipv4Addr, ttl: u32, msg: &[u8]| -> UdpSocket {
+            let s = bound(libc::SOCK_DGRAM, Some("pvd0"));
+            s.set_multicast_if_v4(&local).unwrap();
+            s.set_multicast_loop_v4(true).unwrap();
+            s.set_multicast_ttl_v4(ttl).unwrap();
+            s.set_broadcast(true).unwrap();
+            s.send_to(msg, &std::net::SocketAddr::from((to, mport)).into())
+                .unwrap();
+            let mut b = [0u8; 64];
+            let n = mrx.recv(&mut b).expect("the looped copy is delivered");
+            assert_eq!(&b[..n], msg);
+            UdpSocket::from(s)
+        };
+        let bcast = std::net::Ipv4Addr::new(10, 212, 0, 255);
+        let count = |ev: &[(u64, Direction, u64, Vec<u8>)], c: u64, m: &[u8]| {
+            ev.iter().filter(|e| e.0 == c && e.3 == m).count()
+        };
+        let cases: [(std::net::Ipv4Addr, u32, &[u8], usize); 3] = [
+            (group, 0, b"mc-ttl0", 0),
+            (group, 1, b"mc-ttl1", 1),
+            (bcast, 1, b"bcast", 1),
+        ];
+        for on in [false, true] {
+            set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, u64::from(on));
+            bump(&mut ebpf);
+            let _ = drain(&mut ring);
+            for (to, ttl, m, remote) in cases {
+                let msg = [m, if on { &b"-on"[..] } else { b"-off" }].concat();
+                let all_drops = |e: &Ebpf| {
+                    (0..SCOPE_DROP_REASONS)
+                        .map(|r| drops(e, r))
+                        .collect::<Vec<u64>>()
+                };
+                let d0 = all_drops(&ebpf);
+                let tx = mc_send(to, ttl, &msg);
+                let ev = drain(&mut ring);
+                // Per reason (other traffic on the host can add drops).
+                let dropped: Vec<(&str, u64)> = all_drops(&ebpf)
+                    .iter()
+                    .zip(&d0)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(r, (a, b))| (SCOPE_DROP_NAMES[r], a - b))
+                    .collect();
+                let sent = count(&ev, cookie(&tx), &msg);
+                let rcvd = count(&ev, cookie(&mrx), &msg);
+                println!(
+                    "MCLOOP {to} ttl={ttl} loopback={on}: sender {sent} receiver {rcvd} \
+                     scope_drops {dropped:?}"
+                );
+                if on {
+                    // Measured: the looped clone never reaches the program
+                    // (skb_clone leaves skb->sk NULL; the egress runner
+                    // requires the skb's socket), so only the original.
+                    assert_eq!(sent, remote, "{to} ttl {ttl}: the original only: {ev:?}");
+                    assert!(
+                        !dropped.iter().any(|(r, _)| *r == "loopback"),
+                        "{to} ttl {ttl}: nothing dropped as loopback with it on: {dropped:?}"
+                    );
+                    assert_eq!(rcvd, 1, "{to} ttl {ttl}: receiver captured");
+                } else {
+                    assert_eq!(sent, remote, "{to} ttl {ttl}: only the remote copy: {ev:?}");
+                    assert_eq!(rcvd, 0, "{to} ttl {ttl}: receiver not captured");
+                    assert_eq!(
+                        crate::state(&ebpf, &tx).map(|s| s.local),
+                        Some(0),
+                        "{to} ttl {ttl}: sender not marked local"
+                    );
+                }
+            }
+        }
+        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
+        bump(&mut ebpf);
+        drop(mrx);
+        println!("LOOPBACK VRF MCLOOP OK");
         set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
         bump(&mut ebpf);
         std::fs::write("/proc/sys/net/ipv4/udp_l3mdev_accept", l3_accept.trim()).unwrap();
         drop((cm, sm, cs, ss, tp, tr, tp2, tr2, rx, vrf_u, vrf_l));
         let _ = ip("link del pvd0");
         assert!(ip("link del pvrf"));
-        assert!(
-            !vrf_live(&ebpf, vrf_ifx),
-            "fentry unregister_netdevice_queue removed pvrf"
-        );
+        println!("LOOPBACK VRF OK");
+    }
 
-        // Discovery reaches a namespace held only by a thread's private fd
-        // table (unshare(CLONE_FILES)): no bind mount, no task inside.
-        let _ = ip("netns del pntask");
-        assert!(ip("netns add pntask") && ip("-n pntask link add pvtask type vrf table 213"));
-        let task_ifx = {
-            let out = std::process::Command::new("ip")
-                .args(["-n", "pntask", "-o", "link", "show", "pvtask"])
-                .output()
+    // Looped multicast without a VRF (all five kernels): the same clone,
+    // on a plain dummy device. The sender has only the copy that leaves,
+    // loopback on or off (the clone never reaches the program); the looped
+    // copy's receive is on pmc0, not node-local, so it is captured.
+    {
+        assert!(
+            ip_cmd("link add pmc0 type dummy")
+                && ip_cmd("link set pmc0 multicast on")
+                && ip_cmd("addr add 10.213.0.1/24 dev pmc0")
+                && ip_cmd("link set pmc0 up"),
+            "dummy pmc0"
+        );
+        let group = std::net::Ipv4Addr::new(224, 0, 0, 124);
+        let local = std::net::Ipv4Addr::new(10, 213, 0, 1);
+        let prx = {
+            let s = bound(libc::SOCK_DGRAM, None);
+            s.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 0)).into())
                 .unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .split(':')
-                .next()
-                .and_then(|n| n.trim().parse::<u32>().ok())
-                .expect("pvtask ifindex")
+            s.join_multicast_v4(&group, &local).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            UdpSocket::from(s)
         };
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            // SAFETY: this thread's own fd table only.
-            assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
-            let ns = File::open("/run/netns/pntask").unwrap();
-            held_tx.send(()).unwrap();
-            let _ = done_rx.recv();
-            drop(ns);
-        });
-        held_rx.recv().unwrap();
-        assert!(
-            ip("netns del pntask"),
-            "bind mount removed; the fd keeps it"
-        );
-        let found = scan_vrf_masters().expect("scan");
-        assert!(
-            found.contains(&task_ifx),
-            "per-task fd discovery found pvtask ({task_ifx}): {found:?}"
-        );
-        done_tx.send(()).unwrap();
-        holder.join().unwrap();
-
-        // Exhaustion: with the hooks' map full, a new VRF cannot be counted,
-        // so classification fails (latched) and, with loopback off, every
-        // packet is dropped as vrf_unknown, a veth one too.
-        let mut filler = Vec::new();
-        {
-            let mut live: HashMap<&mut MapData, u32, u32> =
-                HashMap::try_from(ebpf.map_mut("VRF_LIVE").unwrap()).unwrap();
-            for k in 1_000_000u32.. {
-                if live.insert(k, 1, 0).is_err() {
-                    break;
-                }
-                filler.push(k);
+        let pport = prx.local_addr().unwrap().port();
+        for on in [false, true] {
+            set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, u64::from(on));
+            bump(&mut ebpf);
+            let _ = drain(&mut ring);
+            for (ttl, remote) in [(0u32, 0usize), (1, 1)] {
+                let msg = format!("plain-mc-ttl{ttl}-{on}").into_bytes();
+                let s = bound(libc::SOCK_DGRAM, Some("pmc0"));
+                s.set_multicast_if_v4(&local).unwrap();
+                s.set_multicast_loop_v4(true).unwrap();
+                s.set_multicast_ttl_v4(ttl).unwrap();
+                s.send_to(&msg, &std::net::SocketAddr::from((group, pport)).into())
+                    .unwrap();
+                let mut b = [0u8; 64];
+                let n = prx.recv(&mut b).expect("the looped copy is delivered");
+                assert_eq!(&b[..n], &msg[..]);
+                let tx = UdpSocket::from(s);
+                let ev = drain(&mut ring);
+                let sent = ev
+                    .iter()
+                    .filter(|e| e.0 == cookie(&tx) && e.3 == msg)
+                    .count();
+                let rcvd = ev
+                    .iter()
+                    .filter(|e| e.0 == cookie(&prx) && e.3 == msg)
+                    .count();
+                println!("MCPLAIN ttl={ttl} loopback={on}: sender {sent} receiver {rcvd}");
+                assert_eq!(
+                    sent, remote,
+                    "plain ttl {ttl}: the leaving copy only: {ev:?}"
+                );
+                assert_eq!(rcvd, 1, "plain ttl {ttl}: the receive on pmc0 captured");
             }
         }
-        assert!(!filler.is_empty() && vrf_failed_latch(&ebpf) == 0);
-        let _ = ip("link del pvfull");
-        assert!(ip("link add pvfull type vrf table 214"));
-        assert_eq!(vrf_failed_latch(&ebpf), 1, "map full latched VRF_FAILED");
-        assert!(
-            refuse_if_vrf_failed(&ebpf).is_err(),
-            "startup and arming refuse with the latch set"
-        );
-        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 0);
-        bump(&mut ebpf);
-        let unk0 = drops(&ebpf, DROP_VRF_UNKNOWN);
-        let (cu, su) = exchange(&vl, b"veth-latched");
-        let ev = drain(&mut ring);
-        assert!(
-            !ev.iter().any(|e| e.0 == cookie(&cu) || e.0 == cookie(&su)),
-            "nothing exported once VRF classification failed: {ev:?}"
-        );
-        assert!(
-            drops(&ebpf, DROP_VRF_UNKNOWN) >= unk0 + 2,
-            "counted vrf_unknown"
-        );
-        set(&mut ebpf, CONFIG_CAPTURE_LOOPBACK, 1);
-        bump(&mut ebpf);
-        let (cu2, su2) = exchange(&vl, b"veth-latched-on");
-        let ev = drain(&mut ring);
-        assert!(
-            has(&ev, cookie(&cu2), b"veth-latched-on"),
-            "loopback on: the latch drops nothing: {ev:?}"
-        );
-        // Test-only reset, so the sections below run unlatched.
-        assert!(ip("link del pvfull"));
-        {
-            let mut live: HashMap<&mut MapData, u32, u32> =
-                HashMap::try_from(ebpf.map_mut("VRF_LIVE").unwrap()).unwrap();
-            for k in &filler {
-                let _ = live.remove(k);
-            }
-            let mut f: Array<&mut MapData, u32> =
-                Array::try_from(ebpf.map_mut("VRF_FAILED").unwrap()).unwrap();
-            f.set(0, 0, 0).unwrap();
-        }
-        drop((cu, su, cu2, su2));
-        println!("LOOPBACK VRF OK latch_after={} entries", filler.len());
+        drop(prx);
+        assert!(ip_cmd("link del pmc0"));
+        println!("LOOPBACK MCPLAIN OK");
     }
 
     // On again (a widening): loopback captured, TLS on it too.
