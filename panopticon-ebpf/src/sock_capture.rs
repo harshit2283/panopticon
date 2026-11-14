@@ -22,9 +22,10 @@ use aya_ebpf::{
     helpers::bpf_probe_read_kernel,
     helpers::generated::{
         bpf_get_current_ancestor_cgroup_id, bpf_get_current_pid_tgid, bpf_get_prandom_u32,
-        bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_ancestor_cgroup_id, bpf_sk_cgroup_id,
-        bpf_sk_fullsock, bpf_sk_storage_get, bpf_skb_load_bytes, bpf_sock_ops_cb_flags_set,
-        bpf_probe_read_kernel as bpf_probe_read_kernel_raw, bpf_tcp_sock,
+        bpf_get_socket_cookie, bpf_ktime_get_ns,
+        bpf_probe_read_kernel as bpf_probe_read_kernel_raw, bpf_sk_ancestor_cgroup_id,
+        bpf_sk_cgroup_id, bpf_sk_fullsock, bpf_sk_storage_get, bpf_skb_load_bytes,
+        bpf_sock_ops_cb_flags_set, bpf_tcp_sock,
     },
     macros::{cgroup_skb, cgroup_sock, fentry, fexit, sock_ops},
     programs::{FEntryContext, FExitContext, SkBuffContext, SockContext, SockOpsContext},
