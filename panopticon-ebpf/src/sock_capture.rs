@@ -24,7 +24,7 @@ use aya_ebpf::{
         bpf_get_current_ancestor_cgroup_id, bpf_get_current_pid_tgid, bpf_get_prandom_u32,
         bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_ancestor_cgroup_id, bpf_sk_cgroup_id,
         bpf_sk_fullsock, bpf_sk_storage_get, bpf_skb_load_bytes, bpf_sock_ops_cb_flags_set,
-        bpf_tcp_sock,
+        bpf_probe_read_kernel as bpf_probe_read_kernel_raw, bpf_tcp_sock,
     },
     macros::{cgroup_skb, cgroup_sock, fentry, fexit, sock_ops},
     programs::{FEntryContext, FExitContext, SkBuffContext, SockContext, SockOpsContext},
@@ -564,36 +564,44 @@ fn on_tcp_close(ctx: &SockOpsContext) {
 /// `priv_flags`), read from the `sk_buff` itself: the hook's context is the
 /// kernel's `struct sk_buff`, and `skb->dev` is the output device on egress
 /// and the VRF master on VRF ingress. No inventory, so nothing to keep in
-/// sync with device creation or deletion. Unwritten offsets, a failed read
-/// or no device count as a master (fails closed: dropped while loopback is
-/// off).
+/// sync with device creation or deletion. Unwritten offsets (mask 0), a
+/// failed read or no device count as a master (fails closed: dropped while
+/// loopback is off).
+///
+/// Branch-free on purpose: both reads always run and every failure is folded
+/// in arithmetically, so the verifier sees one path. Early returns here
+/// multiplied the states of `try_skb` past the 1M-instruction limit on 5.15
+/// and 4.18.
 #[inline(always)]
 fn on_vrf_master(skb: *const u8) -> bool {
-    let (Some(&dev_off), Some(&byte_off), Some(&mask)) = (
-        NETDEV_OFFS.get(NETDEV_SKB_DEV),
-        NETDEV_OFFS.get(NETDEV_L3M_BYTE),
-        NETDEV_OFFS.get(NETDEV_L3M_MASK),
-    ) else {
-        return true;
+    let off = |i| NETDEV_OFFS.get(i).copied().unwrap_or(0);
+    let (dev_off, byte_off, mask) = (
+        off(NETDEV_SKB_DEV),
+        off(NETDEV_L3M_BYTE),
+        off(NETDEV_L3M_MASK),
+    );
+    let mut dev: u64 = 0;
+    let mut b: u8 = 0;
+    // A failed read zeroes its destination and returns a negative errno.
+    let r1 = unsafe {
+        bpf_probe_read_kernel_raw(
+            &mut dev as *mut u64 as *mut c_void,
+            8,
+            skb.wrapping_add(dev_off as usize) as *const c_void,
+        )
     };
-    if mask == 0 {
-        return true;
-    }
-    let Ok(dev) =
-        (unsafe { bpf_probe_read_kernel(skb.wrapping_add(dev_off as usize) as *const *const u8) })
-    else {
-        return true;
+    let r2 = unsafe {
+        bpf_probe_read_kernel_raw(
+            &mut b as *mut u8 as *mut c_void,
+            1,
+            (dev as usize).wrapping_add(byte_off as usize) as *const c_void,
+        )
     };
-    if dev.is_null() {
-        return true;
-    }
-    match unsafe { bpf_probe_read_kernel(dev.wrapping_add(byte_off as usize)) } {
-        Ok(b) => {
-            let b: u8 = b;
-            b as u32 & mask != 0
-        }
-        Err(_) => true,
-    }
+    let failed = ((r1 | r2) as u64) >> 63;
+    let null = !(dev | dev.wrapping_neg()) >> 63;
+    let unwritten = u64::from(mask.wrapping_sub(1) >> 31); // mask 0 (masks are 1..=128)
+    let hit = u64::from(((u32::from(b) & mask) + 255) >> 8);
+    (failed | null | unwritten | hit) != 0
 }
 
 // ── accept: the acceptor, on the child only ────────────────────────────────

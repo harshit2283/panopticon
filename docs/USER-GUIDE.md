@@ -249,17 +249,12 @@ running config is kept.
   travels the VRF device, and so does a VRF's incoming remote traffic.
   A socket is dropped from its first packet seen on a VRF device on; a
   one-way sender whose packets all leave through a VRF's member
-  interface to a remote peer is captured. The agent recognises VRF
-  devices when they are created and deleted, and scans every reachable
-  network namespace for existing ones at startup, with fexit/fentry
-  hooks that need kernel BTF; without them, or if the scan cannot
-  complete, the `cgroup_skb` backend refuses to start. If a VRF device
-  ever cannot be recorded (see
-  `panopticon_vrf_hook_events_total{event="read_failed"|"map_full"}`),
-  every packet is dropped while this is off, counted under
-  `reason="vrf_unknown"`; restart the agent. Traffic on a device in
-  another network namespace that has the same interface index as a VRF
-  device is dropped too, and a socket that once carried node-local
+  interface to a remote peer is captured. The agent recognises a VRF
+  device on each packet from the device's own flags, in every network
+  namespace and whenever it was created; it needs kernel BTF to locate
+  those flags, and without it the `cgroup_skb` backend refuses to start.
+  A packet whose device cannot be read is treated as on a VRF device
+  (dropped while this is off). A socket that once carried node-local
   traffic stays dropped (an unconnected UDP socket that talked to a
   local and a remote peer). Set `capture_loopback = true` if you need
   those. Same-node pod-to-pod and host-to-pod traffic over veth, a
