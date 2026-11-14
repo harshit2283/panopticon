@@ -363,6 +363,9 @@ fn netdev_offsets(raw: &[u8]) -> Result<[u32; 3]> {
     if int_off != 0 || int_bits != int_size * 8 {
         bail!("net_device.priv_flags has an integer encoding offset or partial width");
     }
+    if pf_bf > int_bits {
+        bail!("net_device.priv_flags bitfield is wider than its integer");
+    }
     let width = if pf_bf != 0 { pf_bf } else { int_bits };
     let val = btf
         .enumerator("IFF_L3MDEV_MASTER")
@@ -571,15 +574,23 @@ impl<'a> RawBtf<'a> {
         self.strip(*target)
     }
 
-    /// (bit offset, bitfield size or 0, type) of member `m` of struct/union
-    /// `id`, searching anonymous members up to [`BTF_ANON_DEPTH`] deep. The
-    /// member found, and every anonymous member on the way, must lie inside
-    /// its container; a bitfield must start on a byte boundary; a union
-    /// member must start at 0 (the BTF is refused otherwise); an anonymous
-    /// aggregate encoded as a bitfield is not searched.
+    /// (bit offset, bitfield size or 0, type) of the one member `m` of
+    /// struct/union `id`, searching anonymous members up to
+    /// [`BTF_ANON_DEPTH`] deep. `None` if there is no such member, or if the
+    /// layout is ambiguous or malformed: two candidates (direct or promoted
+    /// from anonymous members), a candidate or an anonymous member outside
+    /// its container, a candidate not on a byte boundary, a union member not
+    /// at 0, or an anonymous aggregate encoded as a bitfield.
     fn member(&self, id: u32, m: &str, depth: u32) -> Option<(u32, u32, u32)> {
-        let (kind, _, kflag, size, members) = self.types.get(id as usize)?;
-        let container_bits = size.checked_mul(8)?;
+        self.member_in(id, m, depth).ok().flatten()
+    }
+
+    /// [`Self::member`]: `Err` refuses (ambiguous or malformed), `Ok(None)`
+    /// is not found.
+    fn member_in(&self, id: u32, m: &str, depth: u32) -> Result<Option<(u32, u32, u32)>, ()> {
+        let (kind, _, kflag, size, members) = self.types.get(id as usize).ok_or(())?;
+        let container_bits = size.checked_mul(8).ok_or(())?;
+        let mut found = None;
         for &(name, ty, off) in members {
             let (bits, bitfield) = if *kflag {
                 (off & 0xff_ffff, off >> 24)
@@ -587,34 +598,45 @@ impl<'a> RawBtf<'a> {
                 (off, 0)
             };
             if *kind == BTF_UNION && bits != 0 {
-                return None; // malformed: a union member starts at 0
-            }
-            if bits % 8 != 0 {
-                continue;
+                return Err(()); // malformed: a union member starts at 0
             }
             let extent = if bitfield != 0 {
                 bitfield
             } else {
                 self.size_of(ty).map_or(0, |s| s * 8)
             };
-            if self.name(name) == m.as_bytes() {
-                return (extent != 0 && bits.checked_add(extent)? <= container_bits)
-                    .then_some((bits, bitfield, ty));
-            }
-            if name == 0 && bitfield == 0 && depth < BTF_ANON_DEPTH {
-                let inner = self.strip(ty)?;
-                if matches!(
+            let inside = bits.checked_add(extent).ok_or(())? <= container_bits;
+            let candidate = if self.name(name) == m.as_bytes() {
+                if bits % 8 != 0 || extent == 0 || !inside {
+                    return Err(());
+                }
+                Some((bits, bitfield, ty))
+            } else if name == 0 {
+                let inner = self.strip(ty).ok_or(())?;
+                if !matches!(
                     self.types.get(inner as usize),
                     Some((BTF_STRUCT | BTF_UNION, ..))
-                ) && extent != 0
-                    && bits.checked_add(extent)? <= container_bits
-                    && let Some((o, bf, t)) = self.member(inner, m, depth + 1)
-                {
-                    return Some((bits + o, bf, t));
+                ) {
+                    None
+                } else if bitfield != 0 || !inside || bits % 8 != 0 {
+                    return Err(());
+                } else if depth >= BTF_ANON_DEPTH {
+                    return Err(()); // cannot prove the member is absent below
+                } else {
+                    self.member_in(inner, m, depth + 1)?
+                        .map(|(o, bf, t)| (bits + o, bf, t))
                 }
+            } else {
+                None
+            };
+            if let Some(c) = candidate {
+                if found.is_some() {
+                    return Err(()); // ambiguous
+                }
+                found = Some(c);
             }
         }
-        None
+        Ok(found)
     }
 }
 
@@ -1544,6 +1566,48 @@ mod tests {
         b.ty(4, "net_device", false, 64, &[0, 3, 64], 1);
         let blob = skb_btf(&mut b, 4, 1 << 18);
         assert_eq!(netdev_offsets(&blob).unwrap(), [16, 10, 4]);
+    }
+
+    #[test]
+    fn btf_bitfield_wider_than_its_integer_is_refused() {
+        // Codex VRF R5: priv_flags: u16 declared as a 32-bit bitfield.
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u16", false, 2, &[16], 0); // 2
+        b.ty(4, "net_device", true, 64, &[pf, 2, 64 | (32 << 24)], 1); // 3
+        let blob = skb_btf(&mut b, 3, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
+    }
+
+    #[test]
+    fn btf_ambiguous_member_is_refused() {
+        // Codex VRF R5: two anonymous members each holding priv_flags.
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "", false, 4, &[pf, 1, 0], 1); // 3: anon A
+        b.ty(4, "net_device", false, 64, &[0, 3, 64, 0, 3, 192], 2); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err(), "promoted twice");
+        // two direct members of that name
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "net_device", false, 64, &[pf, 1, 64, pf, 1, 192], 2); // 3
+        let blob = skb_btf(&mut b, 3, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err(), "direct twice");
+        // one direct, one promoted
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "", false, 4, &[pf, 1, 0], 1); // 3
+        b.ty(4, "net_device", false, 64, &[pf, 1, 64, 0, 3, 192], 2); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err(), "direct and promoted");
     }
 
     #[test]
