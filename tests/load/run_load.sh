@@ -120,7 +120,7 @@ read -r SUT0 SST0 < <(awk '{print $14, $15}' "/proc/$SP/stat")
   -url "http://$HOST_IP:$PORT" -c "$CONC" -d "$DUR" -rate "$RATE" -size "$SIZE" \
   "${NC[@]}" -out "$OUT/ids.txt" | tee "$OUT/client.txt"
 # Server CPU over the load (its own process: handlers, plus the softirq and
-# TC work charged to it), per request.
+# capture work charged to it), per request.
 read -r SUT SST < <(awk -v u="$SUT0" -v s="$SST0" '{print $14 - u, $15 - s}' "/proc/$SP/stat")
 REQS=$(sed -n 's/^requests=\([0-9]*\).*/\1/p' "$OUT/client.txt")
 DURS=$(sed -n 's/.* elapsed=\([0-9.]*\)s.*/\1/p' "$OUT/client.txt")

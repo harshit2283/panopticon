@@ -78,9 +78,9 @@ pub fn detect_protocol(
 /// Whether the payload that triggered detection was sent by the *client*
 /// (`Some(true)`), by the *server* (`Some(false)`), or cannot tell (`None`).
 ///
-/// TC hook direction says nothing about role: on the node hosting a server,
+/// Capture direction says nothing about role: at the server's socket,
 /// requests arrive on ingress and responses leave on egress — the opposite of
-/// the client's node. Parsers expect `Egress` = client→server, so the caller
+/// the client's socket. Parsers expect `Egress` = client→server, so the caller
 /// uses this to pin which endpoint is the server.
 pub fn sent_by_client(protocol: Protocol, payload: &[u8]) -> Option<bool> {
     match protocol {
