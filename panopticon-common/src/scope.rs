@@ -171,6 +171,16 @@ pub fn local_packet(ifindex: u32, vrf: bool, sticky: bool) -> bool {
     ifindex == LOOPBACK_IFINDEX || vrf || sticky
 }
 
+/// The generation a `cgroup_skb` data event is stamped with: `g0`, read
+/// before the loopback decision (the setting and the socket's `local` flag),
+/// not the verdict's `g` (>= `g0`). User space refuses an event below its
+/// admission floor, which every narrowing raises, so a decision made before
+/// a narrowing never crosses it, whatever that decision was (§3.7).
+#[inline(always)]
+pub fn skb_stamp(g0: u32, g: u32) -> u32 {
+    if g0 < g { g0 } else { g }
+}
+
 /// `DataEvent::role`.
 pub const ROLE_UNKNOWN: u8 = 0;
 pub const ROLE_CLIENT: u8 = 1;
@@ -679,6 +689,21 @@ mod tests {
             };
             assert_eq!(pid_inputs(&s, 7, false), (true, true));
         }
+    }
+
+    #[test]
+    fn skb_stamp_is_the_pre_decision_generation() {
+        // Codex VRF R3 finding 2: packet A reads g0 = 5 and decides "not
+        // local"; packet B marks the socket; a narrowing publishes 6 and
+        // raises the floor to 6; A's verdict is of generation 6. Stamped
+        // with the verdict's generation A would pass the floor; stamped g0
+        // it is refused.
+        let (g0, g, floor) = (5, 6, 6);
+        assert!(g >= floor);
+        assert_eq!(skb_stamp(g0, g), 5);
+        assert!(skb_stamp(g0, g) < floor);
+        // No reload in between: the stamp is the verdict's generation.
+        assert_eq!(skb_stamp(7, 7), 7);
     }
 
     #[test]

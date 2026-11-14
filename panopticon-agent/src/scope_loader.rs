@@ -335,31 +335,34 @@ pub fn write_netdev_offsets(ebpf: &mut Ebpf) -> Result<[u32; 3]> {
 /// from raw kernel BTF (aya keeps its type accessors private). Members of
 /// anonymous structs and unions are searched (bounded depth); every member
 /// used must lie inside its container and have the expected shape (`dev`: a
-/// pointer to `struct net_device`; `priv_flags`: an integer or bitfield
-/// wide enough for the bit; `IFF_L3MDEV_MASTER`: a single bit). Anything
-/// else is refused, so a wrong offset is never used.
+/// pointer to `struct net_device`, whose `priv_flags` is then searched in
+/// that very type, not one found by name; `priv_flags`: an integer with no
+/// encoding offset, or a bitfield, wide enough for the bit;
+/// `IFF_L3MDEV_MASTER`: a single bit; the byte read inside `net_device`).
+/// Anything else is refused, so a wrong offset is never used.
 fn netdev_offsets(raw: &[u8]) -> Result<[u32; 3]> {
     let btf = RawBtf::parse(raw)?;
     let skb = btf.struct_by_name("sk_buff").context("struct sk_buff")?;
-    let nd = btf
-        .struct_by_name("net_device")
-        .context("struct net_device")?;
     let (dev_bits, dev_bf, dev_t) = btf.member(skb, "dev", 0).context("member sk_buff.dev")?;
-    let target = btf.pointee(dev_t).context("sk_buff.dev is not a pointer")?;
+    let nd = btf.pointee(dev_t).context("sk_buff.dev is not a pointer")?;
+    let (nd_kind, nd_name, _, nd_size, nd_members) = &btf.types[nd as usize];
     if dev_bf != 0
         || dev_bits % 8 != 0
-        || btf.types[target as usize].0 != BTF_STRUCT
-        || btf.name(btf.types[target as usize].1) != b"net_device"
+        || *nd_kind != BTF_STRUCT
+        || nd_members.is_empty()
+        || btf.name(*nd_name) != b"net_device"
     {
         bail!("sk_buff.dev is not a pointer to struct net_device");
     }
     let (pf_bits, pf_bf, pf_t) = btf
         .member(nd, "priv_flags", 0)
         .context("member net_device.priv_flags")?;
-    let int_bits = btf
-        .int_size(pf_t)
-        .context("net_device.priv_flags is not an integer")?
-        * 8;
+    let (int_size, int_off, int_bits) = btf
+        .int_info(pf_t)
+        .context("net_device.priv_flags is not an integer")?;
+    if int_off != 0 || int_bits != int_size * 8 {
+        bail!("net_device.priv_flags has an integer encoding offset or partial width");
+    }
     let width = if pf_bf != 0 { pf_bf } else { int_bits };
     let val = btf
         .enumerator("IFF_L3MDEV_MASTER")
@@ -368,6 +371,9 @@ fn netdev_offsets(raw: &[u8]) -> Result<[u32; 3]> {
         bail!("IFF_L3MDEV_MASTER ({val:#x}) is not a single bit of priv_flags");
     }
     let bit = pf_bits + val.trailing_zeros();
+    if bit / 8 >= *nd_size {
+        bail!("IFF_L3MDEV_MASTER byte lies outside struct net_device");
+    }
     let mask = 1u32 << (bit % 8);
     Ok([dev_bits / 8, bit / 8, mask])
 }
@@ -385,7 +391,8 @@ const BTF_MODIFIERS: [u32; 5] = [8, 9, 10, 11, 18];
 const BTF_ANON_DEPTH: u32 = 8;
 
 /// One BTF type: (kind, name_off, kind_flag, size_or_type, members as
-/// (name_off, type, offset field)).
+/// (name_off, type, offset field); for an INT, one entry holding its
+/// encoding word as (0, 0, encoding)).
 type BtfEntry = (u32, u32, bool, u32, Vec<(u32, u32, u32)>);
 
 /// Just enough of the BTF format to find struct members and enumerators,
@@ -472,10 +479,11 @@ impl<'a> RawBtf<'a> {
             };
             if kind == BTF_INT {
                 // The INT encoding's bit size must fit the declared size.
-                let bits = u32_at(i)? & 0xff;
-                if bits > size_or_type * 8 {
+                let enc = u32_at(i)?;
+                if (enc & 0xff) + ((enc >> 16) & 0xff) > size_or_type * 8 {
                     bail!("malformed BTF int");
                 }
+                members.push((0, 0, enc));
             }
             i += extra;
             if i > types_r.end {
@@ -491,13 +499,17 @@ impl<'a> RawBtf<'a> {
         &s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]
     }
 
+    /// The one complete struct named `n`; refused if there are two.
     fn struct_by_name(&self, n: &str) -> Option<u32> {
-        self.types
+        let mut found = self
+            .types
             .iter()
-            .position(|(k, name, _, _, m)| {
+            .enumerate()
+            .filter(|(_, (k, name, _, _, m))| {
                 *k == BTF_STRUCT && !m.is_empty() && self.name(*name) == n.as_bytes()
-            })
-            .map(|i| i as u32)
+            });
+        let (id, _) = found.next()?;
+        found.next().is_none().then_some(id as u32)
     }
 
     /// The value of the enumerator `n`; refused if it is defined twice with
@@ -528,11 +540,13 @@ impl<'a> RawBtf<'a> {
         None
     }
 
-    /// The size of `t` if it is (after modifiers) an INT.
-    fn int_size(&self, t: u32) -> Option<u32> {
+    /// (size in bytes, encoding bit offset, encoding bits) of `t` if it is
+    /// (after modifiers) an INT.
+    fn int_info(&self, t: u32) -> Option<(u32, u32, u32)> {
         let t = self.strip(t)?;
-        let (k, _, _, size, _) = self.types.get(t as usize)?;
-        (*k == BTF_INT).then_some(*size)
+        let (k, _, _, size, enc) = self.types.get(t as usize)?;
+        let enc = enc.first()?.2;
+        (*k == BTF_INT).then_some((*size, (enc >> 16) & 0xff, enc & 0xff))
     }
 
     /// Size in bytes of `t` (after modifiers): integers, pointers,
@@ -560,7 +574,8 @@ impl<'a> RawBtf<'a> {
     /// (bit offset, bitfield size or 0, type) of member `m` of struct/union
     /// `id`, searching anonymous members up to [`BTF_ANON_DEPTH`] deep. The
     /// member found, and every anonymous member on the way, must lie inside
-    /// its container; a bitfield must start on a byte boundary.
+    /// its container; a bitfield must start on a byte boundary; an anonymous
+    /// aggregate encoded as a bitfield is not searched.
     fn member(&self, id: u32, m: &str, depth: u32) -> Option<(u32, u32, u32)> {
         let (_, _, kflag, size, members) = self.types.get(id as usize)?;
         let container_bits = size.checked_mul(8)?;
@@ -582,7 +597,7 @@ impl<'a> RawBtf<'a> {
                 return (extent != 0 && bits.checked_add(extent)? <= container_bits)
                     .then_some((bits, bitfield, ty));
             }
-            if name == 0 && depth < BTF_ANON_DEPTH {
+            if name == 0 && bitfield == 0 && depth < BTF_ANON_DEPTH {
                 let inner = self.strip(ty)?;
                 if matches!(
                     self.types.get(inner as usize),
@@ -1333,6 +1348,7 @@ mod tests {
     struct BtfBuilder {
         strs: Vec<u8>,
         types: Vec<u8>,
+        n: u32,
     }
 
     impl BtfBuilder {
@@ -1356,9 +1372,15 @@ mod tests {
         fn ty(&mut self, kind: u32, name: &str, kflag: bool, size: u32, extra: &[u32], vlen: u32) {
             let n = self.s(name);
             let info = (u32::from(kflag) << 31) | (kind << 24) | vlen;
+            self.n += 1;
             for w in [n, info, size].iter().chain(extra) {
                 self.types.extend(w.to_le_bytes());
             }
+        }
+
+        /// Types added so far (the id of the last one).
+        fn count(&self) -> u32 {
+            self.n
         }
 
         fn build(&self, version: u8) -> Vec<u8> {
@@ -1429,6 +1451,85 @@ mod tests {
         let mut unknown = blob.0.clone();
         unknown[24 + 7] = 25; // the first record's kind byte
         assert!(netdev_offsets(&unknown).is_err(), "unknown kind");
+    }
+
+    /// sk_buff { *net_device dev @16 }, with `nd` the net_device types
+    /// built by the caller after the common ones (int = 1, u64 = 2).
+    fn skb_btf(b: &mut BtfBuilder, dev_target: u32, flag: u32) -> Vec<u8> {
+        let (dev, ix, il3) = (b.s("dev"), b.s("IFF_X"), b.s("IFF_L3MDEV_MASTER"));
+        b.ty(2, "", false, dev_target, &[], 0);
+        let ptr_id = b.count();
+        b.ty(4, "sk_buff", false, 32, &[dev, ptr_id, 128], 1);
+        b.ty(6, "netdev_priv_flags", false, 4, &[ix, 1, il3, flag], 2);
+        b.build(1)
+    }
+
+    #[test]
+    fn btf_int_encoding_offset_is_refused() {
+        // priv_flags: a 4-byte INT whose encoding has offset 8, 24 bits.
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(1, "odd", false, 4, &[(8 << 16) | 24], 0); // 3
+        b.ty(4, "net_device", false, 16, &[pf, 3, 64], 1); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
+    }
+
+    #[test]
+    fn btf_bitfield_anonymous_aggregate_is_not_searched() {
+        // net_device (9 bytes) { int x @0; anon:1 @64 { u64 priv_flags:32 } }
+        let mut b = BtfBuilder::new();
+        let (pf, x) = (b.s("priv_flags"), b.s("x"));
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "", true, 8, &[pf, 2, 32 << 24], 1); // 3
+        b.ty(
+            4,
+            "net_device",
+            true,
+            9,
+            &[x, 1, 0, 0, 3, 64 | (1 << 24)],
+            2,
+        ); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
+    }
+
+    #[test]
+    fn btf_net_device_is_the_dev_pointee() {
+        // Two complete net_device types; sk_buff.dev points to the second,
+        // whose priv_flags is at byte 24: bit 18 -> byte 26, mask 4.
+        let mut b = BtfBuilder::new();
+        let (pf, x) = (b.s("priv_flags"), b.s("x"));
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "net_device", false, 16, &[x, 1, 0, pf, 1, 64], 2); // 3
+        b.ty(4, "net_device", false, 32, &[x, 1, 0, pf, 1, 192], 2); // 4
+        let blob = skb_btf(&mut b, 4, 1 << 18);
+        assert_eq!(netdev_offsets(&blob).unwrap(), [16, 26, 4]);
+        // and a flag byte outside the pointee is refused
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "net_device", false, 10, &[pf, 1, 64], 1); // 3: 4-byte int at 8 overflows
+        let blob = skb_btf(&mut b, 3, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
+    }
+
+    #[test]
+    fn btf_duplicate_sk_buff_is_refused() {
+        let mut b = BtfBuilder::new();
+        let pf = b.s("priv_flags");
+        b.ty(1, "int", false, 4, &[32], 0); // 1
+        b.ty(1, "u64", false, 8, &[64], 0); // 2
+        b.ty(4, "net_device", false, 16, &[pf, 1, 64], 1); // 3
+        let x = b.s("x");
+        b.ty(4, "sk_buff", false, 8, &[x, 2, 0], 1); // 4: a second sk_buff
+        let blob = skb_btf(&mut b, 3, 1 << 18);
+        assert!(netdev_offsets(&blob).is_err());
     }
 
     #[test]

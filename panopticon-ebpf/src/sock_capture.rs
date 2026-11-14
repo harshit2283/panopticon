@@ -41,8 +41,8 @@ use panopticon_common::{
         NETDEV_L3M_BYTE, NETDEV_L3M_MASK, NETDEV_SKB_DEV, OWNER_LISTED, SCOPE_HEAD, SCOPE_SAMPLE,
         SCOPE_SEL_CGROUP, STREAM_OFF_UNKNOWN, SockState, VERDICT_IN, cached_verdict, drop_reason,
         head_take, in_sample, is_initialised, is_unscoped_full, local_packet, pid_inputs,
-        reserved_take, role_of, stream_offset, tls_addr_in_scope, udp_should_reserve, verdict,
-        verdict_cacheable, verdict_word,
+        reserved_take, role_of, skb_stamp, stream_offset, tls_addr_in_scope, udp_should_reserve,
+        verdict, verdict_cacheable, verdict_word,
     },
 };
 
@@ -857,10 +857,11 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     // NIC never saw (IPv6, ::1 included, is not
     // captured, above). The socket is marked whatever the setting, so
     // turning capture off later drops it whole and suppresses its close.
-    // The generation is read before the setting: an event carries `g0`
-    // (unscoped) or is dropped if its verdict's generation is not `g0`
-    // (restricted), so a packet that passed this check before a narrowing
-    // is refused at the ring read.
+    // The generation is read before the setting and the socket's mark, and
+    // every event is stamped `g0` (unscoped and restricted alike), so a
+    // packet whose loopback decision predates a narrowing (the setting
+    // turned off, or another packet marking the socket meanwhile) is refused
+    // at the ring read.
     let sk = sk as *mut c_void;
     let st = state_of(sk, false);
     let g0 = scope_gen();
@@ -871,9 +872,9 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     if lo && !marked && !st.is_null() {
         wr!(st, local, 1);
     }
-    // `lo` is a property of this packet and its socket only (no mutable
-    // inventory or latch), so the decision made under `g0` stays valid; only
-    // the setting can change, which the generation check below covers.
+    // The decision is valid for `g0` only: the setting and the socket's
+    // `local` flag (set by a concurrent packet) can change after it, so the
+    // event is stamped `g0`, below.
     if lo && !capture_loopback() {
         return drop(DROP_LOOPBACK);
     }
@@ -937,11 +938,10 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         Ok(g) => g,
         Err(reason) => return drop(reason),
     };
-    // The loopback setting was read under `g0`; a later generation may
-    // have turned it off.
-    if lo && g != g0 {
-        return drop(DROP_LOOPBACK);
-    }
+    // The verdict is of generation `g` >= `g0`, but the loopback decision
+    // above is of `g0`: the event is stamped `g0` (`scope::skb_stamp`), so
+    // any narrowing since `g0` refuses it at the ring read, whatever `lo` was.
+    let stamp = skb_stamp(g0, g);
 
     // ── kTLS: the payload may be plaintext at this hook (§3.5). After the
     // verdict, so an in-scope kTLS socket has its IN verdict cached (its TLS
@@ -986,7 +986,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
             pkt: &pkt,
             take,
             stream_off: off,
-            scope_gen: g,
+            scope_gen: stamp,
         },
     )
 }
