@@ -365,6 +365,9 @@ impl RedisParser {
         // pairs, ...) carry the data written: scan it for PII.
         if parts.len() > 2 {
             msg.request_text = Some(parts[2..].join(" "));
+            // CONFIG GET takes parameter names (patterns), never values.
+            msg.request_text_is_name =
+                parts[0].eq_ignore_ascii_case("CONFIG") && parts[1].eq_ignore_ascii_case("GET");
         }
         msg.latency_ns = Some(timestamp_ns.saturating_sub(req_ts));
         match &expect {
@@ -1073,6 +1076,34 @@ mod tests {
         crate::pii::mask_credentials(&mut msgs[0]);
         assert_eq!(
             msgs[0].request_text.as_deref(),
+            Some(crate::protocol::FIELD_WITHHELD)
+        );
+        // Codex round 1 #4: a value that reads like a credential name is
+        // not a name: SET's value and GET's reply stay withheld.
+        let mut parser = RedisParser::new();
+        parser.feed(
+            &resp(&["SET", "user:alice:password", "swordfish_password"]),
+            Direction::Egress,
+            1,
+        );
+        let ParseResult::Messages(mut msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
+            panic!()
+        };
+        assert!(!msgs[0].request_text_is_name);
+        crate::pii::mask_credentials(&mut msgs[0]);
+        assert_eq!(
+            msgs[0].request_text.as_deref(),
+            Some(crate::protocol::FIELD_WITHHELD)
+        );
+        let mut parser = RedisParser::new();
+        parser.feed(&resp(&["GET", "user:alice:password"]), Direction::Egress, 1);
+        let reply = b"$18\r\nswordfish_password\r\n";
+        let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
+            panic!()
+        };
+        crate::pii::mask_credentials(&mut msgs[0]);
+        assert_eq!(
+            msgs[0].payload_text.as_deref(),
             Some(crate::protocol::FIELD_WITHHELD)
         );
     }
