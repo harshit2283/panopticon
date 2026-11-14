@@ -219,13 +219,15 @@ production-hardened compliance platform.
     form parameter, a scalar JSON member or URI userinfo, whose value is
     then masked; credential-named headers are masked, and Redis
     credential commands and replies are masked before the same rule (so
-    `AUTH` stays readable, as does `CONFIG GET requirepass`, but its reply
-    is withheld). A credential word that is a bare name is not credential
-    context: the last segment of a captured path of letters-only segments
-    with only `key=value` query components, a column of a simple
-    undecoded `SELECT` list (exported without bound values or error
-    text), or a `CONFIG GET` parameter whose reply proves it a name;
-    anything not proven a name is withheld as before. A letters-only
+    `AUTH` stays readable, while `CONFIG GET requirepass` and its reply
+    are withheld: with renamed commands a reply cannot be tied to its
+    request). A credential word that is a bare name is not credential
+    context: the last segment of a captured, printable-ASCII path of
+    letters-only segments with only `key=value` query components, or a
+    column of a simple undecoded `SELECT` list read on its raw tokens
+    (exported without bound values or error text); anything not proven
+    a name is withheld as before. Short credential names are also
+    matched with `.` and `-` as boundaries (`users.pwd`). A letters-only
     segment before the word (`/reset/abcdef/token`) is a known limit.
     Redis reply text is exported only on connections seen from their
     first byte (SYN on TC, stream offset on `cgroup_skb`, no bytes lost):

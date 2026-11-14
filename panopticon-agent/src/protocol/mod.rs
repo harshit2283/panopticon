@@ -82,10 +82,6 @@ pub struct L7Message {
     /// Decoded request body (e.g. HTTP POST/PUT payload, form data), when the
     /// protocol has one. Scanned and redacted like `payload_text`.
     pub request_text: Option<String>,
-    /// The parser proved `request_text` holds a name, not a value (the
-    /// parameter of a Redis `CONFIG GET` its reply confirms): one credential
-    /// name alone in it is exported (see [`decide_name`]).
-    pub request_text_is_name: bool,
     /// Wire headers (HTTP, HTTP/2, gRPC metadata, AMQP/Kafka fields).
     pub headers: Vec<(String, String)>,
     /// DNS A answers, filled only by the DNS parser: kept apart from wire
@@ -119,7 +115,6 @@ impl L7Message {
             content_type: None,
             payload_text: None,
             request_text: None,
-            request_text_is_name: false,
             headers: Vec::new(),
             dns_answers: Vec::new(),
             request_size_bytes: 0,
@@ -154,7 +149,7 @@ pub use credential_rules::{
     set_credential_rules,
 };
 pub use secrets::{
-    Decision, FIELD_WITHHELD, STATEMENT_WITHHELD, decide, decide_name, has_any_credential_context,
+    Decision, FIELD_WITHHELD, STATEMENT_WITHHELD, decide, has_any_credential_context,
     has_credential_context, is_credential_name, sql_verb, withheld_statement,
 };
 
@@ -226,17 +221,7 @@ pub fn export_error_text(text: String, error_withheld: bool) -> String {
 /// rules only when `builtin`): credential values masked, or the field
 /// replaced by [`FIELD_WITHHELD`].
 pub fn protect_text_in(rules: &CredentialRules, text: &mut String, builtin: bool) {
-    replace_with(text, decide(rules, text, builtin));
-}
-
-/// [`protect_text_in`] for a field its parser proved holds a name (see
-/// [`decide_name`]).
-pub fn protect_name_in(rules: &CredentialRules, text: &mut String) {
-    replace_with(text, decide_name(rules, text));
-}
-
-fn replace_with(text: &mut String, decision: Decision) {
-    if let Some(out) = decision.apply(text) {
+    if let Some(out) = decide(rules, text, builtin).apply(text) {
         zeroize::Zeroize::zeroize(text);
         *text = out;
     }

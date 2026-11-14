@@ -366,7 +366,6 @@ impl RedisParser {
         if parts.len() > 2 {
             msg.request_text = Some(parts[2..].join(" "));
         }
-        msg.request_text_is_name = config_get_name_proved(&parts, &value);
         msg.latency_ns = Some(timestamp_ns.saturating_sub(req_ts));
         match &expect {
             Expect::Subscription(_) if !ack && !matches!(value, RespValue::Error(_)) => {
@@ -519,30 +518,6 @@ fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
     {
         mask_pairs(items);
     }
-}
-
-/// Whether `parts` is `CONFIG GET name` and the reply proves the server ran
-/// it as `CONFIG GET`, so `name` is a parameter name, not a value: the
-/// wire spelling alone does not (`rename-command SET CONFIG` makes
-/// `CONFIG GET pw` a `SET`, answered `+OK`). One argument without glob
-/// characters, and a reply that is an array of name/value pairs (even
-/// length; a RESP3 map) holding that name, byte for byte, at a name
-/// position. Anything else (an error, another shape, no reply) proves
-/// nothing.
-fn config_get_name_proved(parts: &[String], reply: &RespValue) -> bool {
-    let [cmd, sub, name] = parts else {
-        return false;
-    };
-    let named = |item: &RespValue| match item {
-        RespValue::BulkString(Some(b)) => b == name.as_bytes(),
-        RespValue::SimpleString(s) => s == name,
-        _ => false,
-    };
-    cmd.eq_ignore_ascii_case("CONFIG")
-        && sub.eq_ignore_ascii_case("GET")
-        && !name.contains(['*', '?', '[', ']', '\\'])
-        && matches!(reply, RespValue::Array(Some(items))
-            if items.len() % 2 == 0 && items.iter().step_by(2).any(named))
 }
 
 /// `EXEC`'s array answers the queued commands in order; when it does not
@@ -1062,129 +1037,47 @@ mod tests {
         assert_eq!(msgs[0].request_text.as_deref(), Some("SETNAME app"));
     }
 
-    /// `CONFIG GET requirepass` after the built-in rules (USER-GUIDE 5.3):
-    /// the command names a parameter, a bare name, and is exported; its
-    /// reply, the name then its masked value, stays withheld.
+    /// Redis fields after the built-in rules (USER-GUIDE 5.3): no Redis
+    /// argument or reply is a bare name, since with renamed commands and
+    /// `CLIENT REPLY` a reply cannot be tied to its request. So
+    /// `CONFIG GET requirepass`, its reply, `CONFIG SET`, and a value or
+    /// reply that reads like a credential name (Codex rounds 1-3) are all
+    /// withheld.
     #[test]
     fn test_config_get_credential_after_the_builtin_rules() {
-        let mut parser = RedisParser::new();
-        parser.feed(
-            &resp(&["CONFIG", "GET", "requirepass"]),
-            Direction::Egress,
-            1,
-        );
-        let reply = b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n";
-        let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
-            panic!()
-        };
-        crate::pii::mask_credentials(&mut msgs[0]);
-        assert_eq!(msgs[0].method.as_deref(), Some("CONFIG"));
-        assert_eq!(msgs[0].path.as_deref(), Some("GET"));
-        assert_eq!(msgs[0].request_text.as_deref(), Some("requirepass"));
-        assert_eq!(
-            msgs[0].payload_text.as_deref(),
-            Some(crate::protocol::FIELD_WITHHELD)
-        );
-        // CONFIG SET: the masked value next to the name withholds it.
-        let mut parser = RedisParser::new();
-        parser.feed(
-            &resp(&["CONFIG", "SET", "requirepass", "s3cretpw"]),
-            Direction::Egress,
-            1,
-        );
-        let ParseResult::Messages(mut msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
-            panic!()
-        };
-        crate::pii::mask_credentials(&mut msgs[0]);
-        assert_eq!(
-            msgs[0].request_text.as_deref(),
-            Some(crate::protocol::FIELD_WITHHELD)
-        );
-        // Codex round 2 #4: `rename-command SET CONFIG`: `CONFIG GET pw`
-        // runs as SET and answers `+OK`; nothing proves a name. Nor does
-        // an error, a reply without the name, a glob or a second name.
-        for (args, reply) in [
-            (
-                &["CONFIG", "GET", "swordfish_password"][..],
-                &b"+OK\r\n"[..],
-            ),
-            (&["CONFIG", "GET", "swordfish_password"], b"$2\r\nok\r\n"),
-            (
-                &["CONFIG", "GET", "requirepass"],
-                b"-ERR unknown command\r\n",
-            ),
-            (&["CONFIG", "GET", "requirepass"], b"*0\r\n"),
-            (
-                &["CONFIG", "GET", "requirepass"],
-                b"*2\r\n$4\r\nport\r\n$11\r\nrequirepass\r\n",
-            ),
-            (
-                &["CONFIG", "GET", "REQUIREPASS"],
-                b"*2\r\n$11\r\nrequirepass\r\n$1\r\nx\r\n",
-            ),
-            (
-                &["CONFIG", "GET", "requirepass*"],
-                b"*2\r\n$11\r\nrequirepass\r\n$1\r\nx\r\n",
-            ),
-            (
-                &["CONFIG", "GET", "requirepass"],
-                b"*3\r\n$11\r\nrequirepass\r\n$1\r\nx\r\n$1\r\ny\r\n",
-            ),
-        ] {
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let exchange = |args: &[&str], reply: &[u8]| {
             let mut parser = RedisParser::new();
             parser.feed(&resp(args), Direction::Egress, 1);
             let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
                 panic!("{args:?}")
             };
-            assert!(!msgs[0].request_text_is_name, "{args:?}");
             crate::pii::mask_credentials(&mut msgs[0]);
-            assert_eq!(
-                msgs[0].request_text.as_deref(),
-                Some(crate::protocol::FIELD_WITHHELD),
-                "{args:?}"
-            );
-        }
-        // RESP3 map reply: proved.
-        let mut parser = RedisParser::new();
-        parser.feed(
-            &resp(&["CONFIG", "GET", "masterauth"]),
-            Direction::Egress,
-            1,
-        );
-        let reply = b"%1\r\n$10\r\nmasterauth\r\n$8\r\ns3cretpw\r\n";
-        let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
-            panic!()
+            msgs.remove(0)
         };
-        crate::pii::mask_credentials(&mut msgs[0]);
-        assert_eq!(msgs[0].request_text.as_deref(), Some("masterauth"));
-        // Codex round 1 #4: a value that reads like a credential name is
-        // not a name: SET's value and GET's reply stay withheld.
-        let mut parser = RedisParser::new();
-        parser.feed(
-            &resp(&["SET", "user:alice:password", "swordfish_password"]),
-            Direction::Egress,
-            1,
+        let m = exchange(
+            &["CONFIG", "GET", "requirepass"],
+            b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n",
         );
-        let ParseResult::Messages(mut msgs) = parser.feed(b"+OK\r\n", Direction::Ingress, 2) else {
-            panic!()
-        };
-        assert!(!msgs[0].request_text_is_name);
-        crate::pii::mask_credentials(&mut msgs[0]);
-        assert_eq!(
-            msgs[0].request_text.as_deref(),
-            Some(crate::protocol::FIELD_WITHHELD)
+        assert_eq!(m.method.as_deref(), Some("CONFIG"));
+        assert_eq!(m.path.as_deref(), Some("GET"));
+        assert_eq!(m.request_text.as_deref(), withheld);
+        assert_eq!(m.payload_text.as_deref(), withheld);
+        // Under `rename-command SET CONFIG`, a SET answered `+OK`.
+        let m = exchange(&["CONFIG", "GET", "swordfish_password"], b"+OK\r\n");
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(&["CONFIG", "SET", "requirepass", "s3cretpw"], b"+OK\r\n");
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(
+            &["SET", "user:alice:password", "swordfish_password"],
+            b"+OK\r\n",
         );
-        let mut parser = RedisParser::new();
-        parser.feed(&resp(&["GET", "user:alice:password"]), Direction::Egress, 1);
-        let reply = b"$18\r\nswordfish_password\r\n";
-        let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
-            panic!()
-        };
-        crate::pii::mask_credentials(&mut msgs[0]);
-        assert_eq!(
-            msgs[0].payload_text.as_deref(),
-            Some(crate::protocol::FIELD_WITHHELD)
+        assert_eq!(m.request_text.as_deref(), withheld);
+        let m = exchange(
+            &["GET", "user:alice:password"],
+            b"$18\r\nswordfish_password\r\n",
         );
+        assert_eq!(m.payload_text.as_deref(), withheld);
     }
 
     /// Replies that carry a secret: `CONFIG GET` values of secret

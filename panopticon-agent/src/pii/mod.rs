@@ -118,19 +118,13 @@ fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
         &mut msg.method,
         &mut msg.path,
         &mut msg.content_type,
+        &mut msg.request_text,
         &mut msg.payload_text,
     ]
     .into_iter()
     .flatten()
     {
         protect_text_in(rules, field, true);
-    }
-    if let Some(field) = msg.request_text.as_mut() {
-        if msg.request_text_is_name {
-            crate::protocol::protect_name_in(rules, field);
-        } else {
-            protect_text_in(rules, field, true);
-        }
     }
     for (name, value) in msg.headers.iter_mut() {
         // A wiped credential header keeps its name readable; the user's
@@ -601,8 +595,7 @@ impl PiiEngine {
         }
 
         if let Some(body) = msg.request_text.as_mut() {
-            let name = msg.request_text_is_name;
-            self.scan_field_as(body, false, name, redact_enabled, rules, &mut found);
+            self.scan_field(body, false, redact_enabled, rules, &mut found);
         }
 
         let mut redacted_payload = None;
@@ -641,27 +634,7 @@ impl PiiEngine {
         rules: Option<&CredentialRules>,
         found: &mut Found,
     ) {
-        self.scan_field_as(field, decode, false, redact, rules, found);
-    }
-
-    /// [`Self::scan_field`]; `name` when the parser proved the field holds
-    /// a name (see [`crate::protocol::decide_name`]).
-    fn scan_field_as(
-        &self,
-        field: &mut String,
-        decode: bool,
-        name: bool,
-        redact: bool,
-        rules: Option<&CredentialRules>,
-        found: &mut Found,
-    ) {
-        let decision = rules.map_or(Decision::Keep, |r| {
-            if name {
-                crate::protocol::decide_name(r, field)
-            } else {
-                decide(r, field, true)
-            }
-        });
+        let decision = rules.map_or(Decision::Keep, |r| decide(r, field, true));
         let protected = decision.apply(field);
         let decoded = decode.then(|| percent_decode(field));
         let text = decoded.as_deref().unwrap_or(field.as_str());
