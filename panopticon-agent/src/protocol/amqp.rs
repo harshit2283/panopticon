@@ -29,7 +29,10 @@
 //! next plausible frame. A body with bytes kept after a gap inside it (a
 //! gap in a body frame that is not its last, or frame sync lost while it
 //! was assembled) exports no body text, only its size; a gap that only
-//! cuts its end keeps the captured prefix.
+//! cuts its end keeps the captured prefix. Once a direction loses frame
+//! sync, the frames the resync finds are not proven real (they may lie
+//! inside a body), so its messages export no text for the rest of the
+//! connection ([`Side::unsynced`]).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -284,6 +287,13 @@ struct Side {
     discard: usize,
     /// Frame boundary lost: scan for the next plausible frame.
     resync: bool,
+    /// Frame sync was lost on this direction at least once. The scan for
+    /// the next plausible frame can land inside a body (a gapped body's
+    /// bytes, or frames forged in a message), and nothing later proves the
+    /// frames found are real: for the rest of the connection, messages of
+    /// this direction export no text (path, headers, content type or
+    /// body), only method, status, timing and sizes.
+    unsynced: bool,
 }
 
 /// AMQP 0-9-1 protocol parser.
@@ -322,8 +332,18 @@ impl AmqpParser {
     /// The bytes skipped meanwhile may belong to any content being
     /// assembled in that direction, on any channel.
     fn lose_sync(&mut self, direction: Direction) {
-        self.side(direction).resync = true;
+        let side = self.side(direction);
+        side.resync = true;
+        side.unsynced = true;
         self.gap_in_contents(direction);
+    }
+
+    /// Messages produced while reading `direction`: once it lost sync
+    /// ([`Side::unsynced`]), none of their text is exported.
+    fn scrub_unsynced(&mut self, direction: Direction, out: &mut [L7Message]) {
+        if self.side(direction).unsynced {
+            out.iter_mut().for_each(scrub);
+        }
     }
 
     /// Bytes of `direction` were lost where the channel is not known: every
@@ -393,6 +413,7 @@ impl AmqpParser {
             buf.consume(total);
         }
         self.side(direction).buf = buf;
+        self.scrub_unsynced(direction, &mut out);
         if out.is_empty() {
             ParseResult::NeedMoreData
         } else {
@@ -673,6 +694,11 @@ impl AmqpParser {
                     out.push(msg);
                     return;
                 }
+                // A request read from an unsynced side keeps no text: its
+                // reply, from the other side, exports it.
+                if self.side(direction).unsynced {
+                    scrub(&mut msg);
+                }
                 let ch = self.channel(channel);
                 if ch.pending.len() >= MAX_PENDING_PER_CHANNEL {
                     ch.pending.pop_front();
@@ -701,6 +727,25 @@ impl AmqpParser {
             Direction::Egress => ch.publish = Some(content),
             Direction::Ingress => ch.delivery = Some(content),
         }
+    }
+}
+
+/// Drop every text field of a message read from a direction that lost frame
+/// sync ([`Side::unsynced`]): method, status, timing and sizes stay.
+fn scrub(m: &mut L7Message) {
+    for f in [
+        &mut m.path,
+        &mut m.request_text,
+        &mut m.payload_text,
+        &mut m.content_type,
+    ] {
+        if let Some(mut s) = f.take() {
+            zeroize::Zeroize::zeroize(&mut s);
+        }
+    }
+    for (mut k, mut v) in m.headers.drain(..) {
+        zeroize::Zeroize::zeroize(&mut k);
+        zeroize::Zeroize::zeroize(&mut v);
     }
 }
 
@@ -824,9 +869,10 @@ impl ProtocolParser for AmqpParser {
     /// `n` bytes were not captured. Inside a frame of known size the frame
     /// is processed from what was seen (a body frame counts all of its bytes
     /// towards the message) and the rest of it is dropped; otherwise the
-    /// parser resyncs on the next plausible frame. Either way a content
-    /// that may have lost body bytes exports no body text once more body
-    /// bytes follow ([`Content::gapped`]).
+    /// parser resyncs on the next plausible frame, and the direction
+    /// exports no text from then on ([`Side::unsynced`]). Either way a
+    /// content that may have lost body bytes exports no body text once more
+    /// body bytes follow ([`Content::gapped`]).
     fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
         let side = self.side(direction);
         if side.discard >= n {
@@ -855,6 +901,7 @@ impl ProtocolParser for AmqpParser {
         // Drop the end marker if it was captured.
         let frame = &seen[..have.min(total - 1)];
         self.frame(direction, frame, size, timestamp_ns, &mut out);
+        self.scrub_unsynced(direction, &mut out);
         Some(if out.is_empty() {
             ParseResult::NeedMoreData
         } else {
@@ -1223,7 +1270,9 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].request_text, None, "no body text after the gap");
         assert_eq!(m[0].request_size_bytes, 30);
-        assert_eq!(m[1].request_text.as_deref(), Some("next"));
+        // Sync was lost: later messages of this direction keep no text.
+        assert_eq!(m[1].request_text, None);
+        assert_eq!(m[1].request_size_bytes, 4);
     }
 
     /// A gap that only cuts the body's end keeps the captured prefix, as
@@ -1247,6 +1296,78 @@ mod tests {
         assert_eq!(m[0].request_text.as_deref(), Some("clean"));
     }
 
+    /// A gap that loses frame sync inside a body frame: the resync scan
+    /// can land on bytes of that body that read as frames (here, a whole
+    /// Basic.Publish forged inside it). Nothing parsed from such frames may
+    /// export the body's bytes, as a body, a path or a header.
+    #[test]
+    fn resync_inside_a_body_exports_none_of_its_bytes() {
+        let mut p = connected();
+        let forged = publish(5, "leak", "rk.S3CRET", b"S3CRET-tail");
+        let mut body = b"{\"x\":\"".to_vec();
+        body.extend(&forged);
+        body.extend(b"\"}");
+        let wire = publish(1, "ex", "rk", &body);
+        // Method and header frames whole, then the body frame's first 3
+        // bytes (type, channel) lost: its boundary is lost too.
+        let head = wire.len() - (7 + body.len() + 1);
+        assert!(msgs(p.feed(&wire[..head], Direction::Egress, 1)).is_empty());
+        assert!(msgs(p.skip(Direction::Egress, 3, 2).unwrap()).is_empty());
+        let mut rest = wire[head + 3..].to_vec();
+        rest.extend(publish(1, "ex", "rk.after", b"after"));
+        let out = msgs(p.feed(&rest, Direction::Egress, 3));
+        for m in &out {
+            let all = format!(
+                "{:?} {:?} {:?} {:?}",
+                m.path, m.request_text, m.payload_text, m.headers
+            );
+            assert!(!all.contains("S3CRET"), "{all}");
+        }
+        // The direction stays unproven for the connection: later messages
+        // keep method and sizes, no text.
+        let m = msgs(p.feed(
+            &publish(1, "ex", "rk.later", b"later"),
+            Direction::Egress,
+            4,
+        ));
+        assert_eq!(m[0].method.as_deref(), Some("Basic.Publish"));
+        assert_eq!(m[0].path, None);
+        assert_eq!(m[0].request_text, None);
+        assert_eq!(m[0].request_size_bytes, 5);
+        // The other direction is unaffected.
+        let mut args = s("ctag1.0");
+        args.extend_from_slice(&7u64.to_be_bytes());
+        args.push(0);
+        args.extend(s("ex"));
+        args.extend(s("rk"));
+        let mut d = method(2, 60, 60, &args);
+        d.extend(header(2, 2, None));
+        d.extend(frame(FRAME_BODY, 2, b"ok"));
+        let m = msgs(p.feed(&d, Direction::Ingress, 5));
+        assert_eq!(m[0].payload_text.as_deref(), Some("ok"));
+    }
+
+    /// A content header arriving while the content is gap-pending (no new
+    /// method frame between): bytes after it are never joined to the
+    /// prefix kept before the gap.
+    #[test]
+    fn header_after_a_body_gap_joins_nothing() {
+        let mut p = connected();
+        let mut wire = publish_head(1, 3000 + 16);
+        let first = frame(FRAME_BODY, 1, &[b'a'; 3000]);
+        wire.extend(&first[..1000]);
+        assert!(msgs(p.feed(&wire, Direction::Egress, 1)).is_empty());
+        let mut out = msgs(p.skip(Direction::Egress, first.len() - 1000, 2).unwrap());
+        let mut next = header(1, 5, None);
+        next.extend(frame(FRAME_BODY, 1, b"hello"));
+        out.extend(msgs(p.feed(&next, Direction::Egress, 3)));
+        for m in &out {
+            let text = m.request_text.as_deref().unwrap_or("");
+            assert!(!text.contains("hello"), "{text}");
+            assert!(text.bytes().all(|c| c == b'a'), "{text}");
+        }
+    }
+
     #[test]
     fn resyncs_after_garbage() {
         let mut p = connected();
@@ -1254,7 +1375,12 @@ mod tests {
         wire.extend(publish(1, "ex", "rk", b"ok"));
         let m = msgs(p.feed(&wire, Direction::Egress, 1));
         assert_eq!(m.len(), 1);
-        assert_eq!(m[0].path.as_deref(), Some("ex/rk"));
+        assert_eq!(m[0].method.as_deref(), Some("Basic.Publish"));
+        assert_eq!(m[0].request_size_bytes, 2);
+        // Found by the resync scan: not proven to be a real frame, so no
+        // text ([`Side::unsynced`]).
+        assert_eq!(m[0].path, None);
+        assert_eq!(m[0].request_text, None);
     }
 
     #[test]

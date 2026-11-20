@@ -698,6 +698,15 @@ What is exported then:
   body). A Kafka request or response is decoded only up to a gap inside
   it, and a gap anywhere else restarts the parser, so its record text
   never joins bytes from both sides of a gap.
+- **AMQP after lost frame sync**: when a gap (or a malformed frame) loses
+  AMQP frame boundaries in one direction, the agent looks for the next
+  plausible frame, which may lie inside a message body (the gapped body's
+  own bytes, or frames forged in a message) and nothing later proves the
+  frames found real. For the rest of that connection, messages read from
+  that direction export no text: no path (exchange, routing key, queue),
+  header, content type or body, only method, status, timing and sizes;
+  a request read from it exports no text with its reply either. The other
+  direction is unaffected.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
