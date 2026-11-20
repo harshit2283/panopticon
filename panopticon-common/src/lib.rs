@@ -235,10 +235,12 @@ pub struct DataEvent {
     pub dst_addr: u32,
     /// Bytes actually copied into `payload` (≤ MAX_PAYLOAD_SIZE).
     pub payload_len: u32,
-    /// Original payload length of the packet / TLS buffer. Larger than
-    /// `payload_len` when the capture was truncated (e.g. GSO/TSO
-    /// super-packets up to 64KB); parsers use the difference to skip the
-    /// bytes they never saw instead of silently losing stream sync.
+    /// This record's payload bytes on the wire. A packet or TLS buffer over
+    /// MAX_PAYLOAD_SIZE is sent as consecutive records (up to 64 KiB of a
+    /// packet, 16 KiB of a TLS buffer), each counting its own bytes; the
+    /// last also counts what was not captured, and is then larger than
+    /// `payload_len`. Parsers use the difference to skip the bytes they
+    /// never saw instead of silently losing stream sync.
     pub orig_len: u32,
     pub tls_library: TlsLibrary,
     /// TCP sequence number of a packet's first byte (SEG.SEQ), and its

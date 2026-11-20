@@ -245,10 +245,11 @@ Each GSO packet was captured as one record cut at 4,096 bytes. In a raw
 dump of one 8.10 run, the broker's packets to the consumer went up to
 13,032 bytes, and 43 of them lost 110,733 of 334,892 bytes (33%). There
 were no stream holes (no ring drops), no failed loads and no kernel ring
-drops. On 7.0 the same stream's packets stay at or below 7,191 bytes (one
-delivery each), so the cut lands inside a body frame and the AMQP parser
-keeps frame sync; on 8.10 one packet carries several deliveries and the
-cut crosses frame boundaries. Large packets are now sent as consecutive
+drops. On 7.0 the same stream's packets stay at or below 7,191 bytes and
+were cut too (45 packets), but deliveries stayed at 100%: there the cut
+evidently fell inside a body frame, which the AMQP parser can skip. On
+8.10 a packet carries up to 13-24 KB, several deliveries, and the cut
+crosses frame boundaries. Large packets are now sent as consecutive
 4 KiB records with exact stream positions (USER-GUIDE §5.5). The same
 invocation on 8.10 then gives `Basic.Deliver` 164/164 and AMQP 100% in
 four of four runs (22.6-35.4% and 76.8-80.7% in three runs just before),
@@ -257,10 +258,13 @@ both directions captured. On 7.0 AMQP stays at 100% (three runs), with
 truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100%, 94.9%, 100% and
 100% after the change. The 94.9% run lost no bytes: no truncated packet, no
 stream hole, both views agree. The 13 missed records all sat in one 10 KB
-Fetch response carrying about 20 records of four topics, whose exported
-text ends mid-record, consistent with the per-exchange body cap
-(`max_body_bytes`, default 4096): an export limit, reached when the slower
-VM lets records pile up in one fetch, not a capture loss.
+Fetch response carrying about 20 records of four topics. Its exported text
+ends inside a record with a 6 KB value: the records of the first two
+topics up to that one are in it, every record after it (the rest of that
+topic and all of the last two) is not. That is the per-exchange body cap
+(`max_body_bytes`, default 4096), an export limit reached when the slower
+VM lets records pile up in one fetch, not a capture loss; this change does
+not address it.
 
 In these runs every operation matched two records, on both kernels (the
 0-duplicate runs above predate cgroup_skb as the only capture backend).
