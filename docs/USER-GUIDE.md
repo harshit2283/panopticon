@@ -719,9 +719,12 @@ What is exported then:
     it keeps reused keys latched for its whole life. The agent finds Go
     binaries by scanning running processes, so this includes the first
     process of every binary, every Go process running when the agent
-    (re)starts, and a binary's processes started before a later scan
-    finds it (a restarted pod whose binary was rediscovered). New
-    replicas and restarts of a binary already attached get boundaries.
+    (re)starts, and a new binary's processes started before the scan
+    that finds it (every 60 s by default, `tls_scan_interval_secs`). New
+    replicas and restarts of a binary already attached get boundaries,
+    in containers too: the agent knows a file by inode, size and mtime,
+    which every container of one image shares (not by device, which
+    each container's overlay root has its own of).
     Processes running other binaries keep theirs when the agent proves,
     from their memory maps, that they do not map the new binary;
     otherwise they lose them too.
