@@ -681,8 +681,9 @@ pub fn cgroup_filter_rel(path: &str) -> anyhow::Result<&str> {
 /// A `pod_cgroup_root` value as a path relative to the cgroup2 root: it
 /// must be absolute (a cgroup path, as kubelet and `/proc/<pid>/cgroup`
 /// spell it), not the root itself, and plain (no `.`, `..` or empty
-/// components). That it is a root-owned directory reached without a
-/// symlink or mount crossing is checked when it is resolved.
+/// components). That it is a directory reached without a symlink or mount
+/// crossing, owned by root and writable by root alone at every level, is
+/// checked when it is resolved.
 pub fn pod_cgroup_root_rel(path: &str) -> anyhow::Result<&str> {
     let Some(rel) = path.strip_prefix('/') else {
         anyhow::bail!(

@@ -184,8 +184,8 @@ trait PodTree {
 /// counted once.
 ///
 /// `configured` is the operator's `pod_cgroup_root` (relative to the
-/// root, already checked: root-owned at every level, no symlink or mount
-/// crossing), searched the same way besides the recognised roots, named
+/// root, already checked: root-owned and writable by root alone at every
+/// level, no symlink or mount crossing), searched the same way besides the recognised roots, named
 /// by the driver its last component shows (`….slice`: systemd).
 fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
     let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
