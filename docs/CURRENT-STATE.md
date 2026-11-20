@@ -117,18 +117,27 @@ production-hardened compliance platform.
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
     PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
-    exported, every TLS exchange carrying its socket addresses (via fentry).
+    exported (Kafka on 8.10: see below), every TLS exchange carrying its
+    socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and
     captured nothing.
-  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 77-98% over seven lab
-    runs (other AMQP methods 100%). The broker-to-consumer stream there
-    carries GSO segments up to 18 KB, and frames past the 4 KB capture window
-    are lost. Retransmitted segments are now parsed once (see TCP stream
-    integrity below), so deliveries are no longer duplicated; replaying two
-    of these captures with and without sequence tracking gave the same
-    deliveries, so the remaining loss is the capture window.
-    RHEL 9 passed (100%, one earlier run at 85%).
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall is 17-29% over seven lab
+    runs of the CI messaging oracle (300 operations, seed 7; other AMQP
+    methods 100%, AMQP overall 75-79%, no raw PII exported). The
+    broker-to-consumer stream there carries GSO segments up to 18 KB, and
+    frames past the 4 KB capture window are lost. After the first lost frame
+    boundary the consumer direction of that connection exports no AMQP text
+    (fail closed, see USER-GUIDE §5.3), so the later deliveries are still
+    exported, with method, status, timing and sizes, but carry no exchange,
+    routing key or body to match against ground truth (before that change,
+    77-98%). Kafka `Fetch` on 8.10 was 92.6-100% in the same seven runs
+    (five at 100%). Retransmitted segments are parsed once (see TCP stream
+    integrity below), so deliveries are not duplicated by retransmission;
+    replaying two of these captures with and without sequence tracking gave
+    the same deliveries, so the loss is the capture window.
+    RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
+    fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
     every field by 8 bytes). The agent checks each tracepoint's tracefs
