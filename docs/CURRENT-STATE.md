@@ -28,10 +28,17 @@ production-hardened compliance platform.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol and
-  prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
-  every request that carried it, and no raw PII values in the export
-  (`tests/oracle/run_protocols.sh`).
+- Redis, MySQL (text protocol and prepared statements, plaintext) and
+  gRPC are scored the same way: 100% recall, PII flagged in every request
+  that carried it, and no raw PII values in the export
+  (`tests/oracle/run_protocols.sh`). PostgreSQL (simple, extended,
+  prepared): 83.8-84.6% recall over seeds 7, 11 and 23 (simple and
+  extended 100%, reused prepared statements 39-60 of 118-141), PII flagged
+  in 38-42% of the operations that sent it, no raw PII values. Every
+  exchange is exported; what is missing is bound values, where the oracle
+  sends the prepared statements' token and the PII: they stop for the
+  rest of a connection once server bytes are lost, which a large result
+  causes about 200 operations into each run.
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
   `redacted`, `metrics_only`) are checked with planted PII and credentials
   in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
@@ -115,6 +122,8 @@ production-hardened compliance platform.
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
     PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
+    (2026-11-04, before the PostgreSQL bound-value rules of 2026-11-13;
+    see the PostgreSQL oracle above for current figures)
     exported, every TLS exchange carrying its socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and

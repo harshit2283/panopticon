@@ -185,7 +185,7 @@ for each.
 | Protocol | Traffic mix | Recall before → now | PII visibility before → now | Leaks |
 |---|---|---|---|---|
 | Redis 7.4 | SET/GET/HSET/LPUSH/INCRBY/DEL, errors, pipelined batches | 86.2% (GET 0%) → **100%** | 0% → **100%** | 0 |
-| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **100%** | 0% → **100%** | 0 |
+| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **83.8-84.6%** (simple and extended 100%; reused prepared statements 39-60 of 118-141, see below) | 0% → **38-42%** | 0 |
 | MySQL 8.4 | COM_QUERY text protocol, errors, `caching_sha2_password` auth | 0% (see below) → **100%** | 0% → **100%** | 0 |
 | MySQL 8.4, prepared statements | mysql-connector-python prepared cursors (COM_STMT_PREPARE / EXECUTE / CLOSE, statements re-executed with new values), mixed with text queries | 66.7% → **100%** (re-executed statements 0% → 100%; verb accuracy 49.5% → 100%) | 0% → **100%** | 0 |
 | gRPC (HTTP/2) | unary, server-streaming, trailers-only errors (`NOT_FOUND`) | 100% → **100%** | 65% → **100%** | 0 |
@@ -194,8 +194,16 @@ gRPC field accuracy went from 21% to 100% for the method path and from 79% to
 100% for `grpc-status`. Before the fix, the HTTP status of 200 was reported
 even for failed calls.
 
-The latest full runs (seeds 7 and 42) have every protocol at 100%; Redis was
-also checked with seeds 21 and 99.
+The full runs at seeds 7 and 42 (2026-10-19) had every protocol at 100%;
+Redis was also checked with seeds 21 and 99. Re-run on 2026-11-20 (seeds 7,
+11 and 23, kernel 6.8) Redis, MySQL, MySQL prepared and gRPC are still at
+100%, and PostgreSQL scores 83.8%, 84.6% and 84.2%. Every PostgreSQL
+exchange is exported, verb and error flag 100%, but bound values stop for
+the rest of a connection once server bytes are lost (USER-GUIDE §5.3),
+and about 200 operations into each run a 500-row result loses some. The
+prepared statements before that point are all matched (60/60, 51/51,
+39/39), none after it; the extended protocol's PII, also a bound value,
+follows the same split.
 
 ### Kafka, AMQP (RabbitMQ), DNS
 
