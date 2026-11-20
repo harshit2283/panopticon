@@ -154,8 +154,10 @@ production-hardened compliance platform.
     seed 7, and at 65536 in six of six, with nothing truncated (see
     BENCHMARKS.md). AMQP consumers on RHEL 8 should set
     `max_packet_bytes = 32768` (USER-GUIDE §4.2).
-    Kafka `Fetch` was 100% at 16384 (two runs at seed 7, one at seed 42)
-    and at 65536 in five of six runs; the sixth, 94.9%, lost no bytes: its
+    Kafka `Fetch` at 16384 was 100% in three of four runs (seeds 7 and 42)
+    and 96.5% in one (no truncated packet, no ignored segment, no reorder
+    gap), and at 65536 100% in five of six runs; the sixth, 94.9%, lost no
+    bytes: its
     13 missing records were in one Fetch response of about 20 records,
     whose exported text ends at the per-exchange body cap (`max_body_bytes`,
     default 4096, an export limit kept on purpose). On a slow node, where

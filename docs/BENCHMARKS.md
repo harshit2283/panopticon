@@ -276,9 +276,10 @@ parser loses frame sync there and the consumer direction stops exporting
 AMQP text (fail closed). The default stays 16384; AMQP consumers on RHEL
 8 should set `max_packet_bytes = 32768` (USER-GUIDE §4.2). At 65536 every byte of both directions was
 captured. On 7.0 AMQP stays at 100% at 65536 (three runs), with
-truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100% at 16384 (two
-runs at seed 7, one at seed 42), and at 65536 in five of six runs and
-94.9% in one. The 94.9% run lost no bytes: no truncated packet, no
+truncated packets 180 → 0. Kafka `Fetch` on 8.10 at 16384 was 100% in
+three of four runs (seeds 7 and 42) and 96.5% in one (no truncated packet,
+no ignored segment, no reorder gap; no raw dump taken), and at 65536 100%
+in five of six runs and 94.9% in one. The 94.9% run lost no bytes: no truncated packet, no
 stream hole, both views agree. The 13 missed records all sat in one 10 KB
 Fetch response carrying about 20 records of four topics. Its exported text
 ends inside a record with a 6 KB value: the records of the first two
