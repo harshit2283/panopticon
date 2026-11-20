@@ -17,7 +17,7 @@ use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
     CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK,
     CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE,
-    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, scope,
+    CONFIG_USE_RINGBUF, DATA_RING_SHARDS, MAX_PID_FILTER, scope,
 };
 
 /// The kernel scope settings of `config`: `(CONFIG_SCOPE_MODE,
@@ -377,7 +377,7 @@ pub fn sync_config_to_ebpf(
         Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
 
     cfg_map.set(CONFIG_CAPTURE_ENABLED, config.capture_enabled as u64, 0)?;
-    cfg_map.set(CONFIG_MAX_PAYLOAD, MAX_PAYLOAD_SIZE as u64, 0)?;
+    cfg_map.set(CONFIG_MAX_PAYLOAD, config.max_packet_bytes as u64, 0)?;
     cfg_map.set(CONFIG_USE_RINGBUF, caps.has_ringbuf as u64, 0)?;
     cfg_map.set(CONFIG_PID_FILTER_ON, config.pid_filter.is_some() as u64, 0)?;
     cfg_map.set(CONFIG_RING_SHARD_MASK, ring_shard_count() as u64 - 1, 0)?;

@@ -1264,9 +1264,9 @@ fn feed_event(
             .unwrap_or_else(panicked),
         );
     }
-    // Bytes beyond the capture cap (GSO/TSO super-packets, large TLS
-    // writes) were never seen: let the parser count them instead of
-    // desynchronising on the next message.
+    // Bytes beyond the capture cap (a packet past `max_packet_bytes`; a TLS
+    // read or write past 4 records, 16 KiB; a head-only cut) were never seen: let
+    // the parser count them instead of desynchronising on the next message.
     let tail = (event.orig_len as usize).saturating_sub(trim.max(payload.len()));
     if tail > 0 {
         stats.truncated_events.fetch_add(1, Ordering::Relaxed);
@@ -2305,6 +2305,70 @@ mod tests {
             with_off(redis_pkt(false, 5000, 1000 + glen, 0, genpass), 0),
         ]);
         assert!(!leaked(&out), "{out:?}");
+    }
+
+    /// A large server write (a GSO super-packet, one skb) as cgroup_skb
+    /// sends it (sock_capture.rs `emit`): consecutive MAX_PAYLOAD_SIZE
+    /// chunk records with `tcp_seq` and `stream_off` advanced by each
+    /// chunk's offset, `orig_len` the chunk's bytes, FIN on the last only.
+    /// The parser sees the whole reply and the next one stays in sync. Cut
+    /// to one 4 KiB record instead (before chunking), the tail was skipped
+    /// mid-reply and the following reply lost its text.
+    #[test]
+    fn chunked_super_packet_keeps_the_stream_in_sync() {
+        let get = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+        let glen = get.len() as u32;
+        let mut big = format!("${}\r\n", 9000).into_bytes();
+        big.extend(std::iter::repeat_n(b'x', 9000));
+        big.extend(b"\r\n");
+        let blen = big.len() as u32;
+        let small = b"$1\r\nw\r\n";
+        let at = |mut e: DataEvent, off: u64| {
+            e.cgroup_id = 7;
+            e.stream_off = off;
+            e
+        };
+        // The kernel's chunking of `data` at stream offset `off`.
+        let chunks = |seq: u32, ack: u32, off: u64, data: &[u8]| -> Vec<DataEvent> {
+            data.chunks(MAX_PAYLOAD_SIZE)
+                .enumerate()
+                .map(|(i, c)| {
+                    let o = (i * MAX_PAYLOAD_SIZE) as u32;
+                    at(redis_pkt(false, seq + o, ack, 0, c), off + o as u64)
+                })
+                .collect()
+        };
+        let head = |reply: Vec<DataEvent>| {
+            let mut evs = vec![at(redis_pkt(true, 1000, 5000, 0, get), 0)];
+            evs.extend(reply);
+            evs.push(at(
+                redis_pkt(true, 1000 + glen, 5000 + blen, 0, get),
+                glen as u64,
+            ));
+            evs.push(at(
+                redis_pkt(false, 5000 + blen, 1000 + 2 * glen, 0, small),
+                blen as u64,
+            ));
+            evs
+        };
+
+        let evs = head(chunks(5000, 1000 + glen, 0, &big));
+        assert_eq!(evs.len(), 2 + 3 + 1, "9 KiB reply: three chunk records");
+        let out = run_redis(&evs);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[1], (Some("GET".into()), Some("w".into())));
+
+        // One record cut at the capture window: the next reply has no text.
+        let mut cut = at(
+            redis_pkt(false, 5000, 1000 + glen, 0, &big[..MAX_PAYLOAD_SIZE]),
+            0,
+        );
+        cut.orig_len = blen;
+        let out = run_redis(&head(vec![cut]));
+        assert!(
+            out.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            "{out:?}"
+        );
     }
 
     /// TLS plaintext carries no stream position: Redis replies over TLS

@@ -39,15 +39,24 @@ RABBITMQ_IMAGE=${RABBITMQ_IMAGE:-rabbitmq:3.13}
 P=${CONTAINER_PREFIX:-o-}
 OUT=$(mktemp -d)
 
+# One name per call: podman's docker removes neither name when one is
+# missing, which left the broker of the last run behind.
+rm_brokers() {
+  local c
+  for c in "${P}kafka" "${P}rabbit"; do
+    docker rm -f "$c" >/dev/null 2>&1 || true
+  done
+}
+
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
   [[ -n ${DP:-} ]] && kill "$DP" 2>/dev/null || true
-  docker rm -f "${P}kafka" "${P}rabbit" >/dev/null 2>&1 || true
+  rm_brokers
   "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-docker rm -f "${P}kafka" "${P}rabbit" >/dev/null 2>&1 || true
+rm_brokers
 "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
 "$PY" "$HERE/netns.py" up  # first: the published ports bind to $HOST_IP
 

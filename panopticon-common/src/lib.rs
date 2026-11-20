@@ -33,6 +33,9 @@ pub const TCP_FLAG_ACK: u8 = 0x10;
 
 // Config array indices
 pub const CONFIG_CAPTURE_ENABLED: u32 = 0;
+/// `max_packet_bytes`: payload bytes of one packet the cgroup_skb capture
+/// sends (in MAX_PAYLOAD_SIZE records, at most 64 KiB). Written at every
+/// load; 0 reads as MAX_PAYLOAD_SIZE.
 pub const CONFIG_MAX_PAYLOAD: u32 = 1;
 pub const CONFIG_USE_RINGBUF: u32 = 2;
 pub const CONFIG_PID_FILTER_ON: u32 = 3;
@@ -235,10 +238,13 @@ pub struct DataEvent {
     pub dst_addr: u32,
     /// Bytes actually copied into `payload` (≤ MAX_PAYLOAD_SIZE).
     pub payload_len: u32,
-    /// Original payload length of the packet / TLS buffer. Larger than
-    /// `payload_len` when the capture was truncated (e.g. GSO/TSO
-    /// super-packets up to 64KB); parsers use the difference to skip the
-    /// bytes they never saw instead of silently losing stream sync.
+    /// This record's payload bytes on the wire. A packet or TLS buffer over
+    /// MAX_PAYLOAD_SIZE is sent as consecutive records (up to
+    /// `max_packet_bytes` of a packet, 16 KiB of a TLS buffer), each
+    /// counting its own bytes; the
+    /// last also counts what was not captured, and is then larger than
+    /// `payload_len`. Parsers use the difference to skip the bytes they
+    /// never saw instead of silently losing stream sync.
     pub orig_len: u32,
     pub tls_library: TlsLibrary,
     /// TCP sequence number of a packet's first byte (SEG.SEQ), and its
