@@ -135,8 +135,10 @@ pub struct LoadedPrograms {
 pub struct EbpfState {
     pub ebpf: Ebpf,
     pub links: Vec<Box<dyn std::any::Any + Send>>,
-    /// `(device_id, inode)` pairs of already-attached libraries —
-    /// handles symlinks and mount namespace ambiguity.
+    /// `(device_id, inode)` pairs of already-attached libraries, from the
+    /// file each was examined in
+    /// ([`crate::platform::proc_scanner::target_file_id`]) — handles
+    /// symlinks and mount namespace ambiguity.
     pub attached_libs: HashSet<(u64, u64)>,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,

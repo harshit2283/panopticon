@@ -508,20 +508,34 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
         }
     }
 
-    dedup_targets(&mut targets, get_file_id);
+    dedup_targets(&mut targets);
 
     debug!(count = targets.len(), "TLS library scan complete");
     targets
 }
 
-/// Keep one target per library file. TLS uprobes are attached without a
-/// PID filter, so they already cover every process mapping that file; each
-/// PID reaches it through a different `/proc/<pid>/root/...` path, and
-/// attaching once per path made every SSL call emit duplicate events.
-fn dedup_targets(targets: &mut Vec<TlsTarget>, file_id: impl Fn(&str) -> Option<(u64, u64)>) {
+/// `(device, inode)` of the file a target was examined in: its
+/// [`TlsTarget::file_key`], taken by fstat on the descriptor
+/// [`open_workload_file`] opened inside the workload's root. Never a fresh
+/// lookup of `library_path`: that path is under `/proc/<pid>/root`, which
+/// the workload controls, and a plain stat follows its absolute symlinks
+/// against the agent's root, so a co-tenant could make its target carry
+/// the identity of another file (a host libssl) and displace that file's
+/// own target in dedup or in the attached set (security scan F2).
+pub fn target_file_id(target: &TlsTarget) -> Option<(u64, u64)> {
+    target.file_key.map(|(dev, ino, _, _)| (dev, ino))
+}
+
+/// Keep one target per library file ([`target_file_id`]). TLS uprobes are
+/// attached without a PID filter, so they already cover every process
+/// mapping that file; each PID reaches it through a different
+/// `/proc/<pid>/root/...` path, and attaching once per path made every SSL
+/// call emit duplicate events. A target without an examined identity is
+/// kept per path (its attach is refused anyway: [`open_examined`]).
+fn dedup_targets(targets: &mut Vec<TlsTarget>) {
     let mut seen = std::collections::HashSet::new();
     targets.retain(|t| {
-        let file = file_id(&t.library_path).ok_or_else(|| t.library_path.clone());
+        let file = target_file_id(t).ok_or_else(|| t.library_path.clone());
         seen.insert(file)
     });
 }
@@ -724,14 +738,6 @@ fn is_go_binary(path: &str) -> bool {
 
 // ── Background TLS Scanner Task ─────────────────────────────────────────
 
-/// Return `(device_id, inode)` for a file path, handling symlinks correctly.
-#[cfg(target_os = "linux")]
-pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.dev(), meta.ino()))
-}
-
 /// Long-lived background task that periodically rescans `/proc` for new TLS
 /// libraries and attaches uprobes to them.
 ///
@@ -739,7 +745,8 @@ pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
 /// disposable pipeline must not hold captured values (DESIGN §3).
 ///
 /// Key design choices following review feedback:
-/// - **Inode-based dedup**: `(dev, ino)` instead of paths — handles symlinks/namespaces
+/// - **Inode-based dedup**: `(dev, ino)` of the file examined
+///   ([`target_file_id`]) instead of paths — handles symlinks/namespaces
 /// - **IO outside lock**: scan + ELF parsing before acquiring the mutex
 /// - **Batch logging**: one summary log per scan, not per-target
 /// - **Jitter**: 0–10% of interval to prevent fleet-wide CPU spikes
@@ -811,10 +818,7 @@ fn prune_attached_libs(
 ) {
     use std::collections::HashSet;
 
-    let current_ids: HashSet<(u64, u64)> = targets
-        .iter()
-        .filter_map(|t| get_file_id(&t.library_path))
-        .collect();
+    let current_ids: HashSet<(u64, u64)> = targets.iter().filter_map(target_file_id).collect();
 
     let mut state = match shared_ebpf.lock() {
         Ok(state) => state,
@@ -844,11 +848,11 @@ fn attach_new_targets(
         }
     };
 
-    // Pre-filter: resolve inodes and skip already-attached libraries
+    // Pre-filter: skip libraries already attached (by examined identity)
     let new_targets: Vec<_> = targets
         .into_iter()
         .filter(|t| {
-            get_file_id(&t.library_path)
+            target_file_id(t)
                 .map(|id| !already_attached.contains(&id))
                 .unwrap_or(false)
         })
@@ -868,7 +872,7 @@ fn attach_new_targets(
     };
     let mut newly_attached = 0usize;
     for target in &new_targets {
-        if let Some(file_id) = get_file_id(&target.library_path) {
+        if let Some(file_id) = target_file_id(target) {
             // Double-check under lock (another scan may have raced)
             if !state.attached_libs.contains(&file_id) {
                 let count = crate::loader::attach_tls_uprobes_on_state(&mut state, target);
@@ -1007,9 +1011,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn test_dedup_targets_by_file_not_path() {
-        let ssl = |pid: u32, path: &str| TlsTarget {
+    fn ssl_target(pid: u32, path: &str, key: Option<FileKey>) -> TlsTarget {
+        TlsTarget {
             pid,
             library_path: path.to_string(),
             tls_type: TlsType::OpenSsl {
@@ -1019,8 +1022,13 @@ mod tests {
                 ssl_read_ex_offset: None,
                 ssl_new_offset: None,
             },
-            file_key: None,
-        };
+            file_key: key,
+        }
+    }
+
+    #[test]
+    fn test_dedup_targets_by_file_not_path() {
+        let ssl = |pid: u32, path: &str, ino| ssl_target(pid, path, Some((1, ino, 5, 6)));
         let go = |pid: u32, path: &str| TlsTarget {
             pid,
             library_path: path.to_string(),
@@ -1028,26 +1036,60 @@ mod tests {
                 write_offset: 3,
                 read: None,
             },
-            file_key: None,
+            file_key: Some((1, 7, 5, 6)),
         };
         let mut targets = vec![
-            ssl(10, "/proc/10/root/usr/lib/libssl.so.3"),
-            ssl(11, "/proc/11/root/usr/lib/libssl.so.3"), // same file
-            ssl(12, "/proc/12/root/usr/lib/libssl.so.3"), // container's own copy
+            ssl(10, "/proc/10/root/usr/lib/libssl.so.3", 42),
+            ssl(11, "/proc/11/root/usr/lib/libssl.so.3", 42), // same file
+            ssl(12, "/proc/12/root/usr/lib/libssl.so.3", 99), // container's own copy
             go(20, "/proc/20/root/app"),
             go(21, "/proc/21/root/app"), // same binary, other process: covered
             go(21, "/proc/21/root/app"),
+            // Never examined: kept per path (its attach is refused).
+            ssl_target(30, "/proc/30/root/lib/libssl.so.3", None),
+            ssl_target(31, "/proc/30/root/lib/libssl.so.3", None),
+            ssl_target(32, "/proc/32/root/lib/libssl.so.3", None),
         ];
-        let id = |path: &str| {
-            Some(match path {
-                p if p.starts_with("/proc/12/") => (1, 99),
-                p if p.ends_with("libssl.so.3") => (1, 42),
-                _ => (1, 7),
-            })
-        };
-        dedup_targets(&mut targets, id);
+        dedup_targets(&mut targets);
         let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
-        assert_eq!(kept, vec![10, 12, 20]);
+        assert_eq!(kept, vec![10, 12, 20, 30, 32]);
+    }
+
+    /// Security scan F2: a workload swaps its library's directory for a
+    /// symlink to another file (a host libssl) after it was examined. The
+    /// target keeps the identity of the file examined; nothing re-resolves
+    /// the path, so the other file's own target is not dropped as a
+    /// duplicate, nor its identity recorded as attached.
+    #[cfg(unix)]
+    #[test]
+    fn test_dedup_ignores_a_path_swapped_after_examination() {
+        let dir = std::env::temp_dir().join(format!("panopticon-f2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("host")).unwrap();
+        std::fs::create_dir_all(dir.join("ctr")).unwrap();
+        let host = dir.join("host/libssl.so.3");
+        let own = dir.join("ctr/libssl.so.3");
+        std::fs::write(&host, b"host").unwrap();
+        std::fs::write(&own, b"container").unwrap();
+        let key = |p: &std::path::Path| file_key(&std::fs::File::open(p).unwrap()).unwrap();
+        let (host_key, own_key) = (key(&host), key(&own));
+        let attacker = ssl_target(5, &own.to_string_lossy(), Some(own_key));
+        // The swap: the attacker's path now leads to the host's file.
+        std::fs::remove_dir_all(dir.join("ctr")).unwrap();
+        std::os::unix::fs::symlink(dir.join("host"), dir.join("ctr")).unwrap();
+        let mut targets = vec![
+            attacker,
+            ssl_target(9, &host.to_string_lossy(), Some(host_key)),
+        ];
+        dedup_targets(&mut targets);
+        let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
+        assert_eq!(kept, vec![5, 9], "the host's target survives");
+        assert_eq!(
+            target_file_id(&targets[0]),
+            Some((own_key.0, own_key.1)),
+            "the examined file, not the path's file now"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── resolve_elf_symbols_from_bytes ───────────────────────────────
