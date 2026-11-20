@@ -92,8 +92,11 @@ enum Pending {
         ok: Arc<AtomicBool>,
         ts: u64,
     },
-    /// Answered by BindComplete.
-    Bind,
+    /// Answered by BindComplete. Its statement, for an error.
+    Bind {
+        bind: BindSql,
+        ts: u64,
+    },
     /// Answered by RowDescription or NoData, after a ParameterDescription
     /// for a statement (`statement`, cleared once that arrived).
     Describe {
@@ -168,10 +171,13 @@ pub struct PostgresParser {
     /// ReadyForQuery that can be attributed, see `ready_in_doubt`.
     in_doubt: bool,
     /// Server framing was lost with bytes: find the next ReadyForQuery by
-    /// its bytes.
+    /// its bytes. That one only re-anchors the framing (its bytes may be
+    /// row data): it never ends the doubt (`anchored`).
     framing_lost: bool,
-    /// The current group: an Execute was answered (or got the group's
-    /// error); the last Parse answered or dropped (SQL and start); an
+    /// The ReadyForQuery being read was found by its bytes.
+    anchored: bool,
+    /// The current group: it already has a record (an Execute answered,
+    /// or a message failed); its last Parse answered (SQL and start); an
     /// error answering its Sync.
     group_exec: bool,
     group_parse: Option<(Arc<str>, u64)>,
@@ -267,6 +273,7 @@ impl PostgresParser {
             untrusted: false,
             in_doubt: false,
             framing_lost: false,
+            anchored: false,
             group_exec: false,
             group_parse: None,
             group_error: None,
@@ -457,10 +464,10 @@ impl PostgresParser {
                         ts,
                     }
                 }
-                b'B' => {
-                    self.read_bind(&payload);
-                    Pending::Bind
-                }
+                b'B' => Pending::Bind {
+                    bind: self.read_bind(&payload),
+                    ts,
+                },
                 b'D' => Pending::Describe {
                     statement: payload.first() == Some(&b'S'),
                 },
@@ -527,7 +534,7 @@ impl PostgresParser {
     /// A Bind: the statement it runs (the latest unanswered Parse of its
     /// name, else the confirmed statement) and its values, kept under its
     /// portal.
-    fn read_bind(&mut self, payload: &[u8]) {
+    fn read_bind(&mut self, payload: &[u8]) -> BindSql {
         let portal = extract_string(payload);
         let name = extract_second_string(payload);
         let bind = match self.latest_parse.get(&name) {
@@ -556,8 +563,15 @@ impl PostgresParser {
         self.drop_portal(&portal);
         if self.portals.len() < MAX_PORTALS {
             self.held_values += values.as_ref().map_or(0, |v| v.0.len());
-            self.portals.insert(portal, Portal { bind, values });
+            self.portals.insert(
+                portal,
+                Portal {
+                    bind: bind.clone(),
+                    values,
+                },
+            );
         }
+        bind
     }
 
     fn drop_portal(&mut self, name: &str) {
@@ -657,7 +671,9 @@ impl PostgresParser {
         if self.groups == 0 {
             return; // answers a message sent before capture
         }
-        let attributable = self.groups == 1;
+        // One found by its bytes may be row data: it drops the oldest
+        // group (it may answer it) but never ends the doubt.
+        let attributable = self.groups == 1 && !self.anchored;
         while let Some(p) = self.pop() {
             let end = p.ends_group();
             self.retire(p, Some(out), ts, attributable);
@@ -667,7 +683,7 @@ impl PostgresParser {
         }
         self.group_exec = false;
         self.group_parse = None;
-        if attributable || self.untrusted {
+        if attributable || (self.untrusted && !self.anchored) {
             self.in_doubt = false;
         }
     }
@@ -681,6 +697,7 @@ impl PostgresParser {
                 Some(off) => {
                     self.server_buf.consume(off);
                     self.framing_lost = false;
+                    self.anchored = true;
                 }
                 None => {
                     // Keep a tail in case the marker is split across packets.
@@ -723,6 +740,7 @@ impl PostgresParser {
         if self.in_doubt && kind == b'Z' {
             self.ready_in_doubt(ts, out);
         }
+        self.anchored = false;
         true
     }
 
@@ -742,7 +760,7 @@ impl PostgresParser {
         let front = match self.pending.front() {
             Some(Pending::Query { .. }) => Front::Query,
             Some(Pending::Parse { .. }) => Front::Parse,
-            Some(Pending::Bind) => Front::Bind,
+            Some(Pending::Bind { .. }) => Front::Bind,
             Some(Pending::Describe { statement }) => Front::Describe {
                 statement: *statement,
             },
@@ -814,25 +832,20 @@ impl PostgresParser {
             }
             (Front::Sync, b'Z') => {
                 self.pop();
-                let parse = self.group_parse.take().filter(|_| !self.group_exec);
-                match (self.group_error.take(), parse) {
-                    // A group without an Execute (a driver preparing a
-                    // statement): one record for its Parse, as for any
-                    // exchange; with its error if it failed.
-                    (error, Some((sql, start))) => {
-                        let status = Some(error.is_some() as u32);
-                        let shown = Shown::Sql(&sql);
-                        out.push(self.record(shown, None, error, status, ts, Some(start), true));
-                    }
-                    // An error answering the Sync itself (at commit), or
-                    // one with nothing to carry it.
-                    (Some(error), None) => {
-                        let shown = Shown::Nothing;
-                        out.push(self.record(shown, None, Some(error), Some(1), ts, None, true));
-                    }
-                    (None, None) => {}
+                // A group with no record yet (a driver preparing a
+                // statement: Parse and Sync): one record for its Parse.
+                if let (false, Some((sql, start))) = (self.group_exec, self.group_parse.take()) {
+                    let shown = Shown::Sql(&sql);
+                    out.push(self.record(shown, None, None, Some(0), ts, Some(start), true));
+                }
+                // An error answering the Sync itself (at commit): no
+                // statement of its own, so its text is withheld.
+                if let Some(error) = self.group_error.take() {
+                    let shown = Shown::Nothing;
+                    out.push(self.record(shown, None, Some(error), Some(1), ts, None, true));
                 }
                 self.group_exec = false;
+                self.group_parse = None;
             }
             (Front::Sync, b'E') => {
                 self.group_error = Some(parse_error_response(payload));
@@ -841,33 +854,46 @@ impl PostgresParser {
                 Front::Parse | Front::Bind | Front::Describe { .. } | Front::Execute | Front::Close,
                 b'E',
             ) => {
-                // The front message failed and the server skips to the
-                // Sync. The error is reported with the group's first
-                // Execute from there (the statement it was for), else with
-                // the group at its ReadyForQuery.
-                let mut error = Some(parse_error_response(payload));
-                while self.pending.front().is_some_and(|p| !p.ends_group()) {
-                    match self.pop().expect("checked") {
-                        Pending::Execute(exec) if error.is_some() => {
-                            out.push(self.exec_record(*exec, None, error.take(), ts));
-                        }
-                        Pending::Parse {
-                            id,
-                            name,
-                            sql,
-                            ts: start,
-                            ..
-                        } => {
-                            self.parse_left(id, &name);
-                            self.group_parse = Some((sql, start));
-                        }
-                        other => self.retire(other, None, ts, false),
+                // The front message failed: it gets the record, under its
+                // own statement (a failed Parse its SQL, a failed Bind or
+                // Execute the statement it ran; a Describe or Close none,
+                // error text withheld). The server then skips to the Sync:
+                // the messages before it never ran and are not reported.
+                let error = Some(parse_error_response(payload));
+                let record = match self.pop().expect("front checked") {
+                    Pending::Execute(exec) => self.exec_record(*exec, None, error, ts),
+                    Pending::Parse {
+                        id,
+                        name,
+                        sql,
+                        ts: start,
+                        ..
+                    } => {
+                        self.parse_left(id, &name);
+                        let shown = Shown::Sql(&sql);
+                        self.record(shown, None, error, Some(1), ts, Some(start), true)
                     }
+                    Pending::Bind { bind, ts: start } => {
+                        let shown = match bind.sql.as_deref() {
+                            Some(sql) => Shown::Sql(sql),
+                            None => Shown::Unknown,
+                        };
+                        // A statement confirmed earlier may have been
+                        // redefined unseen: its error text is withheld.
+                        let trusted = !bind.reused;
+                        self.record(shown, None, error, Some(1), ts, Some(start), trusted)
+                    }
+                    _ => self.record(Shown::Nothing, None, error, Some(1), ts, None, true),
+                };
+                out.push(record);
+                self.group_exec = true;
+                while self.pending.front().is_some_and(|p| !p.ends_group()) {
+                    let p = self.pop().expect("checked");
+                    self.retire(p, None, ts, false);
                 }
                 if !matches!(self.pending.front(), Some(Pending::Sync)) {
                     return false; // a Query without a Sync before it
                 }
-                self.group_error = error;
             }
             _ => return false,
         }
@@ -906,7 +932,10 @@ impl PostgresParser {
             None => Shown::Unknown,
         };
         let status = Some(error.is_some() as u32);
-        self.record(shown, values, error, status, ts, Some(start), true)
+        // A statement confirmed earlier may have been redefined unseen:
+        // its error text (which may quote a value) is withheld.
+        let trusted = !(bind.reused && error.is_some());
+        self.record(shown, values, error, status, ts, Some(start), trusted)
     }
 
     /// One exchange's record, at `ts` (latency from `start`). Values and
@@ -1187,14 +1216,32 @@ mod tests {
         let mut tail = vec![7u8; 13];
         tail.extend_from_slice(&make_backend_msg(b'C', b"SELECT 900\0"));
         tail.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+        // Found by its bytes, the ReadyForQuery re-anchors the framing and
+        // closes the query (reported without status or latency: its bytes
+        // may have been row data), but does not end the doubt.
         match p.feed(&tail, Direction::Ingress, 2000) {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
-                assert_eq!(msgs[0].latency_ns, Some(1000));
+                assert_eq!((msgs[0].latency_ns, msgs[0].status), (None, None));
             }
             other => panic!("expected the query's message after resync, got {other:?}"),
         }
+        assert!(p.in_doubt);
+        // The next query's own (framed) ReadyForQuery, with one query
+        // waiting, ends it; the one after is reported in full.
+        for (sql, t) in [(&b"SELECT 1\0"[..], 3000), (&b"SELECT 2\0"[..], 4000)] {
+            p.feed(&make_frontend_msg(b'Q', sql), Direction::Egress, t);
+            let mut r = make_backend_msg(b'C', b"SELECT 1\0");
+            r.extend_from_slice(&make_backend_msg(b'Z', b"I"));
+            let ParseResult::Messages(msgs) = p.feed(&r, Direction::Ingress, t + 500) else {
+                panic!("expected a record");
+            };
+            // The first is answered in doubt: no status.
+            let want = if t == 3000 { None } else { Some(0) };
+            assert_eq!((msgs[0].latency_ns, msgs[0].status), (Some(500), want));
+        }
+        assert!(!p.in_doubt);
         assert_eq!(p.state, State::Ready);
     }
 
@@ -1801,9 +1848,9 @@ mod tests {
 
     /// Server bytes lost mid-group: the answered statements keep their
     /// records; the rest are reported without values, status or error
-    /// text. The ReadyForQuery is attributed (one group pending), the
-    /// names Parsed in the group are forgotten, and the next group is
-    /// trusted again.
+    /// text, and the names Parsed in the group are forgotten. Trust
+    /// returns at a framed ReadyForQuery that arrives with one group
+    /// waiting.
     #[test]
     fn test_lost_server_bytes_inside_a_group() {
         let mut p = setup_ready_parser();
@@ -1822,15 +1869,21 @@ mod tests {
         let m = records(p.feed(&tail, Direction::Ingress, 4));
         assert_eq!(m.len(), 1, "{m:?}");
         assert_eq!((m[0].request_text.as_deref(), m[0].status), (None, None));
-        assert!(!p.in_doubt);
+        assert!(p.in_doubt, "found by its bytes");
         assert!(p.prepared.contains_key("a") && !p.prepared.contains_key("b"));
-        // Reused `a`, a statement confirmed before the gap: trusted.
-        p.feed(&extended_cycle(None, "a", &["v3"]), Direction::Egress, 5);
+        // Reused `a`, a statement confirmed before the gap: its first
+        // group's framed ReadyForQuery (one group waiting) ends the doubt;
+        // the next is trusted.
         let mut done = make_backend_msg(b'2', b"");
         done.extend(make_backend_msg(b'C', b"SELECT 1\0"));
         done.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&extended_cycle(None, "a", &["v3"]), Direction::Egress, 5);
         let m = records(p.feed(&done, Direction::Ingress, 6));
-        assert_eq!(m[0].request_text.as_deref(), Some("v3"));
+        assert_eq!(m[0].request_text, None);
+        assert!(!p.in_doubt);
+        p.feed(&extended_cycle(None, "a", &["v4"]), Direction::Egress, 7);
+        let m = records(p.feed(&done, Direction::Ingress, 8));
+        assert_eq!(m[0].request_text.as_deref(), Some("v4"));
     }
 
     /// An answer that matches nothing pending: doubt, no error text, until
@@ -1904,6 +1957,192 @@ mod tests {
         assert!(!out.contains("s7Kf"), "{out}");
     }
 
+    /// Bind of `statement` into `portal`, text-format parameters.
+    fn bind_portal(portal: &str, statement: &str, params: &[&str]) -> Vec<u8> {
+        let mut b = format!("{portal}\0{statement}\0").into_bytes();
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for v in params {
+            b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            b.extend_from_slice(v.as_bytes());
+        }
+        b.extend_from_slice(&0i16.to_be_bytes());
+        make_frontend_msg(b'B', &b)
+    }
+
+    fn execute(portal: &str) -> Vec<u8> {
+        let mut b = format!("{portal}\0").into_bytes();
+        b.extend_from_slice(&0i32.to_be_bytes());
+        make_frontend_msg(b'E', &b)
+    }
+
+    fn parse_msg(name: &str, sql: &str) -> Vec<u8> {
+        let mut body = format!("{name}\0{sql}\0").into_bytes();
+        body.extend_from_slice(&0i16.to_be_bytes());
+        make_frontend_msg(b'P', &body)
+    }
+
+    /// A parser with `s` (benign) and `t` (a credential statement)
+    /// confirmed.
+    fn with_s_and_t() -> PostgresParser {
+        let mut p = setup_ready_parser();
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1::text")), "s", &["x"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        p.feed(
+            &extended_cycle(
+                Some(("t", "UPDATE users SET password = $1::int WHERE id = 1")),
+                "t",
+                &["1"],
+            ),
+            Direction::Egress,
+            3,
+        );
+        let mut r = make_backend_msg(b'1', b"");
+        r.extend(make_backend_msg(b'2', b""));
+        r.extend(make_backend_msg(b'C', b"UPDATE 1\0"));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&r, Direction::Ingress, 4);
+        assert!(p.prepared.contains_key("s") && p.prepared.contains_key("t"));
+        p
+    }
+
+    /// The reviewer's exact input: group 2 answered `1 2 E Z`.
+    #[test]
+    fn test_review_high_1_exact_input() {
+        let mut p = setup_ready_parser();
+        let mut g1 = pbe("", "SELECT $1::int", &["1"]);
+        g1.extend(pbe("", "SELECT $1::int + 1", &["2"]));
+        g1.extend(sync());
+        p.feed(&g1, Direction::Egress, 1);
+        let mut r1 = Vec::new();
+        for _ in 0..2 {
+            r1.extend(make_backend_msg(b'1', b""));
+            r1.extend(make_backend_msg(b'2', b""));
+            r1.extend(make_backend_msg(b'C', b"SELECT 1\0"));
+        }
+        r1.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&r1, Direction::Ingress, 2);
+        let mut g2 = pbe(
+            "",
+            "UPDATE users SET password = $1::int WHERE id = 1",
+            &["hunter2"],
+        );
+        g2.extend(sync());
+        p.feed(&g2, Direction::Egress, 3);
+        let mut r2 = make_backend_msg(b'1', b"");
+        r2.extend(make_backend_msg(b'2', b""));
+        r2.extend(error("invalid input syntax for type integer: \"hunter2\""));
+        r2.extend(make_backend_msg(b'Z', b"I"));
+        let m = records(p.feed(&r2, Direction::Ingress, 4));
+        let out = format!("{m:?}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(m.len(), 1, "{out}");
+        assert_eq!(m[0].method.as_deref(), Some("UPDATE"));
+    }
+
+    /// A failed Parse is reported under its own SQL, not a later Parse's.
+    #[test]
+    fn test_failed_parse_keeps_its_own_sql() {
+        let mut p = setup_ready_parser();
+        let mut c = parse_msg("a", "UPDATE users SET password = 'hunter2' WHER id = 1");
+        c.extend(parse_msg("b", "SELECT 1"));
+        c.extend(sync());
+        p.feed(&c, Direction::Egress, 1);
+        let mut r = error("syntax error at or near \"WHER\": 'hunter2'");
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let m = records(p.feed(&r, Direction::Ingress, 2));
+        let out = format!("{m:?}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(m.len(), 1, "{out}");
+        assert_eq!(m[0].method.as_deref(), Some("UPDATE"));
+        assert!(!p.prepared.contains_key("a") && !p.prepared.contains_key("b"));
+    }
+
+    /// A failed Parse's error is not handed to a later Execute of another
+    /// statement.
+    #[test]
+    fn test_failed_parse_error_not_handed_to_another_statement() {
+        let mut p = with_s_and_t();
+        let mut c = parse_msg("x", "UPDATE users SET password = $1 WHER id = 1");
+        c.extend(make_bind("s", &["hunter2"]));
+        c.extend(execute(""));
+        c.extend(sync());
+        p.feed(&c, Direction::Egress, 5);
+        let mut r = error("syntax error near \"hunter2\"");
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let m = records(p.feed(&r, Direction::Ingress, 6));
+        let out = format!("{m:?}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(m.len(), 1, "{out}");
+        assert_eq!(m[0].method.as_deref(), Some("UPDATE"));
+    }
+
+    /// A failed Bind is reported under its own statement, not under an
+    /// earlier portal's.
+    #[test]
+    fn test_failed_bind_keeps_its_own_statement() {
+        let mut p = with_s_and_t();
+        let mut c = bind_portal("p1", "s", &["ok"]);
+        c.extend(bind_portal("p2", "t", &["hunter2"]));
+        c.extend(execute("p1"));
+        c.extend(execute("p2"));
+        c.extend(sync());
+        p.feed(&c, Direction::Egress, 5);
+        let mut r = make_backend_msg(b'2', b"");
+        r.extend(error("invalid input syntax for type integer: \"hunter2\""));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let m = records(p.feed(&r, Direction::Ingress, 6));
+        let out = format!("{m:?}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(m.len(), 1, "{out}");
+        assert_eq!(m[0].method.as_deref(), Some("UPDATE"));
+        assert_eq!(m[0].status, Some(1));
+    }
+
+    /// An error answering the Sync (at commit) has no statement of its
+    /// own: its text is withheld, and a Parse-only group's record keeps
+    /// its own status.
+    #[test]
+    fn test_sync_error_is_not_shown_under_the_parse() {
+        let mut p = setup_ready_parser();
+        let mut c = parse_msg("a", "SELECT 1");
+        c.extend(sync());
+        p.feed(&c, Direction::Egress, 1);
+        let mut r = make_backend_msg(b'1', b"");
+        r.extend(error("duplicate key value: (email)=(jane@x.io)"));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let m = records(p.feed(&r, Direction::Ingress, 2));
+        let out = format!("{m:?}");
+        assert!(!out.contains("jane@x.io"), "{out}");
+        assert_eq!(m.len(), 2, "{out}");
+        assert_eq!(
+            (m[0].payload_text.as_deref(), m[0].status),
+            (Some("SELECT 1"), Some(0))
+        );
+        assert_eq!(m[1].status, Some(1));
+    }
+
+    /// A failed Execute of a reused statement (which may have been
+    /// redefined unseen) withholds its error text.
+    #[test]
+    fn test_reused_statement_error_text_is_withheld() {
+        let mut p = with_s_and_t();
+        p.feed(
+            &extended_cycle(None, "s", &["hunter2"]),
+            Direction::Egress,
+            5,
+        );
+        let mut r = make_backend_msg(b'2', b"");
+        r.extend(error("invalid input: \"hunter2\""));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let out = format!("{:?}", p.feed(&r, Direction::Ingress, 6));
+        assert!(!out.contains("hunter2"), "{out}");
+    }
+
     /// Pipelines: several Parses before one Sync; each ParseComplete
     /// answers the oldest Parse pending. (Which statements are known is
     /// read from `prepared`: a pipeline's later cycles are exported one
@@ -1956,9 +2195,9 @@ mod tests {
         assert_eq!(known(&p, "s3").as_deref(), Some("SELECT 3"));
 
         // A lost response: the group's Parses may or may not have been
-        // committed, so both names are forgotten; its ReadyForQuery is
-        // attributed (the only group pending) and later Parses are
-        // learned again.
+        // committed, so both names are forgotten. The ReadyForQuery found
+        // by its bytes does not end the doubt; the next group's own does
+        // (one group waiting), and later Parses are learned again.
         let mut p = setup_ready_parser();
         pipeline(&mut p, "SELECT $1 AS two");
         assert!(p.skip(Direction::Ingress, 30, 2).is_some());
@@ -1969,9 +2208,16 @@ mod tests {
             4,
         );
         p.feed(&insert_done(), Direction::Ingress, 5);
+        assert_eq!(known(&p, "s3"), None, "answered in doubt");
+        p.feed(
+            &extended_cycle(Some(("s4", "SELECT 4")), "s4", &[]),
+            Direction::Egress,
+            6,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 7);
         assert_eq!(known(&p, "s1"), None);
         assert_eq!(known(&p, "s2"), None);
-        assert_eq!(known(&p, "s3").as_deref(), Some("SELECT 3"));
+        assert_eq!(known(&p, "s4").as_deref(), Some("SELECT 4"));
     }
 
     /// Codex R5 H3: on a connection joined mid-stream an empty queue does

@@ -950,9 +950,13 @@ values. The agent keeps the client's messages that await an answer in
 order and pairs each answer with its own message: every `Execute` gets
 its own record, also when several statements share one `Sync` (JDBC
 batches, libpq pipelines), with its own values and status. An error is
-reported with the statement it stopped (the `Execute`, or the next
-`Execute` after a `Parse` or `Bind` that failed); the statements the
-server then skips to the `Sync` are not reported, since they never ran.
+reported under the message that failed: a failed `Parse` under its own
+SQL, a failed `Bind` or `Execute` under the statement it ran. A failed
+`Describe` or `Close`, or an error answering the `Sync` (at commit), has
+no statement of its own and its text is withheld, as is the error text
+of a statement confirmed in an earlier exchange (it may have been
+redefined unseen, below). The statements the server then skips to the
+`Sync` are not reported, since they never ran.
 At most 4096 messages awaiting an answer are kept, holding at most 1 MiB
 of bound values (a `Bind` past that is exported without them); past
 4096 the connection is treated as joined mid-stream (below). A `Parse` the server rejects
@@ -988,8 +992,11 @@ unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
 cancels an unanswered `Parse` of it. When server bytes are lost, or an
 answer matches no message awaiting one, the agent drops answers until a
-`ReadyForQuery` it can attribute: one that arrives while exactly one
-group (up to a `Sync`, or a simple Query) awaits an answer. Until then
+`ReadyForQuery` it can attribute: one read in the server's framing that
+arrives while exactly one group (up to a `Sync`, or a simple Query)
+awaits an answer. After lost bytes the next `ReadyForQuery` is found by
+its bytes, which may be row data: it re-establishes the framing and
+closes the oldest group, but never ends the doubt itself. Until then
 the groups are reported without bound values, error text or status, and
 the names their `Parse` messages defined are forgotten (they may or may
 not have been confirmed); statements confirmed before stay known. A
