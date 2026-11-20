@@ -298,9 +298,11 @@ pub struct AgentConfig {
     pub max_body_bytes: usize,
 
     // ── Packet capture ──────────────────────────────
-    /// Payload bytes captured of one packet (`max_packet_bytes`): a packet
-    /// over MAX_PAYLOAD_SIZE (GSO/TSO/GRO) is sent as consecutive 4 KiB
-    /// records up to this, the rest counted, not captured. Restart-only.
+    /// Payload bytes captured of one TCP packet (`max_packet_bytes`): a
+    /// packet over MAX_PAYLOAD_SIZE (GSO/TSO/GRO) is sent as consecutive
+    /// 4 KiB records up to this (`ceil(max_packet_bytes / 4096)` records),
+    /// the rest counted, not captured. UDP and RST-bearing packets stay one
+    /// record. Restart-only.
     pub max_packet_bytes: u32,
 
     // ── Raw capture ─────────────────────────────────
