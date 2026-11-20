@@ -152,20 +152,21 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     plaintext probe would emit a Write twice or not at all), then the
     generation step, then the handshake wrappers, each a boundary on its
     own and retried at each scan if it did not attach. Files are known by
-    the `(dev, ino)` of the file examined (never a fresh stat of a
-    workload path), and never forgotten. A container's overlay root
-    shows an image file under its own device while the uprobes sit on
-    the lower inode every container of the image shares. A Go binary seen
-    again through another mount is not attached again (which would
-    duplicate every probe and step the generation) only on the kernel's
-    evidence: the uprobe breakpoint at every offset the agent would probe,
-    read through a fresh mapping of the file examined and absent from
-    the file itself (loader.rs `attach_tls_uprobes`, proc_scanner.rs
-    `go_probes_present`), and only for a file of an inode number, size
-    and mtime the agent probed. Those three alone never skip anything (a
-    co-tenant can match them on another device); no unprivileged process
-    can place a breakpoint. OpenSSL files are always attached per
-    `(dev, ino)`: other TLS tracers probe the same functions. A binary without
+    the `(dev, ino)` the agent's own uprobes land on (proc_scanner.rs
+    `probe_file_id`), never a fresh stat of a workload path, and never
+    forgotten. A container's overlay root shows an image file under its
+    own device, while the uprobes sit on the real inode every container
+    of the image shares. That real inode is found by looking the path up
+    in the overlay's layers, as overlayfs would (overlay.rs
+    `lower_file_id`), and is used only when the file found is the one
+    examined: the same inode number on the layers' device, the same size
+    and mtime. It is used only when no whiteout, symlink, opaque or
+    redirected directory, or metacopy could make overlayfs resolve the
+    path otherwise. And it is used only for a mount namespace owned by
+    the initial user namespace. Any doubt keys the file by the `(dev,
+    ino)` examined, which can attach a shared inode twice but never
+    skips a file. This holds for OpenSSL libraries and Go binaries alike;
+    a Go binary attached twice would also step the generation. A binary without
     them (stripped, renamed, RETs not found, or no Go reads) keeps the
     latch on reused keys; the agent still starts and captures it. This
     is not a reason to refuse to start.

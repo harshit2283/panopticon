@@ -339,26 +339,20 @@ async fn main() -> Result<()> {
         let mut go_attach = loader::GoAttach::default();
         if agent_config.tls_scan_enabled {
             let targets = platform::proc_scanner::scan_all_processes();
-            let mut tls_probes = 0;
-            for target in &targets {
-                let probes = loader::attach_tls_uprobes(
-                    &mut programs.ebpf,
-                    target,
-                    &mut programs._links,
-                    programs.go_reads,
-                    &mut go_attach,
-                );
-                tls_probes += probes;
-                // Tracked by the identity of the file examined (never a
-                // fresh stat of the workload's path), and only once
-                // attached: a refused attach is retried by the next scan,
-                // as the background scanner does.
-                if probes > 0
-                    && let Some(file_id) = platform::proc_scanner::target_file_id(target)
-                {
-                    attached_libs.insert(file_id);
-                }
-            }
+            // Tracked by the file the probes land on (the real inode under
+            // an overlay root, else the file examined; never a fresh stat of
+            // the workload's path), and only once attached: a refused path
+            // falls back to the file's next one, and the next scan retries.
+            let (_, tls_probes) =
+                platform::proc_scanner::attach_each(&targets, &mut attached_libs, |target| {
+                    loader::attach_tls_uprobes(
+                        &mut programs.ebpf,
+                        target,
+                        &mut programs._links,
+                        programs.go_reads,
+                        &mut go_attach,
+                    )
+                });
             info!(
                 targets = targets.len(),
                 probes = tls_probes,

@@ -139,13 +139,15 @@ pub struct LoadedPrograms {
 pub struct EbpfState {
     pub ebpf: Ebpf,
     pub links: Vec<Box<dyn std::any::Any + Send>>,
-    /// `(device_id, inode)` pairs of already-attached libraries, from the
-    /// file each was examined in
-    /// ([`crate::platform::proc_scanner::target_file_id`]) — handles
-    /// symlinks and mount namespace ambiguity. Never pruned: the probes
-    /// stay attached for the agent's life, so forgetting a file attached
-    /// it again (duplicate probes, and for Go a generation step that
-    /// withholds its running processes) when a process mapped it again.
+    /// `(device_id, inode)` of each file this agent attached uprobes to:
+    /// the file the probes land on
+    /// ([`crate::platform::proc_scanner::probe_file_id`]), which is the
+    /// real inode under a container's overlay root and otherwise the file
+    /// examined (never a fresh stat of a workload path). Never pruned: the
+    /// links stay attached for the agent's life, so forgetting a file
+    /// attached it again (duplicate probes, and for Go a generation step
+    /// that withholds its running processes) when a process mapped it
+    /// again.
     pub attached_libs: HashSet<(u64, u64)>,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,
@@ -159,13 +161,6 @@ pub struct GoAttach {
     /// Go handshake probes that did not attach after their binary's guards
     /// did, retried at each background scan ([`retry_go_handshakes`]).
     pub handshake_retry: Vec<GoHandshakeRetry>,
-    /// Inode number, size and mtime of each Go file this agent attached
-    /// with its Write guard. Never an identity on its own (a co-tenant can
-    /// match all three on another device): only one condition of not
-    /// attaching a file again, with the kernel's evidence that the file's
-    /// real inode carries every probe this agent would put on it
-    /// ([`attach_tls_uprobes`]).
-    pub probed: HashSet<(u64, u64, i64)>,
 }
 
 /// A Go binary whose guards are attached and whose handshake probes (some
@@ -435,40 +430,9 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
-    // Another overlayfs mount of an image file this agent probed (each
-    // container's root shows it under a device of its own, while the
-    // uprobes are on the lower inode they share): attaching it again would
-    // put a second copy of every probe on that inode (each Go read emitted
-    // twice) and step the boundary generation, withholding the running
-    // replicas. It is skipped only on the kernel's evidence: the uprobe
-    // breakpoint at every offset this agent would probe, read through a
-    // mapping of the file examined (proc_scanner.rs `go_probes_present`),
-    // which no unprivileged process can produce, and only for a file of an
-    // inode number, size and mtime this agent probed. Never for OpenSSL,
-    // whose probe set other TLS tracers share. Anything less attaches.
-    let content = target
-        .file_key
-        .map(|(_, ino, mtime, size)| (ino, size, mtime));
-    if let (Some(c), Some(offsets)) = (content, go_probe_offsets(&target.tls_type, go_reads))
-        && go.probed.contains(&c)
-        && crate::platform::proc_scanner::go_probes_present(&file, &offsets)
-    {
-        info!(
-            pid = target.pid,
-            path = %target.library_path,
-            probes = offsets.len(),
-            "Go TLS uprobes already on this file's inode (another mount of it); not attached again"
-        );
-        return 1;
-    }
     let mut out = GoAttachOut::default();
     let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads, &mut out);
     drop(file); // the uprobes hold the inode now
-    if out.guarded
-        && let Some(c) = content
-    {
-        go.probed.insert(c);
-    }
     if !out.missing.is_empty() {
         go.handshake_retry.push(GoHandshakeRetry {
             target: target.clone(),
@@ -497,38 +461,9 @@ fn restricted_kernel_scope(ebpf: &Ebpf) -> bool {
     read().is_none_or(|mode| !scope::is_unscoped_full(mode))
 }
 
-/// Every offset this agent probes in a Go binary with its Write guard
-/// (the only kind recorded in [`GoAttach::probed`]): Write's entry and
-/// RETs, the handshake wrappers, and with Go reads the read probes. None
-/// for any other target.
-fn go_probe_offsets(tls: &TlsType, go_reads: bool) -> Option<Vec<u64>> {
-    let TlsType::GoTls {
-        write_offset,
-        read,
-        boundary: Some(b),
-    } = tls
-    else {
-        return None;
-    };
-    if !go_reads || b.write_entry != *write_offset {
-        return None;
-    }
-    let mut offsets = vec![b.write_entry];
-    offsets.extend(&b.write_rets);
-    offsets.extend(&b.handshakes);
-    if let Some(r) = read {
-        offsets.push(r.read_record_entry);
-        offsets.extend(&r.read_record_rets);
-        offsets.extend(&r.decrypt_rets);
-    }
-    Some(offsets)
-}
-
 /// Go attach results of one target ([`attach_tls_uprobes_to`]).
 #[derive(Default)]
 struct GoAttachOut {
-    /// The Write guard attached.
-    guarded: bool,
     /// Handshake offsets that did not attach (retried).
     missing: Vec<u64>,
 }
@@ -683,7 +618,6 @@ fn attach_tls_uprobes_to(
                 }
                 _ => None,
             };
-            go.guarded = guarded.is_some();
             if let Some(n) = guarded {
                 attached += n;
             } else if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
@@ -1637,41 +1571,5 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         let b = normalize_pin_dir("/sys/fs/bpf/panopticon");
         assert_eq!(a, std::path::Path::new("/sys/fs/bpf/panopticon"));
         assert_eq!(b, std::path::Path::new("/sys/fs/bpf/panopticon"));
-    }
-
-    /// Only a guarded Go binary has a probe set to prove: never OpenSSL
-    /// (its set is shared with other TLS tracers), never an unguarded Go
-    /// binary; a guarded one lists every probe, reads included.
-    #[test]
-    fn go_probe_offsets_cover_every_probe_and_only_go() {
-        use crate::platform::proc_scanner::{GoBoundaryProbes, GoReadProbes};
-        let ssl = TlsType::OpenSsl {
-            ssl_write_offset: 1,
-            ssl_read_offset: 2,
-            ssl_write_ex_offset: None,
-            ssl_read_ex_offset: None,
-            ssl_new_offset: None,
-        };
-        assert_eq!(go_probe_offsets(&ssl, true), None);
-        let go = |boundary| TlsType::GoTls {
-            write_offset: 10,
-            read: Some(GoReadProbes {
-                read_record_entry: 30,
-                read_record_rets: vec![31, 32],
-                decrypt_rets: vec![40],
-            }),
-            boundary,
-        };
-        let b = GoBoundaryProbes {
-            write_entry: 10,
-            write_rets: vec![11, 12],
-            handshakes: vec![20, 21],
-        };
-        assert_eq!(go_probe_offsets(&go(None), true), None);
-        assert_eq!(go_probe_offsets(&go(Some(b.clone())), false), None);
-        assert_eq!(
-            go_probe_offsets(&go(Some(b)), true),
-            Some(vec![10, 11, 12, 20, 21, 30, 31, 32, 40])
-        );
     }
 }

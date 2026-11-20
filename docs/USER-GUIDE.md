@@ -805,11 +805,12 @@ What is exported then:
     (re)starts, and a new binary's processes started before the scan
     that finds it (every 60 s by default, `tls_scan_interval_secs`). New
     replicas and restarts of a binary already attached get boundaries,
-    in containers too: each container's overlay root shows the image
-    file under a device of its own, and the agent does not attach it
-    again (nor step) when the kernel shows the file's real inode already
-    carries every probe the agent would put on it (their breakpoints in
-    a mapping of the file).
+    in containers too. Each container's overlay root shows the image
+    file under a device of its own. The agent finds the real inode that
+    all of them share in the overlay's layers, and does not attach it
+    again (nor step). When it cannot prove which layer file it is, the
+    agent attaches that container's file again, and its running
+    processes lose boundaries.
     Processes running other binaries keep theirs when the agent proves,
     from their memory maps, that they do not map the new binary;
     otherwise they lose them too.
