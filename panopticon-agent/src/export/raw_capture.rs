@@ -12,7 +12,8 @@
 //! - Writing stops, and the file is closed, as soon as a reload tightens
 //!   the privacy mode below `full`: events still queued are not written.
 //! - Payloads are the captured bytes, up to 4096 per record: a larger
-//!   packet is split over up to 16 records (64 KiB), a TLS read or write
+//!   packet is split over records up to `max_packet_bytes` (default 64
+//!   KiB, 16 records), a TLS read or write
 //!   over up to 4 (16 KiB). `orig_len` in each record counts its bytes on
 //!   the wire; in a packet's or TLS call's last record it also counts what
 //!   was not captured.

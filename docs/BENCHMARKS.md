@@ -205,8 +205,8 @@ the server as GSO packets of up to 8 KB, and each packet was captured as
 one record cut at 4,096 bytes: in the raw dump of a seed-7 run, 25 server
 packets lost 79,369 of 260,837 bytes (30%), with no ring drops and no
 failed loads (`panopticon_capture_truncated_total` 50, the two views of
-25). Large packets are now sent as consecutive 4 KiB records (USER-GUIDE
-§7); the same runs score 100% (500/500 at seeds 7, 11 and 23 on 6.8 and
+25). Large packets are now sent as consecutive 4 KiB records (`max_packet_bytes`,
+USER-GUIDE §4.2); at the default 65536 the same runs score 100% (500/500 at seeds 7, 11 and 23 on 6.8 and
 seed 7 on 7.0; PII flagged in 313/313, 283/283 and 291/291 operations
 that sent it; no raw PII values; `panopticon_capture_truncated_total` 0,
 every server byte captured).
@@ -250,13 +250,15 @@ were cut too (45 packets), but deliveries stayed at 100%: there the cut
 evidently fell inside a body frame, which the AMQP parser can skip. On
 8.10 a packet carries up to 13-24 KB, several deliveries, and the cut
 crosses frame boundaries. Large packets are now sent as consecutive
-4 KiB records with exact stream positions (USER-GUIDE §5.5). The same
+4 KiB records with exact stream positions (`max_packet_bytes`, USER-GUIDE
+§4.2). The same
 invocation on 8.10 then gives `Basic.Deliver` 164/164 and AMQP 100% in
-four of four runs (22.6-35.4% and 76.8-80.7% in three runs just before),
+six of six runs at `max_packet_bytes` 65536 (22.6-35.4% and 76.8-80.7% in
+three runs just before),
 with `panopticon_capture_truncated_total` 0 (176 before) and every byte of
 both directions captured. On 7.0 AMQP stays at 100% (three runs), with
-truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100%, 94.9%, 100% and
-100% after the change. The 94.9% run lost no bytes: no truncated packet, no
+truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100% in five of the
+six runs after the change and 94.9% in one. The 94.9% run lost no bytes: no truncated packet, no
 stream hole, both views agree. The 13 missed records all sat in one 10 KB
 Fetch response carrying about 20 records of four topics. Its exported text
 ends inside a record with a 6 KB value: the records of the first two
@@ -1285,10 +1287,10 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   every record was a fixed 4,168 bytes, and at 1K connections `pid_filter`
   lost 2.6-8.2K events in the kernel ring where TC lost none. Now it loses
   none (see Compact records). A packet over 4,096 bytes (GSO, TSO, GRO) is
-  sent as up to 16 full records, so a 64 KiB packet takes about 67 KB of
-  ring where it took one 4.2 KB record. The large-body and load figures
-  in this document were measured before that change and have not been
-  re-run.
+  now sent as consecutive records up to `max_packet_bytes` (default 64 KiB:
+  16 records, about 67 KB of ring where one record took 4.2 KB); see
+  "Large packets" below. The other large-body and load figures in this
+  document predate that change and were not re-run.
 - **`pid_filter` drops the bytes that arrive before `accept()` on a listener
   that predates the agent.** This is every server not restarted since the
   agent started, so it is the case after any agent restart. Such a listener
@@ -1381,6 +1383,38 @@ and close records only for sockets that emitted):
   either view, and the agent exported about twice the records.
 - **Not measured.** TLS traffic under load and the ONNX model.
 
+#### Large packets (`max_packet_bytes`, 2026-11-21)
+
+A GSO, TSO or GRO packet over 4,096 bytes used to be one record cut at
+4,096 bytes. It is now sent as consecutive 4 KiB records up to
+`max_packet_bytes` (default 65536), each at its exact stream position.
+`tests/load/run_load.sh 200 20s <rate> 0 200000` (200 connections, 200 KB
+bodies, unscoped, both views), one 16-vCPU VM on kernel 7.0, one run per
+cell; "before" is the agent without this change, 4096 is this build at one
+record (the control):
+
+| Rate | Build | Requests | Kernel µs / packet | Kernel ring drops | Rate-limit drops | Agent cores | Recall |
+|---|---|---|---|---|---|---|---|
+| 2,000/s | before | 40.0K | 1.31 | 0 | 0 | 0.24 | 100% |
+| 2,000/s | 4096 | 40.0K | 1.48 | 0 | 0 | 0.32 | 100% |
+| 2,000/s | 16384 | 40.0K | 1.64 | 0 | 0 | 0.23 | 100% |
+| 2,000/s | 65536 | 40.0K | 5.23 | 0 | 0 | 0.61 | 100% |
+| max | before | 1.09M | 1.59 | 266K | 2.46M | 2.69 | 79.0% |
+| max | 4096 | 1.14M | 1.57 | 304K | 3.05M | 2.45 | 75.4% |
+| max | 16384 | 956K | 3.12 | 2.81M | 11.3M | 2.35 | 34.2% |
+| max | 65536 | 595K | 10.99 | 3.29M | 21.4M | 2.63 | 15.0% |
+
+At one record the build matches the agent before it, so the restructured
+program costs nothing per packet. At 2,000 requests/s (about 400 MB/s per
+view) every setting captures everything; at 65536 the kernel spends 4x as
+long per packet and the agent 2.5x the CPU, for 8.4x the records. At full
+rate the copy is paid in the sending application's context: at 65536 the
+application completed 45% fewer requests, and records (not packets) count
+against `max_events_per_sec`, so the export fell to 15%. An earlier pair
+of runs at full rate gave the same picture (986K-1.01M requests and
+85-87% recall before; 491-597K and 14-19% at 65536). On a node that moves
+bulk data at line rate, set `max_packet_bytes = 4096` or scope the capture.
+
 ## 5. Micro-benchmarks
 
 Criterion, `cargo bench -p panopticon-agent`. The benchmarks call the real
@@ -1470,8 +1504,9 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.
-- **Capture is cut at 64 KiB per packet** (16 records of 4 KB; BIG TCP
-  packets can be larger) **and 16 KB per TLS read/write** (four records).
+- **Capture is cut at `max_packet_bytes` per packet** (default 64 KiB, 16
+  records of 4 KB; BIG TCP packets can be larger) **and 16 KB per TLS
+  read/write** (four records).
   Larger messages are reassembled where the protocol allows it.
   `panopticon_capture_truncated` counts what was cut.
 - **TLS addresses are learned on the connection's first socket I/O inside a

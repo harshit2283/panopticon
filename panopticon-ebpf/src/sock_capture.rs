@@ -1319,8 +1319,9 @@ fn emit(ctx: &SkBuffContext, h: &Hdr) -> Result<(), ()> {
 }
 
 /// Packets are sent as at most this many records (64 KiB: the default
-/// GSO/TSO/GRO maximum). Bytes past them are counted, not captured (the last
-/// record's `orig_len`). The verifier walks every chunk.
+/// GSO/TSO/GRO maximum), fewer if `max_packet_bytes` ([`packet_cap`]) is
+/// lower. Bytes past them are counted, not captured (the last record's
+/// `orig_len`). The verifier walks every chunk.
 const MAX_SKB_CHUNKS: usize = 16;
 
 // Older kernels' `bpf_skb_load_bytes` fails any offset over 0xffff (the

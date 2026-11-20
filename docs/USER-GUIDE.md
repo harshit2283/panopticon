@@ -119,6 +119,7 @@ worker_channel_capacity = 4096        # events queued per worker; excess is drop
 max_connections_tracked = 65536
 idle_connection_timeout_secs = 30
 max_body_bytes = 4096               # body text kept per exchange for PII scan + export (max 65536)
+max_packet_bytes = 65536            # bytes captured per packet, in 4 KiB records (4096-65536); restart to change
 tls_scan_enabled = true             # find OpenSSL/Go TLS libraries and attach uprobes
 tls_scan_interval_secs = 60
 log_events = false
@@ -168,6 +169,26 @@ watch = true           # stream changes between re-lists; false = refresh only b
 cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgroup,
                        # else /sys/fs/cgroup/unified, else a private mount (RHEL 8)
 ```
+
+**`max_packet_bytes`.** The kernel hands the capture large packets whole
+(GSO, TSO and GRO packets of up to 64 KiB). Each is sent to the agent as
+consecutive 4 KiB records, up to `max_packet_bytes` (4096 to 65536,
+default 65536), each with its exact stream position; what lies past it is
+counted, not captured. Cut at one record (4096, the behaviour before this
+setting), a large response loses message boundaries: a PostgreSQL 500-row
+result then cost the bound values of the rest of its connection, and
+AMQP deliveries batched into one packet lost their text. The cost is
+kernel time and ring space per large packet, paid in the sending
+application's context. Measured on a 16-vCPU VM (7.0) with 200 KB HTTP
+bodies over 200 connections, unscoped: at 2,000 requests/s every setting
+captured 100% with no drops (kernel time per packet 1.3 µs at 4096, 5.2 µs
+at 65536; agent 0.24 → 0.61 cores); at full rate, 65536 cut the
+application's throughput by about 45% (595K requests in 20 s, against
+1.09M) and the export to 15% of exchanges (75-79% at 4096), with 3.3M kernel
+ring drops. Records, not packets, count against `max_events_per_sec`. On a
+node that moves bulk data at line rate, set 4096 (or scope the capture,
+§4.2) and accept the boundary loss on large responses. Changing it needs a
+restart.
 
 **Capture scope.** Packets are captured by `cgroup_skb` programs attached
 to the root of the host's cgroup v2 hierarchy, the only capture backend
@@ -1028,7 +1049,7 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
-| `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: 64 KiB per packet (BIG TCP), 16 KiB per TLS read or write, or a `head_only` cut (§5.5). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
+| `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: `max_packet_bytes` per packet (64 KiB by default, so only BIG TCP), 16 KiB per TLS read or write, or a `head_only` cut (§5.5). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
 | `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback` |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
@@ -1076,8 +1097,8 @@ connection's requests and responses in order. Details:
   left out, and when both ends run on the node only the server's view (the
   end with the lower port) is kept. A TLS connection whose addresses were
   never seen is shown as `127.0.0.1:<port> → 127.0.0.2:443`.
-- Bytes that were not captured (beyond 64 KiB of one packet or 16 KiB of one
-  TLS read or write, see below) show as gaps ("previous segment not
+- Bytes that were not captured (beyond `max_packet_bytes` of one packet or
+  16 KiB of one TLS read or write, see below) show as gaps ("previous segment not
   captured"), not as corrupted streams.
 - Packets carry no handshake (SYN/FIN), so Wireshark marks the first one of
   each connection "previous segment not captured"; that is expected.
@@ -1121,12 +1142,13 @@ computed), `owner_tgid`, `acceptor_tgid`, `scope_gen` and `role` (1 client,
   filled in once the connection has done socket I/O inside a captured call,
   and are zero before that.
 - **A record holds at most 4096 payload bytes.** A larger packet (a GSO,
-  TSO or GRO packet of up to 64 KiB) is split over consecutive records, at
-  most 16 (64 KiB), each with its own `tcp_seq` and `stream_off`; a TLS
-  read or write over at most 4 (16 KiB). `orig_len` is a record's bytes on
-  the wire; in the last record of a packet or TLS call it also counts what
-  was not captured, and `truncated` is then `true` (BIG TCP packets over
-  64 KiB, TLS calls over 16 KiB, a `head_only` cut).
+  TSO or GRO packet of up to 64 KiB) is split over consecutive records up
+  to `max_packet_bytes` (default 65536: 16 records), each with its own
+  `tcp_seq` and `stream_off`; a TLS read or write over at most 4 (16 KiB).
+  `orig_len` is a record's bytes on the wire; in the last record of a
+  packet or TLS call it also counts what was not captured, and `truncated`
+  is then `true` (a packet past `max_packet_bytes`, a TLS call over 16 KiB,
+  a `head_only` cut).
 - If the disk cannot keep up, events are dropped from the file and counted in
   `panopticon_raw_capture_dropped_total`; the rest of the agent is
   unaffected.
@@ -1205,8 +1227,10 @@ real cluster.
 
 ## 7. Limits worth knowing
 
-IPv4 only; the capture-scope trade-offs (§4.2); at most 64 KiB of one
-packet and 16 KiB of one TLS read or write are captured (§5.5); Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
+IPv4 only; the capture-scope trade-offs (§4.2); at most `max_packet_bytes`
+(default 64 KiB) of one packet and 16 KiB of one TLS read or write are
+captured (§5.5), and capturing large packets whole costs kernel time and
+ring space under bulk transfers (`max_packet_bytes`, §4.2); Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
 OpenSSL/Go; PII detection is regex-based by default; TCP checksums are not
 verified, so a forger who knows a connection's sequence numbers (on path)
 can still slip a segment in; DNS-derived names say what a client asked for

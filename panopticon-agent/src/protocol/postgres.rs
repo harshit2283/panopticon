@@ -855,7 +855,7 @@ impl ProtocolParser for PostgresParser {
     fn skip(&mut self, direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<ParseResult> {
         match (direction, &self.state) {
             // Lost part of a response (ring drops, or a large result set in
-            // a packet past the 64 KiB capture cap): the row data is not
+            // a packet past `max_packet_bytes`): the row data is not
             // needed, so drop the partial message and resync on the
             // closing ReadyForQuery.
             (

@@ -33,7 +33,8 @@ production-hardened compliance platform.
   100% recall, PII flagged in every request that carried it, and no raw
   PII values in the export (`tests/oracle/run_protocols.sh`). PostgreSQL
   was re-measured on 2026-11-20 after large packets were captured whole
-  (seeds 7, 11 and 23 on 6.8, seed 7 on 7.0); before that, a 500-row
+  (default `max_packet_bytes`; seeds 7, 11 and 23 on 6.8, seed 7 on 7.0);
+  before that, a 500-row
   result cut at the 4 KiB per-packet window cost the bound values of the
   rest of the connection (83.8-84.6%, PII in 38-42%).
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
@@ -85,7 +86,14 @@ production-hardened compliance platform.
   seen on a VRF device) only with
   `capture_loopback = true` (default false; it covers packets only: TLS
   plaintext over loopback is scoped by process either way). IPv6 is not
-  captured. `pid_filter` matches TC's
+  captured. Large packets (GSO, TSO, GRO) are captured whole, in 4 KiB
+  records up to `max_packet_bytes` (default 64 KiB). That costs kernel
+  time in the sending application and ring space: at 200 KB bodies on 200
+  connections (7.0, 16 vCPUs) nothing is lost at 2,000 requests/s, but at
+  full rate the application completed 45% fewer requests and the export
+  fell from 75-79% to 15% (BENCHMARKS.md, "Large packets"); a node moving
+  bulk data at line rate should set 4096 or scope the capture.
+  `pid_filter` matches TC's
   recall only for a server whose listener was created after the agent
   started, with `pid_filter_listener = "creator"`; under the default
   `"acceptor"` every listener loses the bytes before `accept()`, like a
@@ -135,10 +143,11 @@ production-hardened compliance platform.
     4 KB; the parser lost frame sync and the consumer direction stopped
     exporting AMQP text (fail closed, USER-GUIDE §5.3). Not a ring or
     helper limit: no ring drops, no failed loads. Large packets are now sent
-    as consecutive 4 KB records with exact stream positions (up to 64 KiB
-    per packet); deliveries are 164/164 and AMQP 100% in four of four runs,
-    with nothing truncated (see BENCHMARKS.md). Kafka `Fetch` was 100% in
-    three of those runs and 94.9% in one, which lost no bytes: its 13
+    as consecutive 4 KB records with exact stream positions (up to
+    `max_packet_bytes`, default 64 KiB); deliveries are 164/164 and AMQP
+    100% in six of six runs, with nothing truncated (see BENCHMARKS.md).
+    Kafka `Fetch` was 100% in five of those runs and 94.9% in one, which
+    lost no bytes: its 13
     missing records were in one Fetch response of about 20 records, whose
     exported text ends at the per-exchange body cap (`max_body_bytes`).
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP

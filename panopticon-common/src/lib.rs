@@ -239,8 +239,9 @@ pub struct DataEvent {
     /// Bytes actually copied into `payload` (≤ MAX_PAYLOAD_SIZE).
     pub payload_len: u32,
     /// This record's payload bytes on the wire. A packet or TLS buffer over
-    /// MAX_PAYLOAD_SIZE is sent as consecutive records (up to 64 KiB of a
-    /// packet, 16 KiB of a TLS buffer), each counting its own bytes; the
+    /// MAX_PAYLOAD_SIZE is sent as consecutive records (up to
+    /// `max_packet_bytes` of a packet, 16 KiB of a TLS buffer), each
+    /// counting its own bytes; the
     /// last also counts what was not captured, and is then larger than
     /// `payload_len`. Parsers use the difference to skip the bytes they
     /// never saw instead of silently losing stream sync.

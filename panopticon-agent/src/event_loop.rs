@@ -1264,8 +1264,8 @@ fn feed_event(
             .unwrap_or_else(panicked),
         );
     }
-    // Bytes beyond the capture cap (a packet past 16 records, 64 KiB; a TLS
-    // read or write past 4, 16 KiB; a head-only cut) were never seen: let
+    // Bytes beyond the capture cap (a packet past `max_packet_bytes`; a TLS
+    // read or write past 4 records, 16 KiB; a head-only cut) were never seen: let
     // the parser count them instead of desynchronising on the next message.
     let tail = (event.orig_len as usize).saturating_sub(trim.max(payload.len()));
     if tail > 0 {
