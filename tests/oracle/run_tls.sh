@@ -18,8 +18,9 @@
 # Each view is scored separately and must reach MIN_RECALL, as must the
 # share of its exchanges that carry the socket's addresses. go-h2 must also
 # show as many distinct keys as connections (tls_conns.py). go-h2-reuse is
-# gated instead on no raw PII in the export and on every record it could not
-# attribute carrying no path, status, content type or header.
+# gated instead on no raw PII in the export, on every record it could not
+# attribute carrying no path, status, content type or header, and on no
+# client exchange decoded on a reused key (tls_conns.py --reused-latched).
 #
 # Usage: sudo tests/oracle/run_tls.sh [requests=500] [seed=1234] [min_recall=0.99] [stacks="openssl go go-h2 go-h2-reuse"]
 # Needs: root, a built agent (target/release/panopticon-agent), openssl,
@@ -105,7 +106,8 @@ for stack in $STACKS; do
   case $stack in
     go-h2) python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt" --distinct || status=1 ;;
     go-h2-reuse)
-      python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt"
+      python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt" \
+        --reused-latched "$D/client.jsonl" || status=1
       gate=(0 --withheld) ;;
   esac
   for view in client server; do

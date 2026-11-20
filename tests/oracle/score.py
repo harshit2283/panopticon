@@ -24,11 +24,18 @@ truth = {json.loads(l)["id"]: json.loads(l) for l in open(sys.argv[1])}
 seen = collections.defaultdict(list)
 phantom = 0
 phantom_fields = collections.Counter()
+protocols = collections.Counter()
 for line in open(sys.argv[2]):
     e = json.loads(line)
-    if e.get("protocol") not in ("http1", "http2"):  # same HTTP semantics
-        continue
+    protocols[e.get("protocol")] += 1
     m = re.search(r"[?&]id=(q\d+)", e.get("path") or "")
+    if e.get("protocol") not in ("http1", "http2"):  # same HTTP semantics
+        # Under --withheld a record of any other protocol is unattributed
+        # too: it must carry no header-derived field either.
+        if "--withheld" in flags and not (m and m.group(1) in truth):
+            for field in ("path", "status", "content_type", "headers"):
+                phantom_fields[field] += bool(e.get(field))
+        continue
     if not m or m.group(1) not in truth:
         phantom += 1
         for field in ("path", "status", "content_type", "headers"):
@@ -54,6 +61,7 @@ for k in found:
 missing = [k for k in truth if not seen[k]]
 by_kind = collections.Counter(truth[k]["path"].split("?")[0].rsplit("/", 1)[0] if truth[k]["path"].count("/") > 1 else truth[k]["path"].split("?")[0] for k in missing)
 print(f"truth={n} recall={len(found)/n:.1%} ({len(found)}/{n}) duplicates={len(dups)} phantoms={phantom}")
+print("  agent protocols:", dict(protocols))
 print("  phantoms carrying path / status / content_type / headers:",
       {f: phantom_fields[f] for f in ("path", "status", "content_type", "headers")})
 for f in ("method", "status", "response_size"):

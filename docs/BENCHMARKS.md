@@ -85,7 +85,10 @@ per view with as many distinct keys as connections (`tls_conns.py`). The
 `go-h2-reuse` stack closes each connection before opening the next, so Go
 reuses addresses; a reused key never decodes headers (§7), so its recall is
 reported, not gated, and it is gated on no raw PII and on every record it
-cannot attribute carrying no path, status, content type or header.
+cannot attribute carrying no path, status, content type or header, and on no
+client exchange decoded on a connection whose `*tls.Conn` address an earlier
+connection used (`tls_conns.py --reused-latched`, from the addresses the
+oracle records, not the agent's keys).
 
 | Run | Exchanges | Recall (client / server view) | Status / method / size | With socket addresses | Leaks |
 |---|---|---|---|---|---|
@@ -131,9 +134,9 @@ HTTP/2 over TLS had two problems of its own:
   connection object, so a new connection can get the same `*tls.Conn` /
   `SSL*` key. Its preface then landed in the old connection's parser, along
   with its stale HPACK state. A client preface now restarts the parser.
-  Since then (credential masking, USER-GUIDE §5.3) a reused key starts
-  clean only after the agent saw the library create the new object;
-  otherwise the restarted parser stays latched. OpenSSL's `SSL_new`
+  Since then (credential masking, USER-GUIDE §5.3) a reused key started
+  clean only after the agent saw the library create the new object (for
+  OpenSSL still the rule); otherwise the restarted parser stayed latched. OpenSSL's `SSL_new`
   return had that record from the start; Go had none, so on this branch
   every `go-h2` connection after the first on a reused `*tls.Conn` key
   was exported with no path, status or headers (CI, 2026-11-20: 56.6% /
