@@ -64,6 +64,76 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoReadPr
     })
 }
 
+/// Writes plaintext; its entry probe emits before Write runs an implicit
+/// handshake, so it is guarded (tls_probes.rs `go_tls_guard_entry`).
+pub const WRITE: &str = "crypto/tls.(*Conn).Write";
+/// Calls `clientHandshake` again on a live connection: guarded.
+pub const RENEGOTIATE: &str = "crypto/tls.(*Conn).handleRenegotiation";
+/// A connection's handshake (`c.handshakeFn`): its entry starts a new
+/// connection object (tls_probes.rs `go_tls_handshake_entry`).
+pub const CLIENT_HANDSHAKE: &str = "crypto/tls.(*Conn).clientHandshake";
+pub const SERVER_HANDSHAKE: &str = "crypto/tls.(*Conn).serverHandshake";
+
+/// Probe offsets for the Go new-connection boundary (`TlsNew` at a
+/// handshake's entry). Each handshake entry is attached only after every
+/// guard it needs: `Write`'s entry and RETs for both, and
+/// `handleRenegotiation`'s entry and RETs for `clientHandshake`, the one it
+/// calls. A binary without them (stripped, renamed, or a handshake that
+/// cannot be guarded) gets no boundary: a reused key stays latched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBoundaryProbes {
+    pub write_entry: u64,
+    pub write_rets: Vec<u64>,
+    /// `handleRenegotiation`: entry and RETs.
+    pub renegotiate: Option<(u64, Vec<u64>)>,
+    /// `clientHandshake` entry, only with `renegotiate`.
+    pub client_handshake: Option<u64>,
+    pub server_handshake: Option<u64>,
+}
+
+/// The boundary probe offsets in an ELF, or None without a guarded Write
+/// or without any handshake that can be attached (see
+/// [`GoBoundaryProbes`]). A symbol name that cannot be read stops the scan.
+pub fn go_boundary_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoBoundaryProbes> {
+    let elf = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data).ok()?;
+    let (mut write, mut reneg, mut client, mut server) = (None, None, None, None);
+    for sym in elf.symbols() {
+        let name = sym.name().ok()?;
+        let slot = match name {
+            WRITE => &mut write,
+            RENEGOTIATE => &mut reneg,
+            CLIENT_HANDSHAKE => &mut client,
+            SERVER_HANDSHAKE => &mut server,
+            _ => continue,
+        };
+        if sym.size() > 0 && slot.is_none() {
+            *slot = Some((sym.address(), sym.size()));
+        }
+    }
+    let write = write?;
+    let write_rets = function_returns(&elf, data, write)?;
+    let renegotiate = reneg.and_then(|r| {
+        Some((
+            symbol_file_offset(&elf, r.0),
+            function_returns(&elf, data, r)?,
+        ))
+    });
+    let client_handshake = client
+        .filter(|_| renegotiate.is_some())
+        .map(|c| symbol_file_offset(&elf, c.0));
+    let server_handshake = server.map(|s| symbol_file_offset(&elf, s.0));
+    if client_handshake.is_none() && server_handshake.is_none() {
+        return None;
+    }
+    Some(GoBoundaryProbes {
+        write_entry: symbol_file_offset(&elf, write.0),
+        write_rets,
+        renegotiate,
+        client_handshake,
+        server_handshake,
+    })
+}
+
 /// File offsets of the return instructions of the function at `addr`
 /// (`size` bytes), or None (see [`go_read_probes_from`]).
 fn function_returns<'data, R: ReadRef<'data>>(
@@ -174,8 +244,13 @@ pub fn symbol_file_offset<'data, Elf: FileHeader, R: ReadRef<'data>>(
 pub struct Sweep {
     epochs: aya::maps::Map,
     calls: aya::maps::Map,
+    guard_calls: aya::maps::Map,
+    guard_conns: aya::maps::Map,
+    guard_lost_map: aya::maps::Map,
     /// Whether the last pass walked with batched lookups ([`walk_map`]).
     pub batched: bool,
+    /// A pass set `GO_GUARD_LOST` (see [`Sweep::run`]).
+    pub guard_lost: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -189,10 +264,18 @@ impl Sweep {
             };
             Ok(Map::HashMap(MapData::from_id(id)?))
         };
+        let lost = match ebpf.map("GO_GUARD_LOST") {
+            Some(Map::Array(d)) => Map::Array(MapData::from_id(d.info()?.id())?),
+            _ => anyhow::bail!("GO_GUARD_LOST: no such array"),
+        };
         Ok(Self {
             epochs: open("PROC_EPOCH")?,
             calls: open("GO_READ_CALLS")?,
+            guard_calls: open("GO_GUARD_CALLS")?,
+            guard_conns: open("GO_GUARD_CONNS")?,
+            guard_lost_map: lost,
             batched: false,
+            guard_lost: false,
         })
     }
 
@@ -201,7 +284,13 @@ impl Sweep {
     /// re-created its epoch after its leader's exit removed it), then
     /// `GO_READ_CALLS` slots whose epoch is not their process's current one
     /// (record reads that never returned: the process exited or exec'd
-    /// mid-read). Returns how many of each were removed.
+    /// mid-read), and the same for `GO_GUARD_CALLS` (Write or
+    /// handleRenegotiation calls that never returned). `GO_GUARD_CONNS`
+    /// entries of processes gone from `/proc` are removed too; if one of
+    /// those PIDs exists again after its removal (PID reuse in between), a
+    /// live guard may have gone, so `GO_GUARD_LOST` is set and no Go
+    /// `TlsNew` is sent again (fail closed). Returns how many slots (read
+    /// and guard) and epochs were removed.
     ///
     /// Each slot's epoch is compared with `PROC_EPOCH` as it is when that
     /// slot is examined. A slot exists only after its epoch did, and an
@@ -235,10 +324,44 @@ impl Sweep {
         let (keys, _) = walk_map::<GoReadKey, GoReadCall>(calls_fd, GO_READS_IN_FLIGHT, |k| {
             calls.get(k, 0).is_ok()
         })?;
-        let dead = keys
+        let mut dead = keys
             .iter()
             .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && calls.remove(k).is_ok())
             .count();
+
+        let guard_calls_fd = fd(&self.guard_calls);
+        let mut guards: HashMap<&mut MapData, GoReadKey, GoReadCall> =
+            HashMap::try_from(&mut self.guard_calls)?;
+        let (keys, _) =
+            walk_map::<GoReadKey, GoReadCall>(guard_calls_fd, GO_READS_IN_FLIGHT, |k| {
+                guards.get(k, 0).is_ok()
+            })?;
+        dead += keys
+            .iter()
+            .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && guards.remove(k).is_ok())
+            .count();
+
+        let conns_fd = fd(&self.guard_conns);
+        let mut conns: HashMap<&mut MapData, panopticon_common::GoGuardKey, u64> =
+            HashMap::try_from(&mut self.guard_conns)?;
+        let (keys, _) =
+            walk_map::<panopticon_common::GoGuardKey, u64>(conns_fd, GO_READS_IN_FLIGHT, |k| {
+                conns.get(k, 0).is_ok()
+            })?;
+        let alive = |tgid: u32| std::path::Path::new(&format!("/proc/{tgid}")).exists();
+        let mut lost = false;
+        for k in keys.iter().filter(|k| !alive(k.tgid)) {
+            if conns.remove(k).is_ok() {
+                dead += 1;
+                lost |= alive(k.tgid);
+            }
+        }
+        if lost {
+            let mut flag: aya::maps::Array<&mut MapData, u32> =
+                aya::maps::Array::try_from(&mut self.guard_lost_map)?;
+            flag.set(0, 1, 0)?;
+            self.guard_lost = true;
+        }
         Ok((dead, gone))
     }
 }

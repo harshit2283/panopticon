@@ -5,8 +5,9 @@
 //! `crypto/tls.(*Conn).Write`. Captures the plaintext buffer contents and
 //! emits TlsData events tagged with the connection object pointer (`SSL*`,
 //! `*tls.Conn`) so user space can tell connections apart. `SSL_new`'s
-//! return sends a TlsNew record, so a connection that gets a destroyed
-//! object's address is not read as the old one.
+//! return, and the entry of a Go connection's first handshake, send a
+//! TlsNew record, so a connection that gets a destroyed object's address
+//! is not read as the old one.
 //!
 //! Go received plaintext is not taken from the caller's `Read` buffer, whose
 //! lifetime a probe cannot establish, but from each record as
@@ -28,13 +29,14 @@ use panopticon_common::{
 };
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple,
-    TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR,
-    TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for,
-    shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_GUARD_CALLS, GO_GUARD_CONNS, GO_GUARD_LOST,
+    GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY,
+    TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_NEW_CALL, TLS_SCRATCH, TlsCall,
+    TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_reserve_as,
+    shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_capture::read_sock_tuple;
-use panopticon_common::{GoReadCall, GoReadKey};
+use panopticon_common::{GoGuardKey, GoReadCall, GoReadKey};
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
 /// socket hooks below can attach its addresses.
@@ -749,6 +751,15 @@ fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     {
         return Ok(());
     }
+    send_tls_new(ssl, pid_tgid, TlsLibrary::OpenSsl)
+}
+
+/// Send the header-only `TlsNew` record of connection object `conn`, keyed
+/// like its data events (same address and pid: the same ring shard and
+/// worker), gated like them per process.
+#[inline(always)]
+fn send_tls_new(conn: u64, pid_tgid: u64, library: TlsLibrary) -> Result<(), ()> {
+    let ssl = conn;
     let pid = (pid_tgid >> 32) as u32;
     // The new object has its own sockets: no address of an earlier one.
     let _ = TLS_CONN_ADDR.remove(&TlsConnKey {
@@ -787,7 +798,7 @@ fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         (*event).src_port = 0;
         (*event).dst_port = 0;
         (*event).ip_proto = 0;
-        (*event).tls_library = TlsLibrary::OpenSsl;
+        (*event).tls_library = library;
         (*event).payload_len = 0;
         (*event).orig_len = 0;
         (*event).tcp_flags = 0;
@@ -833,6 +844,117 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
         TlsLibrary::GoTls,
         NO_ADDR,
     )
+}
+
+// ── Go TLS: a new connection object, at its first handshake ─────────────
+
+/// Entry of `crypto/tls.(*Conn).clientHandshake` or `serverHandshake`
+/// (receiver: the `*tls.Conn`). Go has no `SSL_new` to probe: `tls.Client`
+/// and `tls.Server`, which allocate the object, are inlined. The handshake
+/// function (`c.handshakeFn`) runs once per object, from
+/// `handshakeContext`, before any application data of it is read or
+/// written: every `Read` and `Write` calls `Handshake` first, and only one
+/// call runs it (`handshakeMutex`). So when it enters, any earlier object
+/// at that address was garbage collected, after its last data event; this
+/// record is reserved in the same shard as both objects' events
+/// (`shard_for(conn)`), and reservations are serialised.
+///
+/// Two exceptions, guarded by `GO_GUARD_CONNS` (see `go_tls_guard_entry`):
+/// a `Write` entry probe emits its plaintext before Write runs an implicit
+/// handshake (data of the new object before this record), and
+/// `handleRenegotiation` calls `clientHandshake` again on a live
+/// connection. While either is in flight on the connection, or once a
+/// guard was lost (`GO_GUARD_LOST`), nothing is sent: the key keeps its
+/// latches. The function's stack-growth prologue jumps back to its entry,
+/// so this probe can fire twice for one call; a second record, with no
+/// data between, ends a connection with no state again.
+#[uprobe]
+pub fn go_tls_handshake_entry(ctx: ProbeContext) {
+    let _ = try_go_tls_handshake_entry(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_handshake_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    let conn = go_receiver(ctx);
+    if conn == 0 {
+        return Ok(());
+    }
+    match GO_GUARD_LOST.get(0) {
+        Some(&0) => {}
+        _ => return Ok(()),
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let key = GoGuardKey {
+        conn,
+        tgid: (pid_tgid >> 32) as u32,
+        _pad: 0,
+    };
+    // SAFETY: a presence check; the value is not read.
+    if unsafe { GO_GUARD_CONNS.get(&key) }.is_some() {
+        return Ok(());
+    }
+    send_tls_new(conn, pid_tgid, TlsLibrary::GoTls)
+}
+
+/// Entry of `(*Conn).Write` or `(*Conn).handleRenegotiation` (attached at
+/// the same offset as `go_tls_write_entry`, never instead of it): guard
+/// the receiver while the call is in flight, so a handshake it runs or
+/// waits for sends no `TlsNew` (`go_tls_handshake_entry`). A guard that
+/// cannot be recorded sets `GO_GUARD_LOST`. Runs whether or not capture
+/// is on: a Write that emits after capture turns on must be guarded.
+#[uprobe]
+pub fn go_tls_guard_entry(ctx: ProbeContext) {
+    if try_go_tls_guard_entry(&ctx).is_err() {
+        guard_lost();
+    }
+}
+
+#[inline(always)]
+fn try_go_tls_guard_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    let conn = go_receiver(ctx);
+    if conn == 0 {
+        return Ok(());
+    }
+    let key = go_read_key(ctx, true)?;
+    let call = GoReadCall { conn, depth: 0 };
+    GO_GUARD_CALLS.insert(&key, &call, 0).map_err(|_| ())?;
+    let guard = GoGuardKey {
+        conn,
+        tgid: key.tgid,
+        _pad: 0,
+    };
+    GO_GUARD_CONNS.insert(&guard, &1, 0).map_err(|_| ())
+}
+
+#[inline(always)]
+fn guard_lost() {
+    if let Some(lost) = GO_GUARD_LOST.get_ptr_mut(0) {
+        // SAFETY: a u32 store; only ever set to 1.
+        unsafe { *lost = 1 };
+    }
+}
+
+/// A RET instruction of a guarded function (attached at every one): the
+/// call is over, its connection unguarded. Guarded calls do not nest, so
+/// the goroutine's slot is this call's.
+#[uprobe]
+pub fn go_tls_guard_ret(ctx: ProbeContext) {
+    let Ok(key) = go_read_key(&ctx, false) else {
+        return; // no epoch: the slot, if any, is left to the sweep
+    };
+    // SAFETY: this goroutine's own slot, copied out at once.
+    let Some(call) = (unsafe { GO_GUARD_CALLS.get(&key) }).copied() else {
+        return;
+    };
+    let _ = GO_GUARD_CALLS.remove(&key);
+    let _ = GO_GUARD_CONNS.remove(&GoGuardKey {
+        conn: call.conn,
+        tgid: key.tgid,
+        _pad: 0,
+    });
 }
 
 // ── Go TLS: received plaintext, at crypto/tls.(*halfConn).decrypt ─────────

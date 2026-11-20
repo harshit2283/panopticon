@@ -97,10 +97,12 @@ pub enum EventType {
     SockClose = 6,
     UdpSend = 7,
     UdpRecv = 8,
-    /// The TLS library created a connection object (`SSL_new` returned it):
-    /// the header only, keyed like that object's `TlsData` events. Any
-    /// earlier object at that address was destroyed: a new connection
-    /// starts on its key.
+    /// The TLS library started a new connection object: OpenSSL's `SSL_new`
+    /// returned it, or Go `crypto/tls` entered its first handshake
+    /// (`(*Conn).clientHandshake` / `serverHandshake`, with no guarded call
+    /// in flight on it, tls_probes.rs `go_tls_handshake_entry`). The header
+    /// only, keyed like that object's `TlsData` events. Any earlier object
+    /// at that address was destroyed: a new connection starts on its key.
     TlsNew = 9,
 }
 
@@ -321,6 +323,17 @@ pub struct ConnInfo {
     pub _pad: [u8; 4],
 }
 
+/// `GO_GUARD_CONNS` key: a Go `*tls.Conn` of one process (tgid) that has a
+/// guarded call in flight (`(*Conn).Write` or `handleRenegotiation`,
+/// tls_probes.rs `go_tls_guard_entry`): no `TlsNew` is sent for it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GoGuardKey {
+    pub conn: u64,
+    pub tgid: u32,
+    pub _pad: u32,
+}
+
 // ── Pod Impls (user-space only) ────────────────────────────────────────────
 
 // SAFETY: DataEvent is #[repr(C)], Copy, contains no pointers.
@@ -345,6 +358,8 @@ unsafe impl aya::Pod for scope::SockState {}
 unsafe impl aya::Pod for GoReadKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GoReadCall {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoGuardKey {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 

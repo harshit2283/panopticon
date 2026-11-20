@@ -9,8 +9,9 @@ use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
-    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoReadCall, GoReadKey, MAX_CGROUP_ALLOW,
-    MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE, ring_shard,
+    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoGuardKey, GoReadCall, GoReadKey,
+    MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE,
+    ring_shard,
     scope::{NETDEV_OFFS_LEN, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
@@ -422,6 +423,39 @@ pub static GO_READ_CALLS: HashMap<GoReadKey, GoReadCall> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
 const BPF_F_NO_PREALLOC: u32 = 1;
+
+/// Go calls that can precede or contain a handshake of their own
+/// connection, in flight, by goroutine (tls_probes.rs `go_tls_guard_entry`,
+/// `go_tls_guard_ret`): `(*Conn).Write`, whose entry probe emits the
+/// plaintext before Write runs an implicit handshake, and
+/// `(*Conn).handleRenegotiation`, which calls `clientHandshake` on a live
+/// connection. The value names the connection, so the RET probe can clear
+/// its `GO_GUARD_CONNS` entry. Same ownership and sweep as GO_READ_CALLS
+/// (a slot whose epoch is not current is dead); a slot left by a call
+/// that never returned keeps its connection guarded, which only withholds.
+#[map]
+pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoReadCall> =
+    HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
+
+/// Go connections with a guarded call in flight (`GO_GUARD_CALLS`): a
+/// handshake entering on one sends no `TlsNew`. Set at the call's entry,
+/// removed at its return. Presence, not a count: two calls in flight on
+/// one connection share the entry, and the first to return removes it.
+/// That cannot unguard a handshake: a Write that entered before its
+/// connection's handshake returns only after that handshake ran, or at
+/// once with `net.ErrClosed` (a closed connection, nothing follows).
+/// Not LRU: an evicted entry would send a `TlsNew` after the new
+/// object's data. User space's sweep removes entries of processes gone
+/// from `/proc` (and sets GO_GUARD_LOST if one came back meanwhile).
+#[map]
+pub static GO_GUARD_CONNS: HashMap<GoGuardKey, u64> =
+    HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
+
+/// Nonzero once a guard could not be recorded (a full map, no epoch) or
+/// the sweep may have removed a live one: no Go `TlsNew` is sent again
+/// until the agent restarts, so every reused Go key stays latched.
+#[map]
+pub static GO_GUARD_LOST: Array<u32> = Array::with_max_entries(1, 0);
 
 /// The current instance of each process doing Go TLS reads: boot-time
 /// nanoseconds at the first `readRecordOrCCS` entry seen
