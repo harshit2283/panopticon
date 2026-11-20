@@ -168,8 +168,12 @@ production-hardened compliance platform.
     (`tests/oracle/run_scope.sh`: 100% of reads from both processes in
     unscoped `full`, `pid_filter` and `cgroup_filter`, the last not on
     RHEL 8, where `cgroup_filter` is refused); `run_tls.sh` scores 100%
-    recall in both views, except the known client-view flake (one to three
-    exchanges in 500 in some runs, docs/BENCHMARKS.md). Record reads in flight at once are
+    recall in both views for the `go` and `go-h2` stacks in 30 runs of
+    seeds 42–51 (Go 1.22.2 and 1.25.4, kernel 7.0, docs/BENCHMARKS.md),
+    after two fixes: a Go connection's first handshake now starts a new
+    connection on a reused `*tls.Conn` key (`go-h2` scored 56.6% / 41.6%
+    without it), and a `Write` whose entry probe fires again (Go's
+    stack-growth prologue) is emitted once. Record reads in flight at once are
     capped at 65,536 node-wide (a goroutine parked waiting for a record on
     an idle keep-alive connection holds one); past that, further reads are
     not captured until some return; likewise past 8,192 processes doing Go TLS reads at once
@@ -210,9 +214,13 @@ production-hardened compliance platform.
     was not captured, or one whose parser restarted after lost bytes; a
     later client preface on it does not lift this. Over TLS a new
     connection that reuses a closed one's key starts clean only once the
-    agent has seen OpenSSL's `SSL_new` return the new object; with Go TLS
-    (no such hook), a static or renamed libssl, `SSL_clear` reuse, I/O
-    inside `SSL_new` (a creation callback), or when that record was lost,
+    agent has seen the library create the new object: OpenSSL's `SSL_new`
+    return, or the entry of a Go connection's first handshake
+    (`clientHandshake` / `serverHandshake`). With a static or renamed
+    libssl, `SSL_clear` reuse, I/O inside `SSL_new` (a creation
+    callback), a Go binary whose handshake or guards cannot be probed
+    (stripped, renamed), a Go connection whose handshake runs inside its
+    first `Write`, after a lost Go guard, or when that record was lost,
     it is not decoded either. While credential masking is on its bodies are not exported
     either.
   - Kafka, AMQP and DNS are scored against ground truth
@@ -255,8 +263,8 @@ production-hardened compliance platform.
     prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
-    start, over TLS on a reused key only after `SSL_new` returned
-    the new object as above,
+    start, over TLS on a reused key only after the agent saw the library
+    create the new object as above,
     and bodies whose content type is repeated or over 256 bytes),
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their

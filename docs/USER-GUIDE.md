@@ -314,7 +314,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 | IPv6 | Not captured. |
 | HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
 | HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
-| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw OpenSSL's `SSL_new` return it (§5.3). |
+| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw the library create it: OpenSSL's `SSL_new` return, or the entry of a Go connection's first handshake (§5.3). |
 | PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
 | Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
@@ -691,23 +691,37 @@ What is exported then:
   exports bodies again. Over TLS a new connection can reuse a closed
   one's key (the library's connection object address). It starts clean
   only once the agent has seen the library create the new object at that
-  address (the return of OpenSSL's `SSL_new`, in every mode), which
-  proves the old one was destroyed; nothing else resets the key (no
-  client preface, wherever it falls, nor `SSL_free`, which may drop one
-  reference of several). Otherwise a new connection on the key gets
-  neither its headers decoded nor its bodies exported, for as long as
-  the agent tracks that key: Go TLS (no such hook), a libssl whose
-  `SSL_new` the agent cannot find (static or renamed), an object reused
-  through `SSL_clear`, an object created before the agent attached, an
-  object read or written inside `SSL_new` (a creation callback, so before
-  the agent saw it created), and a record that was lost (ring or channel
-  full, rate limit).
+  address, in every mode: the return of OpenSSL's `SSL_new`, or for Go
+  `crypto/tls` the entry of the connection's first handshake
+  (`(*Conn).clientHandshake` / `serverHandshake`, which runs once per
+  connection object, before any of its data; Go's constructors are
+  inlined and cannot be probed). Either proves the old object was
+  destroyed; nothing else resets the key (no client preface, wherever it
+  falls, nor `SSL_free`, which may drop one reference of several).
+  Otherwise a new connection on the key gets neither its headers decoded
+  nor its bodies exported, for as long as the agent tracks that key: a
+  libssl whose `SSL_new` the agent cannot find (static or renamed), an
+  object reused through `SSL_clear`, an object created before the agent
+  attached, an object read or written inside `SSL_new` (a creation
+  callback, so before the agent saw it created), and a record that was
+  lost (ring or channel full, rate limit). For Go, also: a binary whose
+  handshake functions or whose `(*Conn).Write` return instructions
+  cannot be found (stripped, renamed; per binary, the agent still
+  starts and captures it, with reused keys latched), a binary without
+  Go reads (the `sched_process_exec`/`exit` tracepoints are missing),
+  `clientHandshake` where `handleRenegotiation` cannot be probed, a
+  connection whose handshake runs inside its first `Write` (`tls.Client`
+  then `Write` without `Handshake`: Write's data is captured before the
+  handshake, so no record is sent), a TLS 1.2 renegotiation (never a
+  boundary), and every Go connection after a guard could not be recorded
+  (a full map) until the agent restarts.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
   connection the agent did not see whole (as above), no header is decoded
   at all. Both last for the connection, and a reused TLS key starts
-  clean only after the agent saw `SSL_new` return it, as above.
+  clean only after the agent saw the library create the new object, as
+  above.
 - **DNS answers** whose name has credential context (any credential
   word: a DNS name holds no bare name, so `db.password.internal`
   included), or matches one of your `[credentials]` patterns, are

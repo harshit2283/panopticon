@@ -529,7 +529,8 @@ impl ConnectionFsmManager {
         // anywhere else the preface bytes can be the inside of a DATA
         // payload, so it is latched. A new connection reusing a TLS key
         // gets a new entry only when the library created a new object at
-        // that address (`EventType::TlsNew`, `SSL_new`), never by its bytes.
+        // that address (`EventType::TlsNew`: `SSL_new`, or a Go handshake
+        // entry), never by its bytes.
         let h2 = matches!(entry.fsm.protocol(), Protocol::Http2 | Protocol::Grpc);
         let preface = h2 && data.starts_with(super::detect::HTTP2_PREFACE);
         let first = !entry.fed && !entry.lost;

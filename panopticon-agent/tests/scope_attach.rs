@@ -2498,7 +2498,10 @@ fn go_tls_reads() {
     assert!(
         boundary.server_handshake.is_some()
             && boundary.client_handshake.is_some()
-            && boundary.renegotiate.as_ref().is_some_and(|(_, r)| !r.is_empty()),
+            && boundary
+                .renegotiate
+                .as_ref()
+                .is_some_and(|(_, r)| !r.is_empty()),
         "every Go boundary probe found: {boundary:?}"
     );
     println!(

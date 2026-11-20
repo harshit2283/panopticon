@@ -1768,8 +1768,10 @@ fn ssl_rec(kind: EventType, dir: Direction, payload: &[u8]) -> DataEvent {
     e
 }
 
-/// Through the real worker loop: only a TlsNew record (`SSL_new` returned
-/// the object) starts a new connection on a TLS key. Codex R10's up-ref
+/// Through the real worker loop: only a TlsNew record (here `SSL_new`
+/// returned the object; for Go TLS, see
+/// `go_tls_handshake_starts_a_new_connection_on_a_reused_key`) starts a
+/// new connection on a TLS key. Codex R10's up-ref
 /// schedule (`SSL_up_ref`, a non-final `SSL_free`, the object still in
 /// use, no new object) sends no TlsNew: a latched connection followed by
 /// a preface stays withheld. After a TlsNew the next connection exports,

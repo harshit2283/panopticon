@@ -105,10 +105,36 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   exported, for the connection's life.
 - **HTTP/2 content type over 256 bytes, or repeated.** With credential
   masking on, that stream's body is withheld.
-- **TLS key reuse boundary at `SSL_new`.** A new TLS connection on a reused
-  library object starts clean only after the agent saw OpenSSL's `SSL_new`
-  return it; otherwise it is treated as not seen whole (Go TLS has no such
-  hook).
+- **TLS key reuse boundary at object creation.** A new TLS connection on a
+  reused library object starts clean only after the agent saw the library
+  create it: OpenSSL's `SSL_new` return, or for Go `crypto/tls` the entry of
+  the connection's first handshake (`clientHandshake` / `serverHandshake`;
+  `tls.Client` / `tls.Server` are inlined). Otherwise it is treated as not
+  seen whole. The Go boundary fails closed:
+  - Two Go calls can break "the handshake runs before any data of the
+    object": `Write`, whose entry probe emits before it runs an implicit
+    handshake, and `handleRenegotiation`, which re-enters
+    `clientHandshake` on a live connection. Both guard their connection
+    from entry to every RET, for every goroutine (`GO_GUARD_CONNS`) and
+    for their own (`GO_GUARD_CALLS`, which a Write returning on another
+    goroutine cannot clear); a handshake on a guarded connection sends no
+    record. `Write`'s guarded entry also emits each call once: Go's
+    stack-growth prologue re-enters a function, which fired the entry
+    probe two or three times per call. A guard that cannot be recorded, or that
+    the sweep may have removed live (PID reuse), stops Go records until
+    the agent restarts (`GO_GUARD_LOST`).
+  - Per binary, all or nothing, in order: `Write`'s RETs, its guarded
+    entry, `handleRenegotiation`'s RETs and entry, then the handshake
+    entries (`clientHandshake` only with a guarded `handleRenegotiation`).
+    A binary without them (stripped, renamed, RETs not found, or no Go
+    reads) keeps the latch on reused keys; the agent still starts and
+    captures it. This is not a reason to refuse to start.
+  - User space cannot tell a boundary record mid-connection from a real
+    one: a record followed by bytes that happen to start with a client
+    preface would start clean against an empty HPACK table. The kernel
+    guards are what rule that out; a record followed by anything else
+    leaves the next bytes unparsed or latched (narrowing_tests.rs
+    `go_tls_boundary_without_a_preface_withholds`).
 - **PostgreSQL bound values are dropped** when the statement has credential
   context.
 - **Credential masking is narrowed** to fields where a credential value
