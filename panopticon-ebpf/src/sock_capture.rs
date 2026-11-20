@@ -882,33 +882,48 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     // ── initialisation
     let cookie = unsafe { bpf_get_socket_cookie(skb as *mut c_void) };
     let initialised = !st.is_null() && is_initialised(rd!(st, init_cookie), cookie);
-    if is_unscoped_full(mode) {
+    // Both modes end in the one `emit` below: a second inlined copy of the
+    // chunk loop doubled the verifier's work.
+    let (hdr_st, take, stream_off, stamp) = if is_unscoped_full(mode) {
         let mut off = STREAM_OFF_UNKNOWN;
         if initialised && !udp && rd!(st, flags) & FLAG_BASELINE != 0 {
             if let Some(o) = tcp_offset(tp, st, direction, pkt.seq) {
                 off = position(o);
             }
         }
-        mark_emitted(st);
-        let st = if initialised { st } else { null_mut() };
-        return emit(
-            ctx,
-            &Record {
-                sk,
-                st,
-                cookie,
-                direction,
-                udp,
-                pkt: &pkt,
-                take: pkt.payload_len,
-                stream_off: off,
-                scope_gen: g0,
-            },
-        );
-    }
-    if !initialised {
+        let hdr_st = if initialised { st } else { null_mut() };
+        (hdr_st, pkt.payload_len, off, g0)
+    } else if !initialised {
         return drop(DROP_UNINIT);
-    }
+    } else {
+        match restricted(st, sk, tp, mode, direction, udp, &pkt, g0) {
+            Ok(v) => v,
+            Err(reason) => return drop(reason),
+        }
+    };
+    mark_emitted(st);
+    let h = header(
+        sk, hdr_st, cookie, direction, udp, &pkt, take, stream_off, stamp,
+    );
+    emit(ctx, &h)
+}
+
+/// The restricted-mode steps of [`try_skb`] for an initialised socket:
+/// (UDP head reservation), verdict, kTLS, head cut. The socket state for
+/// the header, the bytes to capture, the stream offset and the generation
+/// stamp, or the `SCOPE_DROPS` reason to drop the packet with.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn restricted(
+    st: *mut SockState,
+    sk: *mut c_void,
+    tp: *mut aya_ebpf::bindings::bpf_tcp_sock,
+    mode: u64,
+    direction: Direction,
+    udp: bool,
+    pkt: &Packet,
+    g0: u32,
+) -> Result<(*mut SockState, u32, u64, u32), u32> {
     let flags = rd!(st, flags);
     let head = mode & SCOPE_HEAD != 0;
     let n = cfg(CONFIG_HEAD_BYTES);
@@ -918,7 +933,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     let mut off = STREAM_OFF_UNKNOWN;
     if udp && head {
         if flags & FLAG_BASELINE == 0 {
-            return drop(DROP_NO_BASELINE);
+            return Err(DROP_NO_BASELINE);
         }
         let counter = match direction {
             Direction::Egress => unsafe { &raw mut (*st).udp_sent },
@@ -933,10 +948,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     }
 
     // ── verdict (cached per generation)
-    let g = match scope_verdict(st, sk, mode) {
-        Ok(g) => g,
-        Err(reason) => return drop(reason),
-    };
+    let g = scope_verdict(st, sk, mode)?;
     // The verdict is of generation `g` >= `g0`, but the loopback decision
     // above is of `g0`: the event is stamped `g0` (`scope::skb_stamp`), so
     // any narrowing since `g0` refuses it at the ring read, whatever `lo` was.
@@ -947,7 +959,7 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     // calls get their address, `sock_addr_checked`); before every emit, so
     // none of its payload leaves outside unscoped full.
     if flags & FLAG_KTLS != 0 {
-        return drop(DROP_KTLS_PAYLOAD);
+        return Err(DROP_KTLS_PAYLOAD);
     }
 
     // ── TCP stream offset (every mode), then the head cut
@@ -962,32 +974,18 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
     if head {
         if !udp {
             if flags & FLAG_BASELINE == 0 {
-                return drop(DROP_NO_BASELINE);
+                return Err(DROP_NO_BASELINE);
             }
             let Some(o) = tcp_off else {
-                return drop(DROP_HEAD_INCOHERENT);
+                return Err(DROP_HEAD_INCOHERENT);
             };
             take = head_take(o, pkt.payload_len, n);
         }
         if take == 0 {
-            return drop(DROP_HEAD_CUT);
+            return Err(DROP_HEAD_CUT);
         }
     }
-    mark_emitted(st);
-    emit(
-        ctx,
-        &Record {
-            sk,
-            st,
-            cookie,
-            direction,
-            udp,
-            pkt: &pkt,
-            take,
-            stream_off: off,
-            scope_gen: stamp,
-        },
-    )
+    Ok((st, take, off, stamp))
 }
 
 /// `DataEvent::stream_off` for an offset: a segment from before the origin
@@ -1158,17 +1156,102 @@ fn parse(ctx: &SkBuffContext, udp: bool) -> Result<Packet, ()> {
     })
 }
 
-/// A packet record's fields, for [`emit_sized`].
-struct Record<'a> {
+/// A packet record's header fields and what to copy, for [`emit`]: plain
+/// values only (no pointers), so [`header`] can launder them in one copy.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Hdr {
+    cookie: u64,
+    /// The packet's first payload byte's stream offset, or STREAM_OFF_UNKNOWN.
+    stream_off: u64,
+    cgroup_id: u64,
+    src_addr: u32,
+    dst_addr: u32,
+    seq: u32,
+    ack: u32,
+    payload_off: u32,
+    /// Payload bytes on the wire.
+    payload_len: u32,
+    /// Payload bytes to capture (<= payload_len).
+    take: u32,
+    scope_gen: u32,
+    owner_tgid: u32,
+    acceptor_tgid: u32,
+    /// A `Direction` (repr(u32)).
+    direction: u32,
+    src_port: u16,
+    dst_port: u16,
+    tcp_flags: u8,
+    ip_proto: u8,
+    role: u8,
+    /// Written (zero) like every other byte: the verifier refuses a copy
+    /// that reads uninitialised stack.
+    _pad: [u8; 5],
+}
+
+const _: () = assert!(core::mem::size_of::<Hdr>() == 80);
+
+/// The record header for a packet, laundered through a helper copy: the
+/// verifier sees helper-written bytes as unknown on every path, so the many
+/// paths through `try_skb` (constants on some, map values on others) reach
+/// the chunk loop in [`emit`] as one state instead of each walking it
+/// again (the loop put scope_skb_ingress past the 1M-instruction limit on
+/// 5.15). The copy is from this program's own stack and cannot fault; its
+/// result is not checked, so no branch is added (the TLS header does the
+/// same, tls_probes.rs `tls_header`).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn header(
     sk: *mut c_void,
     st: *mut SockState,
     cookie: u64,
     direction: Direction,
     udp: bool,
-    pkt: &'a Packet,
+    pkt: &Packet,
     take: u32,
     stream_off: u64,
     scope_gen: u32,
+) -> Hdr {
+    let (owner_tgid, acceptor_tgid, role) = if st.is_null() {
+        (0, 0, 0)
+    } else {
+        (
+            rd!(st, owner_tgid),
+            rd!(st, acceptor_tgid),
+            role_of(rd!(st, flags)),
+        )
+    };
+    let a = Hdr {
+        cookie,
+        stream_off,
+        cgroup_id: unsafe { bpf_sk_cgroup_id(sk) },
+        src_addr: pkt.src_addr,
+        dst_addr: pkt.dst_addr,
+        seq: pkt.seq,
+        ack: pkt.ack,
+        payload_off: pkt.payload_off,
+        payload_len: pkt.payload_len,
+        take,
+        scope_gen,
+        owner_tgid,
+        acceptor_tgid,
+        src_port: pkt.src_port,
+        dst_port: pkt.dst_port,
+        tcp_flags: pkt.tcp_flags,
+        ip_proto: if udp { IPPROTO_UDP } else { IPPROTO_TCP } as u8,
+        direction: direction as u32,
+        role,
+        _pad: [0; 5],
+    };
+    let mut h = a;
+    unsafe {
+        bpf_probe_read_kernel_raw(
+            &raw mut h as *mut c_void,
+            core::mem::size_of::<Hdr>() as u32,
+            &raw const a as *const c_void,
+        );
+    }
+    h
 }
 
 /// Mark `st`'s socket as having had a packet record emitted, so its close
@@ -1180,88 +1263,177 @@ fn mark_emitted(st: *mut SockState) {
     }
 }
 
-/// Send a packet record with its first `take` payload bytes to the socket's
-/// ring shard, reserved at the smallest power-of-two payload size class
-/// (64 to 4,096 bytes) that holds them: the header plus the captured bytes
-/// rounded up to a power of two (at least 64), where a whole DataEvent is
-/// 4,192 bytes.
-/// Reserved in the ring, never built in a shared per-CPU buffer: egress
-/// runs in process context, where a softirq or (on a preemptible kernel)
-/// another task on the CPU can run these programs again mid-event; with
-/// nothing shared between runs, nesting cannot mix two sockets' bytes.
+/// Send a packet's first `take` payload bytes to the socket's ring shard.
+///
+/// A TCP packet whose `take` exceeds MAX_PAYLOAD_SIZE (a GSO/TSO or GRO
+/// super-packet) is sent as consecutive chunk records ([`emit_full_chunk`],
+/// then [`emit_last`]), at most MAX_SKB_CHUNKS in all, so parsers see the
+/// stream contiguously instead of one 4 KiB window and a skipped tail that
+/// loses frame boundaries. Each chunk carries its own stream position:
+/// `tcp_seq` and a known `stream_off` advanced by the chunk's offset in the
+/// packet, `orig_len` the chunk's bytes on the wire, so the chunks'
+/// `orig_len` sum to the packet's and user space accounts every byte
+/// exactly. The last chunk's `orig_len` also counts whatever is left
+/// uncaptured (past MAX_SKB_CHUNKS, or past a head-only cut), and it alone
+/// carries FIN / RST. Every chunk goes to the same shard, in order. If a
+/// chunk cannot be reserved the rest of the packet is not sent: user space
+/// sees the missing bytes as a gap at the connection's next record, as for
+/// any ring drop. A UDP datagram stays one record (one datagram is one
+/// message to the parsers).
+///
+/// Every record is reserved in the ring, never built in a shared per-CPU
+/// buffer: egress runs in process context, where a softirq or (on a
+/// preemptible kernel) another task on the CPU can run these programs again
+/// mid-event; with nothing shared between runs, nesting cannot mix two
+/// sockets' bytes. Scope was decided once for the whole packet, before
+/// this: every chunk carries the same generation stamp.
 #[inline(always)]
-fn emit(ctx: &SkBuffContext, r: &Record) -> Result<(), ()> {
-    match r.take {
-        0..=64 => emit_sized::<64>(ctx, r),
-        65..=128 => emit_sized::<128>(ctx, r),
-        129..=256 => emit_sized::<256>(ctx, r),
-        257..=512 => emit_sized::<512>(ctx, r),
-        513..=1024 => emit_sized::<1024>(ctx, r),
-        1025..=2048 => emit_sized::<2048>(ctx, r),
-        _ => emit_sized::<MAX_PAYLOAD_SIZE>(ctx, r),
+fn emit(ctx: &SkBuffContext, h: &Hdr) -> Result<(), ()> {
+    let mut off = 0u32;
+    if h.ip_proto != IPPROTO_UDP as u8 {
+        for _ in 0..MAX_SKB_CHUNKS - 1 {
+            if h.take <= off + MAX_PAYLOAD_SIZE as u32 {
+                break;
+            }
+            if !emit_full_chunk(ctx, h, off) {
+                return Ok(());
+            }
+            off += MAX_PAYLOAD_SIZE as u32;
+        }
+    }
+    emit_last(ctx, h, off)
+}
+
+/// Packets are sent as at most this many records (64 KiB: the default
+/// GSO/TSO/GRO maximum). Bytes past them are counted, not captured (the last
+/// record's `orig_len`). The verifier walks every chunk.
+const MAX_SKB_CHUNKS: usize = 16;
+
+/// Header fields of the record for payload bytes from `off`, with
+/// `orig_len` bytes on the wire. Only the last record carries FIN / RST.
+#[inline(always)]
+unsafe fn write_header(event: *mut DataEvent, h: &Hdr, off: u32, orig_len: u32, last: bool) {
+    use panopticon_common::{TCP_FLAG_FIN, TCP_FLAG_RST};
+    // A known offset (< 2^63) advances; STREAM_OFF_UNKNOWN (u64::MAX) stays.
+    // Branch-free: the verifier walks this once per chunk.
+    let known = (h.stream_off >> 63).wrapping_sub(1);
+    unsafe {
+        (*event).timestamp_ns = bpf_ktime_get_ns();
+        (*event).socket_cookie = h.cookie;
+        (*event).event_type = EventType::TcPacket;
+        // `direction` holds a Direction (repr(u32)) written by `header`:
+        // all four bytes are written.
+        *(&raw mut (*event).direction as *mut u32) = h.direction;
+        (*event).pid = 0;
+        (*event).tgid = 0;
+        (*event).src_addr = h.src_addr;
+        (*event).dst_addr = h.dst_addr;
+        (*event).src_port = h.src_port;
+        (*event).dst_port = h.dst_port;
+        (*event).ip_proto = h.ip_proto;
+        (*event).tls_library = TlsLibrary::None;
+        (*event).tcp_flags = if last {
+            h.tcp_flags
+        } else {
+            h.tcp_flags & !(TCP_FLAG_FIN | TCP_FLAG_RST)
+        };
+        (*event).tcp_seq = h.seq.wrapping_add(off);
+        (*event).tcp_ack = h.ack;
+        (*event).orig_len = orig_len;
+        crate::maps::clear_scope_fields(event);
+        (*event).cgroup_id = h.cgroup_id;
+        (*event).stream_off = h.stream_off.wrapping_add(off as u64 & known);
+        (*event).scope_gen = h.scope_gen;
+        (*event).owner_tgid = h.owner_tgid;
+        (*event).acceptor_tgid = h.acceptor_tgid;
+        (*event).role = h.role;
+    }
+}
+
+/// A full MAX_PAYLOAD_SIZE record for payload bytes `[off, off + 4096)`,
+/// not the last. The copy has a constant length and covers the whole
+/// payload (a failed load clears it), so every published byte is written
+/// without zeroing. False if it could not be reserved (a kernel drop).
+#[inline(always)]
+fn emit_full_chunk(ctx: &SkBuffContext, h: &Hdr, off: u32) -> bool {
+    let shard = shard_for(h.cookie);
+    let Some(mut entry) = shard_reserve_as::<SizedEvent<MAX_PAYLOAD_SIZE>>(shard) else {
+        count_kernel_drop();
+        return false;
+    };
+    let rec = entry.as_mut_ptr();
+    let event = rec as *mut DataEvent;
+    unsafe {
+        write_header(event, h, off, MAX_PAYLOAD_SIZE as u32, false);
+        let ret = bpf_skb_load_bytes(
+            ctx.skb.skb as *const c_void,
+            h.payload_off.wrapping_add(off),
+            (&raw mut (*rec).payload) as *mut c_void,
+            MAX_PAYLOAD_SIZE as u32,
+        );
+        // 4096 on success, 0 on failure (ret < 0), without a branch.
+        (*event).payload_len = MAX_PAYLOAD_SIZE as u32 & !((ret >> 63) as u32);
+    }
+    entry.submit(shard_submit_flags_for::<SizedEvent<MAX_PAYLOAD_SIZE>>(
+        shard,
+    ));
+    true
+}
+
+/// The last (or only) record of a packet: payload bytes `[off, take)`,
+/// reserved at the smallest power-of-two payload size class (64 to 4,096
+/// bytes) that holds them: the header plus the captured bytes rounded up to
+/// a power of two (at least 64), where a whole DataEvent is 4,192 bytes.
+#[inline(always)]
+fn emit_last(ctx: &SkBuffContext, h: &Hdr, off: u32) -> Result<(), ()> {
+    match h.take.saturating_sub(off) {
+        0..=64 => emit_sized::<64>(ctx, h, off),
+        65..=128 => emit_sized::<128>(ctx, h, off),
+        129..=256 => emit_sized::<256>(ctx, h, off),
+        257..=512 => emit_sized::<512>(ctx, h, off),
+        513..=1024 => emit_sized::<1024>(ctx, h, off),
+        1025..=2048 => emit_sized::<2048>(ctx, h, off),
+        _ => emit_sized::<MAX_PAYLOAD_SIZE>(ctx, h, off),
     }
 }
 
 #[inline(always)]
-fn emit_sized<const N: usize>(ctx: &SkBuffContext, r: &Record) -> Result<(), ()> {
-    let shard = shard_for(r.cookie);
+fn emit_sized<const N: usize>(ctx: &SkBuffContext, h: &Hdr, off: u32) -> Result<(), ()> {
+    let shard = shard_for(h.cookie);
     let Some(mut entry) = shard_reserve_as::<SizedEvent<N>>(shard) else {
         count_kernel_drop();
         return Ok(());
     };
     let rec = entry.as_mut_ptr();
     // Header fields through the DataEvent layout (all within the record);
-    // the payload only through `rec.payload`, N bytes.
+    // the payload only through `rec.payload`, N bytes. Its `orig_len` is
+    // everything from `off` to the packet's end.
     let event = rec as *mut DataEvent;
-    let pkt = r.pkt;
     unsafe {
-        (*event).timestamp_ns = bpf_ktime_get_ns();
-        (*event).socket_cookie = r.cookie;
-        (*event).event_type = EventType::TcPacket;
-        (*event).direction = r.direction;
-        (*event).pid = 0;
-        (*event).tgid = 0;
-        (*event).src_addr = pkt.src_addr;
-        (*event).dst_addr = pkt.dst_addr;
-        (*event).src_port = pkt.src_port;
-        (*event).dst_port = pkt.dst_port;
-        (*event).ip_proto = if r.udp { IPPROTO_UDP } else { IPPROTO_TCP } as u8;
-        (*event).tls_library = TlsLibrary::None;
-        (*event).tcp_flags = pkt.tcp_flags;
-        (*event).tcp_seq = pkt.seq;
-        (*event).tcp_ack = pkt.ack;
-        (*event).orig_len = pkt.payload_len;
-        crate::maps::clear_scope_fields(event);
-        (*event).cgroup_id = bpf_sk_cgroup_id(r.sk);
-        (*event).stream_off = r.stream_off;
-        (*event).scope_gen = r.scope_gen;
-        let st = r.st;
-        if !st.is_null() {
-            (*event).owner_tgid = rd!(st, owner_tgid);
-            (*event).acceptor_tgid = rd!(st, acceptor_tgid);
-            (*event).role = role_of(rd!(st, flags));
-        }
+        write_header(event, h, off, h.payload_len.saturating_sub(off), true);
         // The verifier needs the length provably in [1, N]. LLVM knows it
         // is already in range and drops any plain bounds check, so a
         // volatile read hides the value and the mask + 1 gives the verifier
-        // [1, N] directly. `take` is in [1, N] here (the class was chosen by it, and the largest
-        // class is MAX_PAYLOAD_SIZE), so the mask changes nothing at runtime.
-        let want = if r.take > N as u32 { N as u32 } else { r.take };
+        // [1, N] directly. `take - off` is in [1, N] here (the class was
+        // chosen by it, and the largest class is MAX_PAYLOAD_SIZE), so the
+        // mask changes nothing at runtime.
+        let rest = h.take.saturating_sub(off);
+        let want = if rest > N as u32 { N as u32 } else { rest };
         let opaque = read_volatile(&want);
         let len = (opaque.wrapping_sub(1) & (N as u32 - 1)) + 1;
         // Every published byte is written: ring memory is not zeroed and
         // the whole record is mapped into user space, so unwritten slack
         // would show an earlier record. The load covers [0, len), and
         // len > N/2 in every class above 64 (the smallest class that holds
-        // `take`), so only [N/2, N) is zeroed before it; the 64-byte class
-        // is zeroed whole. A failed load clears what it was given (the
+        // `take - off`), so only [N/2, N) is zeroed before it; the 64-byte
+        // class is zeroed whole. A failed load clears what it was given (the
         // helper's `err_clear`), and [0, N/2) is zeroed again then.
         let payload = (&raw mut (*rec).payload) as *mut u8;
         let lo = if N == 64 { 0 } else { N / 2 };
         skb_zero(ctx, payload.add(lo), (N - lo) as u32);
         let ret = bpf_skb_load_bytes(
             ctx.skb.skb as *const c_void,
-            pkt.payload_off,
+            h.payload_off.wrapping_add(off),
             payload as *mut c_void,
             len,
         );

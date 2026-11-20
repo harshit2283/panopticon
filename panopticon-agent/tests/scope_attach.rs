@@ -1051,6 +1051,61 @@ fn scope_programs_load_attach_and_hold() {
     check(drain_raw(&mut ring));
     assert!(checked > 2400, "records checked: {checked}");
 
+    // A write larger than MAX_PAYLOAD_SIZE leaves loopback as one skb
+    // (64 KiB MTU, GSO): it is sent as consecutive chunk records, each at
+    // its own stream offset and sequence number, whose bytes reassemble to
+    // the write exactly and whose `orig_len` sum to it. Only the last may be
+    // short, and none but the last carries FIN.
+    let mut c6 = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut s6, _) = listener.accept().unwrap();
+    let _ = drain_records(&mut ring);
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    c6.write_all(&data).unwrap();
+    let mut got = 0;
+    while got < data.len() {
+        got += s6.read(&mut sink).unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let c6_cookie = cookie(&c6);
+    let recs: Vec<DataEvent> = drain_records(&mut ring)
+        .into_iter()
+        .map(|(e, _)| e)
+        .filter(|e| e.socket_cookie == c6_cookie && e.direction == Direction::Egress)
+        .collect();
+    assert!(
+        recs.len() >= 5,
+        "20,000 bytes: at least five records, got {}",
+        recs.len()
+    );
+    let mut rebuilt = vec![0u8; data.len()];
+    let (seq0, mut wire) = (recs[0].tcp_seq, 0usize);
+    for (i, e) in recs.iter().enumerate() {
+        let off = e.stream_off as usize;
+        assert_ne!(e.stream_off, STREAM_OFF_UNKNOWN, "chunk {i} has a position");
+        assert_eq!(
+            e.tcp_seq.wrapping_sub(seq0) as usize,
+            off,
+            "chunk {i}: seq follows offset"
+        );
+        assert_eq!(off, wire, "chunk {i} starts where the previous ended");
+        assert_eq!(e.payload_len, e.orig_len, "chunk {i} captured whole");
+        rebuilt[off..off + e.payload_len as usize].copy_from_slice(e.payload_bytes());
+        wire += e.orig_len as usize;
+        assert!(
+            e.tcp_flags & TCP_FLAG_FIN == 0 || i == recs.len() - 1,
+            "FIN on chunk {i} only if last"
+        );
+    }
+    assert_eq!(wire, data.len(), "orig_len sums to the write");
+    assert!(rebuilt == data, "chunks reassemble to the write");
+    assert!(
+        recs.iter().any(|e| e.orig_len == MAX_PAYLOAD_SIZE as u32),
+        "full chunks"
+    );
+    drop((c6, s6));
+    let _ = drain_records(&mut ring);
+    println!("SKB_CHUNKS OK ({} records)", recs.len());
+
     // ── head_only, N = 3
     set(&mut ebpf, CONFIG_HEAD_BYTES, 3);
     set(&mut ebpf, CONFIG_SCOPE_MODE, SCOPE_HEAD);

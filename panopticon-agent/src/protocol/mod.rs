@@ -272,7 +272,8 @@ pub trait ProtocolParser: Send {
     fn state_name(&self) -> &'static str;
 
     /// `n` bytes of the stream in `direction` were never captured (the packet
-    /// or TLS buffer was larger than the capture cap). Account for them if the
+    /// or TLS buffer was larger than the capture cap, or ring records were
+    /// lost). Account for them if the
     /// parser can stay in sync — e.g. by counting them against a known body
     /// length — and return the result. `None` means the parser cannot resync
     /// and must be replaced with a fresh one.

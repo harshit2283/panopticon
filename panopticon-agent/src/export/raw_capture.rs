@@ -11,8 +11,11 @@
 //! - Writing stops at `max_bytes` so a forgotten flag cannot fill the disk.
 //! - Writing stops, and the file is closed, as soon as a reload tightens
 //!   the privacy mode below `full`: events still queued are not written.
-//! - Payloads are the captured bytes: up to 4096 per packet / TLS buffer;
-//!   `orig_len` in each record says how large the original was.
+//! - Payloads are the captured bytes, up to 4096 per record: a larger
+//!   packet is split over up to 16 records (64 KiB), a TLS read or write
+//!   over up to 4 (16 KiB). `orig_len` in each record counts its bytes on
+//!   the wire; in a packet's or TLS call's last record it also counts what
+//!   was not captured.
 //!
 //! `decode_to_jsonl` turns a capture into JSON lines (metadata + base64
 //! payload); exposed as `panopticon-agent --privacy-mode full --decode-capture <FILE>`.
