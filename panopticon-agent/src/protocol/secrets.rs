@@ -708,7 +708,10 @@ fn user_spans(
     (set, each): &(regex::RegexSet, Vec<regex::Regex>),
     text: &str,
 ) -> Option<Vec<(usize, usize)>> {
-    // (pattern, start, end) of every raw match collected for masking.
+    // (pattern, start, end) of every raw match collected for masking, in
+    // ascending order (patterns in order, each one's matches left to
+    // right), so a decoded match is looked up by binary search: at most
+    // MAX_SPANS of each, and no scan of one list per item of the other.
     let mut found = Vec::new();
     for i in set.matches(text).iter() {
         for m in each[i].find_iter(text).filter(|m| !m.is_empty()) {
@@ -721,7 +724,7 @@ fn user_spans(
     if let Some(decoded) = decode(text) {
         for i in set.matches(&decoded).iter() {
             for m in each[i].find_iter(&decoded).filter(|m| !m.is_empty()) {
-                let collected = found.contains(&(i, m.start(), m.end()));
+                let collected = found.binary_search(&(i, m.start(), m.end())).is_ok();
                 if !collected || text.get(m.range()) != Some(m.as_str()) {
                     return None;
                 }
@@ -1246,9 +1249,23 @@ fn plain_credential_name(raw: &str) -> bool {
 /// `name=value` at the start or after `?` / `&`; the value runs to `&` or
 /// the end, without whitespace (a value with a space is not a form value:
 /// `password=correct horse` in prose).
+///
+/// Linear in the field (security scan F1): every byte is read by at most
+/// one name scan and one value scan. A name scan stops at the next `?` or
+/// `&`, where the next parameter starts. The value scan runs to the first
+/// `&` or whitespace and is remembered: a later parameter whose value
+/// starts before that stop (`?pwd=?pwd=…`) reaches the same stop, so its
+/// value is not read again. A masked value covers every parameter that
+/// starts inside it, and those would only push spans inside the ones
+/// already pushed (same end), so the scan resumes at its end.
 fn form_params(b: &[u8], text: &str, mask: &mut Spans, delete: &mut Spans) {
-    for p in 0..b.len() {
+    // The first `&` or whitespace at or after the start of the last value
+    // scanned (b.len() when none).
+    let mut stop: Option<usize> = None;
+    let mut p = 0;
+    while p < b.len() {
         if p > 0 && !matches!(b[p - 1], b'?' | b'&') {
+            p += 1;
             continue;
         }
         let Some(eq) = b[p..]
@@ -1257,20 +1274,30 @@ fn form_params(b: &[u8], text: &str, mask: &mut Spans, delete: &mut Spans) {
             .map(|o| p + o)
             .filter(|&e| e > p && b[e] == b'=')
         else {
+            p += 1;
             continue;
         };
         if !plain_credential_name(&text[p..eq]) {
+            p += 1;
             continue;
         }
-        let end = b[eq + 1..]
-            .iter()
-            .position(|&c| c == b'&')
-            .map_or(b.len(), |o| eq + 1 + o);
-        if b[eq + 1..end].iter().any(u8::is_ascii_whitespace) {
+        let from = eq + 1;
+        let s = match stop {
+            Some(s) if from <= s => s,
+            _ => b[from..]
+                .iter()
+                .position(|&c| c == b'&' || c.is_ascii_whitespace())
+                .map_or(b.len(), |o| from + o),
+        };
+        stop = Some(s);
+        if s < b.len() && b[s] != b'&' {
+            // Whitespace before the value's end: not a form value.
+            p += 1;
             continue;
         }
-        mask.push((eq + 1, end));
-        delete.push((p, end));
+        mask.push((from, s));
+        delete.push((p, s));
+        p = s.max(p + 1);
     }
 }
 
@@ -2163,6 +2190,68 @@ mod tests {
         assert_eq!(p("\\ud83d\\ude00 token"), FIELD_WITHHELD);
     }
 
+    /// The form-parameter scan before it was made linear (security scan
+    /// F1): the reference for what it masks and removes.
+    fn form_params_quadratic(b: &[u8], text: &str, mask: &mut Spans, delete: &mut Spans) {
+        for p in 0..b.len() {
+            if p > 0 && !matches!(b[p - 1], b'?' | b'&') {
+                continue;
+            }
+            let Some(eq) = b[p..]
+                .iter()
+                .position(|&c| {
+                    matches!(c, b'=' | b'&' | b'#' | b'?' | b'/') || c.is_ascii_whitespace()
+                })
+                .map(|o| p + o)
+                .filter(|&e| e > p && b[e] == b'=')
+            else {
+                continue;
+            };
+            if !plain_credential_name(&text[p..eq]) {
+                continue;
+            }
+            let end = b[eq + 1..]
+                .iter()
+                .position(|&c| c == b'&')
+                .map_or(b.len(), |o| eq + 1 + o);
+            if b[eq + 1..end].iter().any(u8::is_ascii_whitespace) {
+                continue;
+            }
+            mask.push((eq + 1, end));
+            delete.push((p, end));
+        }
+    }
+
+    /// The linear scan masks and removes exactly what the quadratic one
+    /// did, so no value it masked is exported now.
+    #[test]
+    fn form_params_matches_the_quadratic_scan() {
+        for text in [
+            "?pwd=a?pwd=b&q=1",
+            "?pwd=a b?pwd=c",
+            "?pwd=a b?pwd=c&token=d e&x=1?secret=f",
+            "/login?password=x&q=1",
+            "/a?b=1?token=2 3&pwd=4",
+            "pwd=?pwd=?pwd=",
+            "pwd=&pwd=&",
+            "?pwd=\t?pwd=x",
+            "token=abc?def",
+            "?q=1&api_key=k1?api_key=k2&a=b c&secret=s",
+            "x?y=1&pwd=v?w&pass=v2?pwd= &token=t",
+            "&&??pwd==&=pwd=a",
+            "pässword=é&password=x&ß",
+        ] {
+            let b = text.as_bytes();
+            let (mut m1, mut d1, mut m2, mut d2) = (vec![], vec![], vec![], vec![]);
+            form_params(b, text, &mut m1, &mut d1);
+            form_params_quadratic(b, text, &mut m2, &mut d2);
+            assert_eq!(merge(m1), merge(m2), "mask {text:?}");
+            assert_eq!(remove(text, &d1), remove(text, &d2), "removed {text:?}");
+        }
+        assert_eq!(p("?pwd=a?pwd=b&q=1"), "?pwd=<REDACTED>&q=1");
+        assert_eq!(p("token=abc?def"), "token=<REDACTED>");
+    }
+
     /// Linear in the field size, whatever its shape.
     #[test]
     fn scan_time_is_bounded() {
@@ -2176,6 +2265,19 @@ mod tests {
             "\"k\":".repeat(15_000),
             "//".repeat(30_000),
             "a=".repeat(30_000),
+            // Security scan F1: `?`-chained parameters, each value running
+            // to the field's end, or to whitespace at its end.
+            "?pwd=".repeat(13_000),
+            "?pwd=".repeat(13_000) + " ",
+            "pwd=?".repeat(13_000) + " ",
+            "?password=".repeat(6_500) + " x",
+            "?pwd=&".repeat(11_000),
+            "?pwd=a".repeat(11_000) + "\n",
+            "&pwd=?pwd=".repeat(6_500) + " ",
+            "\"pwd\":\"".repeat(9_000),
+            "\"pwd\":\"\\\"".repeat(7_000),
+            "//a:b@c".repeat(9_000),
+            "pwd ".repeat(16_000),
         ] {
             let t = std::time::Instant::now();
             let _ = protect_text(&body);
