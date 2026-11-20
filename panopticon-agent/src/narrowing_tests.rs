@@ -1898,7 +1898,7 @@ mod publisher {
             cgroup_filter: &[String],
             pods: &[crate::config::PodFilter],
         ) -> crate::scope_publisher::Publisher<Maps> {
-            crate::scope_publisher::Publisher::new(
+            let mut publisher = crate::scope_publisher::Publisher::new(
                 self.maps.clone(),
                 Arc::clone(&self.env.scope),
                 self.root.clone(),
@@ -1908,7 +1908,11 @@ mod publisher {
                 pods,
                 crate::config::ScopeOptions::default(),
             )
-            .unwrap()
+            .unwrap();
+            // The pod directories here are the test user's, not root's.
+            // SAFETY: geteuid cannot fail.
+            publisher.trust_pod_dirs_of(unsafe { libc::geteuid() });
+            publisher
         }
 
         fn set_pods(&self, pods: &[crate::k8s::model::Pod]) {

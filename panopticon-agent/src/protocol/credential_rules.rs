@@ -26,7 +26,8 @@ pub enum Builtin {
     #[default]
     Full,
     /// Credential-named headers, the certain structures (form parameters,
-    /// JSON members, URI userinfo) and SQL statement withholding only: no
+    /// JSON members, URI userinfo), and SQL statement and Redis
+    /// whole-command withholding (decided by the parsers) only: no
     /// free-text context detection on other fields.
     NamesOnly,
 }

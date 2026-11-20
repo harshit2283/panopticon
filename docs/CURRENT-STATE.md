@@ -95,7 +95,11 @@ production-hardened compliance platform.
   `"creator"`, a listener created by a listed process selects every
   connection accepted on it, also by processes not in the list; under
   `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
-  Both settings change on reload. Replay (`--replay-bench`) refuses every
+  Both settings change on reload. `pod_filter` takes a pod's cgroup only
+  from where kubelet makes it (a top-level kubepods root and its
+  `burstable` / `besteffort` level, either cgroup driver), with every
+  directory on the way owned by root; a pod with no such directory, or
+  with several (logged as an error), is not captured. Replay (`--replay-bench`) refuses every
   scope setting. The `client_pid` / `server_pid` export fields, filled
   from TC's connect / accept probes, are gone; packet events in the raw
   dump carry the kernel's `owner_tgid` / `acceptor_tgid`.
@@ -251,8 +255,11 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    A Redis command with credential context in its key or any argument
+    is withheld as one unit (key, arguments and reply text, and its
+    result inside `EXEC`), so `SET otp:<id> <code>` exports no value.
+    Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
+    message bodies; a cut end keeps its prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
     start, over TLS on a reused key only after `SSL_new` returned

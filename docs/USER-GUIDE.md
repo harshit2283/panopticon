@@ -198,7 +198,20 @@ validated on x86_64 only and refused elsewhere.
   node's pods): capture the sockets of these cgroups and every cgroup
   below them. A socket's cgroup is fixed when it is created, so this has
   none of the accept-time gaps of `pid_filter` below and is the primary
-  selector. Pods
+  selector. A pod's cgroup is its directory where kubelet makes it, and
+  nowhere else: in a kubepods root at the top of the cgroup2 hierarchy
+  (`kubepods` with the cgroupfs driver, `kubepods.slice` with systemd, or
+  `<name>.slice/<name>-kubepods.slice` when kubelet's cgroup root is
+  `/<name>`, as in kind), directly (guaranteed QoS) or in its
+  `burstable` / `besteffort` level, named as that driver names it
+  (`pod<uid>`, `kubepods-burstable-pod<uid>.slice`). That directory and
+  every one above it up to the root must be owned by root, so a
+  directory another user creates (in a subtree delegated to them, such as
+  `user@<uid>.service`) is never taken for a pod's. A selected pod with
+  no such directory on this node is not captured (a warning names it);
+  one whose uid matches more than one directory is not captured either,
+  and is logged as an error, since only root can create those and
+  neither can be told to be the real one. Pods
   that start, stop or change labels are followed; a reload may change
   either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
   host (RHEL 8's default) the agent mounts a private cgroup2 at
@@ -656,7 +669,8 @@ What is exported then:
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
 - **Any other field** (path, header value, method, content type, bodies,
-  Redis arguments and replies, Kafka and AMQP fields): `<field withheld>`,
+  Redis replies with no credential context in their command (next item),
+  Kafka and AMQP fields): `<field withheld>`,
   unless every credential in it is one of these, in which case only the
   value becomes `<REDACTED>` and the rest stays readable: a query or form
   parameter (`name=value` at the start or after `?` or `&`, the value
@@ -666,15 +680,23 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
+- **A Redis command** with credential context in its key or any argument
+  is withheld as one unit: key, arguments and reply text (below), even
+  where a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
   or the capture cap, then more of the same body kept), or an HTTP/2 body
   whose stream's headers the agent did not see, is not exported (its size
-  is): what is left may hold a credential's value without its name. A gap
+  is): what is left may hold a credential's value without its name. This
+  covers HTTP/1, HTTP/2 and AMQP message bodies; for AMQP, a gap inside a
+  body frame that is not the body's last, or a gap that loses frame sync
+  while a body is being assembled, followed by more of that body. A gap
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
-  body).
+  body). A Kafka request or response is decoded only up to a gap inside
+  it, and a gap anywhere else restarts the parser, so its record text
+  never joins bytes from both sides of a gap.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
@@ -749,7 +771,17 @@ argument or reply holding a word from the first list, alone or with a
 value next to it, masked or not (`CONFIG GET requirepass`,
 `CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
-whole: no Redis field has a bare name (above). Protocol and subscription
+whole: no Redis field has a bare name (above). A Redis command is
+protected as one unit: when its key or any argument has credential
+context, read together or one by one, the key (`path`), the arguments
+(`request_text`) and the reply text are all exported as
+`<field withheld>` (method, status, timing and sizes stay), and its
+result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
+300`, `SETEX password_reset_token:alice 3600 <token>` and
+`GET otp:+15551234567` export no key, value or reply, however opaque the
+value; field-by-field, the key would be withheld and the value next to it
+exported. This holds whatever `builtin` is set to; your own patterns
+still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
 command (a script returning an array of the
@@ -846,7 +878,8 @@ scanned at that moment finishes with the previous rules.
 
 `builtin = "names_only"` keeps the cheap built-in rules: credential-named
 headers, the certain structures above (credential-named form parameters
-and JSON members, URI userinfo) and SQL statement withholding. It skips
+and JSON members, URI userinfo), SQL statement withholding and Redis
+whole-command withholding (both decided by the parsers). It skips
 looking for credential context in the free text of other fields, so a
 body mentioning a token in prose, or a JSON array under a credential name,
 is exported. Use it when your own patterns cover the formats that matter
