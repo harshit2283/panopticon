@@ -32,8 +32,9 @@ production-hardened compliance platform.
   and prepared statements, plaintext) and gRPC are scored the same way:
   100% recall, PII flagged in every request that carried it, and no raw
   PII values in the export (`tests/oracle/run_protocols.sh`). PostgreSQL
-  was re-measured on 2026-11-20 after large packets were captured whole
-  (default `max_packet_bytes`; seeds 7, 11 and 23 on 6.8, seed 7 on 7.0);
+  was re-measured on 2026-11-21 after large packets were captured in
+  several records: 100% at the default `max_packet_bytes` 16384 (seeds 7
+  and 11 on 6.8) and at 65536 (seeds 7, 11 and 23 on 6.8, seed 7 on 7.0);
   before that, a 500-row
   result cut at the 4 KiB per-packet window cost the bound values of the
   rest of the connection (83.8-84.6%, PII in 38-42%).
@@ -86,13 +87,15 @@ production-hardened compliance platform.
   seen on a VRF device) only with
   `capture_loopback = true` (default false; it covers packets only: TLS
   plaintext over loopback is scoped by process either way). IPv6 is not
-  captured. Large packets (GSO, TSO, GRO) are captured whole, in 4 KiB
-  records up to `max_packet_bytes` (default 64 KiB). That costs kernel
-  time in the sending application and ring space: at 200 KB bodies on 200
-  connections (7.0, 16 vCPUs) nothing is lost at 2,000 requests/s, but at
-  full rate the application completed 45% fewer requests and the export
-  fell from 75-79% to 15% (BENCHMARKS.md, "Large packets"); a node moving
-  bulk data at line rate should set 4096 or scope the capture.
+  captured. Large packets (GSO, TSO, GRO) are captured in 4 KiB records
+  up to `max_packet_bytes` (default 16384, at most 65536); bytes past it
+  are counted, not captured. That costs kernel time in the sending
+  application and ring space: at 200 KB bodies on 200 connections (7.0,
+  16 vCPUs) nothing is lost at 2,000 requests/s at any setting, but at
+  full rate the application completed 974K requests at 16384 and 595K at
+  65536 (1.09M before), and the export kept 34% and 15% of exchanges (79%
+  before) (BENCHMARKS.md, "Large packets"); a node moving bulk data at
+  line rate should set 4096 or scope the capture.
   `pid_filter` matches TC's
   recall only for a server whose listener was created after the agent
   started, with `pid_filter_listener = "creator"`; under the default
@@ -143,13 +146,19 @@ production-hardened compliance platform.
     4 KB; the parser lost frame sync and the consumer direction stopped
     exporting AMQP text (fail closed, USER-GUIDE §5.3). Not a ring or
     helper limit: no ring drops, no failed loads. Large packets are now sent
-    as consecutive 4 KB records with exact stream positions (up to
-    `max_packet_bytes`, default 64 KiB); deliveries are 164/164 and AMQP
-    100% in six of six runs, with nothing truncated (see BENCHMARKS.md).
-    Kafka `Fetch` was 100% in five of those runs and 94.9% in one, which
-    lost no bytes: its 13
-    missing records were in one Fetch response of about 20 records, whose
-    exported text ends at the per-exchange body cap (`max_body_bytes`).
+    as consecutive 4 KB records with exact stream positions, up to
+    `max_packet_bytes`. At the default 16384 that is not enough here: one
+    broker-to-consumer packet in about 300 is 23 KB, is still cut, and
+    deliveries at seed 7 were 27-63% in four runs (139/139 in one run at
+    seed 42). At 32768 deliveries are 164/164 in three of three runs at
+    seed 7, and at 65536 in six of six, with nothing truncated (see
+    BENCHMARKS.md); a RHEL 8 node carrying AMQP should set one of them.
+    Kafka `Fetch` was 100% at 16384 (two runs at seed 7, one at seed 42)
+    and at 65536 in five of six runs; the sixth, 94.9%, lost no bytes: its
+    13 missing records were in one Fetch response of about 20 records,
+    whose exported text ends at the per-exchange body cap (`max_body_bytes`,
+    default 4096, an export limit kept on purpose). On a slow node, where
+    records pile up in one fetch, records past that cap are not exported.
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
     fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
