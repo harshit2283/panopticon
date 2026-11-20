@@ -297,6 +297,12 @@ pub struct AgentConfig {
     /// to 64 KiB; larger values are clamped to that.
     pub max_body_bytes: usize,
 
+    // ── Packet capture ──────────────────────────────
+    /// Payload bytes captured of one packet (`max_packet_bytes`): a packet
+    /// over MAX_PAYLOAD_SIZE (GSO/TSO/GRO) is sent as consecutive 4 KiB
+    /// records up to this, the rest counted, not captured. Restart-only.
+    pub max_packet_bytes: u32,
+
     // ── Raw capture ─────────────────────────────────
     /// If set, write every processed event, unredacted, to this PNCAP file.
     pub capture_raw_path: Option<String>,
@@ -315,6 +321,13 @@ pub struct AgentConfig {
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4096;
 /// Upper bound for `max_body_bytes` (what parsers buffer).
 pub const MAX_BODY_BYTES_LIMIT: usize = 64 * 1024;
+
+/// Default `max_packet_bytes`.
+pub const DEFAULT_MAX_PACKET_BYTES: u32 = 64 * 1024;
+/// Bounds of `max_packet_bytes`: one record, and the 16 records the kernel
+/// program sends at most (sock_capture.rs `MAX_SKB_CHUNKS`).
+pub const MIN_PACKET_BYTES: u32 = panopticon_common::MAX_PAYLOAD_SIZE as u32;
+pub const MAX_PACKET_BYTES: u32 = 64 * 1024;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -365,6 +378,7 @@ impl Default for AgentConfig {
             capture_raw_path: None,
             capture_raw_max_bytes: 1 << 30,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
         }
     }
 }
@@ -547,6 +561,7 @@ pub struct AgentConfigFile {
     pub capture_raw_path: Option<String>,
     pub capture_raw_max_bytes: Option<u64>,
     pub max_body_bytes: Option<usize>,
+    pub max_packet_bytes: Option<u32>,
 }
 
 /// `[privacy]` table.
@@ -918,6 +933,9 @@ impl AgentConfigFile {
         if let Some(v) = self.max_body_bytes {
             base.max_body_bytes = v.min(MAX_BODY_BYTES_LIMIT);
         }
+        if let Some(v) = self.max_packet_bytes {
+            base.max_packet_bytes = v.clamp(MIN_PACKET_BYTES, MAX_PACKET_BYTES);
+        }
         if let Some(v) = self.map_pin_path {
             base.map_pin_path = Some(v);
         }
@@ -1120,6 +1138,9 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     }
     if running.pod_cgroup_root != new.pod_cgroup_root {
         return Err("changing pod_cgroup_root needs a restart".into());
+    }
+    if running.max_packet_bytes != new.max_packet_bytes {
+        return Err("changing max_packet_bytes needs a restart".into());
     }
     if running.sampling_mode != new.sampling_mode || running.sample_rate != new.sample_rate {
         return Err(
@@ -1498,6 +1519,23 @@ mod tests {
         assert!(err("pid_filter = []\n").contains("would capture nothing"));
         assert!(err("pid_filter = [1, 0]\n").contains("cannot contain 0"));
         assert!(err("pid_filter = [-1]\n").contains("Invalid TOML"));
+    }
+
+    #[test]
+    fn max_packet_bytes_is_clamped_and_restart_only() {
+        let load = |toml: &str| load_config_from_str(toml).unwrap();
+        assert_eq!(load("").max_packet_bytes, DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(load("max_packet_bytes = 16384\n").max_packet_bytes, 16384);
+        assert_eq!(
+            load("max_packet_bytes = 1\n").max_packet_bytes,
+            MIN_PACKET_BYTES
+        );
+        assert_eq!(
+            load("max_packet_bytes = 1000000\n").max_packet_bytes,
+            MAX_PACKET_BYTES
+        );
+        let err = check_restart_only(&load(""), &load("max_packet_bytes = 8192\n")).unwrap_err();
+        assert!(err.contains("max_packet_bytes"), "{err}");
     }
 
     #[test]

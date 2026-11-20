@@ -1055,7 +1055,8 @@ fn scope_programs_load_attach_and_hold() {
     // (64 KiB MTU, GSO): it is sent as consecutive chunk records, each at
     // its own stream offset and sequence number, whose bytes reassemble to
     // the write exactly and whose `orig_len` sum to it. Only the last may be
-    // short, and none but the last carries FIN.
+    // short, and none but the last carries FIN. `max_packet_bytes` 64 KiB.
+    set(&mut ebpf, CONFIG_MAX_PAYLOAD, 64 * 1024);
     let mut c6 = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (mut s6, _) = listener.accept().unwrap();
     let _ = drain_records(&mut ring);
@@ -1102,9 +1103,39 @@ fn scope_programs_load_attach_and_hold() {
         recs.iter().any(|e| e.orig_len == MAX_PAYLOAD_SIZE as u32),
         "full chunks"
     );
+    // At the default cap (unwritten: one record), the same write is one
+    // record per packet, cut at 4096, `orig_len` still summing to it.
+    set(&mut ebpf, CONFIG_MAX_PAYLOAD, 0);
+    let _ = drain_records(&mut ring);
+    c6.write_all(&data).unwrap();
+    let mut got = 0;
+    while got < data.len() {
+        got += s6.read(&mut sink).unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let one: Vec<DataEvent> = drain_records(&mut ring)
+        .into_iter()
+        .map(|(e, _)| e)
+        .filter(|e| e.socket_cookie == c6_cookie && e.direction == Direction::Egress)
+        .collect();
+    let wire: usize = one.iter().map(|e| e.orig_len as usize).sum();
+    assert_eq!(wire, data.len(), "orig_len sums to the write at the cap");
+    assert!(
+        one.iter()
+            .any(|e| e.payload_len == MAX_PAYLOAD_SIZE as u32
+                && e.orig_len > MAX_PAYLOAD_SIZE as u32),
+        "a packet cut at one record: {:?}",
+        one.iter()
+            .map(|e| (e.payload_len, e.orig_len))
+            .collect::<Vec<_>>()
+    );
     drop((c6, s6));
     let _ = drain_records(&mut ring);
-    println!("SKB_CHUNKS OK ({} records)", recs.len());
+    println!(
+        "SKB_CHUNKS OK ({} records, {} at the cap)",
+        recs.len(),
+        one.len()
+    );
 
     // ── head_only, N = 3
     set(&mut ebpf, CONFIG_HEAD_BYTES, 3);

@@ -31,9 +31,10 @@ use aya_ebpf::{
     programs::{FEntryContext, FExitContext, SkBuffContext, SockContext, SockOpsContext},
 };
 use panopticon_common::{
-    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_PID_CREATOR_RULE,
-    CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN,
-    CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary,
+    CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
+    CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED,
+    CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
+    TlsLibrary,
     scope::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
         DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_UNINIT, FLAG_BASELINE,
@@ -902,10 +903,23 @@ fn try_skb(ctx: &SkBuffContext, direction: Direction) -> Result<(), ()> {
         }
     };
     mark_emitted(st);
+    let take = take.min(packet_cap());
     let h = header(
         sk, hdr_st, cookie, direction, udp, &pkt, take, stream_off, stamp,
     );
     emit(ctx, &h)
+}
+
+/// `max_packet_bytes` (`CONFIG_MAX_PAYLOAD`): payload bytes captured of
+/// one packet, at most MAX_SKB_CHUNKS records. Unwritten (0) reads as one
+/// record, MAX_PAYLOAD_SIZE. What is cut is counted in the last record's
+/// `orig_len`, like a head-only cut.
+#[inline(always)]
+fn packet_cap() -> u32 {
+    match cfg(CONFIG_MAX_PAYLOAD) {
+        0 => MAX_PAYLOAD_SIZE as u32,
+        n => n.min((MAX_SKB_CHUNKS * MAX_PAYLOAD_SIZE) as u64) as u32,
+    }
 }
 
 /// The restricted-mode steps of [`try_skb`] for an initialised socket:
@@ -1308,6 +1322,11 @@ fn emit(ctx: &SkBuffContext, h: &Hdr) -> Result<(), ()> {
 /// GSO/TSO/GRO maximum). Bytes past them are counted, not captured (the last
 /// record's `orig_len`). The verifier walks every chunk.
 const MAX_SKB_CHUNKS: usize = 16;
+
+// Older kernels' `bpf_skb_load_bytes` fails any offset over 0xffff (the
+// check `skb_zero` relies on): the last chunk's offset, after the largest
+// IPv4 and TCP headers (60 bytes each), must stay under it.
+const _: () = assert!((MAX_SKB_CHUNKS - 1) * MAX_PAYLOAD_SIZE + 60 + 60 <= 0xffff);
 
 /// Header fields of the record for payload bytes from `off`, with
 /// `orig_len` bytes on the wire. Only the last record carries FIN / RST.
