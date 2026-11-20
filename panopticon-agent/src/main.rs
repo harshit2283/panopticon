@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
                     programs.go_reads,
                     &mut go_handshake_retry,
                 );
-                // Track by inode to handle symlinks/mount namespaces
+                // Track by file (FileId) to handle symlinks, namespaces, overlayfs
                 if let Some(file_id) = platform::proc_scanner::get_file_id(&target.library_path) {
                     attached_libs.insert(file_id);
                 }

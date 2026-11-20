@@ -1111,11 +1111,13 @@ fn pop_from(calls: &GoGuardCalls, mut n: u64, depth: u64) -> u64 {
 
 /// A guard of this image could not be recorded: end its boundaries (no
 /// `GO_EXEC` entry, so no `TlsNew` again for this image) before the call
-/// emits, and count it.
+/// emits, and count the image once (when its entry goes).
 #[inline(always)]
 fn lose_guard() {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let _ = GO_EXEC.remove(&tgid);
+    if GO_EXEC.remove(&tgid).is_err() {
+        return; // no boundaries already, or another thread counted it
+    }
     if let Some(lost) = GO_GUARD_LOST.get_ptr_mut(0) {
         // SAFETY: a counter for the metric; an increment lost to a race
         // only undercounts.

@@ -139,9 +139,11 @@ pub struct LoadedPrograms {
 pub struct EbpfState {
     pub ebpf: Ebpf,
     pub links: Vec<Box<dyn std::any::Any + Send>>,
-    /// `(device_id, inode)` pairs of already-attached libraries —
-    /// handles symlinks and mount namespace ambiguity.
-    pub attached_libs: HashSet<(u64, u64)>,
+    /// Files already attached ([`crate::platform::proc_scanner::FileId`]).
+    /// Never pruned: their probes stay attached for the agent's life, so
+    /// forgetting one re-attached it (duplicate probes) when a process
+    /// mapped it again.
+    pub attached_libs: HashSet<crate::platform::proc_scanner::FileId>,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,
     /// Go handshake probes that did not attach after their binary's guards

@@ -70,7 +70,18 @@ for stack in $STACKS; do
   sleep 1
   "$AGENT" --json-export "$D/agent.jsonl" >"$D/agent.log" 2>&1 &
   AP=$!
-  sleep 4
+  # Wait for the attach (for Go, also its boundary generation step), not
+  # a fixed time: a Go server started before it would be withheld.
+  ready() {
+    grep -q 'Initial TLS scan complete' "$D/agent.log" &&
+      { [[ $stack == openssl ]] || grep -q 'Go TLS boundary generation step' "$D/agent.log"; }
+  }
+  for _ in $(seq 120); do
+    ready && break
+    kill -0 "$AP" 2>/dev/null || break
+    sleep 0.5
+  done
+  ready || { echo "agent not ready" >&2; cat "$D/agent.log" >&2; exit 1; }
   "${server[@]}" &
   SP=$!
   SP_PID=$SP

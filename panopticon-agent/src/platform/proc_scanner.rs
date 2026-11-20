@@ -526,7 +526,7 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
 /// PID filter, so they already cover every process mapping that file; each
 /// PID reaches it through a different `/proc/<pid>/root/...` path, and
 /// attaching once per path made every SSL call emit duplicate events.
-fn dedup_targets(targets: &mut Vec<TlsTarget>, file_id: impl Fn(&str) -> Option<(u64, u64)>) {
+fn dedup_targets(targets: &mut Vec<TlsTarget>, file_id: impl Fn(&str) -> Option<FileId>) {
     let mut seen = std::collections::HashSet::new();
     targets.retain(|t| {
         let file = file_id(&t.library_path).ok_or_else(|| t.library_path.clone());
@@ -741,12 +741,22 @@ fn is_go_binary(path: &str) -> bool {
 
 // ── Background TLS Scanner Task ─────────────────────────────────────────
 
-/// Return `(device_id, inode)` for a file path, handling symlinks correctly.
+/// Identity of a probed library file: inode number, size and mtime (ns).
+/// Not the device: a container's overlayfs root has a device of its own,
+/// so one image file run by two containers stats with two devices and the
+/// same inode number (lab: Docker overlayfs, kernel 6.8), while a uprobe
+/// lands on the real (lower) inode both share. Keyed by device, every new
+/// container re-attached the file (duplicate probes) and stepped the Go
+/// boundary generation, withholding every running replica.
+pub type FileId = (u64, u64, i64);
+
+/// The [`FileId`] of a file path (symlinks followed).
 #[cfg(target_os = "linux")]
-pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
+pub fn get_file_id(path: &str) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.dev(), meta.ino()))
+    let mtime_ns = meta.mtime().saturating_mul(1_000_000_000) + meta.mtime_nsec();
+    Some((meta.ino(), meta.size(), mtime_ns))
 }
 
 /// Long-lived background task that periodically rescans `/proc` for new TLS
@@ -756,7 +766,7 @@ pub fn get_file_id(path: &str) -> Option<(u64, u64)> {
 /// disposable pipeline must not hold captured values (DESIGN §3).
 ///
 /// Key design choices following review feedback:
-/// - **Inode-based dedup**: `(dev, ino)` instead of paths — handles symlinks/namespaces
+/// - **File-based dedup**: [`FileId`] (inode, size, mtime) instead of paths — handles symlinks, namespaces and overlayfs container roots
 /// - **IO outside lock**: scan + ELF parsing before acquiring the mutex
 /// - **Batch logging**: one summary log per scan, not per-target
 /// - **Jitter**: 0–10% of interval to prevent fleet-wide CPU spikes
@@ -787,7 +797,6 @@ pub async fn tls_scanner_task(
         let Ok(targets) = tokio::task::spawn_blocking(scan_all_processes).await else {
             continue;
         };
-        prune_attached_libs(&shared_ebpf, &targets);
         let newly_attached = attach_new_targets(&shared_ebpf, targets);
         {
             let mut state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
@@ -968,29 +977,6 @@ fn maps_binary_ruled_out(pid: u32, (size, mtime_ns): (u64, i64)) -> bool {
     true
 }
 
-/// Prune `attached_libs` to libraries still visible in the latest full scan.
-#[cfg(target_os = "linux")]
-fn prune_attached_libs(
-    shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>,
-    targets: &[TlsTarget],
-) {
-    use std::collections::HashSet;
-
-    let current_ids: HashSet<(u64, u64)> = targets
-        .iter()
-        .filter_map(|t| get_file_id(&t.library_path))
-        .collect();
-
-    let mut state = match shared_ebpf.lock() {
-        Ok(state) => state,
-        Err(e) => {
-            warn!(error = %e, "TLS scanner lock poisoned during prune; continuing");
-            e.into_inner()
-        }
-    };
-    state.attached_libs.retain(|id| current_ids.contains(id));
-}
-
 /// Attach uprobes for any new TLS targets not already tracked.
 /// Returns the number of newly attached libraries.
 #[cfg(target_os = "linux")]
@@ -1001,7 +987,7 @@ fn attach_new_targets(
     use std::collections::HashSet;
 
     // Snapshot the current set to filter without holding the lock
-    let already_attached: HashSet<(u64, u64)> = match shared_ebpf.lock() {
+    let already_attached: HashSet<FileId> = match shared_ebpf.lock() {
         Ok(state) => state.attached_libs.clone(),
         Err(e) => {
             warn!(error = %e, "TLS scanner lock poisoned while reading attached set");
@@ -1207,9 +1193,9 @@ mod tests {
         ];
         let id = |path: &str| {
             Some(match path {
-                p if p.starts_with("/proc/12/") => (1, 99),
-                p if p.ends_with("libssl.so.3") => (1, 42),
-                _ => (1, 7),
+                p if p.starts_with("/proc/12/") => (99, 1, 1),
+                p if p.ends_with("libssl.so.3") => (42, 1, 1),
+                _ => (7, 1, 1),
             })
         };
         dedup_targets(&mut targets, id);
