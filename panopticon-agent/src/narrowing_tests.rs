@@ -1845,10 +1845,12 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
 }
 
 /// A Go `crypto/tls` record on `*tls.Conn` 0xc000_1a2b_c000 of pid 70,
-/// between 127.0.0.1:41000 and 127.0.0.1:`port`.
-fn go_rec(dir: Direction, port: u16, payload: &[u8]) -> DataEvent {
+/// between 127.0.0.1:41000 and 127.0.0.1:`port`, with process stamp
+/// `stamp` (`DataEvent::stream_off`).
+fn go_rec(dir: Direction, port: u16, payload: &[u8], stamp: u64) -> DataEvent {
     let mut e = ssl_rec(EventType::TlsData, dir, payload);
     e.tls_library = panopticon_common::TlsLibrary::GoTls;
+    e.stream_off = stamp;
     e.socket_cookie = 0xc000_1a2b_c000;
     (e.src_addr, e.dst_addr) = (0x7f00_0001, 0x7f00_0001);
     (e.src_port, e.dst_port) = match dir {
@@ -1886,7 +1888,9 @@ async fn h2_records(env: &Env) -> Vec<serde_json::Value> {
 fn go_tls_reused_key_stays_latched() {
     t2("go_tls_reused_key_stays_latched", 4, async {
         let env = Env::new("goreuse").await;
-        let rec = |dir, p: &[u8]| go_rec(dir, 18444, p);
+        // An instance the agent saw start after the pipeline was installed.
+        let stamp = panopticon_common::GO_EPOCH_EXEC | crate::protocol::fsm::mono_ns();
+        let rec = |dir, p: &[u8]| go_rec(dir, 18444, p, stamp);
         let reply = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]); // :status 200
         let mut events = vec![];
         for q in ["goreuse-q1", "goreuse-q2", "goreuse-q3"] {

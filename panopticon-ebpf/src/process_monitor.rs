@@ -14,7 +14,7 @@ use aya_ebpf::{
     macros::tracepoint,
     programs::TracePointContext,
 };
-use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
+use panopticon_common::{EventType, GO_EPOCH_EXEC, GO_EPOCH_MASK, MAX_COMM_SIZE, ProcessEvent};
 
 use crate::maps::{
     PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROC_EPOCH,
@@ -37,10 +37,14 @@ fn try_sched_process_exec(_ctx: &TracePointContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let tgid = pid_tgid as u32;
-    // A new image is a new process instance: Go read slots of the old one
-    // never match again (maps.rs PROC_EPOCH). First, before anything that
-    // can fail.
-    let _ = PROC_EPOCH.remove(&pid);
+    // A new image is a new process instance, seen from its start: Go read
+    // slots of the old one never match again (maps.rs PROC_EPOCH). First,
+    // before anything that can fail; on a full map the instance has no
+    // entry (its Go keys are not proven).
+    let epoch = (unsafe { bpf_ktime_get_ns() } & GO_EPOCH_MASK) | GO_EPOCH_EXEC;
+    if PROC_EPOCH.insert(&pid, &epoch, 0).is_err() {
+        let _ = PROC_EPOCH.remove(&pid);
+    }
 
     // The sched_process_exec tracepoint has NO comm field:
     //   field:__data_loc char[] filename  offset:8  size:4

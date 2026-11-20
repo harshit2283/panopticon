@@ -407,8 +407,15 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
+    let go = matches!(target.tls_type, TlsType::GoTls { .. });
+    if go {
+        crate::protocol::fsm::go_attach_begin();
+    }
     let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads);
     drop(file); // the uprobes hold the inode now
+    if go {
+        crate::protocol::fsm::go_attach_end();
+    }
     if attached > 0 {
         info!(
             pid = target.pid,

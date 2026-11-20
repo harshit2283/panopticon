@@ -251,7 +251,9 @@ impl Sweep {
     /// The walks run while the kernel inserts and deletes ([`walk_map`]).
     pub fn run(&mut self) -> anyhow::Result<(usize, usize)> {
         use aya::maps::{HashMap, Map, MapData};
-        use panopticon_common::{GO_READS_IN_FLIGHT, GoReadCall, GoReadKey, TLS_SCRATCH_SIZE};
+        use panopticon_common::{
+            GO_EPOCH_MASK, GO_READS_IN_FLIGHT, GoReadCall, GoReadKey, TLS_SCRATCH_SIZE,
+        };
         use std::os::fd::{AsFd, AsRawFd};
         let fd = |m: &Map| match m {
             Map::HashMap(d) => d.fd().as_fd().as_raw_fd() as u32,
@@ -274,7 +276,10 @@ impl Sweep {
         })?;
         let mut dead = keys
             .iter()
-            .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && calls.remove(k).is_ok())
+            .filter(|k| {
+                epochs.get(&k.tgid, 0).ok().map(|e| e & GO_EPOCH_MASK) != Some(k.epoch)
+                    && calls.remove(k).is_ok()
+            })
             .count();
 
         let guard_calls_fd = fd(&self.guard_calls);
@@ -287,7 +292,10 @@ impl Sweep {
         )?;
         dead += keys
             .iter()
-            .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && guards.remove(k).is_ok())
+            .filter(|k| {
+                epochs.get(&k.tgid, 0).ok().map(|e| e & GO_EPOCH_MASK) != Some(k.epoch)
+                    && guards.remove(k).is_ok()
+            })
             .count();
 
         Ok((dead, gone))

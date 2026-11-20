@@ -225,7 +225,10 @@ pub struct DataEvent {
     /// cgroup v2 id of the socket (packet events); 0 otherwise.
     pub cgroup_id: u64,
     /// Stream offset of the first captured byte (TCP), or the UDP budget
-    /// reservation's start; `scope::STREAM_OFF_UNKNOWN` if not computed.
+    /// reservation's start; for a Go TLS record from the guarded `Write`
+    /// probe or the read probes, the process instance's `PROC_EPOCH` value
+    /// at emit (`GO_EPOCH_*` bits); `scope::STREAM_OFF_UNKNOWN` if not
+    /// computed.
     pub stream_off: u64,
     // 4-byte aligned fields
     pub event_type: EventType,
@@ -282,6 +285,18 @@ pub struct ProcessEvent {
     pub ppid: u32,
     pub comm: [u8; MAX_COMM_SIZE],
 }
+
+/// `PROC_EPOCH` value bit: the instance was created by `sched_process_exec`
+/// (the agent saw the image start), not lazily by a Go probe.
+pub const GO_EPOCH_EXEC: u64 = 1 << 62;
+/// `PROC_EPOCH` value bit: a Go TLS record of the instance was not emitted
+/// (capture off or out of scope, a full ring, a read whose call could not
+/// be recorded or matched, a Write whose call could not be recorded). Set
+/// once, never cleared: the instance's records may have holes.
+pub const GO_EPOCH_LOST: u64 = 1 << 63;
+/// The `PROC_EPOCH` value bits that name the instance: monotonic
+/// nanoseconds (`bpf_ktime_get_ns`) at its creation.
+pub const GO_EPOCH_MASK: u64 = GO_EPOCH_EXEC - 1;
 
 /// Capacity of `GO_READ_CALLS`: Go TLS record reads in flight on the node.
 /// A goroutine parked waiting for a record (an idle keep-alive connection)

@@ -435,12 +435,18 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoGuardCalls> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
-/// The current instance of each process doing Go TLS reads: boot-time
-/// nanoseconds at the first `readRecordOrCCS` entry seen
-/// (`go_tls_rrc_entry`), removed when the instance ends: at exec (a new
-/// image) and when the thread group leader exits. Part of every
-/// GO_READ_CALLS key, so a later instance (PID reuse, exec) never matches an
-/// earlier one's slots.
+/// The current instance of each process: monotonic nanoseconds
+/// (`bpf_ktime_get_ns`) at its creation, with `GO_EPOCH_EXEC` when that
+/// was its `sched_process_exec` (the agent saw the image start), else
+/// created by the first Go probe that needs it (`go_read_key`). Replaced at
+/// exec, removed when the thread group leader exits. Its low bits
+/// (`GO_EPOCH_MASK`) are part of every GO_READ_CALLS key, so a later
+/// instance (PID reuse, exec) never matches an earlier one's slots.
+/// `GO_EPOCH_LOST` is set (never cleared) when a Go TLS record of the
+/// instance is not emitted (tls_probes.rs `go_lose`). Go records carry the
+/// value (`DataEvent::stream_off`), from which user space decides whether
+/// a new key starts at its connection's first record (event_loop.rs
+/// `go_stamp`).
 #[map]
 pub static PROC_EPOCH: HashMap<u32, u64> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 

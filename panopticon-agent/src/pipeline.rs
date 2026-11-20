@@ -183,6 +183,19 @@ impl Shared {
 pub struct PipelineHandle {
     pub(crate) gate: Arc<IoGate>,
     pub(crate) senders: Vec<mpsc::Sender<EventBatch>>,
+    /// When the pipeline was installed (monotonic ns, `u64::MAX` until
+    /// then), shared with its workers (event_loop.rs `WorkerTaskContext`).
+    pub(crate) installed_ns: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PipelineHandle {
+    /// Record that the readers load this handle from now on.
+    fn installed(&self) {
+        self.installed_ns.store(
+            crate::protocol::fsm::mono_ns(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
 }
 
 impl PipelineHandle {
@@ -193,6 +206,7 @@ impl PipelineHandle {
         Arc::new(Self {
             gate,
             senders: Vec::new(),
+            installed_ns: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         })
     }
 }
@@ -281,6 +295,7 @@ impl Pipeline {
             .enabled
             .then(|| Arc::new(GraphBuilder::new(&cfg.graph).with_k8s(shared.k8s.clone())));
         let kafka_topics = crate::protocol::kafka::KafkaTopics::default();
+        let installed_ns = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
 
         // Capacity is configured in events; the channels carry batches.
         let batch_cap = cfg
@@ -310,6 +325,7 @@ impl Pipeline {
                 privacy: Arc::clone(&shared.privacy),
                 io_gate: Arc::clone(&gate),
                 kafka_topics: kafka_topics.clone(),
+                installed_ns: Arc::clone(&installed_ns),
             };
             workers.push(tokio::spawn(dispatched(
                 crate::event_loop::worker_task(worker_id, rx, ctx),
@@ -325,6 +341,7 @@ impl Pipeline {
             handle: Arc::new(PipelineHandle {
                 gate: Arc::clone(&gate),
                 senders,
+                installed_ns,
             }),
             gate,
             workers,
@@ -461,8 +478,10 @@ impl Scope {
     /// Build the first pipeline. Failing here fails startup.
     pub fn start(shared: Arc<Shared>, floor: AdmissionFloor) -> Result<Arc<Self>> {
         let first = Pipeline::build(&shared)?;
+        let slot = Arc::new(ArcSwap::new(first.handle()));
+        first.handle.installed();
         Ok(Arc::new(Self {
-            slot: Arc::new(ArcSwap::new(first.handle())),
+            slot,
             shared,
             floor,
             current: tokio::sync::Mutex::new(Some(first)),
@@ -479,6 +498,7 @@ impl Scope {
         match Pipeline::build(&self.shared) {
             Ok(p) => {
                 self.slot.store(p.handle());
+                p.handle.installed();
                 Some(p)
             }
             Err(e) => {

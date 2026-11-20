@@ -8,6 +8,10 @@
 //! - `ProtocolFsm` trait for FSM-based protocol parsing
 //! - `ConnectionFsmManager` for concurrent FSM instance management
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::BytesMut;
@@ -345,6 +349,12 @@ struct ConnectionEntry {
     tcp: TcpTracker,
     /// Payload was fed to a parser of this entry.
     fed: bool,
+    /// When a TLS entry was created (monotonic ns, [`mono_ns`]): a
+    /// user-space drop after it may have taken one of its records.
+    since_ns: u64,
+    /// The Go process instance (pid, epoch) a Go TLS entry was created for
+    /// ([`GoStamp`]); tombstoned on removal.
+    go: Option<(u32, u64)>,
     /// Bytes of the connection were lost, its start was proved missing (an
     /// unplaced TCP side, a gap the parser could not account for), or its
     /// parser latched (`ProtocolFsm::uncertain`: a preface that did not
@@ -374,6 +384,155 @@ pub struct ConnectionFsmManager {
     max_connections: usize,
     /// The pipeline's Kafka topic ID map, given to every Kafka parser.
     topics: super::kafka::KafkaTopics,
+    /// TLS keys whose next entry starts a new connection object: an
+    /// OpenSSL `TlsNew` record, with its emit time ([`Self::note_tls_object`]).
+    tls_objects: Mutex<HashMap<u64, u64>>,
+    /// Go TLS keys this manager removed, per process instance
+    /// ([`Self::start_tls`]).
+    go_tombs: Mutex<GoTombs>,
+    /// When the pipeline this manager serves was installed (monotonic ns;
+    /// `u64::MAX` until then): the readers route a record drained after it
+    /// here, never to an earlier pipeline.
+    installed_ns: Arc<AtomicU64>,
+}
+
+/// How a TLS record's key may start a new entry clean (no latch).
+///
+/// Nothing in a TLS record says it is its connection's first: a key first
+/// seen in the middle of a connection (the agent started after it, the
+/// entry was evicted, records were lost) can begin with bytes that look
+/// like a client preface (a DATA payload cut where a Write starts). So an
+/// entry starts latched unless something outside the bytes proves the key
+/// starts at its connection's first record:
+/// - OpenSSL: a `TlsNew` record (`SSL_new` returned the object) emitted
+///   after the last user-space drop.
+/// - Go: the record's process stamp ([`GoStamp`]) shows the agent saw the
+///   process image start (`exec`) after every Go binary's probes were
+///   attached and after the last user-space drop, the instance lost no
+///   record in the kernel (`lost`), the pipeline was installed before the
+///   instance existed, and this manager never removed the key for that
+///   instance. Then every record of every connection of the instance
+///   reached this manager, so a key it has never held starts at its
+///   connection's first record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsOrigin {
+    Object,
+    Go(Option<GoStamp>),
+}
+
+/// A Go TLS record's process stamp (`DataEvent::stream_off`, the kernel's
+/// `PROC_EPOCH` value): the instance (pid, creation time in monotonic ns)
+/// and its two marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoStamp {
+    pub pid: u32,
+    pub epoch: u64,
+    /// Created at `sched_process_exec`: the agent saw the image start.
+    pub exec: bool,
+    /// A record of the instance was not emitted (kernel `GO_EPOCH_LOST`).
+    pub lost: bool,
+}
+
+/// What every new TLS entry is checked against (monotonic ns).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlsFloors {
+    /// The last completed attach of a Go binary's probes (`u64::MAX` while
+    /// one is in progress).
+    pub go_probes: u64,
+    /// The last user-space drop of an event.
+    pub dropped: u64,
+}
+
+/// Most `TlsNew` records waiting for their object's first data; on overflow
+/// they are forgotten (those keys only start latched).
+const TLS_OBJECTS_CAP: usize = 65_536;
+/// Most Go instances, and keys per instance, remembered as removed; past
+/// either an instance (or every instance) gets no new clean key.
+const GO_TOMB_INSTANCES: usize = 16_384;
+const GO_TOMBS_PER_INSTANCE: usize = 65_536;
+
+#[derive(Default)]
+struct GoTombs {
+    keys: HashMap<(u32, u64), HashSet<u64>>,
+    /// Instances whose removed keys could not all be remembered.
+    tainted: HashSet<(u32, u64)>,
+    /// Too many instances: no Go key of any starts clean.
+    all: bool,
+}
+
+impl GoTombs {
+    fn remember(&mut self, inst: (u32, u64), key: u64) {
+        if self.all || self.tainted.contains(&inst) {
+            return;
+        }
+        if !self.keys.contains_key(&inst)
+            && self.keys.len() + self.tainted.len() >= GO_TOMB_INSTANCES
+        {
+            self.all = true;
+            self.keys.clear();
+            self.tainted.clear();
+            return;
+        }
+        let keys = self.keys.entry(inst).or_default();
+        if keys.len() >= GO_TOMBS_PER_INSTANCE {
+            self.keys.remove(&inst);
+            self.tainted.insert(inst);
+        } else {
+            keys.insert(key);
+        }
+    }
+
+    fn holds(&self, inst: (u32, u64), key: u64) -> bool {
+        self.all
+            || self.tainted.contains(&inst)
+            || self.keys.get(&inst).is_some_and(|k| k.contains(&key))
+    }
+
+    /// Forget instances whose process is gone (a later process with the
+    /// pid is another instance).
+    fn prune(&mut self, alive: impl Fn(u32) -> bool) {
+        self.keys.retain(|inst, _| alive(inst.0));
+        self.tainted.retain(|inst| alive(inst.0));
+    }
+}
+
+/// When the last attach of a Go binary's probes completed (monotonic ns;
+/// `u64::MAX` while one is in progress, 0 before any). A Go process
+/// instance the agent saw start after it had every probe of its binary
+/// from its first instruction: uprobes are per file, and the instance's
+/// binary was attached at or before this time ([`TlsOrigin`]). Later
+/// attaches only move it forward.
+static GO_PROBES_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// A Go binary's probes are being attached (loader.rs `attach_tls_uprobes`).
+pub fn go_attach_begin() {
+    GO_PROBES_SINCE.store(u64::MAX, Ordering::Release);
+}
+
+/// That attach is over, whatever attached.
+pub fn go_attach_end() {
+    GO_PROBES_SINCE.store(mono_ns(), Ordering::Release);
+}
+
+/// [`TlsFloors::go_probes`] now.
+pub fn go_probes_floor() -> u64 {
+    GO_PROBES_SINCE.load(Ordering::Acquire)
+}
+
+/// CLOCK_MONOTONIC in nanoseconds: the kernel's `bpf_ktime_get_ns` clock.
+pub fn mono_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime(2) writes the timespec it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
+}
+
+/// Whether a process with this pid exists now (Linux: `/proc/<pid>`).
+fn pid_alive(pid: u32) -> bool {
+    !cfg!(target_os = "linux") || std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 impl ConnectionFsmManager {
@@ -389,6 +548,90 @@ impl ConnectionFsmManager {
             origins: DashMap::new(),
             max_connections,
             topics,
+            tls_objects: Mutex::default(),
+            go_tombs: Mutex::default(),
+            installed_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Serve the pipeline whose installation time `installed_ns` holds
+    /// (see [`TlsOrigin`]).
+    pub fn with_installed_ns(mut self, installed_ns: Arc<AtomicU64>) -> Self {
+        self.installed_ns = installed_ns;
+        self
+    }
+
+    /// An OpenSSL `TlsNew` record for `conn_id`, emitted at `emitted_ns`:
+    /// the key's next entry may start clean ([`TlsOrigin::Object`]).
+    pub fn note_tls_object(&self, conn_id: u64, emitted_ns: u64) {
+        let mut objects = self.tls_objects.lock().unwrap_or_else(|e| e.into_inner());
+        if objects.len() >= TLS_OBJECTS_CAP {
+            objects.clear();
+        }
+        objects.insert(conn_id, emitted_ns);
+    }
+
+    /// A TLS entry for `conn_id` was just created: it starts clean only on
+    /// proof that the key starts at its connection's first record
+    /// ([`TlsOrigin`]); otherwise latched (`lost`, [`ProtocolFsm::joined_late`]),
+    /// so no preface can restart it clean.
+    pub fn start_tls(&self, conn_id: u64, origin: TlsOrigin, floors: TlsFloors) {
+        let object = self
+            .tls_objects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conn_id);
+        let Some(mut entry) = self.connections.get_mut(&conn_id) else {
+            return;
+        };
+        entry.since_ns = mono_ns();
+        let clean = match origin {
+            TlsOrigin::Object => object.is_some_and(|at| at > floors.dropped),
+            TlsOrigin::Go(Some(s)) => {
+                entry.go = Some((s.pid, s.epoch));
+                let installed = self.installed_ns.load(Ordering::Acquire);
+                s.exec
+                    && !s.lost
+                    && s.epoch > floors.go_probes
+                    && s.epoch > floors.dropped
+                    && s.epoch > installed
+                    && !self
+                        .go_tombs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .holds((s.pid, s.epoch), conn_id)
+            }
+            TlsOrigin::Go(None) => false,
+        };
+        if !clean {
+            entry.lost = true;
+            entry.fsm.joined_late();
+        }
+    }
+
+    /// Before a TLS record of `conn_id` is fed: the entry is latched if a
+    /// user-space drop came after its creation (`dropped_ns`), or the
+    /// record's Go process stamp shows a lost record or another instance.
+    pub fn check_tls(&self, conn_id: u64, stamp: Option<GoStamp>, dropped_ns: u64) {
+        let Some(mut entry) = self.connections.get_mut(&conn_id) else {
+            return;
+        };
+        let other_instance = entry.go.is_some() && stamp.map(|s| (s.pid, s.epoch)) != entry.go;
+        let latch = dropped_ns > entry.since_ns || stamp.is_some_and(|s| s.lost) || other_instance;
+        if latch && !entry.lost {
+            entry.lost = true;
+            entry.fsm.joined_late();
+        }
+    }
+
+    /// A Go TLS entry leaves: remember its key for its instance, so the key
+    /// never starts clean again for it (its connection may go on).
+    fn retire(&self, conn_id: u64, entry: &ConnectionEntry) {
+        if let Some(inst) = entry.go {
+            self.go_tombs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(inst, conn_id);
         }
     }
 
@@ -442,6 +685,8 @@ impl ConnectionFsmManager {
             tcp: TcpTracker::default(),
             fed: false,
             lost: false,
+            since_ns: 0,
+            go: None,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
@@ -482,7 +727,8 @@ impl ConnectionFsmManager {
             ages.truncate(target);
         }
         ages.iter()
-            .filter(|(_, id)| self.connections.remove(id).is_some())
+            .filter_map(|(_, id)| self.connections.remove(id))
+            .map(|(id, entry)| self.retire(id, &entry))
             .count()
     }
 
@@ -633,9 +879,11 @@ impl ConnectionFsmManager {
     }
 
     /// The connection's parser did not see its stream from the start (see
-    /// [`ProtocolFsm::joined_late`]).
+    /// [`ProtocolFsm::joined_late`]). For good: `lost` is set, so a client
+    /// preface later (even as the first payload) does not restart it clean.
     pub fn mark_joined_late(&self, conn_id: u64) {
         if let Some(mut entry) = self.connections.get_mut(&conn_id) {
+            entry.lost = true;
             entry.fsm.joined_late();
         }
     }
@@ -695,7 +943,13 @@ impl ConnectionFsmManager {
     /// Close a connection and return whether it existed.
     pub fn close_connection(&self, conn_id: u64) -> bool {
         self.origins.remove(&conn_id);
-        self.connections.remove(&conn_id).is_some()
+        match self.connections.remove(&conn_id) {
+            Some((id, entry)) => {
+                self.retire(id, &entry);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn connection_state(&self, conn_id: u64) -> Option<&'static str> {
@@ -715,9 +969,15 @@ impl ConnectionFsmManager {
 
         let count = expired.len();
         for conn_id in expired {
-            self.connections.remove(&conn_id);
+            if let Some((id, entry)) = self.connections.remove(&conn_id) {
+                self.retire(id, &entry);
+            }
         }
         self.origins.retain(|_, o| now.duration_since(o.at) <= ttl);
+        self.go_tombs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prune(pid_alive);
         count
     }
 
@@ -744,6 +1004,8 @@ impl Default for ConnectionFsmManager {
 mod tests {
     use super::*;
 
+    /// A new OpenSSL object at a key (`TlsNew`, here before each
+    /// connection) starts it clean, preface first.
     #[test]
     fn test_reused_connection_key_restarts_http2_parsing() {
         fn frame(t: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -780,18 +1042,20 @@ mod tests {
         let open = || {
             if !m.contains(9) {
                 m.get_or_create_with_server(9, Protocol::Http2, Some(server));
-                m.mark_joined_late(9);
+                m.start_tls(9, TlsOrigin::Object, TlsFloors::default());
             }
         };
-        // First connection: one exchange, then a new object at the same
-        // address (a TlsNew record closes the key)...
+        // First connection: its object's TlsNew, one exchange, then a new
+        // object at the same address (a TlsNew record closes the key)...
         let (mut c1, mut s1) = (hpack::Encoder::new(), hpack::Encoder::new());
+        m.note_tls_object(9, 1);
         open();
         m.process_packet_from(9, client, Direction::Egress, &preface(&mut c1, "/one"), 1);
         let first =
             paths(m.process_packet_from(9, server, Direction::Ingress, &response(&mut s1), 2));
         assert_eq!(first, vec![Some("/one".to_string())]);
         assert!(m.close_connection(9));
+        m.note_tls_object(9, 2);
         // ...and a new one gets the same key (reallocated SSL*).
         let (mut c2, mut s2) = (hpack::Encoder::new(), hpack::Encoder::new());
         open();
@@ -1343,5 +1607,231 @@ mod tests {
                 CreateResult::Created
             );
         }
+    }
+
+    // ── A TLS key first seen mid-connection (Codex #5) ───────────────────
+
+    fn h2_frame(t: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend([t, flags]);
+        f.extend(stream.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// A Write that begins inside a DATA payload whose bytes are a client
+    /// preface, SETTINGS and a HEADERS block (`GET` `/forged`), then a
+    /// `:status 200` reply: what a key first seen mid-connection can get
+    /// when a Write starts where Go's buffered writer cut a frame.
+    fn forged_start() -> (Vec<u8>, Vec<u8>) {
+        let mut w = super::super::detect::HTTP2_PREFACE.to_vec();
+        w.extend(h2_frame(0x4, 0, 0, &[]));
+        w.extend(h2_frame(
+            0x1,
+            0x4 | 0x1,
+            1,
+            &[0x82, 0x04, 7, b'/', b'f', b'o', b'r', b'g', b'e', b'd'],
+        ));
+        (w, h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]))
+    }
+
+    /// The paths a key's parser exports for `forged_start`, fed as its
+    /// first payloads after `start` ran on the new entry.
+    fn first_paths(
+        m: &ConnectionFsmManager,
+        key: u64,
+        start: impl FnOnce(&ConnectionFsmManager),
+    ) -> Vec<Option<String>> {
+        let (client, server) = ((0, 1), (0, 2));
+        m.get_or_create_with_server(key, Protocol::Http2, Some(server));
+        start(m);
+        let (w, reply) = forged_start();
+        m.process_packet_from(key, client, Direction::Egress, &w, 1);
+        match m.process_packet_from(key, server, Direction::Ingress, &reply, 2) {
+            Some(FsmResult::Messages(ms)) => ms.into_iter().map(|m| m.path).collect(),
+            Some(FsmResult::MessageComplete(m)) => vec![m.path],
+            _ => vec![],
+        }
+    }
+
+    /// A Go stamp of this test process (a live pid: tombstones of a gone
+    /// one are pruned).
+    fn stamp(epoch: u64, exec: bool, lost: bool) -> TlsOrigin {
+        TlsOrigin::Go(Some(GoStamp {
+            pid: std::process::id(),
+            epoch,
+            exec,
+            lost,
+        }))
+    }
+
+    /// The control: a Go key of an instance the agent saw start after the
+    /// probes, with nothing lost, starts clean and its preface decodes.
+    #[test]
+    fn test_go_key_with_proof_decodes() {
+        let m = ConnectionFsmManager::new(16);
+        let floors = TlsFloors {
+            go_probes: 100,
+            dropped: 50,
+        };
+        let paths = first_paths(&m, 9, |m| m.start_tls(9, stamp(200, true, false), floors));
+        assert_eq!(paths, vec![Some("/forged".to_string())]);
+    }
+
+    /// The agent (or its Go probes) started after the connection: the
+    /// instance was not seen starting (no exec mark), or started before
+    /// the probes. The preface-looking first Write must not decode.
+    #[test]
+    fn test_go_key_joined_mid_connection_stays_latched() {
+        let floors = TlsFloors {
+            go_probes: 100,
+            dropped: 0,
+        };
+        for (what, origin) in [
+            ("not seen starting", stamp(200, false, false)),
+            ("started before the probes", stamp(90, true, false)),
+            ("probes being attached", stamp(200, true, false)),
+            ("no stamp (unguarded Write probe)", TlsOrigin::Go(None)),
+        ] {
+            let m = ConnectionFsmManager::new(16);
+            let floors = if what == "probes being attached" {
+                TlsFloors {
+                    go_probes: u64::MAX,
+                    ..floors
+                }
+            } else {
+                floors
+            };
+            let paths = first_paths(&m, 9, |m| m.start_tls(9, origin, floors));
+            assert_eq!(paths, vec![None], "{what}");
+        }
+    }
+
+    /// The key's entry was evicted (idle, or at capacity) while its
+    /// connection went on: the key's next record is mid-connection even
+    /// though the instance is proven. Never clean again for that instance;
+    /// another instance (a new process) may use it.
+    #[test]
+    fn test_go_key_evicted_then_seen_again_stays_latched() {
+        let floors = TlsFloors::default();
+        let m = ConnectionFsmManager::new(16);
+        let paths = first_paths(&m, 9, |m| m.start_tls(9, stamp(200, true, false), floors));
+        assert_eq!(paths, vec![Some("/forged".to_string())]);
+        assert_eq!(m.evict_idle(std::time::Duration::ZERO), 1);
+        let paths = first_paths(&m, 9, |m| m.start_tls(9, stamp(200, true, false), floors));
+        assert_eq!(paths, vec![None], "evicted key of the same instance");
+        // Capacity eviction too: fill a 2-entry manager.
+        let m = ConnectionFsmManager::new(2);
+        m.get_or_create(10, Protocol::Http2);
+        m.start_tls(10, stamp(200, true, false), floors);
+        m.get_or_create(11, Protocol::Dns);
+        m.get_or_create(12, Protocol::Dns); // evicts the oldest: key 10
+        assert!(!m.contains(10));
+        let paths = first_paths(&m, 10, |m| m.start_tls(10, stamp(200, true, false), floors));
+        assert_eq!(paths, vec![None], "key evicted at capacity");
+        let paths = first_paths(&m, 13, |m| m.start_tls(13, stamp(300, true, false), floors));
+        assert_eq!(paths, vec![Some("/forged".to_string())], "a key never held");
+    }
+
+    /// Lost records: the kernel's lost mark on the instance, a user-space
+    /// drop before the instance began, or one after the entry was created.
+    #[test]
+    fn test_go_key_with_lost_records_stays_latched() {
+        let m = ConnectionFsmManager::new(16);
+        let paths = first_paths(&m, 9, |m| {
+            m.start_tls(9, stamp(200, true, true), TlsFloors::default())
+        });
+        assert_eq!(paths, vec![None], "kernel lost mark");
+
+        let m = ConnectionFsmManager::new(16);
+        let floors = TlsFloors {
+            go_probes: 0,
+            dropped: 250,
+        };
+        let paths = first_paths(&m, 9, |m| m.start_tls(9, stamp(200, true, false), floors));
+        assert_eq!(
+            paths,
+            vec![None],
+            "a user-space drop after the instance began"
+        );
+
+        // Clean at creation, then a drop: the next record finds it latched.
+        let m = ConnectionFsmManager::new(16);
+        m.get_or_create_with_server(9, Protocol::Http2, Some((0, 2)));
+        m.start_tls(9, stamp(200, true, false), TlsFloors::default());
+        m.check_tls(
+            9,
+            Some(GoStamp {
+                pid: std::process::id(),
+                epoch: 200,
+                exec: true,
+                lost: false,
+            }),
+            u64::MAX,
+        );
+        let (w, reply) = forged_start();
+        m.process_packet_from(9, (0, 1), Direction::Egress, &w, 1);
+        let out = m.process_packet_from(9, (0, 2), Direction::Ingress, &reply, 2);
+        assert!(!format!("{out:?}").contains("forged"), "{out:?}");
+
+        // A record of the entry's key from another instance (the pid
+        // exec'd): latched.
+        let m = ConnectionFsmManager::new(16);
+        m.get_or_create_with_server(9, Protocol::Http2, Some((0, 2)));
+        m.start_tls(9, stamp(200, true, false), TlsFloors::default());
+        m.check_tls(
+            9,
+            Some(GoStamp {
+                pid: std::process::id(),
+                epoch: 300,
+                exec: true,
+                lost: false,
+            }),
+            0,
+        );
+        let (w, _) = forged_start();
+        let out = m.process_packet_from(9, (0, 1), Direction::Egress, &w, 1);
+        assert!(!format!("{out:?}").contains("forged"), "{out:?}");
+    }
+
+    /// A pipeline installed after the instance began (a narrowing) may
+    /// have missed its first records: they went to the earlier pipeline.
+    #[test]
+    fn test_go_key_of_an_instance_older_than_the_pipeline_stays_latched() {
+        let m = ConnectionFsmManager::new(16).with_installed_ns(Arc::new(AtomicU64::new(250)));
+        let paths = first_paths(&m, 9, |m| {
+            m.start_tls(9, stamp(200, true, false), TlsFloors::default())
+        });
+        assert_eq!(paths, vec![None]);
+        let paths = first_paths(&m, 10, |m| {
+            m.start_tls(10, stamp(300, true, false), TlsFloors::default())
+        });
+        assert_eq!(paths, vec![Some("/forged".to_string())]);
+    }
+
+    /// OpenSSL: without a `TlsNew` (the agent started after the object was
+    /// created, or the entry was evicted) the key starts latched; a
+    /// `TlsNew` older than the last drop proves nothing either. And a key
+    /// marked joined late stays so even if its first payload is a preface.
+    #[test]
+    fn test_object_key_without_tls_new_stays_latched() {
+        let m = ConnectionFsmManager::new(16);
+        let paths = first_paths(&m, 9, |m| {
+            m.start_tls(9, TlsOrigin::Object, TlsFloors::default())
+        });
+        assert_eq!(paths, vec![None], "no TlsNew");
+
+        let m = ConnectionFsmManager::new(16);
+        m.note_tls_object(9, 100);
+        let floors = TlsFloors {
+            go_probes: 0,
+            dropped: 150,
+        };
+        let paths = first_paths(&m, 9, |m| m.start_tls(9, TlsOrigin::Object, floors));
+        assert_eq!(paths, vec![None], "TlsNew before a drop");
+
+        let m = ConnectionFsmManager::new(16);
+        let paths = first_paths(&m, 9, |m| m.mark_joined_late(9));
+        assert_eq!(paths, vec![None], "joined late");
     }
 }

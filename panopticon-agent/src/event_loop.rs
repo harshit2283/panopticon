@@ -65,6 +65,10 @@ pub(crate) struct WorkerTaskContext {
     pub io_gate: Arc<IoGate>,
     /// The pipeline's Kafka topic ID map.
     pub kafka_topics: crate::protocol::kafka::KafkaTopics,
+    /// When the pipeline was installed (monotonic ns, `u64::MAX` before):
+    /// a Go TLS key of a process instance created earlier never starts
+    /// clean in it (fsm.rs `TlsOrigin`).
+    pub installed_ns: Arc<AtomicU64>,
 }
 
 struct MessageContext<'a> {
@@ -129,6 +133,20 @@ pub struct EventStats {
     /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
     /// (refreshed from the map; indexed by `scope::DROP_*`).
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
+    /// When user space last dropped an event before its parser (monotonic
+    /// ns, fsm.rs `mono_ns`; 0: never): a TLS record dropped there leaves a
+    /// hole no later record shows, so TLS entries created before it are
+    /// latched, and later ones start clean only from proof newer than it
+    /// (fsm.rs `TlsOrigin`).
+    pub last_drop_ns: AtomicU64,
+}
+
+impl EventStats {
+    /// An event was dropped before reaching its parser.
+    fn note_drop(&self) {
+        self.last_drop_ns
+            .fetch_max(crate::protocol::fsm::mono_ns(), Ordering::Relaxed);
+    }
 }
 
 impl EventStats {
@@ -154,6 +172,7 @@ impl EventStats {
             drops_no_pipeline: AtomicU64::new(0),
             capture_stopped: AtomicBool::new(false),
             scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
+            last_drop_ns: AtomicU64::new(0),
         }
     }
 }
@@ -554,11 +573,14 @@ fn drain_ringbuf(
 }
 
 /// One drained batch's admission (DESIGN §3, review 11 finding 2): the
-/// pipeline handle is loaded once, *then* the admission floor, and the
-/// floor check, the dispatch and the hand-off to workers all use that
-/// snapshot. Batches pending in the [`WorkerBatcher`] keep their
-/// destination: they are never moved to a newer pipeline, and die with
-/// theirs if it is revoked.
+/// pipeline handle is loaded, *then* the admission floor, and the floor
+/// check, the dispatch and the hand-off to workers use that snapshot.
+/// Before each event the slot is checked again: once a new pipeline is
+/// installed, the events drained after go to it (with the floor loaded
+/// again), so a record emitted after the installation never reaches an
+/// earlier pipeline (fsm.rs `TlsOrigin`). Batches pending in the
+/// [`WorkerBatcher`] keep their destination: they are never moved to a
+/// newer pipeline, and die with theirs if it is revoked.
 ///
 /// The load order matters: the publisher raises the floor before it
 /// installs a new pipeline, so a reader that sees the new pipeline also
@@ -568,6 +590,8 @@ fn drain_ringbuf(
 pub(crate) struct Admission<'a> {
     batcher: WorkerBatcher,
     floor: u32,
+    slot: &'a arc_swap::ArcSwap<PipelineHandle>,
+    floor_src: &'a AdmissionFloor,
     stats: &'a EventStats,
     received: u64,
     stale: u64,
@@ -575,17 +599,19 @@ pub(crate) struct Admission<'a> {
 
 impl<'a> Admission<'a> {
     pub(crate) fn new(
-        slot: &arc_swap::ArcSwap<PipelineHandle>,
-        floor: &AdmissionFloor,
+        slot: &'a arc_swap::ArcSwap<PipelineHandle>,
+        floor_src: &'a AdmissionFloor,
         stats: &'a EventStats,
         shard: usize,
         shards: usize,
     ) -> Self {
         let handle = slot.load_full(); // first: see above
-        let floor = floor.get(); // then the floor
+        let floor = floor_src.get(); // then the floor
         Self {
             batcher: WorkerBatcher::new(handle, shard, shards),
             floor,
+            slot,
+            floor_src,
             stats,
             received: 0,
             stale: 0,
@@ -595,14 +621,23 @@ impl<'a> Admission<'a> {
     /// Admit or drop one event.
     pub(crate) fn offer(&mut self, event: &DataEvent, rate_limiter: &RateLimiter) {
         self.received += 1;
+        if !Arc::ptr_eq(&self.slot.load(), &self.batcher.handle) {
+            // A new pipeline: what is pending keeps its destination.
+            self.batcher.flush(self.stats);
+            let handle = self.slot.load_full(); // first: see above
+            self.floor = self.floor_src.get(); // then the floor
+            self.batcher = WorkerBatcher::new(handle, self.batcher.shard, self.batcher.shards);
+        }
         // Before dispatch: computed under a scope a narrowing has revoked.
         if below_floor(event, self.floor) {
             self.stale += 1;
+            self.stats.note_drop();
             return;
         }
         if !rate_limiter.try_acquire() {
             self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             self.stats.drops_rate_limit.fetch_add(1, Ordering::Relaxed);
+            self.stats.note_drop();
             return;
         }
         crate::test_hooks::pause(
@@ -752,6 +787,7 @@ impl WorkerBatcher {
             // No pipeline installed: dropped, counted.
             stats.events_dropped.fetch_add(1, Ordering::Relaxed);
             stats.drops_no_pipeline.fetch_add(1, Ordering::Relaxed);
+            stats.note_drop();
             return;
         }
         let idx = worker_index(routing_key, self.shard, self.shards, workers);
@@ -777,6 +813,7 @@ impl WorkerBatcher {
         if self.handle.senders[idx].try_send(batch).is_err() {
             stats.events_dropped.fetch_add(n, Ordering::Relaxed);
             stats.drops_channel_full.fetch_add(n, Ordering::Relaxed);
+            stats.note_drop();
         }
     }
 }
@@ -914,7 +951,8 @@ pub(crate) async fn worker_task(
         manager: ConnectionFsmManager::with_topics(
             ctx.max_connections_tracked,
             ctx.kafka_topics.clone(),
-        ),
+        )
+        .with_installed_ns(Arc::clone(&ctx.installed_ns)),
         stats: Arc::clone(&ctx.stats),
     };
     let mut last_sweep = Instant::now();
@@ -967,6 +1005,14 @@ pub(crate) async fn worker_task(
                     {
                         raw.record(&scratch);
                     }
+                    ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+                    end_connection(&ctx, &manager, cookie);
+                    // Only OpenSSL sends one; the next entry on the key
+                    // may start clean (fsm.rs `TlsOrigin::Object`).
+                    if scratch.tls_library == panopticon_common::TlsLibrary::OpenSsl {
+                        manager.note_tls_object(cookie, scratch.timestamp_ns);
+                    }
+                    continue;
                 }
                 // The kernel made every scope decision (DESIGN §8): nothing
                 // is filtered, held or cut here.
@@ -1231,9 +1277,21 @@ fn feed_event(
             manager.note_origin(cookie, src, event.direction, s.seq);
         }
         Some(_) => {}
-        // TLS plaintext and UDP carry no stream position.
+        // TLS plaintext carries no stream position: a new key starts
+        // latched unless proven to start at its connection's first record
+        // (fsm.rs `TlsOrigin`). UDP has none either.
+        None if created && event.event_type == EventType::TlsData => {
+            manager.start_tls(cookie, tls_origin(event), tls_floors(stats))
+        }
         None if created => manager.mark_joined_late(cookie),
         None => {}
+    }
+    if event.event_type == EventType::TlsData {
+        manager.check_tls(
+            cookie,
+            go_stamp(event),
+            stats.last_drop_ns.load(Ordering::Relaxed),
+        );
     }
     let (gap, trim) =
         match seg.and_then(|seg| manager.admit_segment(cookie, src, event.direction, seg)) {
@@ -1622,6 +1680,40 @@ fn server_endpoint(
         None if event.dst_port <= event.src_port => dst,
         None => src,
     })
+}
+
+/// A Go TLS record's process stamp (`stream_off`: the kernel's
+/// `PROC_EPOCH` value at emit, tls_probes.rs `emit_tls_event`). None for
+/// any other record, and for a Go record without one (the unguarded Write
+/// probe, or no instance entry).
+fn go_stamp(event: &DataEvent) -> Option<crate::protocol::fsm::GoStamp> {
+    use panopticon_common::{GO_EPOCH_EXEC, GO_EPOCH_LOST, GO_EPOCH_MASK};
+    let v = event.stream_off;
+    (event.tls_library == panopticon_common::TlsLibrary::GoTls
+        && v != panopticon_common::scope::STREAM_OFF_UNKNOWN)
+        .then_some(crate::protocol::fsm::GoStamp {
+            pid: event.pid,
+            epoch: v & GO_EPOCH_MASK,
+            exec: v & GO_EPOCH_EXEC != 0,
+            lost: v & GO_EPOCH_LOST != 0,
+        })
+}
+
+/// What can prove a new TLS key of this record starts clean.
+fn tls_origin(event: &DataEvent) -> crate::protocol::fsm::TlsOrigin {
+    match event.tls_library {
+        panopticon_common::TlsLibrary::GoTls => {
+            crate::protocol::fsm::TlsOrigin::Go(go_stamp(event))
+        }
+        _ => crate::protocol::fsm::TlsOrigin::Object,
+    }
+}
+
+fn tls_floors(stats: &EventStats) -> crate::protocol::fsm::TlsFloors {
+    crate::protocol::fsm::TlsFloors {
+        go_probes: crate::protocol::fsm::go_probes_floor(),
+        dropped: stats.last_drop_ns.load(Ordering::Relaxed),
+    }
 }
 
 /// Key identifying the connection an event belongs to.
@@ -2104,6 +2196,37 @@ mod tests {
     }
 
     const CANARY: &[u8] = b"canary-s7Kf2v9LmQ8z";
+
+    /// Codex #5 through the worker's parsing step: a Go TLS key whose first
+    /// record starts with a client preface (a Write that began inside a
+    /// DATA payload of a connection the agent joined late) decodes only
+    /// when the record's process stamp proves the key starts at its
+    /// connection's first record (fsm.rs `TlsOrigin`).
+    #[test]
+    fn go_key_first_seen_mid_connection_stays_latched() {
+        use panopticon_common::{GO_EPOCH_EXEC, GO_EPOCH_LOST};
+        let go = |dir, p: &[u8], stamp: u64| {
+            let mut e = ssl_event(dir, p);
+            e.tls_library = panopticon_common::TlsLibrary::GoTls;
+            e.stream_off = stamp;
+            e
+        };
+        let decoded = |stamp: u64| {
+            let out = run_events(&[
+                go(Direction::Egress, &h2_start(&h2_request(3, CANARY)), stamp),
+                go(Direction::Ingress, &h2_reply(3), stamp),
+            ]);
+            format!("{out:?}").contains("s7Kf")
+        };
+        assert!(decoded(GO_EPOCH_EXEC | 1_000), "proven: the control");
+        for (what, stamp) in [
+            ("instance not seen starting", 1_000),
+            ("instance lost a record", GO_EPOCH_EXEC | GO_EPOCH_LOST | 1_000),
+            ("no stamp", STREAM_OFF_UNKNOWN),
+        ] {
+            assert!(!decoded(stamp), "{what}");
+        }
+    }
 
     /// Codex R8 #1 / R9: TLS writes inside one DATA payload that start with
     /// the client preface (an upload of captured HTTP/2 bytes) must not

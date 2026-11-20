@@ -35,7 +35,10 @@ use crate::maps::{
     shard_for, shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_capture::read_sock_tuple;
-use panopticon_common::{GO_GUARD_NEST, GoGuardCalls, GoReadCall, GoReadKey};
+use panopticon_common::scope::STREAM_OFF_UNKNOWN;
+use panopticon_common::{
+    GO_EPOCH_LOST, GO_EPOCH_MASK, GO_GUARD_NEST, GoGuardCalls, GoReadCall, GoReadKey,
+};
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
 /// socket hooks below can attach its addresses.
@@ -462,6 +465,7 @@ fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
         Direction::Egress,
         TlsLibrary::OpenSsl,
         NO_ADDR,
+        false,
     )
 }
 
@@ -503,6 +507,7 @@ fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
         Direction::Egress,
         TlsLibrary::OpenSsl,
         NO_ADDR,
+        false,
     )
 }
 
@@ -549,6 +554,7 @@ fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         Direction::Egress,
         TlsLibrary::OpenSsl,
         call.addr,
+        false,
     )
 }
 
@@ -689,6 +695,7 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         Direction::Ingress,
         TlsLibrary::OpenSsl,
         addr,
+        false,
     )
 }
 
@@ -845,6 +852,8 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     }
     mark_active(conn);
 
+    // No stamp: without its RETs the probe can emit one call twice, so its
+    // keys are never proven (event_loop.rs `go_stamp`).
     emit_tls_event(
         ctx,
         conn,
@@ -853,6 +862,7 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
         Direction::Egress,
         TlsLibrary::GoTls,
         NO_ADDR,
+        false,
     )
 }
 
@@ -990,8 +1000,13 @@ pub fn go_tls_write_guarded(ctx: ProbeContext) {
 #[inline(always)]
 fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
     let (conn, buf, len) = read_go_write_args(ctx)?;
-    let again = guard_call(ctx, conn).unwrap_or(false);
-    if again || len == 0 || !crate::sock_capture::tls_capture_on() {
+    // A call that cannot be recorded may be emitted twice: the instance's
+    // records are no longer proven whole.
+    let again = guard_call(ctx, conn).unwrap_or_else(|()| {
+        go_lose();
+        false
+    });
+    if again || len == 0 {
         return Ok(());
     }
     mark_active(conn);
@@ -1003,7 +1018,22 @@ fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
         Direction::Egress,
         TlsLibrary::GoTls,
         NO_ADDR,
+        true,
     )
+}
+
+/// A Go TLS record of this process instance was not emitted: set
+/// `GO_EPOCH_LOST` in its `PROC_EPOCH` value, for good (no instance entry:
+/// nothing to mark, its keys are not proven anyway). A plain read-modify-
+/// write: every writer of an existing entry stores the value with the bit
+/// set (exec replaces it with a new instance), so racing writers agree.
+#[inline(always)]
+fn go_lose() {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if let Some(e) = PROC_EPOCH.get_ptr_mut(&tgid) {
+        // SAFETY: a map value pointer; see above for the race.
+        unsafe { core::ptr::write_volatile(e, core::ptr::read_volatile(e) | GO_EPOCH_LOST) };
+    }
 }
 
 // ── Go TLS: received plaintext, at crypto/tls.(*halfConn).decrypt ─────────
@@ -1042,6 +1072,9 @@ fn try_go_tls_rrc_entry(ctx: &ProbeContext) -> Result<(), ()> {
         mark_active(conn);
     } else {
         let _ = GO_READ_CALLS.remove(&key);
+        if on && conn != 0 {
+            go_lose(); // its records will not be emitted
+        }
     }
     Ok(())
 }
@@ -1075,24 +1108,14 @@ fn try_go_tls_decrypt_ret(ctx: &ProbeContext) -> Result<(), ()> {
     if err != 0 || typ & 0xff != RECORD_TYPE_APPLICATION_DATA || len == 0 || len > u32::MAX as u64 {
         return Ok(());
     }
-    if !crate::sock_capture::tls_capture_on() {
+    // From here an application-data record is returned: every way it is
+    // not emitted marks the instance (`go_lose`).
+    let Some((conn, ok)) = go_read_call(ctx) else {
+        go_lose();
         return Ok(());
-    }
-    let key = go_read_key(ctx, false)?;
-    let Some(c) = GO_READ_CALLS.get_ptr(&key) else {
-        return Ok(()); // no readRecordOrCCS entry seen for this call
     };
-    // SAFETY: this goroutine's own slot (maps.rs GO_READ_CALLS).
-    let (conn, depth) = unsafe { ((*c).conn, (*c).depth) };
-    // Still the current instance after the reads: no sweep had seen the
-    // epoch dead, so the element was not recycled under them.
-    match PROC_EPOCH.get_ptr(&key.tgid) {
-        Some(e) if unsafe { *e } == key.epoch => {}
-        _ => return Ok(()),
-    }
-    // decrypt runs inside that readRecordOrCCS: deeper on the stack.
-    let (_, hi) = go_stack(key.goroutine)?;
-    if hi.wrapping_sub(user_sp(ctx.regs)) <= depth {
+    if !ok {
+        go_lose();
         return Ok(());
     }
     emit_tls_event(
@@ -1103,7 +1126,29 @@ fn try_go_tls_decrypt_ret(ctx: &ProbeContext) -> Result<(), ()> {
         Direction::Ingress,
         TlsLibrary::GoTls,
         NO_ADDR,
+        true,
     )
+}
+
+/// The connection of the `readRecordOrCCS` call this decrypt RET is inside,
+/// and whether it is this call's: its slot is the goroutine's, its epoch
+/// still current, and decrypt is deeper on the stack. None without a slot.
+#[inline(always)]
+fn go_read_call(ctx: &ProbeContext) -> Option<(u64, bool)> {
+    let key = go_read_key(ctx, false).ok()?;
+    let c = GO_READ_CALLS.get_ptr(&key)?;
+    // SAFETY: this goroutine's own slot (maps.rs GO_READ_CALLS).
+    let (conn, depth) = unsafe { ((*c).conn, (*c).depth) };
+    // Still the current instance after the reads: no sweep had seen the
+    // epoch dead, so the element was not recycled under them.
+    let current = matches!(
+        PROC_EPOCH.get_ptr(&key.tgid),
+        Some(e) if unsafe { *e } & GO_EPOCH_MASK == key.epoch
+    );
+    // decrypt runs inside that readRecordOrCCS: deeper on the stack.
+    let deeper =
+        go_stack(key.goroutine).is_ok_and(|(_, hi)| hi.wrapping_sub(user_sp(ctx.regs)) > depth);
+    Some((conn, current && deeper))
 }
 
 /// This goroutine's key: the `g` register and the process instance
@@ -1119,7 +1164,8 @@ fn go_read_key(ctx: &ProbeContext, create: bool) -> Result<GoReadKey, ()> {
         Some(e) => unsafe { *e },
         None if create => {
             const BPF_NOEXIST: u64 = 1;
-            let now = unsafe { bpf_ktime_get_ns() };
+            // No GO_EPOCH_EXEC: the agent did not see this image start.
+            let now = unsafe { bpf_ktime_get_ns() } & GO_EPOCH_MASK;
             if PROC_EPOCH.insert(&tgid, &now, BPF_NOEXIST).is_ok() {
                 now
             } else {
@@ -1128,7 +1174,7 @@ fn go_read_key(ctx: &ProbeContext, create: bool) -> Result<GoReadKey, ()> {
             }
         }
         None => return Err(()),
-    };
+    } & GO_EPOCH_MASK;
     Ok(GoReadKey {
         tgid,
         _pad: 0,
@@ -1214,7 +1260,8 @@ fn read_go_write_args(ctx: &ProbeContext) -> Result<(u64, *const u8, usize), ()>
 
 // ── Shared helper ──────────────────────────────────────────────────────────
 
-/// An event's addresses: `ports` is src | dst << 16. No padding.
+/// An event's addresses: `ports` is src | dst << 16; and its
+/// `stream_off` (a Go record's process stamp). No padding.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct HdrAddr {
@@ -1222,6 +1269,7 @@ struct HdrAddr {
     dst_addr: u32,
     ports: u32,
     ip_proto: u32,
+    stamp: u64,
 }
 
 /// Fields shared by every event of one TLS read/write, computed once.
@@ -1244,6 +1292,7 @@ fn tls_header(
     restricted: bool,
     scope_gen: u32,
     call_addr: CallAddr,
+    stamp: u64,
 ) -> TlsHeader {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
@@ -1256,6 +1305,7 @@ fn tls_header(
             dst_addr: 0,
             ports: 0,
             ip_proto: 0,
+            stamp,
         },
         direction,
         tls_lib,
@@ -1297,6 +1347,7 @@ fn tls_header(
             dst_addr: 0,
             ports: 0,
             ip_proto: 0,
+            stamp,
         }
     } else if direction == Direction::Egress {
         HdrAddr {
@@ -1304,6 +1355,7 @@ fn tls_header(
             dst_addr: remote_addr,
             ports: local_port as u32 | (remote_port as u32) << 16,
             ip_proto: 6,
+            stamp,
         }
     } else {
         HdrAddr {
@@ -1311,6 +1363,7 @@ fn tls_header(
             dst_addr: local_addr,
             ports: remote_port as u32 | (local_port as u32) << 16,
             ip_proto: 6,
+            stamp,
         }
     };
     // Launder through a helper copy: the verifier sees helper-written bytes
@@ -1339,10 +1392,19 @@ fn emit_tls_event<C: EbpfContext>(
     direction: Direction,
     tls_lib: TlsLibrary,
     call_addr: CallAddr,
+    go_stamped: bool,
 ) -> Result<(), ()> {
     note_tls_io();
+    // `go_stamped`: a Go record that carries its process stamp, and whose
+    // every way of not being emitted marks the instance (`go_lose`).
+    let lose = || {
+        if go_stamped {
+            go_lose();
+        }
+    };
     // Decided here, before any reserve or copy, for every TLS writer.
     if !crate::sock_capture::tls_capture_on() {
+        lose();
         return Ok(());
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
@@ -1356,6 +1418,7 @@ fn emit_tls_event<C: EbpfContext>(
         // Unscoped full: no selector is set (pid_filter makes the mode
         // restricted), so this check passes every process.
         if !pid_allowed(tgid) {
+            lose();
             return Ok(());
         }
     } else {
@@ -1365,11 +1428,23 @@ fn emit_tls_event<C: EbpfContext>(
             Ok(g) => scope_gen = g,
             Err(reason) => {
                 crate::maps::count_scope_drop(reason);
+                lose();
                 return Ok(());
             }
         }
     }
-    let h = tls_header(conn, direction, tls_lib, restricted, scope_gen, call_addr);
+    // Read after every check above: a record emitted with the stamp left
+    // nothing of the instance unmarked before it.
+    let stamp = match go_stamped {
+        // SAFETY: a u64 copied out at once.
+        true => unsafe { PROC_EPOCH.get(&tgid) }
+            .copied()
+            .unwrap_or(STREAM_OFF_UNKNOWN),
+        false => STREAM_OFF_UNKNOWN,
+    };
+    let h = tls_header(
+        conn, direction, tls_lib, restricted, scope_gen, call_addr, stamp,
+    );
     let use_ringbuf = match CONFIG.get(panopticon_common::CONFIG_USE_RINGBUF) {
         Some(&v) => v != 0,
         None => true,
@@ -1378,6 +1453,7 @@ fn emit_tls_event<C: EbpfContext>(
         // PerfEventArray path (kernels < 5.8): one event per call, on the
         // per-CPU scratch map (DataEvent far exceeds the BPF stack).
         let Some(event) = EVENT_SCRATCH.get_ptr_mut(0) else {
+            lose();
             return Ok(());
         };
         unsafe {
@@ -1408,6 +1484,7 @@ fn emit_tls_event<C: EbpfContext>(
         }
         let Some(mut entry) = shard_reserve(shard) else {
             crate::maps::count_kernel_drop();
+            lose();
             return Ok(()); // RingBuf full — drop
         };
         populate_tls_event(
@@ -1426,10 +1503,12 @@ fn emit_tls_event<C: EbpfContext>(
     // fit the verifier on 5.15 and RHEL 8).
     if off < len {
         let Some(zeros) = crate::maps::ZEROS.get_ptr(0) else {
+            lose();
             return Ok(());
         };
         let Some(mut entry) = shard_reserve(shard) else {
             crate::maps::count_kernel_drop();
+            lose();
             return Ok(());
         };
         let event = entry.as_mut_ptr();
@@ -1469,6 +1548,7 @@ fn populate_tls_event(event: *mut DataEvent, h: &TlsHeader, buf: *const u8, len:
         (*event).tcp_seq = 0;
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
+        (*event).stream_off = h.addr.stamp;
         (*event).scope_gen = h.scope_gen;
         (*event).orig_len = len as u32;
 
