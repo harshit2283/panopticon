@@ -32,6 +32,11 @@ pub struct TlsTarget {
     /// Identity of the file the probe offsets were read from: the attach
     /// must hit that same file (see [`open_examined`]).
     pub file_key: Option<FileKey>,
+    /// `(device, inode)` of the file the uprobes land on, when it is not
+    /// the one examined: the real inode under a container's overlay root
+    /// (`overlay::lower_file_id`). Set by [`scan_all_processes`];
+    /// [`probe_file_id`] falls back to the examined file.
+    pub probe_file: Option<(u64, u64)>,
 }
 
 /// Identity of a file's contents: device, inode, mtime (ns) and size, so a
@@ -111,7 +116,7 @@ fn open_workload_file_hooked(path: &str, between: impl FnOnce()) -> std::io::Res
 /// An `O_PATH` descriptor for `path`, resolved inside `/proc/<pid>/root`
 /// when the path is under one (refused on a kernel without `openat2`).
 #[cfg(target_os = "linux")]
-fn open_path_in_root(path: &str) -> std::io::Result<std::os::fd::OwnedFd> {
+pub(crate) fn open_path_in_root(path: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let cstr = |s: &str| CString::new(s).map_err(|_| std::io::Error::other("NUL in path"));
@@ -517,6 +522,10 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
     }
 
     dedup_targets(&mut targets);
+    for t in &mut targets {
+        t.probe_file = resolve_probe_file(t);
+    }
+    dedup_targets(&mut targets);
 
     debug!(count = targets.len(), "TLS library scan complete");
     targets
@@ -534,16 +543,43 @@ pub fn target_file_id(target: &TlsTarget) -> Option<(u64, u64)> {
     target.file_key.map(|(dev, ino, _, _)| (dev, ino))
 }
 
-/// Keep one target per library file ([`target_file_id`]). TLS uprobes are
-/// attached without a PID filter, so they already cover every process
-/// mapping that file; each PID reaches it through a different
-/// `/proc/<pid>/root/...` path, and attaching once per path made every SSL
-/// call emit duplicate events. A target without an examined identity is
-/// kept per path (its attach is refused anyway: [`open_examined`]).
+/// `(device, inode)` of the file a target's uprobes land on: what the
+/// agent tracks as attached. That is the real inode under an overlay
+/// root, which every container of an image shares
+/// ([`TlsTarget::probe_file`]), and otherwise the file examined
+/// ([`target_file_id`]). The fallback can only attach a shared inode
+/// twice, never skip a file.
+pub fn probe_file_id(target: &TlsTarget) -> Option<(u64, u64)> {
+    target.probe_file.or_else(|| target_file_id(target))
+}
+
+/// The real inode of a target examined under a container's overlay root
+/// (`overlay::lower_file_id`), or None.
+#[cfg(target_os = "linux")]
+fn resolve_probe_file(target: &TlsTarget) -> Option<(u64, u64)> {
+    let path = target
+        .library_path
+        .strip_prefix(&format!("/proc/{}/root", target.pid))?;
+    super::overlay::lower_file_id(target.pid, path, target.file_key?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_probe_file(_target: &TlsTarget) -> Option<(u64, u64)> {
+    None
+}
+
+/// Keep one target per file the uprobes land on ([`probe_file_id`]). TLS
+/// uprobes are attached without a PID filter, so they already cover every
+/// process mapping that file. Each PID reaches it through a different
+/// `/proc/<pid>/root/...` path, and each container of an image through an
+/// overlay device of its own. Attaching once per path or per device put
+/// a second copy of every probe on the file, so every TLS call was emitted
+/// twice. A target without an examined identity is kept per path (its
+/// attach is refused anyway: [`open_examined`]).
 fn dedup_targets(targets: &mut Vec<TlsTarget>) {
     let mut seen = std::collections::HashSet::new();
     targets.retain(|t| {
-        let file = target_file_id(t).ok_or_else(|| t.library_path.clone());
+        let file = probe_file_id(t).ok_or_else(|| t.library_path.clone());
         seen.insert(file)
     });
 }
@@ -569,6 +605,7 @@ pub fn scan_pid(pid: u32) -> Vec<TlsTarget> {
                 library_path: namespace_path,
                 tls_type,
                 file_key: Some(file_key),
+                probe_file: None,
             });
         }
     }
@@ -861,67 +898,6 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
     }
 }
 
-/// Whether the real inode of `file` (an executable examined as a Go TLS
-/// binary) carries uprobes at every one of `offsets`: the kernel's
-/// evidence, not a file identity. A uprobe
-/// lives on the inode a mapping resolves to (overlayfs: the lower inode
-/// every container of the image shares), and the kernel writes its
-/// breakpoint into each executable mapping of that inode, the agent's own
-/// included, never into the file. So each offset must read the breakpoint
-/// instruction through a fresh private executable mapping and something
-/// else through `pread` of the file. Any doubt (a mapping refused, a
-/// noexec mount, a short read) is false.
-#[cfg(target_os = "linux")]
-pub fn go_probes_present(file: &std::fs::File, offsets: &[u64]) -> bool {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::FileExt;
-    #[cfg(target_arch = "x86_64")]
-    const SWBP: &[u8] = &[0xcc]; // int3
-    #[cfg(target_arch = "aarch64")]
-    const SWBP: &[u8] = &0xd420_00a0u32.to_le_bytes(); // BRK64_OPCODE_UPROBES
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    return false;
-    let Ok(len) = file.metadata().map(|m| m.len()) else {
-        return false;
-    };
-    if offsets.is_empty()
-        || len == 0
-        || offsets
-            .iter()
-            .any(|&o| o.saturating_add(SWBP.len() as u64) > len)
-    {
-        return false;
-    }
-    // SAFETY: a private read/exec mapping of a regular file, read only at
-    // offsets inside it, unmapped before return.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len as usize,
-            libc::PROT_READ | libc::PROT_EXEC,
-            libc::MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return false;
-    }
-    let present = offsets.iter().all(|&o| {
-        let mut on_disk = vec![0u8; SWBP.len()];
-        if file.read_exact_at(&mut on_disk, o).is_err() {
-            return false;
-        }
-        // SAFETY: o + SWBP.len() <= len, inside the mapping.
-        let mapped =
-            unsafe { std::slice::from_raw_parts((base as *const u8).add(o as usize), SWBP.len()) };
-        mapped == SWBP && on_disk != SWBP
-    });
-    // SAFETY: the mapping made above.
-    unsafe { libc::munmap(base, len as usize) };
-    present
-}
-
 /// What a Go boundary generation step did ([`step_generation`]).
 #[derive(Debug, Default)]
 pub struct GenerationStep {
@@ -1053,11 +1029,12 @@ fn attach_new_targets(
         }
     };
 
-    // Pre-filter: skip libraries already attached (by examined identity)
+    // Pre-filter: skip files already attached (by the file the probes
+    // land on)
     let new_targets: Vec<_> = targets
         .into_iter()
         .filter(|t| {
-            target_file_id(t)
+            probe_file_id(t)
                 .map(|id| !already_attached.contains(&id))
                 .unwrap_or(false)
         })
@@ -1077,7 +1054,7 @@ fn attach_new_targets(
     };
     let mut newly_attached = 0usize;
     for target in &new_targets {
-        if let Some(file_id) = target_file_id(target) {
+        if let Some(file_id) = probe_file_id(target) {
             // Double-check under lock (another scan may have raced)
             if !state.attached_libs.contains(&file_id) {
                 let count = crate::loader::attach_tls_uprobes_on_state(&mut state, target);
@@ -1200,6 +1177,7 @@ mod tests {
                 boundary: None,
             },
             file_key: key,
+            probe_file: None,
         };
         assert!(open_examined(&target(Some(examined))).is_ok());
         assert!(open_examined(&target(None)).is_err(), "never examined");
@@ -1229,6 +1207,7 @@ mod tests {
                 ssl_new_offset: None,
             },
             file_key: key,
+            probe_file: None,
         }
     }
 
@@ -1244,6 +1223,7 @@ mod tests {
                 boundary: None,
             },
             file_key: Some((1, 7, 5, 6)),
+            probe_file: None,
         };
         let mut targets = vec![
             ssl(10, "/proc/10/root/usr/lib/libssl.so.3", 42),
@@ -1287,6 +1267,25 @@ mod tests {
             !attached.contains(&target_file_id(&host).unwrap()),
             "the tenant's file attached does not count as the host's"
         );
+    }
+
+    /// Two containers of one image: each examined under its own overlay
+    /// device, one real inode under both. One target, and attaching it
+    /// counts for both. A target whose real inode is unknown stays keyed
+    /// by the file examined.
+    #[test]
+    fn test_one_target_per_real_inode() {
+        let ctr = |pid: u32, dev: u64, real: Option<(u64, u64)>| TlsTarget {
+            probe_file: real,
+            ..ssl_target(pid, "/proc/x/root/app", Some((dev, 1_585_382, 1_700, 4096)))
+        };
+        let real = Some((64_769, 1_585_382));
+        let mut targets = vec![ctr(1, 49, real), ctr(2, 52, real), ctr(3, 55, None)];
+        dedup_targets(&mut targets);
+        let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
+        assert_eq!(kept, vec![1, 3]);
+        assert_eq!(probe_file_id(&ctr(2, 52, real)), real);
+        assert_eq!(probe_file_id(&targets[1]), Some((55, 1_585_382)));
     }
 
     /// Security scan F2: a workload swaps its library's directory for a
@@ -1497,6 +1496,7 @@ mod tests {
                     boundary: None,
                 },
                 file_key: Some((0, 0, 0, 0)),
+                probe_file: None,
             };
             let _ = tx.send((
                 open_workload_file(&p).is_err(),
@@ -1594,29 +1594,6 @@ mod tests {
             assert!(!maps_binary_ruled_out(pid, me));
             assert!(maps_binary_ruled_out(pid, (me.0 + 1, me.1)));
             assert!(!maps_binary_ruled_out(u32::MAX - 1, (me.0 + 1, me.1)));
-        }
-
-        /// The proof that skips a generation step is the kernel's, never
-        /// the file's bytes: with no uprobe on the inode the mapping reads
-        /// what the file holds, so neither an ordinary file nor one that
-        /// holds the breakpoint byte itself at every offset proves guards.
-        #[test]
-        fn test_go_probes_present_needs_a_kernel_breakpoint() {
-            let dir = std::env::temp_dir().join(format!("panopticon-swbp-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let probes = [16u64, 64, 128, 256];
-            for (name, byte) in [("plain", 0x90u8), ("forged", 0xcc)] {
-                let path = dir.join(name);
-                std::fs::write(&path, vec![byte; 4096]).unwrap();
-                let file = std::fs::File::open(&path).unwrap();
-                assert!(!go_probes_present(&file, &probes), "{name}");
-            }
-            let short = dir.join("short");
-            std::fs::write(&short, [0u8; 32]).unwrap();
-            let file = std::fs::File::open(&short).unwrap();
-            assert!(!go_probes_present(&file, &probes), "offsets past the end");
-            assert!(!go_probes_present(&file, &[]), "no offsets");
-            std::fs::remove_dir_all(&dir).ok();
         }
 
         #[test]

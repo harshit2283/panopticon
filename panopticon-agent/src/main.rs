@@ -349,12 +349,13 @@ async fn main() -> Result<()> {
                     &mut go_attach,
                 );
                 tls_probes += probes;
-                // Tracked by the identity of the file examined (never a
+                // Tracked by the file the probes land on (the real inode
+                // under an overlay root, else the file examined; never a
                 // fresh stat of the workload's path), and only once
                 // attached: a refused attach is retried by the next scan,
                 // as the background scanner does.
                 if probes > 0
-                    && let Some(file_id) = platform::proc_scanner::target_file_id(target)
+                    && let Some(file_id) = platform::proc_scanner::probe_file_id(target)
                 {
                     attached_libs.insert(file_id);
                 }
