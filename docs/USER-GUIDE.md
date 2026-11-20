@@ -113,7 +113,7 @@ capture_enabled = true
 sampling_mode = "full"              # "full" | "connection_sample" | "head_only"
 # sample_rate = 0.1                 # connection_sample only, and required there
 # head_only_bytes = 4096            # head_only only (default 4096)
-max_events_per_sec = 500000         # user-space rate limit on records (a packet is up to max_packet_bytes / 4096 records); excess is dropped and counted
+max_events_per_sec = 500000         # user-space rate limit on records (a TCP packet is up to ceil(max_packet_bytes / 4096) records); excess is dropped and counted
 max_worker_count = 4                # default: number of CPUs
 worker_channel_capacity = 4096        # events queued per worker; excess is dropped and counted
 max_connections_tracked = 65536
@@ -171,10 +171,12 @@ cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgrou
 ```
 
 **`max_packet_bytes`.** The kernel hands the capture large packets whole
-(GSO, TSO and GRO packets of up to 64 KiB). Each is sent to the agent as
-consecutive 4 KiB records, up to `max_packet_bytes` (4096 to 65536,
-default 16384), each with its exact stream position; what lies past it is
-counted, not captured. A cut can cost a parser its message boundaries,
+(GSO, TSO and GRO packets of up to 64 KiB). Each TCP packet is sent to the
+agent as consecutive 4 KiB records, up to `max_packet_bytes` (4096 to
+65536, default 16384; `ceil(max_packet_bytes / 4096)` records at most),
+each with its exact stream position; what lies past it is counted, not
+captured. A UDP datagram, and a TCP packet carrying RST, stay one record
+of at most 4096 bytes whatever the setting. A cut can cost a parser its message boundaries,
 and then some fields for the rest of the connection (§5.3). At one record
 (4096, the behaviour before this setting) a PostgreSQL 500-row result,
 sent in 8 KB packets, cost the bound values of the rest of its connection;
@@ -197,8 +199,8 @@ and 15% of exchanges. On a node that moves bulk data at line rate, set
 bulk throughput, raise it. Changing it needs a restart.
 
 `max_events_per_sec` counts records, not packets: a packet at the cap
-takes up to `max_packet_bytes / 4096` records of the budget, a TLS read or
-write up to 4. Records are what the agent's work scales with. A record
+takes up to `ceil(max_packet_bytes / 4096)` records of the budget, a TLS
+read or write up to 4. Records are what the agent's work scales with. A record
 the limiter drops in the middle of a packet is a gap in that stream, as a
 kernel ring drop is.
 
@@ -1091,6 +1093,8 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
+| `panopticon_tcp_reorder_held_total` | TCP records held briefly because their bytes arrived ahead of the next expected byte: the records of two packets of one socket, captured on two CPUs at once, can reach the agent interleaved. Held with the rest of that connection's records (at most 5 ms, 128 KiB per connection, 1,024 records per worker) until the missing bytes arrive |
+| `panopticon_tcp_reorder_gaps_total` | Records that went on with the hole before them still open (the hold's time or space bound was reached, or the hole was wider than 64 KiB): the missing bytes are taken as lost, a gap for the parser (§5.3) |
 | `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: `max_packet_bytes` per packet (16 KiB by default), 16 KiB per TLS read or write, or a `head_only` cut (§5.5). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
 | `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback` |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
@@ -1185,10 +1189,12 @@ computed), `owner_tgid`, `acceptor_tgid`, `scope_gen` and `role` (1 client,
   object (unique per open connection within that process); addresses are
   filled in once the connection has done socket I/O inside a captured call,
   and are zero before that.
-- **A record holds at most 4096 payload bytes.** A larger packet (a GSO,
-  TSO or GRO packet of up to 64 KiB) is split over consecutive records up
-  to `max_packet_bytes` (default 16384: 4 records; at most 16), each with its own
-  `tcp_seq` and `stream_off`; a TLS read or write over at most 4 (16 KiB).
+- **A record holds at most 4096 payload bytes.** A larger TCP packet (a
+  GSO, TSO or GRO packet of up to 64 KiB) is split over consecutive records
+  up to `max_packet_bytes` (`ceil(max_packet_bytes / 4096)` records: 4 at
+  the default 16384, at most 16), each with its own `tcp_seq` and
+  `stream_off`; a TLS read or write over at most 4 (16 KiB). A UDP
+  datagram and a TCP packet carrying RST are one record, cut at 4096.
   `orig_len` is a record's bytes on the wire; in the last record of a
   packet or TLS call it also counts what was not captured, and `truncated`
   is then `true` (a packet past `max_packet_bytes`, a TLS call over 16 KiB,

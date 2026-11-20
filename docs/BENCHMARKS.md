@@ -212,7 +212,7 @@ the server as GSO packets of up to 8 KB, and each packet was captured as
 one record cut at 4,096 bytes: in the raw dump of a seed-7 run, 25 server
 packets lost 79,369 of 260,837 bytes (30%), with no ring drops and no
 failed loads (`panopticon_capture_truncated_total` 50, the two views of
-25). Large packets are now sent as consecutive 4 KiB records (`max_packet_bytes`,
+25). Large TCP packets are now sent as consecutive 4 KiB records (`max_packet_bytes`,
 USER-GUIDE §4.2). At the default 16384 the same runs score 100% (500/500
 at seeds 7 and 11 on 6.8; PII flagged in 313/313 and 283/283 operations
 that sent it; no raw PII values; `panopticon_capture_truncated_total` 0,
@@ -1306,8 +1306,8 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   captured bytes, and a close record is the 96-byte header. Before that,
   every record was a fixed 4,168 bytes, and at 1K connections `pid_filter`
   lost 2.6-8.2K events in the kernel ring where TC lost none. Now it loses
-  none (see Compact records). A packet over 4,096 bytes (GSO, TSO, GRO) is
-  now sent as consecutive records up to `max_packet_bytes` (default 16 KiB:
+  none (see Compact records). A TCP packet over 4,096 bytes (GSO, TSO, GRO)
+  is now sent as consecutive records up to `max_packet_bytes` (default 16 KiB:
   4 records, about 17 KB of ring where one record took 4.2 KB; at most
   16 records, about 67 KB); see
   "Large packets" below. The other large-body and load figures in this
@@ -1406,9 +1406,10 @@ and close records only for sockets that emitted):
 
 #### Large packets (`max_packet_bytes`, 2026-11-21)
 
-A GSO, TSO or GRO packet over 4,096 bytes used to be one record cut at
+A GSO, TSO or GRO TCP packet over 4,096 bytes used to be one record cut at
 4,096 bytes. It is now sent as consecutive 4 KiB records up to
-`max_packet_bytes` (default 16384), each at its exact stream position.
+`max_packet_bytes` (default 16384), each at its exact stream position
+(UDP datagrams and RST-bearing packets stay one record).
 `tests/load/run_load.sh 200 20s <rate> 0 200000` (200 connections, 200 KB
 bodies, unscoped, both views), one 16-vCPU VM on kernel 7.0, one run per
 cell (two at 16384 at full rate); "before" is the agent without this

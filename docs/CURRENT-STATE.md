@@ -87,7 +87,7 @@ production-hardened compliance platform.
   seen on a VRF device) only with
   `capture_loopback = true` (default false; it covers packets only: TLS
   plaintext over loopback is scoped by process either way). IPv6 is not
-  captured. Large packets (GSO, TSO, GRO) are captured in 4 KiB records
+  captured. Large TCP packets (GSO, TSO, GRO) are captured in 4 KiB records
   up to `max_packet_bytes` (default 16384, at most 65536); bytes past it
   are counted, not captured. That costs kernel time in the sending
   application and ring space: at 200 KB bodies on 200 connections (7.0,
@@ -239,8 +239,13 @@ production-hardened compliance platform.
     was parsed and the genuine retransmission dropped as a duplicate).
     Forging one needs the connection's current sequence numbers (an
     on-path attacker).
-  - Segments are not reordered: one that arrives before an earlier one is
-    taken as a gap, and the earlier one is then ignored. The kernel's
+  - Reordering is bounded: a segment that arrives ahead of the next
+    expected byte is held, with the rest of its connection's records, for
+    at most 5 ms (128 KiB per connection, 1,024 records per worker) until
+    the missing bytes arrive. This covers the chunk records of two packets
+    of one socket captured on two CPUs at once. Past those bounds it is
+    taken as a gap, and an earlier segment arriving later is ignored
+    (`panopticon_tcp_reorder_gaps_total`). The kernel's
     stream offset places each direction's first byte. A connection is
     keyed by its socket, so a new connection on a reused 5-tuple is a new
     socket with no state from the old one.
