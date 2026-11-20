@@ -839,8 +839,9 @@ fn is_go_binary(path: &str) -> bool {
 /// disposable pipeline must not hold captured values (DESIGN §3).
 ///
 /// Key design choices following review feedback:
-/// - **Inode-based dedup**: `(dev, ino)` of the file examined
-///   ([`target_file_id`]) instead of paths — handles symlinks/namespaces
+/// - **Inode-based attach**: one attach per `(dev, ino)` the uprobes land
+///   on ([`probe_file_id`], [`attach_each`]), not per path. This handles
+///   symlinks, namespaces and overlay roots.
 /// - **IO outside lock**: scan + ELF parsing before acquiring the mutex
 /// - **Batch logging**: one summary log per scan, not per-target
 /// - **Jitter**: 0–10% of interval to prevent fleet-wide CPU spikes
