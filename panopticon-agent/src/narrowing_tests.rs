@@ -1933,8 +1933,8 @@ fn go_tls_handshake_starts_a_new_connection_on_a_reused_key() {
 }
 
 /// Fail closed: a TlsNew on a live Go key that no client preface follows
-/// (a renegotiation the kernel guard missed, or any boundary the bytes do
-/// not start at) never decodes the next header blocks against an empty
+/// (a boundary the bytes do not start at, which the kernel's guards are
+/// there to rule out) never decodes the next header blocks against an empty
 /// HPACK table. On a port without a fallback the bytes after it are not
 /// parsed at all; on gRPC's port (50051) the entry the fallback creates is
 /// latched, so no header of it, path included, is exported.
@@ -1971,9 +1971,14 @@ fn go_tls_boundary_without_a_preface_withholds() {
             let json = env.file("events.jsonl");
             assert!(!contains(&json, "gomid-q2"), "port {port}: {h2:?}");
             assert_eq!(h2[0]["path"], "/len/10?id=gomid-q1", "port {port}: {h2:?}");
+            // 18444: nothing after the boundary is parsed. 50051: exactly
+            // one record of the latched entry, with no header.
+            let withheld = if port == 50051 { 1 } else { 0 };
+            assert_eq!(h2.len(), 1 + withheld, "port {port}: {h2:?}");
             for e in &h2[1..] {
                 let no_headers = e["headers"].as_array().is_none_or(|h| h.is_empty());
                 assert!(e["path"].is_null() && no_headers, "port {port}: {e:?}");
+                assert_eq!(e["protocol"], "grpc", "port {port}: {e:?}");
             }
         }
     });

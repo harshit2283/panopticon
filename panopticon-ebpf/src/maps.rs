@@ -9,7 +9,7 @@ use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
-    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoGuardCalls, GoGuardKey, GoReadCall,
+    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoExec, GoGuardCalls, GoGuardKey, GoReadCall,
     GoReadKey, MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER,
     TLS_SCRATCH_SIZE, ring_shard,
     scope::{NETDEV_OFFS_LEN, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
@@ -424,43 +424,68 @@ pub static GO_READ_CALLS: HashMap<GoReadKey, GoReadCall> =
 
 const BPF_F_NO_PREALLOC: u32 = 1;
 
-/// Go calls that can precede or contain a handshake of their own
-/// connection, in flight, by goroutine (tls_probes.rs `guard_call`,
-/// `go_tls_guard_ret`): `(*Conn).Write`, whose entry probe emits the
-/// plaintext before Write runs an implicit handshake, and
-/// `(*Conn).handleRenegotiation`, which calls `clientHandshake` on a live
-/// connection. The value lists the calls the goroutine is in (nested on
-/// TLS inside TLS), each with its connection and frame depth, so a RET
-/// clears exactly its own call's `GO_GUARD_CONNS` entry. Same ownership and
-/// sweep as GO_READ_CALLS (a slot whose epoch is not current is dead); a
-/// call that never returned keeps its connection guarded, which only
-/// withholds, until a RET of an outer call of the goroutine drops it.
+/// Go `(*Conn).Write` calls in flight, by goroutine (tls_probes.rs
+/// `guard_call`, `go_tls_guard_ret`): Write's entry probe emits the
+/// plaintext before Write runs an implicit handshake of a new connection.
+/// The value lists the calls the goroutine is in (nested on TLS inside
+/// TLS), each with its connection and frame depth, so a RET clears exactly
+/// its own call's `GO_GUARD_CONNS` entry. Same ownership and sweep as
+/// GO_READ_CALLS (a slot whose epoch is not current is dead).
 #[map]
 pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoGuardCalls> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
-/// Go connections with a guarded call in flight (`GO_GUARD_CALLS`): a
-/// handshake entering on one sends no `TlsNew`. Set at the call's entry,
-/// removed at its return. Presence, not a count: two calls in flight on
-/// one connection share the entry, and the first to return removes it.
-/// That cannot unguard a new connection's first handshake: a Write that
-/// entered before it returns only after that handshake ran, or at once
-/// with `net.ErrClosed` (a closed connection, nothing follows). A
-/// renegotiation, which a Write on another goroutine can unguard here, is
-/// also guarded by its own goroutine's `GO_GUARD_CALLS` slot.
-/// Not LRU: an evicted entry would send a `TlsNew` after the new
-/// object's data. User space's sweep removes entries of processes gone
-/// from `/proc` (and sets GO_GUARD_LOST if one came back meanwhile).
+/// Go connections of a process instance (tgid, epoch) with a guarded Write
+/// in flight (`GO_GUARD_CALLS`): a handshake entering on one sends no
+/// `TlsNew`. Set at the call's entry, before it emits; removed only at the
+/// call's own RET. A call that ended without one (a panic through Write)
+/// leaves its entry, which only withholds, until the instance ends.
+/// Presence, not a count: two Writes in flight on one connection share the
+/// entry, and the first to return removes it. That cannot unguard a new
+/// connection's first handshake: a Write that entered before it returns
+/// only after that handshake ran (or failed), since Write calls Handshake,
+/// which waits on `handshakeMutex`, or at once with `net.ErrClosed` (a
+/// closed connection: its bytes were never sent and nothing follows).
+/// Not LRU: an evicted entry would send a `TlsNew` after the new object's
+/// data. User space's sweep removes entries whose epoch is not their
+/// process's current one: an instance that ended, or one whose live epoch
+/// it removed, which `GO_EXEC` then no longer matches (no boundaries).
 #[map]
 pub static GO_GUARD_CONNS: HashMap<GoGuardKey, u64> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
-/// Nonzero once a guard could not be recorded (a full map, more than
-/// GO_GUARD_NEST nested calls, an unreadable goroutine stack, no epoch) or
-/// the sweep may have removed a live one: no Go `TlsNew` is sent again
-/// until the agent restarts, so every reused Go key stays latched.
+/// Process instances whose Go boundaries a probe ended because a guard
+/// could not be recorded (a full map, more than GO_GUARD_NEST nested calls,
+/// an unreadable goroutine stack, no epoch): the probe removes the
+/// instance's `GO_EXEC` entry, and counts it here (exported as a metric).
 #[map]
-pub static GO_GUARD_LOST: Array<u32> = Array::with_max_entries(1, 0);
+pub static GO_GUARD_LOST: Array<u64> = Array::with_max_entries(1, 0);
+
+/// Process images the agent saw start, by tgid (`sched_process_exec`;
+/// removed when the thread group leader exits). A Go `TlsNew` is sent only
+/// for an image with an entry that also passes `GO_BOUNDARY_GEN`: a process
+/// running before the agent started, or before the guards of the binary it
+/// runs were attached, may have a Write in flight that no guard covers.
+/// Not preallocated; a full map leaves the image without an entry (no
+/// boundaries for it).
+#[map]
+pub static GO_EXEC: HashMap<u32, GoExec> =
+    HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
+
+/// Go boundary generation: user space adds 1 after attaching a Go binary's
+/// guards and before attaching its handshake probes. An image whose
+/// `GO_EXEC.generation` is lower started before that attach and gets boundaries
+/// only if `GO_BOUNDARY_OK` holds its stamp.
+#[map]
+pub static GO_BOUNDARY_GEN: Array<u64> = Array::with_max_entries(1, 0);
+
+/// Images (tgid -> `GO_EXEC.stamp`) user space proved, before a generation
+/// step, do not map the binary whose guards were just attached and that
+/// had boundaries until then (proc_scanner.rs `step_generation`): they keep
+/// them. A stamp of an earlier image never matches the current one.
+#[map]
+pub static GO_BOUNDARY_OK: HashMap<u32, u64> =
+    HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
 /// The current instance of each process doing Go TLS reads: boot-time
 /// nanoseconds at the first `readRecordOrCCS` entry seen

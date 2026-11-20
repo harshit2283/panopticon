@@ -67,43 +67,39 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoReadPr
 /// Writes plaintext; its entry probe emits before Write runs an implicit
 /// handshake, so it is guarded (tls_probes.rs `go_tls_write_guarded`).
 pub const WRITE: &str = "crypto/tls.(*Conn).Write";
-/// Calls `clientHandshake` again on a live connection: guarded.
-pub const RENEGOTIATE: &str = "crypto/tls.(*Conn).handleRenegotiation";
-/// A connection's handshake (`c.handshakeFn`): its entry starts a new
-/// connection object (tls_probes.rs `go_tls_handshake_entry`).
-pub const CLIENT_HANDSHAKE: &str = "crypto/tls.(*Conn).clientHandshake";
-pub const SERVER_HANDSHAKE: &str = "crypto/tls.(*Conn).serverHandshake";
+/// The method-value wrappers `tls.Client` / `tls.Server` store in
+/// `c.handshakeFn`, which `(*Conn).handshakeContext` calls once per
+/// connection object: the entry starts a new object (tls_probes.rs
+/// `go_tls_handshake_entry`). Never the bare `clientHandshake`, which a
+/// TLS 1.2 renegotiation (`handleRenegotiation`) calls on a live object.
+pub const CLIENT_HANDSHAKE_FN: &str = "crypto/tls.(*Conn).clientHandshake-fm";
+pub const SERVER_HANDSHAKE_FN: &str = "crypto/tls.(*Conn).serverHandshake-fm";
 
-/// Probe offsets for the Go new-connection boundary (`TlsNew` at a
-/// handshake's entry). Each handshake entry is attached only after every
-/// guard it needs: `Write`'s entry and RETs for both, and
-/// `handleRenegotiation`'s entry and RETs for `clientHandshake`, the one it
-/// calls. A binary without them (stripped, renamed, or a handshake that
-/// cannot be guarded) gets no boundary: a reused key stays latched.
+/// Probe offsets for the Go new-connection boundary (`TlsNew` at the entry
+/// of a connection's first handshake). The handshake entries are attached
+/// only after `Write`'s guard (its entry and every RET). A binary without
+/// them (stripped, renamed, Write's RETs not found) gets no boundary: a
+/// reused key stays latched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoBoundaryProbes {
     pub write_entry: u64,
     pub write_rets: Vec<u64>,
-    /// `handleRenegotiation`: entry and RETs.
-    pub renegotiate: Option<(u64, Vec<u64>)>,
-    /// `clientHandshake` entry, only with `renegotiate`.
-    pub client_handshake: Option<u64>,
-    pub server_handshake: Option<u64>,
+    /// `clientHandshake-fm` / `serverHandshake-fm` entries, where present.
+    pub handshakes: Vec<u64>,
 }
 
 /// The boundary probe offsets in an ELF, or None without a guarded Write
-/// or without any handshake that can be attached (see
-/// [`GoBoundaryProbes`]). A symbol name that cannot be read stops the scan.
+/// or without a handshake wrapper (see [`GoBoundaryProbes`]). A symbol
+/// name that cannot be read stops the scan.
 pub fn go_boundary_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoBoundaryProbes> {
     let elf = ElfFile::<object::elf::FileHeader64<object::Endianness>, R>::parse(data).ok()?;
-    let (mut write, mut reneg, mut client, mut server) = (None, None, None, None);
+    let (mut write, mut client, mut server) = (None, None, None);
     for sym in elf.symbols() {
         let name = sym.name().ok()?;
         let slot = match name {
             WRITE => &mut write,
-            RENEGOTIATE => &mut reneg,
-            CLIENT_HANDSHAKE => &mut client,
-            SERVER_HANDSHAKE => &mut server,
+            CLIENT_HANDSHAKE_FN => &mut client,
+            SERVER_HANDSHAKE_FN => &mut server,
             _ => continue,
         };
         if sym.size() > 0 && slot.is_none() {
@@ -112,25 +108,18 @@ pub fn go_boundary_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoBo
     }
     let write = write?;
     let write_rets = function_returns(&elf, data, write)?;
-    let renegotiate = reneg.and_then(|r| {
-        Some((
-            symbol_file_offset(&elf, r.0),
-            function_returns(&elf, data, r)?,
-        ))
-    });
-    let client_handshake = client
-        .filter(|_| renegotiate.is_some())
-        .map(|c| symbol_file_offset(&elf, c.0));
-    let server_handshake = server.map(|s| symbol_file_offset(&elf, s.0));
-    if client_handshake.is_none() && server_handshake.is_none() {
+    let handshakes: Vec<u64> = [client, server]
+        .into_iter()
+        .flatten()
+        .map(|(addr, _)| symbol_file_offset(&elf, addr))
+        .collect();
+    if handshakes.is_empty() {
         return None;
     }
     Some(GoBoundaryProbes {
         write_entry: symbol_file_offset(&elf, write.0),
         write_rets,
-        renegotiate,
-        client_handshake,
-        server_handshake,
+        handshakes,
     })
 }
 
@@ -249,10 +238,12 @@ pub struct Sweep {
     guard_lost_map: aya::maps::Map,
     /// Whether the last pass walked with batched lookups ([`walk_map`]).
     pub batched: bool,
-    /// `GO_GUARD_LOST` was set after the last pass, by a probe or by the
-    /// pass itself (see [`Sweep::run`]): Go connections on reused keys stay
-    /// latched until the agent restarts.
-    pub guard_lost: bool,
+    /// `GO_GUARD_LOST` after the last pass: process images whose Go
+    /// boundaries a probe ended (a guard it could not record).
+    pub guard_lost: u64,
+    /// `GO_GUARD_CONNS` entries left after the last pass: connections
+    /// guarded by a Write in flight, or left by one that never returned.
+    pub guarded_conns: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -277,7 +268,8 @@ impl Sweep {
             guard_conns: open("GO_GUARD_CONNS")?,
             guard_lost_map: lost,
             batched: false,
-            guard_lost: false,
+            guard_lost: 0,
+            guarded_conns: 0,
         })
     }
 
@@ -286,13 +278,9 @@ impl Sweep {
     /// re-created its epoch after its leader's exit removed it), then
     /// `GO_READ_CALLS` slots whose epoch is not their process's current one
     /// (record reads that never returned: the process exited or exec'd
-    /// mid-read), and the same for `GO_GUARD_CALLS` (Write or
-    /// handleRenegotiation calls that never returned). `GO_GUARD_CONNS`
-    /// entries of processes gone from `/proc` are removed too; if one of
-    /// those PIDs exists again after its removal (PID reuse in between), a
-    /// live guard may have gone, so `GO_GUARD_LOST` is set and no Go
-    /// `TlsNew` is sent again (fail closed). Returns how many slots (read
-    /// and guard) and epochs were removed.
+    /// mid-read), and the same for `GO_GUARD_CALLS` (Writes that never
+    /// returned) and `GO_GUARD_CONNS` (connections they guarded). Returns
+    /// how many slots (read and guard) and epochs were removed.
     ///
     /// Each slot's epoch is compared with `PROC_EPOCH` as it is when that
     /// slot is examined. A slot exists only after its epoch did, and an
@@ -300,7 +288,10 @@ impl Sweep {
     /// timestamp), so a slot whose epoch is absent or different then is dead
     /// for good: no probe can still accept it (maps.rs GO_READ_CALLS).
     /// Removing a live epoch (a PID reused between the `/proc` check and the
-    /// removal) only makes that process's reads in flight emit nothing.
+    /// removal) makes that process's reads in flight emit nothing and ends
+    /// its Go boundaries: the epoch it creates next is not the one its
+    /// `GO_EXEC` entry is bound to (tls_probes.rs `handshake_is_boundary`),
+    /// so the guards removed with the old epoch are never needed.
     ///
     /// The walks run while the kernel inserts and deletes ([`walk_map`]).
     pub fn run(&mut self) -> anyhow::Result<(usize, usize)> {
@@ -351,21 +342,15 @@ impl Sweep {
             walk_map::<panopticon_common::GoGuardKey, u64>(conns_fd, GO_READS_IN_FLIGHT, |k| {
                 conns.get(k, 0).is_ok()
             })?;
-        let alive = |tgid: u32| std::path::Path::new(&format!("/proc/{tgid}")).exists();
-        let mut lost = false;
-        for k in keys.iter().filter(|k| !alive(k.tgid)) {
-            if conns.remove(k).is_ok() {
-                dead += 1;
-                lost |= alive(k.tgid);
-            }
-        }
-        let mut flag: aya::maps::Array<&mut MapData, u32> =
+        let removed = keys
+            .iter()
+            .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && conns.remove(k).is_ok())
+            .count();
+        dead += removed;
+        self.guarded_conns = keys.len() - removed;
+        let flag: aya::maps::Array<&mut MapData, u64> =
             aya::maps::Array::try_from(&mut self.guard_lost_map)?;
-        if lost {
-            flag.set(0, 1, 0)?;
-        }
-        // Set here or by a probe (a guard that could not be stored).
-        self.guard_lost = flag.get(&0, 0)? != 0;
+        self.guard_lost = flag.get(&0, 0)?;
         Ok((dead, gone))
     }
 }

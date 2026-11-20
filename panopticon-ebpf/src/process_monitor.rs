@@ -14,11 +14,11 @@ use aya_ebpf::{
     macros::tracepoint,
     programs::TracePointContext,
 };
-use panopticon_common::{EventType, MAX_COMM_SIZE, ProcessEvent};
+use panopticon_common::{EventType, GoExec, MAX_COMM_SIZE, ProcessEvent};
 
 use crate::maps::{
-    PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROC_EPOCH,
-    PROCESS_EVENTS, TLS_CALL, TLS_SCRATCH,
+    GO_BOUNDARY_GEN, GO_BOUNDARY_OK, GO_EXEC, PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED,
+    PID_EXITED_LOST, PID_FILTER, PROC_EPOCH, PROCESS_EVENTS, TLS_CALL, TLS_SCRATCH,
 };
 
 // ── Process Exec ───────────────────────────────────────────────────────────
@@ -41,6 +41,17 @@ fn try_sched_process_exec(_ctx: &TracePointContext) -> Result<(), ()> {
     // never match again (maps.rs PROC_EPOCH). First, before anything that
     // can fail.
     let _ = PROC_EPOCH.remove(&pid);
+    // The agent saw this image start: it may get Go boundaries (maps.rs
+    // GO_EXEC), at the generation current now.
+    let _ = GO_BOUNDARY_OK.remove(&pid);
+    let exec = GoExec {
+        generation: GO_BOUNDARY_GEN.get(0).copied().unwrap_or(0),
+        stamp: unsafe { bpf_ktime_get_ns() },
+        epoch: 0,
+    };
+    if GO_EXEC.insert(&pid, &exec, 0).is_err() {
+        let _ = GO_EXEC.remove(&pid);
+    }
 
     // The sched_process_exec tracepoint has NO comm field:
     //   field:__data_loc char[] filename  offset:8  size:4
@@ -127,8 +138,10 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         }
     }
     let _ = PID_FILTER.remove(&pid);
-    // The process instance ends (maps.rs PROC_EPOCH).
+    // The process instance ends (maps.rs PROC_EPOCH, GO_EXEC).
     let _ = PROC_EPOCH.remove(&pid);
+    let _ = GO_EXEC.remove(&pid);
+    let _ = GO_BOUNDARY_OK.remove(&pid);
 
     let comm = read_comm(ctx)?;
 

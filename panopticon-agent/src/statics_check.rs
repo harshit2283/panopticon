@@ -39,8 +39,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "platform/proc_scanner.rs",
-        "GUARD_LOST_LOGGED",
-        "whether the lost Go TLS guard warning was logged, a flag",
+        "GO_GUARDED_CONNS",
+        "a count of Go TLS guard map entries, read from a BPF map",
+    ),
+    (
+        "platform/proc_scanner.rs",
+        "GO_BOUNDARY_LOST",
+        "a count of Go processes whose boundaries a probe ended, read from a BPF map",
     ),
     (
         "export/otlp.rs",

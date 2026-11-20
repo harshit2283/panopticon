@@ -336,6 +336,7 @@ async fn main() -> Result<()> {
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
+        let mut go_handshake_retry = Vec::new();
         if agent_config.tls_scan_enabled {
             let targets = platform::proc_scanner::scan_all_processes();
             let mut tls_probes = 0;
@@ -345,6 +346,7 @@ async fn main() -> Result<()> {
                     target,
                     &mut programs._links,
                     programs.go_reads,
+                    &mut go_handshake_retry,
                 );
                 // Track by inode to handle symlinks/mount namespaces
                 if let Some(file_id) = platform::proc_scanner::get_file_id(&target.library_path) {
@@ -365,6 +367,7 @@ async fn main() -> Result<()> {
             links: programs._links,
             attached_libs,
             go_reads: programs.go_reads,
+            go_handshake_retry,
         }));
         let cgroup_root = programs_cgroup_root;
 

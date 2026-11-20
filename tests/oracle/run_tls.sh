@@ -28,6 +28,7 @@ OUT=$(mktemp -d)
 cleanup() {
   [[ -n ${AP:-} ]] && kill -INT "$AP" 2>/dev/null && wait "$AP" 2>/dev/null || true
   [[ -n ${SP:-} ]] && kill "$SP" 2>/dev/null || true
+  [[ -n ${HP:-} ]] && kill "$HP" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -42,7 +43,7 @@ for stack in $STACKS; do
     openssl)
       PORT=18443
       server=(env TLS=1 HOST=127.0.0.1 TLS_CERT="$OUT/cert.pem" TLS_KEY="$OUT/key.pem" MODE=server
-              python3 -I "$HERE/http_oracle.py" "$PORT")
+              python3 -I "$HERE/http_oracle.py")
       client=(env TLS=1 HOST=127.0.0.1 SEED="$SEED" MODE=client
               python3 -I "$HERE/http_oracle.py" "$PORT" "$N" "$D/truth.jsonl")
       ;;
@@ -51,27 +52,36 @@ for stack in $STACKS; do
       h2=0; [[ $stack == go-h2 ]] && h2=1
       GO=${GO:-$(command -v go || echo /usr/local/go/bin/go)}
       [[ -x $OUT/go_tls_oracle ]] || "$GO" build -o "$OUT/go_tls_oracle" "$HERE/go_tls_oracle.go"
-      server=(env H2=$h2 "$OUT/go_tls_oracle" server "127.0.0.1:$PORT")
+      server=(env H2=$h2 "$OUT/go_tls_oracle" server)
       client=(env H2=$h2 "$OUT/go_tls_oracle" client "127.0.0.1:$PORT" "$N" "$D/truth.jsonl" "$SEED")
       ;;
     *) echo "unknown stack $stack" >&2; exit 2 ;;
   esac
   echo "==== $stack"
-  # The server must be running before the agent starts so the initial TLS
-  # scan finds its library (later processes are picked up on exec).
-  "${server[@]}" &
-  SP=$!
-  SP_PID=$SP
+  # A copy of the server (another port) runs before the agent starts so
+  # the initial TLS scan finds its library. The measured server starts
+  # after the probes are attached: a Go process running before its binary's
+  # probes attach never gets connection boundaries (reused keys stay
+  # latched), as in production (docs/USER-GUIDE.md §5.3).
+  if [[ $stack == openssl ]]; then holder=("${server[@]}" $((PORT + 1000))); else holder=("${server[@]}" "127.0.0.1:$((PORT + 1000))"); fi
+  if [[ $stack == openssl ]]; then server+=("$PORT"); else server+=("127.0.0.1:$PORT"); fi
+  "${holder[@]}" &
+  HP=$!
   sleep 1
   "$AGENT" --json-export "$D/agent.jsonl" >"$D/agent.log" 2>&1 &
   AP=$!
   sleep 4
+  "${server[@]}" &
+  SP=$!
+  SP_PID=$SP
+  sleep 1
   "${client[@]}" &
   CP=$!
   wait "$CP"
   sleep 1
   kill -INT "$AP"; wait "$AP" 2>/dev/null || true; AP=
   kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null || true; SP=
+  kill "$HP" 2>/dev/null; wait "$HP" 2>/dev/null || true; HP=
   echo "uprobes attached: $(grep -c 'uprobe attached' "$D/agent.log")"
   # `env` execs the server, so $SP is its PID; same for the client.
   python3 -I "$HERE/split_tls.py" "$D" "$SP_PID" "$CP" "$PORT" "$MIN_RECALL" || status=1
