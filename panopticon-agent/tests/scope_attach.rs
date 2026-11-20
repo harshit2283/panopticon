@@ -2493,6 +2493,19 @@ fn go_tls_reads() {
         probes.read_record_rets.len(),
         probes.decrypt_rets.len()
     );
+    let boundary = go_read::go_boundary_probes_from(&elf[..])
+        .expect("discovery finds Write and its RETs and a handshake entry");
+    assert!(
+        boundary.server_handshake.is_some()
+            && boundary.client_handshake.is_some()
+            && boundary.renegotiate.as_ref().is_some_and(|(_, r)| !r.is_empty()),
+        "every Go boundary probe found: {boundary:?}"
+    );
+    println!(
+        "GOBOUNDARY Write rets={} handleRenegotiation rets={}",
+        boundary.write_rets.len(),
+        boundary.renegotiate.as_ref().map_or(0, |(_, r)| r.len())
+    );
 
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");

@@ -859,13 +859,13 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
 /// record is reserved in the same shard as both objects' events
 /// (`shard_for(conn)`), and reservations are serialised.
 ///
-/// Two exceptions, guarded by `GO_GUARD_CONNS` (see `guard_call`):
-/// a `Write` entry probe emits its plaintext before Write runs an implicit
-/// handshake (data of the new object before this record), and
-/// `handleRenegotiation` calls `clientHandshake` again on a live
-/// connection. While either is in flight on the connection, or once a
-/// guard was lost (`GO_GUARD_LOST`), nothing is sent: the key keeps its
-/// latches. The function's stack-growth prologue jumps back to its entry,
+/// Two exceptions, guarded (see `guard_call`): a `Write` entry probe emits
+/// its plaintext before Write runs an implicit handshake (data of the new
+/// object before this record), and `handleRenegotiation` calls
+/// `clientHandshake` again on a live connection. While either is in
+/// flight on the connection (`GO_GUARD_CONNS`, any goroutine) or on this
+/// goroutine (`GO_GUARD_CALLS`), or once a guard was lost
+/// (`GO_GUARD_LOST`), nothing is sent: the key keeps its latches. The function's stack-growth prologue jumps back to its entry,
 /// so this probe can fire twice for one call; a second record, with no
 /// data between, ends a connection with no state again.
 #[uprobe]
@@ -894,6 +894,20 @@ fn try_go_tls_handshake_entry(ctx: &ProbeContext) -> Result<(), ()> {
     };
     // SAFETY: a presence check; the value is not read.
     if unsafe { GO_GUARD_CONNS.get(&key) }.is_some() {
+        return Ok(());
+    }
+    // This goroutine's own guarded call on `conn` (the Write or
+    // handleRenegotiation this handshake runs inside). Checked apart from
+    // GO_GUARD_CONNS, which another goroutine's Write returning on the same
+    // live connection can clear while a renegotiation is under way. No
+    // process instance yet (`PROC_EPOCH`): no guard could be read, so
+    // nothing is sent (no Go TLS call of this instance ran before, so no
+    // entry exists on the key anyway).
+    let call = go_read_key(ctx, false)?;
+    // SAFETY: this goroutine's own slot, copied out at once.
+    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&call) }.copied()
+        && c.conn == conn
+    {
         return Ok(());
     }
     send_tls_new(conn, pid_tgid, TlsLibrary::GoTls)

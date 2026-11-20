@@ -441,9 +441,11 @@ pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoReadCall> =
 /// handshake entering on one sends no `TlsNew`. Set at the call's entry,
 /// removed at its return. Presence, not a count: two calls in flight on
 /// one connection share the entry, and the first to return removes it.
-/// That cannot unguard a handshake: a Write that entered before its
-/// connection's handshake returns only after that handshake ran, or at
-/// once with `net.ErrClosed` (a closed connection, nothing follows).
+/// That cannot unguard a new connection's first handshake: a Write that
+/// entered before it returns only after that handshake ran, or at once
+/// with `net.ErrClosed` (a closed connection, nothing follows). A
+/// renegotiation, which a Write on another goroutine can unguard here, is
+/// also guarded by its own goroutine's `GO_GUARD_CALLS` slot.
 /// Not LRU: an evicted entry would send a `TlsNew` after the new
 /// object's data. User space's sweep removes entries of processes gone
 /// from `/proc` (and sets GO_GUARD_LOST if one came back meanwhile).
