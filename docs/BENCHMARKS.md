@@ -92,6 +92,9 @@ measurements (kernel 7.0, 32 vCPU VM, unscoped `full`).
 | HTTP/2 (`go-h2` stack), 2026-11-20, credential masking latch, no Go boundary (CI, seed 42) | 500 | 56.6% / 41.6% | 100% / 100% / 100% (matched) | 100% / 100% | 0 |
 | HTTP/2 (`go-h2` stack), 2026-11-20, Go handshake boundary and Write re-entry fix, seeds 42–51, Go 1.22.2 and Go 1.25.4 (20 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
 | HTTP/1.1 (`go` stack), 2026-11-20, same build, seeds 42–51, Go 1.22.2 (10 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), 2026-11-20, fail-closed boundary (handshake wrappers, guards checked after the record's reservation, processes started after the attach only), seeds 42–51, Go 1.22.2 and Go 1.25.4 (20 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/1.1 (`go` stack), 2026-11-20, same build, seeds 42–51, Go 1.22.2 (10 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), same build, server started before the agent (seed 42) | 500 | 100% client / 51.2% server (the server's reused keys latched: 244 header-less records, scored as phantoms) | — | 100% / 100% | 0 |
 
 Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
 64 vCPUs) are not always clean. In 2 runs of 10, the client view scores
@@ -127,8 +130,12 @@ HTTP/2 over TLS had two problems of its own:
   41.6%; lab: 46.4% / 38.4%, every phantom on a reused key and every
   match on a key's first connection, the 119 connections sharing 59 keys
   in one process and 49 in the other). The entry of the connection's first
-  handshake (`clientHandshake` / `serverHandshake`) is now Go's record,
-  with `Write` and `handleRenegotiation` guarded (USER-GUIDE §5.3).
+  handshake (`clientHandshake-fm` / `serverHandshake-fm`, which a
+  renegotiation never calls) is now Go's record, with `Write` guarded,
+  for processes the agent saw start after their binary's probes
+  attached; `run_tls.sh` now starts the measured server after the agent
+  (a copy of it runs before, for the initial scan), since a server
+  already running keeps reused keys latched (USER-GUIDE §5.3).
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,

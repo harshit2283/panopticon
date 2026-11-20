@@ -173,7 +173,9 @@ production-hardened compliance platform.
     after two fixes: a Go connection's first handshake now starts a new
     connection on a reused `*tls.Conn` key (`go-h2` scored 56.6% / 41.6%
     without it), and a `Write` whose entry probe fires again (Go's
-    stack-growth prologue) is emitted once. Record reads in flight at once are
+    stack-growth prologue) is emitted once. The measured server starts
+    after the agent attached its binary: a server already running keeps
+    reused keys latched (USER-GUIDE §5.3). Record reads in flight at once are
     capped at 65,536 node-wide (a goroutine parked waiting for a record on
     an idle keep-alive connection holds one); past that, further reads are
     not captured until some return; likewise past 8,192 processes doing Go TLS reads at once
@@ -216,12 +218,15 @@ production-hardened compliance platform.
     connection that reuses a closed one's key starts clean only once the
     agent has seen the library create the new object: OpenSSL's `SSL_new`
     return, or the entry of a Go connection's first handshake
-    (`clientHandshake` / `serverHandshake`). With a static or renamed
-    libssl, `SSL_clear` reuse, I/O inside `SSL_new` (a creation
-    callback), a Go binary whose handshake or guards cannot be probed
-    (stripped, renamed), a Go connection whose handshake runs inside its
-    first `Write`, after a lost Go guard, or when that record was lost,
-    it is not decoded either. While credential masking is on its bodies are not exported
+    (`clientHandshake-fm` / `serverHandshake-fm`; a renegotiation is
+    never one). With a static or renamed libssl, `SSL_clear` reuse, I/O
+    inside `SSL_new` (a creation callback), a Go binary whose handshake
+    or guards cannot be probed (stripped, renamed), a Go process that was
+    running when the agent started or attached its binary (the first
+    process of every Go binary included: it keeps reused keys latched
+    for its life), a Go connection whose handshake runs inside its first
+    `Write`, a Go process that lost a guard, or when that record was
+    lost, it is not decoded either. While credential masking is on its bodies are not exported
     either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are

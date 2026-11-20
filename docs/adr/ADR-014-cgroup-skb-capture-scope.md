@@ -107,33 +107,54 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   masking on, that stream's body is withheld.
 - **TLS key reuse boundary at object creation.** A new TLS connection on a
   reused library object starts clean only after the agent saw the library
-  create it: OpenSSL's `SSL_new` return, or for Go `crypto/tls` the entry of
-  the connection's first handshake (`clientHandshake` / `serverHandshake`;
-  `tls.Client` / `tls.Server` are inlined). Otherwise it is treated as not
+  create it: OpenSSL's `SSL_new` return, or for Go `crypto/tls` the entry
+  of the connection's first handshake, probed on the method-value
+  wrappers `(*Conn).clientHandshake-fm` / `serverHandshake-fm` that
+  `handshakeContext` calls once per object through `c.handshakeFn`
+  (`tls.Client` / `tls.Server` are inlined). A TLS 1.2 renegotiation calls
+  `clientHandshake` directly and never reaches the wrapper (Go 1.22.2,
+  1.24.9, 1.25.4 sources and disassembly). Otherwise it is treated as not
   seen whole. The Go boundary fails closed:
-  - Two Go calls can break "the handshake runs before any data of the
-    object": `Write`, whose entry probe emits before it runs an implicit
-    handshake, and `handleRenegotiation`, which re-enters
-    `clientHandshake` on a live connection. Both guard their connection
-    from entry to every RET, for every goroutine (`GO_GUARD_CONNS`) and
-    for their own (`GO_GUARD_CALLS`, which a Write returning on another
-    goroutine cannot clear); a handshake on a guarded connection sends no
-    record. `Write`'s guarded entry also emits each call once: Go's
-    stack-growth prologue re-enters a function, which fired the entry
-    probe two or three times per call. Guarded calls nest (TLS inside
-    TLS: the outer `Write` runs the inner connection's), so a goroutine's
-    slot holds up to four, each with its frame depth, and a RET clears
-    only its own call (SP at a RET equals SP at the entry). A guard that
-    cannot be recorded (a full map, deeper nesting, an unreadable stack,
-    no `PROC_EPOCH` room) or that the sweep may have removed live (PID
-    reuse) stops Go records node-wide until the agent restarts
-    (`GO_GUARD_LOST`, not pinned); the agent logs it once.
-  - Per binary, all or nothing, in order: `Write`'s RETs, its guarded
-    entry, `handleRenegotiation`'s RETs and entry, then the handshake
-    entries (`clientHandshake` only with a guarded `handleRenegotiation`).
-    A binary without them (stripped, renamed, RETs not found, or no Go
-    reads) keeps the latch on reused keys; the agent still starts and
-    captures it. This is not a reason to refuse to start.
+  - `(*Conn).Write`'s entry probe emits before Write runs an implicit
+    handshake, so Write guards its connection from entry to every RET,
+    for every goroutine (`GO_GUARD_CONNS`) and for its own
+    (`GO_GUARD_CALLS`), set before it emits. The handshake probe reserves
+    its ring record first and checks the guards after: data reserved
+    before the record was guarded before it (one ring shard per key,
+    reservations serialised), so a guard present at the check covers
+    every earlier record of the new object, and a record sent precedes
+    all of its data. Only a Write's own RET removes its guard; one that
+    never returned (a panic) leaves it, which only withholds. `Write`'s
+    guarded entry also emits each call once (Go's stack-growth prologue
+    re-enters a function). Guarded calls nest (TLS inside TLS) up to
+    four per goroutine, each with its frame depth.
+  - Only process images the agent saw start get boundaries
+    (`sched_process_exec` writes `GO_EXEC`), and only if they started
+    after the guards of their binary attached: user space steps
+    `GO_BOUNDARY_GEN` after attaching a binary's guards and before its
+    handshake probes, and an image whose exec read an older generation
+    keeps boundaries only if user space proved, from its
+    `/proc/<pid>/maps`, that it does not map that binary
+    (`GO_BOUNDARY_OK`, keyed by the image's exec stamp). A process
+    running before the agent or its binary's probes (the first process
+    of every binary included) keeps reused keys latched for its life.
+  - A guard that cannot be recorded (a full map, deeper nesting, an
+    unreadable stack, no `PROC_EPOCH` room) removes the image's
+    `GO_EXEC` entry before the Write emits: that process loses
+    boundaries; it is counted (`GO_GUARD_LOST`, a metric). The image's
+    `GO_EXEC` entry is bound to its first `PROC_EPOCH`; the sweep's
+    removal of a live epoch (PID reuse) makes the next one differ, so
+    the guards removed with it are never needed. The sweep removes
+    guards by epoch only, never by PID.
+  - Per binary, in order: `Write`'s RETs and its guarded entry, all or
+    nothing (on a failure the attached RET probes are detached and the
+    unguarded Write probe is used; not retried, since swapping the live
+    plaintext probe would emit a Write twice or not at all), then the
+    generation step, then the handshake wrappers, each a boundary on its
+    own and retried at each scan if it did not attach. A binary without
+    them (stripped, renamed, RETs not found, or no Go reads) keeps the
+    latch on reused keys; the agent still starts and captures it. This
+    is not a reason to refuse to start.
   - User space cannot tell a boundary record mid-connection from a real
     one: a record followed by bytes that happen to start with a client
     preface would start clean against an empty HPACK table. The kernel

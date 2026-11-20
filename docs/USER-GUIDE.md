@@ -314,7 +314,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 | IPv6 | Not captured. |
 | HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
 | HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
-| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw the library create it: OpenSSL's `SSL_new` return, or the entry of a Go connection's first handshake (§5.3). |
+| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw the library create it: OpenSSL's `SSL_new` return, or the entry of a Go connection's first handshake, in a Go process the agent saw start after its binary's probes attached (§5.3). |
 | PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
 | Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
@@ -692,35 +692,60 @@ What is exported then:
   one's key (the library's connection object address). It starts clean
   only once the agent has seen the library create the new object at that
   address, in every mode: the return of OpenSSL's `SSL_new`, or for Go
-  `crypto/tls` the entry of the connection's first handshake
-  (`(*Conn).clientHandshake` / `serverHandshake`, which runs once per
-  connection object, before any of its data; Go's constructors are
-  inlined and cannot be probed). Either proves the old object was
-  destroyed; nothing else resets the key (no client preface, wherever it
-  falls, nor `SSL_free`, which may drop one reference of several).
+  `crypto/tls` the entry of the connection's first handshake. Go's
+  constructors are inlined and cannot be probed; the probe is on the
+  method-value wrappers `(*Conn).clientHandshake-fm` /
+  `serverHandshake-fm` that `tls.Client` / `tls.Server` store in the
+  connection and `(*Conn).handshakeContext` calls once per connection
+  object, before any of its data. A TLS 1.2 renegotiation calls
+  `clientHandshake` directly, never the wrapper, so it is never a
+  boundary (checked in the Go 1.22.2, 1.24.9 and 1.25.4 sources and
+  binaries, and in the lab: three renegotiations, no record). Either
+  proves the old object was destroyed; nothing else resets the key (no
+  client preface, wherever it falls, nor `SSL_free`, which may drop one
+  reference of several).
   Otherwise a new connection on the key gets neither its headers decoded
   nor its bodies exported, for as long as the agent tracks that key: a
   libssl whose `SSL_new` the agent cannot find (static or renamed), an
   object reused through `SSL_clear`, an object created before the agent
   attached, an object read or written inside `SSL_new` (a creation
   callback, so before the agent saw it created), and a record that was
-  lost (ring or channel full, rate limit). For Go, also: a binary whose
-  handshake functions or whose `(*Conn).Write` return instructions
-  cannot be found (stripped, renamed; per binary, the agent still
-  starts and captures it, with reused keys latched), a binary without
-  Go reads (the `sched_process_exec`/`exit` tracepoints are missing),
-  `clientHandshake` where `handleRenegotiation` cannot be probed, a
-  connection whose handshake runs inside its first `Write` (`tls.Client`
-  then `Write` without `Handshake`: Write's data is captured before the
-  handshake, so no record is sent), a TLS 1.2 renegotiation (never a
-  boundary), and, on the whole node until the agent restarts, every Go
-  connection after a guard could not be recorded: a full guard map, more
-  than four guarded calls nested in one goroutine (TLS inside TLS
-  inside TLS...), a goroutine whose stack could not be read, no room for
-  the process in `PROC_EPOCH`, or a guard the sweep may have removed
-  live (PID reuse). Any Go workload on the node can cause this; the
-  agent logs a warning once when it happens, and a restart clears it
-  (the guard maps are never pinned).
+  lost (ring or channel full, rate limit). For Go, also:
+  - **Processes already running when the probes attached.** A Go
+    process gets connection boundaries only if the agent saw it start
+    (exec) after the probes of its binary were attached. A process
+    running when the agent started, or when the agent attached its
+    binary, may be inside a `(*Conn).Write` whose start no probe saw, so
+    it keeps reused keys latched for its whole life. The agent finds Go
+    binaries by scanning running processes, so this includes the first
+    process of every binary, every Go process running when the agent
+    (re)starts, and a binary's processes started before a later scan
+    finds it (a restarted pod whose binary was rediscovered). New
+    replicas and restarts of a binary already attached get boundaries.
+    Processes running other binaries keep theirs when the agent proves,
+    from their memory maps, that they do not map the new binary;
+    otherwise they lose them too.
+  - A binary whose handshake wrappers or whose `(*Conn).Write` return
+    instructions cannot be found (stripped, renamed, inlined by a
+    profile-guided build), or whose `Write` guard did not attach in full
+    (the agent detaches the part that did and captures the binary
+    without boundaries; per binary, the agent still starts and captures
+    it, with reused keys latched); a binary without Go reads (the
+    `sched_process_exec`/`exit` tracepoints are missing).
+  - A connection whose handshake runs inside its first `Write`
+    (`tls.Client` then `Write` without `Handshake`: Write's data is
+    captured before the handshake, so no record is sent).
+  - A process whose `Write` guard could not be recorded (a full guard
+    map, more than four guarded calls nested in one goroutine, TLS
+    inside TLS inside TLS..., a goroutine whose stack could not be read,
+    no room for the process in `PROC_EPOCH`), or whose Go read state the
+    agent's sweep removed while it was running (PID reuse): that process
+    loses boundaries for the rest of its life; other processes keep
+    theirs. The agent logs a warning and counts these processes
+    (`panopticon_go_tls_boundary_lost_processes_total`). A `Write` that never
+    returned (a panic through it) keeps its connection guarded until
+    the process ends; `panopticon_go_tls_guarded_connections` shows the
+    guard map's occupancy.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
@@ -937,6 +962,8 @@ leave the node, use `metrics_only`.
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
 | `panopticon_active_connections` | Connections being parsed |
+| `panopticon_go_tls_guarded_connections` | Go TLS connections with a `Write` in flight, or left guarded by one that never returned (a panic), until their process ends. At the map's capacity (65,536) new guards fail and their processes lose Go connection boundaries (§5.3) |
+| `panopticon_go_tls_boundary_lost_processes_total` | Go processes whose connection boundaries ended because a `Write` guard could not be recorded; their reused connection keys stay latched (§5.3) |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 
 The endpoints have no authentication: bind to loopback or a private address.
