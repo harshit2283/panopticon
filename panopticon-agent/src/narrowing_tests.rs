@@ -1842,6 +1842,56 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
     );
 }
 
+/// The `go-h2` TLS oracle (tests/oracle/run_tls.sh) as the worker sees it.
+/// Go's `crypto/tls` has no `SSL_new`: nothing sends a TlsNew, and Go's
+/// allocator hands a closed connection's `*tls.Conn` address to the next
+/// one. The first connection on a key exports its `:path`; a later
+/// connection on the reused key restarts its parser latched (the preface
+/// proves nothing there), so it exports an HTTP/2 record with no path,
+/// status or headers, which the oracle scores as a phantom plus a miss.
+/// This pins the current rule (USER-GUIDE §5.3: a reused TLS key starts
+/// clean only after `SSL_new` returned the new object); it must change
+/// together with that rule if Go gets a new-object boundary.
+#[test]
+fn reused_go_tls_key_withholds_http2_headers() {
+    t2("reused_go_tls_key_withholds_http2_headers", 4, async {
+        let env = Env::new("goreuse").await;
+        let go = |dir, p: &[u8]| {
+            let mut e = ssl_rec(EventType::TlsData, dir, p);
+            e.tls_library = panopticon_common::TlsLibrary::GoTls;
+            e.socket_cookie = 0xc000_1a2b_c000; // the *tls.Conn
+            e
+        };
+        // GET <path> on stream 1: :method GET, :path as a literal.
+        let get = |path: &str| {
+            let mut block = vec![0x82, 0x04, path.len() as u8];
+            block.extend_from_slice(path.as_bytes());
+            h2_start(&h2_frame(0x1, 0x4 | 0x1, 1, &block))
+        };
+        let reply = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]); // :status 200
+        env.feed(&[
+            go(Direction::Egress, &get("/len/10?id=goreuse-q1")),
+            go(Direction::Ingress, &reply),
+            // The next connection, same *tls.Conn address, no TlsNew.
+            go(Direction::Egress, &get("/len/10?id=goreuse-q2")),
+            go(Direction::Ingress, &reply),
+        ]);
+        env.wait_for("goreuse-q1", &["json"]).await;
+        env.scope.shutdown().await;
+        let json = env.file("events.jsonl");
+        let h2: Vec<serde_json::Value> = String::from_utf8_lossy(&json)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["protocol"] == "http2")
+            .collect();
+        let paths: Vec<_> = h2.iter().map(|e| e["path"].as_str()).collect();
+        assert_eq!(paths, [Some("/len/10?id=goreuse-q1"), None], "{h2:?}");
+        assert_eq!(h2[0]["status"], 200, "{h2:?}");
+        assert!(h2[1]["status"].is_null(), "{h2:?}");
+        assert!(!contains(&json, "goreuse-q2"));
+    });
+}
+
 /// The publisher resolves cgroups with openat2 (`scope_select::resolve`):
 /// Linux only.
 #[cfg(target_os = "linux")]
