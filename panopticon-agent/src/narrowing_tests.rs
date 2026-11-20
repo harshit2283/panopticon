@@ -2026,6 +2026,17 @@ mod publisher {
             ] {
                 std::fs::create_dir_all(root.join(d)).unwrap();
             }
+            // 0755 whatever the umask: pod_filter never trusts a group- or
+            // other-writable directory on the way to a pod's.
+            for d in [
+                "kubepods".to_string(),
+                format!("kubepods/pod{UID_A}"),
+                format!("kubepods/pod{UID_B}"),
+            ] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
             let meta = crate::k8s::K8sMetadata::new("http://test");
             Self {
                 env,
