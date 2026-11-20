@@ -28,17 +28,14 @@ production-hardened compliance platform.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- Redis, MySQL (text protocol and prepared statements, plaintext) and
-  gRPC are scored the same way: 100% recall, PII flagged in every request
-  that carried it, and no raw PII values in the export
-  (`tests/oracle/run_protocols.sh`). PostgreSQL (simple, extended,
-  prepared): 83.8-84.6% recall over seeds 7, 11 and 23 (simple and
-  extended 100%, reused prepared statements 39-60 of 118-141), PII flagged
-  in 38-42% of the operations that sent it, no raw PII values. Every
-  exchange is exported; what is missing is bound values, where the oracle
-  sends the prepared statements' token and the PII: they stop for the
-  rest of a connection once server bytes are lost, which a large result
-  causes about 200 operations into each run.
+- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol
+  and prepared statements, plaintext) and gRPC are scored the same way:
+  100% recall, PII flagged in every request that carried it, and no raw
+  PII values in the export (`tests/oracle/run_protocols.sh`). PostgreSQL
+  was re-measured on 2026-11-20 after large packets were captured whole
+  (seeds 7, 11 and 23 on 6.8, seed 7 on 7.0); before that, a 500-row
+  result cut at the 4 KiB per-packet window cost the bound values of the
+  rest of the connection (83.8-84.6%, PII in 38-42%).
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
   `redacted`, `metrics_only`) are checked with planted PII and credentials
   in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
@@ -131,20 +128,19 @@ production-hardened compliance platform.
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and
     captured nothing.
-  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall is 17-29% over seven lab
-    runs of the CI messaging oracle (300 operations, seed 7; other AMQP
-    methods 100%, AMQP overall 75-79%, no raw PII exported). The
-    broker-to-consumer stream there carries GSO segments up to 18 KB, and
-    frames past the 4 KB capture window are lost. After the first lost frame
-    boundary the consumer direction of that connection exports no AMQP text
-    (fail closed, see USER-GUIDE §5.3), so the later deliveries are still
-    exported, with method, status, timing and sizes, but carry no exchange,
-    routing key or body to match against ground truth (before that change,
-    77-98%). Kafka `Fetch` on 8.10 was 92.6-100% in the same seven runs
-    (five at 100%). Retransmitted segments are parsed once (see TCP stream
-    integrity below), so deliveries are not duplicated by retransmission;
-    replaying two of these captures with and without sequence tracking gave
-    the same deliveries, so the loss is the capture window.
+  - RHEL 8.10: AMQP `Basic.Deliver` recall was 17-35% in the CI messaging
+    oracle (300 operations, seed 7) until 2026-11-20. The broker-to-consumer
+    stream there carries GSO packets of up to 13-24 KB, each holding
+    several deliveries, and each packet was captured as one record cut at
+    4 KB; the parser lost frame sync and the consumer direction stopped
+    exporting AMQP text (fail closed, USER-GUIDE §5.3). Not a ring or
+    helper limit: no ring drops, no failed loads. Large packets are now sent
+    as consecutive 4 KB records with exact stream positions (up to 64 KiB
+    per packet); deliveries are 164/164 and AMQP 100% in four of four runs,
+    with nothing truncated (see BENCHMARKS.md). Kafka `Fetch` was 100% in
+    three of those runs and 94.9% in one, which lost no bytes: its 13
+    missing records were in one Fetch response of about 20 records, whose
+    exported text ends at the per-exchange body cap (`max_body_bytes`).
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
     fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a

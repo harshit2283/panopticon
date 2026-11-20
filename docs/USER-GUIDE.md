@@ -1028,7 +1028,7 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_export_full_total` | Parsed exchanges the JSON writer could not keep up with (slow disk) |
 | `panopticon_drops_parser_error_total` | Streams a parser gave up on |
 | `panopticon_tcp_segments_ignored_total` | TCP segments not parsed: retransmissions of bytes already parsed (normal on lossy links), or segments and RSTs outside the connection's sequence window (forged, or stale). Only the next expected bytes of each direction reach the parsers, once |
-| `panopticon_capture_truncated_total` | Packets larger than the 4 KB capture window (normal with large transfers; parsers account for the skipped bytes) |
+| `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: 64 KiB per packet (BIG TCP), 16 KiB per TLS read or write, or a `head_only` cut (§5.5). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
 | `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback` |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
@@ -1076,8 +1076,9 @@ connection's requests and responses in order. Details:
   left out, and when both ends run on the node only the server's view (the
   end with the lower port) is kept. A TLS connection whose addresses were
   never seen is shown as `127.0.0.1:<port> → 127.0.0.2:443`.
-- Bytes that were not captured (beyond 4096 per packet or TLS buffer) show as
-  gaps ("previous segment not captured"), not as corrupted streams.
+- Bytes that were not captured (beyond 64 KiB of one packet or 16 KiB of one
+  TLS read or write, see below) show as gaps ("previous segment not
+  captured"), not as corrupted streams.
 - Packets carry no handshake (SYN/FIN), so Wireshark marks the first one of
   each connection "previous segment not captured"; that is expected.
 - Timestamps are the kernel's monotonic clock (time since boot), so dates
@@ -1119,9 +1120,13 @@ computed), `owner_tgid`, `acceptor_tgid`, `scope_gen` and `role` (1 client,
   object (unique per open connection within that process); addresses are
   filled in once the connection has done socket I/O inside a captured call,
   and are zero before that.
-- **At most 4096 bytes per packet or TLS buffer are captured.** When
-  `truncated` is `true`, the original was `orig_len` bytes and the rest was
-  not captured (large GSO/TSO packets, big TLS writes).
+- **A record holds at most 4096 payload bytes.** A larger packet (a GSO,
+  TSO or GRO packet of up to 64 KiB) is split over consecutive records, at
+  most 16 (64 KiB), each with its own `tcp_seq` and `stream_off`; a TLS
+  read or write over at most 4 (16 KiB). `orig_len` is a record's bytes on
+  the wire; in the last record of a packet or TLS call it also counts what
+  was not captured, and `truncated` is then `true` (BIG TCP packets over
+  64 KiB, TLS calls over 16 KiB, a `head_only` cut).
 - If the disk cannot keep up, events are dropped from the file and counted in
   `panopticon_raw_capture_dropped_total`; the rest of the agent is
   unaffected.
@@ -1194,13 +1199,14 @@ real cluster.
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
 | `Failed to attach kprobe` | A TLS address hook is unavailable on this kernel/VM; TLS events carry no addresses. Packet capture is not affected. |
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, binaries with a symbol table; others are logged at debug level as `Go binary not probed`). Other statically linked TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) and Go binaries built with `-ldflags=-s` appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
-| Each exchange appears twice | Both ends of the connection run on this node: each end's socket is captured. Select one side with `pid_filter` or `cgroup_filter`. |
+| Each exchange appears twice | Both ends of the connection run on this node: each end's socket is captured (two views). The two records are alike in the JSON export: without NAT between the ends they carry the same addresses, ports and direction, and differ only in timestamp and latency (by microseconds). Select one side with `pid_filter` or `cgroup_filter`. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
 | `Kubernetes API unavailable` warning, no `src_workload` | `hint` in the log line names the cause: 403 = the ClusterRole lacks `get/list/watch` on pods/services (`rbac.create=true`), 401 = token not mounted or rejected. Endpoints keep IP names meanwhile (§5.6). |
 
 ## 7. Limits worth knowing
 
-IPv4 only; the capture-scope trade-offs (§4.2); Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
+IPv4 only; the capture-scope trade-offs (§4.2); at most 64 KiB of one
+packet and 16 KiB of one TLS read or write are captured (§5.5); Kubernetes names not yet validated on a real cluster (§5.6); HTTPS only via
 OpenSSL/Go; PII detection is regex-based by default; TCP checksums are not
 verified, so a forger who knows a connection's sequence numbers (on path)
 can still slip a segment in; DNS-derived names say what a client asked for

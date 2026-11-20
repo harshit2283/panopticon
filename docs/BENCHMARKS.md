@@ -185,7 +185,7 @@ for each.
 | Protocol | Traffic mix | Recall before → now | PII visibility before → now | Leaks |
 |---|---|---|---|---|
 | Redis 7.4 | SET/GET/HSET/LPUSH/INCRBY/DEL, errors, pipelined batches | 86.2% (GET 0%) → **100%** | 0% → **100%** | 0 |
-| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **83.8-84.6%** (simple and extended 100%; reused prepared statements 39-60 of 118-141, see below) | 0% → **38-42%** | 0 |
+| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, 500-row results, errors | 45.6% → **100%** (83.8-84.6% before large packets were captured whole, see below) | 0% → **100%** | 0 |
 | MySQL 8.4 | COM_QUERY text protocol, errors, `caching_sha2_password` auth | 0% (see below) → **100%** | 0% → **100%** | 0 |
 | MySQL 8.4, prepared statements | mysql-connector-python prepared cursors (COM_STMT_PREPARE / EXECUTE / CLOSE, statements re-executed with new values), mixed with text queries | 66.7% → **100%** (re-executed statements 0% → 100%; verb accuracy 49.5% → 100%) | 0% → **100%** | 0 |
 | gRPC (HTTP/2) | unary, server-streaming, trailers-only errors (`NOT_FOUND`) | 100% → **100%** | 65% → **100%** | 0 |
@@ -196,14 +196,20 @@ even for failed calls.
 
 The full runs at seeds 7 and 42 (2026-10-19) had every protocol at 100%;
 Redis was also checked with seeds 21 and 99. Re-run on 2026-11-20 (seeds 7,
-11 and 23, kernel 6.8) Redis, MySQL, MySQL prepared and gRPC are still at
-100%, and PostgreSQL scores 83.8%, 84.6% and 84.2%. Every PostgreSQL
-exchange is exported, verb and error flag 100%, but bound values stop for
-the rest of a connection once server bytes are lost (USER-GUIDE §5.3),
-and about 200 operations into each run a 500-row result loses some. The
-prepared statements before that point are all matched (60/60, 51/51,
-39/39), none after it; the extended protocol's PII, also a bound value,
-follows the same split.
+11 and 23, kernel 6.8) Redis, MySQL, MySQL prepared and gRPC were still at
+100%, and PostgreSQL scored 83.8%, 84.6% and 84.2%: every exchange was
+exported, verb and error flag 100%, but bound values stop for the rest of
+a connection once server bytes are lost (USER-GUIDE §5.3), and about 200
+operations into each run a 500-row result lost some. That result leaves
+the server as GSO packets of up to 8 KB, and each packet was captured as
+one record cut at 4,096 bytes: in the raw dump of a seed-7 run, 25 server
+packets lost 79,369 of 260,837 bytes (30%), with no ring drops and no
+failed loads (`panopticon_capture_truncated_total` 50, the two views of
+25). Large packets are now sent as consecutive 4 KiB records (USER-GUIDE
+§7); the same runs score 100% (500/500 at seeds 7, 11 and 23 on 6.8 and
+seed 7 on 7.0; PII flagged in 313/313, 283/283 and 291/291 operations
+that sent it; no raw PII values; `panopticon_capture_truncated_total` 0,
+every server byte captured).
 
 ### Kafka, AMQP (RabbitMQ), DNS
 
@@ -229,15 +235,44 @@ direction that lost frame sync (USER-GUIDE §5.3), with the CI invocation
 runs. On Rocky Linux 8.10 (4.18), seven runs: AMQP `Basic.Deliver` 17.1-28.7%
 (other AMQP methods 100%, AMQP overall 75.2-78.6%), Kafka 95.7-100%
 (`Fetch` 92.6-100%, five runs at 100%), DNS 100%, no raw PII exported. On
-8.10 frames past the 4 KB capture window are lost on the broker-to-consumer
-stream (GSO segments up to 18 KB); after the first lost frame boundary the
-deliveries on that connection are exported without exchange, routing key
-or body, so they no longer match ground truth (77-98% before the change).
+8.10 frames past the 4 KB capture window were lost on the broker-to-consumer
+stream; after the first lost frame boundary the deliveries on that
+connection are exported without exchange, routing key or body, so they no
+longer match ground truth (77-98% before the change).
+
+The loss was the capture window, not the ring or the kernel's helpers.
+Each GSO packet was captured as one record cut at 4,096 bytes. In a raw
+dump of one 8.10 run, the broker's packets to the consumer went up to
+13,032 bytes, and 43 of them lost 110,733 of 334,892 bytes (33%). There
+were no stream holes (no ring drops), no failed loads and no kernel ring
+drops. On 7.0 the same stream's packets stay at or below 7,191 bytes (one
+delivery each), so the cut lands inside a body frame and the AMQP parser
+keeps frame sync; on 8.10 one packet carries several deliveries and the
+cut crosses frame boundaries. Large packets are now sent as consecutive
+4 KiB records with exact stream positions (USER-GUIDE §5.5). The same
+invocation on 8.10 then gives `Basic.Deliver` 164/164 and AMQP 100% in
+four of four runs (22.6-35.4% and 76.8-80.7% in three runs just before),
+with `panopticon_capture_truncated_total` 0 (176 before) and every byte of
+both directions captured. On 7.0 AMQP stays at 100% (three runs), with
+truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100%, 94.9%, 100% and
+100% after the change. The 94.9% run lost no bytes: no truncated packet, no
+stream hole, both views agree. The 13 missed records all sat in one 10 KB
+Fetch response carrying about 20 records of four topics, whose exported
+text ends mid-record, consistent with the per-exchange body cap
+(`max_body_bytes`, default 4096): an export limit, reached when the slower
+VM lets records pile up in one fetch, not a capture loss.
+
 In these runs every operation matched two records, on both kernels (the
-0-duplicate runs above predate cgroup_skb as the only capture backend);
-the client and the server run on the same host, consistent with each
-packet being seen once leaving the client's socket and once reaching the
-server's. Not yet confirmed.
+0-duplicate runs above predate cgroup_skb as the only capture backend).
+This is confirmed from the raw dumps: each connection has two socket
+cookies, a client view (`role` 1, the client's socket in the netns) and a
+server view (`role` 2, the server's socket: the host's DNS server, or the
+broker in its container behind DNAT). A TCP DNS query's two records carry
+the same 5-tuple. The JSON export carries neither the role nor the socket,
+so the two records of a DNS query are identical apart from timestamp and
+latency (about 15 µs apart). AMQP's two views differ only incidentally:
+the server view has the broker's container address, the client view the
+published address.
 
 What was wrong before:
 
@@ -1245,7 +1280,11 @@ stamping as in the scaling study (every 64th event). The p50 is set by the
   captured bytes, and a close record is the 96-byte header. Before that,
   every record was a fixed 4,168 bytes, and at 1K connections `pid_filter`
   lost 2.6-8.2K events in the kernel ring where TC lost none. Now it loses
-  none (see Compact records).
+  none (see Compact records). A packet over 4,096 bytes (GSO, TSO, GRO) is
+  sent as up to 16 full records, so a 64 KiB packet takes about 67 KB of
+  ring where it took one 4.2 KB record. The large-body and load figures
+  in this document were measured before that change and have not been
+  re-run.
 - **`pid_filter` drops the bytes that arrive before `accept()` on a listener
   that predates the agent.** This is every server not restarted since the
   agent started, so it is the case after any agent restart. Such a listener
@@ -1427,9 +1466,10 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.
-- **Per-packet capture is truncated at 4 KB** (16 KB per TLS read/write, in
-  four events). Larger messages are reassembled where the protocol allows it. `panopticon_capture_truncated` counts what was
-  cut.
+- **Capture is cut at 64 KiB per packet** (16 records of 4 KB; BIG TCP
+  packets can be larger) **and 16 KB per TLS read/write** (four records).
+  Larger messages are reassembled where the protocol allows it.
+  `panopticon_capture_truncated` counts what was cut.
 - **TLS addresses are learned on the connection's first socket I/O inside a
   hooked call.** Until then, and on kernels where neither the sock tracepoints
   nor fentry/kprobes are available, TLS exchanges are exported without

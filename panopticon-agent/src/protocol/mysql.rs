@@ -844,8 +844,9 @@ impl ProtocolParser for MysqlParser {
     }
     fn skip(&mut self, direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<ParseResult> {
         match (direction, &self.state) {
-            // Lost part of a response, typically a large result set in a
-            // GSO super-packet: rows are not needed, wait for the next command.
+            // Lost part of a response (ring drops, or a large result set in
+            // a packet past the 64 KiB capture cap): rows are not needed,
+            // wait for the next command.
             (Direction::Ingress, State::InQuery | State::InResponse { .. }) => {
                 self.server_buf.clear();
                 self.resync_server = true;
