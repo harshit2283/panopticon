@@ -50,8 +50,11 @@ jobs:
       - name: HTTP/1.1 (packet capture)
         run: sudo env PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run.sh 1000 1234 0.99
 
+      # Stacks: openssl, go (HTTP/1.1), go-h2 (no *tls.Conn reuse, recall
+      # gated) and go-h2-reuse (reused keys: gated on no raw PII and on
+      # unattributed records carrying no path, status or headers).
       - name: HTTPS (OpenSSL and Go crypto/tls uprobes)
-        run: sudo env PATH="$PATH" tests/oracle/run_tls.sh 500 42 0.99
+        run: sudo env PATH="$PATH" tests/oracle/run_tls.sh 500 42 0.99 "openssl go go-h2 go-h2-reuse"
 
       - name: Privacy modes (planted PII in every sink, HTTP and HTTPS)
         run: sudo env PATH="$PATH" PYTHON=/tmp/oracle-venv/bin/python tests/oracle/run_modes.sh 300 1234 0.99

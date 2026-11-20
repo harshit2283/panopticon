@@ -5,15 +5,25 @@ Per truth request (matched by its unique ?id= tag in the path):
   - duplicates: emitted more than once
   - field accuracy: method, status, response_size_bytes
 Also counts agent records whose id is not in the truth (phantoms).
+
+Usage: score.py TRUTH AGENT_JSONL [MIN_RECALL] [--withheld]
+With MIN_RECALL, exits non-zero below it or if any raw PII value reached
+the export. --withheld (connections whose TLS keys were reused, which the
+agent never decodes again) also exits non-zero if any phantom carries a
+path, status, content type or header: a record the agent could not
+attribute must be withheld, not guessed.
 """
 import collections
 import json
 import re
 import sys
 
+flags = {a for a in sys.argv[1:] if a.startswith("--")}
+sys.argv = [a for a in sys.argv if not a.startswith("--")]
 truth = {json.loads(l)["id"]: json.loads(l) for l in open(sys.argv[1])}
 seen = collections.defaultdict(list)
 phantom = 0
+phantom_fields = collections.Counter()
 for line in open(sys.argv[2]):
     e = json.loads(line)
     if e.get("protocol") not in ("http1", "http2"):  # same HTTP semantics
@@ -21,6 +31,8 @@ for line in open(sys.argv[2]):
     m = re.search(r"[?&]id=(q\d+)", e.get("path") or "")
     if not m or m.group(1) not in truth:
         phantom += 1
+        for field in ("path", "status", "content_type", "headers"):
+            phantom_fields[field] += bool(e.get(field))
         continue
     seen[m.group(1)].append(e)
 
@@ -42,6 +54,8 @@ for k in found:
 missing = [k for k in truth if not seen[k]]
 by_kind = collections.Counter(truth[k]["path"].split("?")[0].rsplit("/", 1)[0] if truth[k]["path"].count("/") > 1 else truth[k]["path"].split("?")[0] for k in missing)
 print(f"truth={n} recall={len(found)/n:.1%} ({len(found)}/{n}) duplicates={len(dups)} phantoms={phantom}")
+print("  phantoms carrying path / status / content_type / headers:",
+      {f: phantom_fields[f] for f in ("path", "status", "content_type", "headers")})
 for f in ("method", "status", "response_size"):
     print(f"  {f:14s} accuracy={1 - wrong[f]/max(len(found),1):.1%}  {examples[f]}")
 print("  missing by endpoint:", dict(by_kind))
@@ -85,5 +99,7 @@ print(f"  request bodies: captured {len(with_body)}/{len(posts)} POSTs, "
 # Optional gate: score.py truth agent MIN_RECALL (e.g. 0.99) exits 1 below it.
 if len(sys.argv) > 3 and leaks:
     sys.exit(f"{len(leaks)} raw PII values reached the export")
+if "--withheld" in flags and sum(phantom_fields.values()):
+    sys.exit(f"phantoms carry header-derived fields: {dict(phantom_fields)}")
 if len(sys.argv) > 3 and len(found) / n < float(sys.argv[3]):
     sys.exit(f"recall {len(found)/n:.1%} below required {float(sys.argv[3]):.1%}")

@@ -10,6 +10,14 @@
 // carries an email and an SSN. The server uses an in-memory self-signed
 // certificate; the client does not verify it. Build with symbols (the
 // default) so the agent can find the crypto/tls functions it probes.
+//
+// By default each finished connection is closed before the next opens, so
+// Go may allocate a new connection's *tls.Conn at a freed one's address:
+// the agent's key for it is reused (a reused key never decodes again,
+// docs/adr/014). REUSE=0 instead holds every connection open until the
+// client exits, so no *tls.Conn address is reused within either process.
+// Each truth record carries its client *tls.Conn address (tls_conn); the
+// server writes each accepted one's address to $CONNLOG, one per line.
 package main
 
 import (
@@ -26,10 +34,13 @@ import (
 	"log"
 	mrand "math/rand"
 	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -97,6 +108,20 @@ func server(addr string) {
 		// Non-nil, empty: no HTTP/2.
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
+	if path := os.Getenv("CONNLOG"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var mu sync.Mutex
+		srv.ConnState = func(c net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				mu.Lock()
+				fmt.Fprintf(f, "%p\n", c) // the *tls.Conn
+				mu.Unlock()
+			}
+		}
+	}
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
@@ -109,6 +134,7 @@ type truth struct {
 	ResponseSize int      `json:"response_size"`
 	Conn         int      `json:"conn"`
 	Pos          int      `json:"pos"`
+	TLSConn      string   `json:"tls_conn"`
 }
 
 func client(args []string) {
@@ -138,11 +164,22 @@ func client(args []string) {
 	defer f.Close()
 	enc := json.NewEncoder(f)
 	hc, tr := newClient()
+	reuse := os.Getenv("REUSE") != "0"
+	held := []*http.Transport{tr}
+	defer func() {
+		for _, t := range held {
+			t.CloseIdleConnections()
+		}
+	}()
 	conn, pos := 0, -1
 	for i := 0; i < n; i++ {
 		if pos >= 5 || (pos >= 0 && rnd.Float64() < 0.15) {
-			tr.CloseIdleConnections()
+			if reuse {
+				tr.CloseIdleConnections()
+				held = held[:0]
+			}
 			hc, tr = newClient()
+			held = append(held, tr)
 			conn, pos = conn+1, 0
 		} else {
 			pos++
@@ -165,6 +202,10 @@ func client(args []string) {
 		default:
 			req, _ = http.NewRequest("GET", fmt.Sprintf("https://%s/missing?id=%s", addr, tag), nil)
 		}
+		var tlsConn string
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { tlsConn = fmt.Sprintf("%p", info.Conn) },
+		}))
 		resp, err := hc.Do(req)
 		if err != nil {
 			log.Fatalf("request %s: %v", tag, err)
@@ -175,7 +216,7 @@ func client(args []string) {
 			pii = []string{}
 		}
 		enc.Encode(truth{ID: tag, Method: req.Method, Path: req.URL.RequestURI(), BodyPII: pii,
-			Status: resp.StatusCode, ResponseSize: len(data), Conn: conn, Pos: pos})
+			Status: resp.StatusCode, ResponseSize: len(data), Conn: conn, Pos: pos, TLSConn: tlsConn})
 	}
 	fmt.Fprintf(os.Stderr, "go-tls: %d requests\n", n)
 }
