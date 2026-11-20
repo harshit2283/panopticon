@@ -377,7 +377,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 | IPv6 | Not captured. |
 | HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
 | HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
-| TLS connection object reused | A new TLS connection on a reused library object starts clean only after the agent saw the library create it: OpenSSL's `SSL_new` return, or the entry of a Go connection's first handshake, in a Go process the agent saw start after its binary's probes attached (§5.3). |
+| TLS connection object reused, or first seen mid-connection | A TLS key starts clean only when proven to start at its connection's first record: OpenSSL's `SSL_new` return for it, or for Go a key never used before by a process the agent saw start after its probes attached, with nothing lost. A Go connection on a reused `*tls.Conn` address never decodes headers (§5.3). |
 | PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
 | Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
@@ -775,77 +775,75 @@ What is exported then:
   content type are ever examined). This lasts for the connection: a
   client preface seen later on it does not lift it (it may be the payload
   of a DATA frame). Only a new connection observed from its start
-  exports bodies again. Over TLS a new connection can reuse a closed
-  one's key (the library's connection object address). It starts clean
-  only once the agent has seen the library create the new object at that
-  address, in every mode: the return of OpenSSL's `SSL_new`, or for Go
-  `crypto/tls` the entry of the connection's first handshake. Go's
-  constructors are inlined and cannot be probed; the probe is on the
-  method-value wrappers `(*Conn).clientHandshake-fm` /
-  `serverHandshake-fm` that `tls.Client` / `tls.Server` store in the
-  connection and `(*Conn).handshakeContext` calls once per connection
-  object, before any of its data. A TLS 1.2 renegotiation calls
-  `clientHandshake` directly, never the wrapper, so it is never a
-  boundary (checked in the Go 1.22.2, 1.24.9 and 1.25.4 sources and
-  binaries, and in the lab: three renegotiations, no record). Either
-  proves the old object was destroyed; nothing else resets the key (no
-  client preface, wherever it falls, nor `SSL_free`, which may drop one
-  reference of several).
-  Otherwise a new connection on the key gets neither its headers decoded
-  nor its bodies exported, for as long as the agent tracks that key: a
-  libssl whose `SSL_new` the agent cannot find (static or renamed), an
-  object reused through `SSL_clear`, an object created before the agent
-  attached, an object read or written inside `SSL_new` (a creation
-  callback, so before the agent saw it created), and a record that was
-  lost (ring or channel full, rate limit). For Go, also:
-  - **Processes already running when the probes attached.** A Go
-    process gets connection boundaries only if the agent saw it start
-    (exec) after the probes of its binary were attached. A process
-    running when the agent started, or when the agent attached its
-    binary, may be inside a `(*Conn).Write` whose start no probe saw, so
-    it keeps reused keys latched for its whole life. The agent finds Go
+  exports bodies again. Over TLS that start must be proven: a TLS record
+  carries no stream position, and a connection is keyed by the library's
+  connection object address (OpenSSL `SSL*`, Go `*tls.Conn`), which a new
+  connection can reuse after a closed one. A key the agent sees for the
+  first time starts clean, in every mode, only when:
+  - **OpenSSL**: the agent saw `SSL_new` return the object at that
+    address, after its last dropped event. A reused `SSL*` the agent saw
+    created starts clean; nothing else resets a key (no client preface,
+    wherever it falls, nor `SSL_free`, which may drop one reference of
+    several).
+  - **Go `crypto/tls`**: the agent saw the process start (exec) after it
+    attached the probes of every Go binary it has, no Go record of the
+    process was lost (the kernel marks the process on every one it skips
+    or cannot send), nothing was dropped since the process started, and
+    the process has never used that key before. Go's constructors are
+    inlined, so there is no creation event: **a Go connection on a reused
+    `*tls.Conn` address never starts clean**. Go reuses addresses of
+    closed connections, so a process that opens and closes HTTP/2
+    connections one after another keeps headers withheld on most of them
+    (the `go-h2-reuse` oracle in docs/BENCHMARKS.md §7: 31–72% of the
+    exchanges exported, none with headers or raw PII among the rest).
+    Connections held open at once (a pool, a server's concurrent clients)
+    have distinct addresses and decode in full.
+
+  Otherwise a connection on the key gets neither its headers decoded nor
+  its bodies exported, for as long as the agent tracks that key: a libssl
+  whose `SSL_new` the agent cannot find (static or renamed), an object
+  reused through `SSL_clear`, an object created before the agent attached,
+  an object read or written inside `SSL_new` (a creation callback, so
+  before the agent saw it created), any event the agent dropped (channel
+  full, rate limit), and for Go also any record lost in the kernel. Not
+  detected: an OpenSSL record the kernel could not send (ring full)
+  after its object's `SSL_new`, which can leave that key starting clean
+  at a later record. For Go also:
+  - **Processes already running when the probes attached.** A process
+    running when the agent started, or when the agent attached a Go
+    binary, keeps every key latched for its whole life. The agent finds Go
     binaries by scanning running processes, so this includes the first
     process of every binary, every Go process running when the agent
-    (re)starts, and a new binary's processes started before the scan
-    that finds it (every 60 s by default, `tls_scan_interval_secs`). New
-    replicas and restarts of a binary already attached get boundaries,
-    in containers too. Each container's overlay root shows the image
-    file under a device of its own. The agent finds the real inode that
-    all of them share in the overlay's layers, and does not attach it
-    again (nor step). When it cannot prove which layer file it is, the
-    agent attaches that container's file again, and its running
-    processes lose boundaries.
-    Processes running other binaries keep theirs when the agent proves,
-    from their memory maps, that they do not map the new binary;
-    otherwise they lose them too.
-  - A binary whose handshake wrappers or whose `(*Conn).Write` return
-    instructions cannot be found (stripped, renamed, inlined by a
-    profile-guided build), or whose `Write` guard did not attach in full
-    (the agent detaches the part that did and captures the binary
-    without boundaries; per binary, the agent still starts and captures
-    it, with reused keys latched); a binary without Go reads (the
-    `sched_process_exec`/`exit` tracepoints are missing).
-  - A connection whose handshake runs inside its first `Write`
-    (`tls.Client` then `Write` without `Handshake`: Write's data is
-    captured before the handshake, so no record is sent).
-  - A process whose `Write` guard could not be recorded (a full guard
-    map, more than four guarded calls nested in one goroutine, TLS
-    inside TLS inside TLS..., a goroutine whose stack could not be read,
-    no room for the process in `PROC_EPOCH`), or whose Go read state the
-    agent's sweep removed while it was running (PID reuse): that process
-    loses boundaries for the rest of its life; other processes keep
-    theirs. The agent logs a warning and counts these processes
-    (`panopticon_go_tls_boundary_lost_processes_total`). A `Write` that never
-    returned (a panic through it) keeps its connection guarded until
-    the process ends; `panopticon_go_tls_guarded_connections` shows the
-    guard map's occupancy.
+    (re)starts, and a new binary's processes started before the scan that
+    finds it (every 60 s by default, `tls_scan_interval_secs`). Each Go
+    binary attached later also latches new connections of every Go
+    process started before that attach. New replicas and restarts of a
+    binary already attached decode, in containers too:
+    each container's overlay root shows the image file under a device of
+    its own, and the agent finds the real inode all of them share in the
+    overlay's layers and does not attach it again. When it cannot prove
+    which layer file it is, it attaches that container's file again, and
+    processes running at that moment stay latched.
+  - A binary whose `(*Conn).Write` return instructions cannot be found
+    (stripped, renamed, inlined by a profile-guided build) or did not all
+    attach (the agent then uses an entry-only `Write` probe whose records
+    prove nothing; the agent still starts and captures it); a binary
+    without Go reads (the `sched_process_exec`/`exit` tracepoints are
+    missing); a process that found `PROC_EPOCH` full (8,192 entries)
+    when it started.
+
+  Concurrent `Write`s on one Go connection are captured at their start,
+  before `crypto/tls` serialises them, so two that overlap may be
+  captured in the opposite order to the wire. HTTP/2 encodes and writes
+  each frame under one lock, so only writes whose order HTTP/2 leaves
+  open can swap; redaction does not depend on order, and a swap that
+  breaks parsing latches the connection.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
   connection the agent did not see whole (as above), no header is decoded
-  at all. Both last for the connection, and a reused TLS key starts
-  clean only after the agent saw the library create the new object, as
-  above.
+  at all. Both last for the connection, and a new TLS key starts clean
+  only when proven to start at its connection's first record, as above.
 - **DNS answers** whose name has credential context (any credential
   word: a DNS name holds no bare name, so `db.password.internal`
   included), or matches one of your `[credentials]` patterns, are
@@ -1106,8 +1104,6 @@ leave the node, use `metrics_only`.
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
 | `panopticon_pod_filter_unresolved_total` | Resolutions of a pod `pod_filter` selected that left it uncaptured, by `reason`: `not_found` (no cgroup directory in the kubepods roots searched: a pod not started yet, or a kubelet cgroup root to name in `pod_cgroup_root`), `ambiguous` (several), `unusable`. Rising → check the agent's errors |
 | `panopticon_active_connections` | Connections being parsed |
-| `panopticon_go_tls_guarded_connections` | Go TLS connections with a `Write` in flight, or left guarded by one that never returned (a panic), until their process ends. At the map's capacity (65,536) new guards fail and their processes lose Go connection boundaries (§5.3) |
-| `panopticon_go_tls_boundary_lost_processes_total` | Go processes whose connection boundaries ended because a `Write` guard could not be recorded; their reused connection keys stay latched (§5.3) |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 
 The endpoints have no authentication: bind to loopback or a private address.

@@ -14,7 +14,7 @@
 // By default each finished connection is closed before the next opens, so
 // Go may allocate a new connection's *tls.Conn at a freed one's address:
 // the agent's key for it is reused (a reused key never decodes again,
-// docs/adr/014). REUSE=0 instead holds every connection open until the
+// docs/adr/ADR-014). REUSE=0 instead holds every connection open until the
 // client exits, so no *tls.Conn address is reused within either process.
 // Each truth record carries its client *tls.Conn address (tls_conn); the
 // server writes each accepted one's address to $CONNLOG, one per line.

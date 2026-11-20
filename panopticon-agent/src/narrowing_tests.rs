@@ -1878,7 +1878,7 @@ async fn h2_records(env: &Env) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The `go-h2` TLS oracle's reuse variant (tests/oracle/run_tls.sh) as the
+/// The `go-h2-reuse` TLS oracle stack (tests/oracle/run_tls.sh) as the
 /// worker sees it. Go's allocator hands a closed connection's `*tls.Conn`
 /// address to the next one, so connections share a key, and Go has no
 /// connection boundary: the second connection on the key restarts its

@@ -10,9 +10,9 @@
 #            address, the agent's key, is reused in either process
 #   go-h2-reuse
 #            HTTP/2 with each connection closed before the next opens, so
-#            Go reallocates *tls.Conn addresses: a reused key never decodes
-#            again (docs/adr/014-capture-scope.md), recall is reported, not
-#            gated
+#            Go reallocates *tls.Conn addresses: a reused key never
+#            decodes again (docs/adr/ADR-014-cgroup-skb-capture-scope.md),
+#            so recall is reported, not gated
 # Each runs on loopback. The uprobes see both ends, so every exchange is
 # exported twice: once from the client process and once from the server.
 # Each view is scored separately and must reach MIN_RECALL, as must the

@@ -105,54 +105,53 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   exported, for the connection's life.
 - **HTTP/2 content type over 256 bytes, or repeated.** With credential
   masking on, that stream's body is withheld.
-- **TLS key reuse boundary at object creation.** A new TLS connection on a
-  reused library object starts clean only after the agent saw the library
-  create it: OpenSSL's `SSL_new` return, or for Go `crypto/tls` the entry
-  of the connection's first handshake, probed on the method-value
-  wrappers `(*Conn).clientHandshake-fm` / `serverHandshake-fm` that
-  `handshakeContext` calls once per object through `c.handshakeFn`
-  (`tls.Client` / `tls.Server` are inlined). A TLS 1.2 renegotiation calls
-  `clientHandshake` directly and never reaches the wrapper (Go 1.22.2,
-  1.24.9, 1.25.4 sources and disassembly). Otherwise it is treated as not
-  seen whole. The Go boundary fails closed:
-  - `(*Conn).Write`'s entry probe emits before Write runs an implicit
-    handshake, so Write guards its connection from entry to every RET,
-    for every goroutine (`GO_GUARD_CONNS`) and for its own
-    (`GO_GUARD_CALLS`), set before it emits. The handshake probe reserves
-    its ring record first and checks the guards after: data reserved
-    before the record was guarded before it (one ring shard per key,
-    reservations serialised), so a guard present at the check covers
-    every earlier record of the new object, and a record sent precedes
-    all of its data. Only a Write's own RET removes its guard; one that
-    never returned (a panic) leaves it, which only withholds. `Write`'s
-    guarded entry also emits each call once (Go's stack-growth prologue
-    re-enters a function). Guarded calls nest (TLS inside TLS) up to
-    four per goroutine, each with its frame depth.
-  - Only process images the agent saw start get boundaries
-    (`sched_process_exec` writes `GO_EXEC`), and only if they started
-    after the guards of their binary attached: user space steps
-    `GO_BOUNDARY_GEN` after attaching a binary's guards and before its
-    handshake probes, and an image whose exec read an older generation
-    keeps boundaries only if user space proved, from its
-    `/proc/<pid>/maps`, that it does not map that binary
-    (`GO_BOUNDARY_OK`, keyed by the image's exec stamp). A process
-    running before the agent or its binary's probes (the first process
-    of every binary included) keeps reused keys latched for its life.
-  - A guard that cannot be recorded (a full map, deeper nesting, an
-    unreadable stack, no `PROC_EPOCH` room) removes the image's
-    `GO_EXEC` entry before the Write emits: that process loses
-    boundaries; it is counted (`GO_GUARD_LOST`, a metric). The image's
-    `GO_EXEC` entry is bound to its first `PROC_EPOCH`; the sweep's
-    removal of a live epoch (PID reuse) makes the next one differ, so
-    the guards removed with it are never needed. The sweep removes
-    guards by epoch only, never by PID.
-  - Per binary, in order: `Write`'s RETs and its guarded entry, all or
-    nothing (on a failure the attached RET probes are detached and the
-    unguarded Write probe is used; not retried, since swapping the live
-    plaintext probe would emit a Write twice or not at all), then the
-    generation step, then the handshake wrappers, each a boundary on its
-    own and retried at each scan if it did not attach. Files are known by
-    the `(dev, ino)` the agent's own uprobes land on (proc_scanner.rs
+- **A TLS key starts latched unless proven to start at its connection's
+  first record.** A TLS record is keyed by the library's connection object
+  (OpenSSL `SSL*`, Go `*tls.Conn`) and carries no stream position, so a key
+  the agent first sees can be mid-connection (the agent started after it,
+  its entry was evicted, records were lost), and a Write there can begin
+  with bytes that look like a client preface. A new key's entry starts
+  clean only with proof from outside the bytes (protocol/fsm.rs
+  `TlsOrigin`); without it the entry is latched (HTTP/2: no headers decoded
+  for its life):
+  - OpenSSL: a `TlsNew` record (`SSL_new`'s return for that object),
+    emitted after the agent's last user-space drop. A reused `SSL*` the
+    agent saw created starts clean.
+  - Go `crypto/tls` has no creation hook (`tls.Client` / `tls.Server` are
+    inlined). Each Go record carries its process's `PROC_EPOCH` stamp
+    (tls_probes.rs `emit_tls_event`, in `stream_off`), and a key starts
+    clean only if the agent saw that process image start
+    (`sched_process_exec` sets `GO_EPOCH_EXEC`) after the last completed
+    attach of Go probes (none during one), no Go record of the process was
+    lost in the kernel (`GO_EPOCH_LOST`, below), nothing was dropped in
+    user space since the image started, the pipeline was installed before
+    it, and the key was never held by that instance before (a removed
+    key is remembered per instance: protocol/fsm.rs `GoTombs`). Then every
+    record of the instance reached the parser, so a key never held starts
+    at its connection's first record. **A reused Go key never starts clean
+    again**: Go reallocates a closed connection's `*tls.Conn` address, and
+    the new connection's records continue (or follow the removal of) the
+    old key's latched or live entry. Its HTTP/2 headers are withheld for
+    the rest of the process's life on that key; recall is lost, nothing
+    leaks (`run_tls.sh` `go-h2-reuse`). Any Go process image that started
+    before the agent or before its binary's probes attached, or found
+    `PROC_EPOCH` full at exec (8,192 entries), keeps every key latched.
+  - Loss marking: every Go probe path that skips or cannot emit a record
+    (capture off, process out of scope, ring full, scratch missing, a read
+    slot not saved or lost, a guard not recorded) sets `GO_EPOCH_LOST` on
+    the process (tls_probes.rs `go_lose`); every later record carries it
+    and all of the process's keys latch. A failed `GO_READ_CALLS` insert is
+    one such path. User space notes every drop before a parser
+    (event_loop.rs `EventStats::note_drop`) and latches the TLS entries
+    created before it. Known gap: an OpenSSL record the kernel could not
+    emit (ring full) after its object's `TlsNew` marks nothing, so that
+    key's next record can still start clean.
+  - `(*Conn).Write` is probed at its entry and every RET; the entry is
+    emitted once per call (Go's stack-growth prologue re-enters a
+    function: tls_probes.rs `go_tls_write_guarded`), all or nothing per
+    binary (otherwise the unguarded entry probe is used, whose records
+    carry no stamp and never start clean). Files are known by the `(dev,
+    ino)` the agent's own uprobes land on (proc_scanner.rs
     `probe_file_id`), never a fresh stat of a workload path, and never
     forgotten. A container's overlay root shows an image file under its
     own device, while the uprobes sit on the real inode every container
@@ -165,17 +164,21 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     path otherwise. And it is used only for a mount namespace owned by
     the initial user namespace. Any doubt keys the file by the `(dev,
     ino)` examined, which can attach a shared inode twice but never
-    skips a file. This holds for OpenSSL libraries and Go binaries alike;
-    a Go binary attached twice would also step the generation. A binary without
-    them (stripped, renamed, RETs not found, or no Go reads) keeps the
-    latch on reused keys; the agent still starts and captures it. This
-    is not a reason to refuse to start.
-  - User space cannot tell a boundary record mid-connection from a real
-    one: a record followed by bytes that happen to start with a client
-    preface would start clean against an empty HPACK table. The kernel
-    guards are what rule that out; a record followed by anything else
-    leaves the next bytes unparsed or latched (narrowing_tests.rs
-    `go_tls_boundary_without_a_preface_withholds`).
+    skips a file. This holds for OpenSSL libraries and Go binaries alike.
+    A binary without Write RETs or Go reads keeps every key latched; the
+    agent still starts and captures it.
+  - Concurrent Writes on one connection are emitted at their entries,
+    before `crypto/tls` takes the connection's write lock (`c.out`), so
+    two that overlap may be emitted in an order other than the wire's.
+    The lock keeps each Write's bytes contiguous: only whole Writes can
+    swap. This is a documented limit, not a leak. HTTP/2 needs its writer
+    serialised: every header block shares one HPACK state, so an
+    application whose header-carrying Writes could overlap would corrupt
+    its own stream for its peer too, and Go's `net/http` HTTP/2 encodes
+    and writes under one lock (client `cc.wmu`; the server writes one
+    frame at a time). Overlap can only swap Writes whose relative order
+    the protocol leaves open, PII redaction does not depend on record
+    order, and a swap that breaks parsing latches the entry.
 - **PostgreSQL bound values are dropped** when the statement has credential
   context.
 - **Credential masking is narrowed** to fields where a credential value
