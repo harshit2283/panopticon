@@ -656,7 +656,8 @@ What is exported then:
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
 - **Any other field** (path, header value, method, content type, bodies,
-  Redis arguments and replies, Kafka and AMQP fields): `<field withheld>`,
+  Redis replies with no credential context in their command (next item),
+  Kafka and AMQP fields): `<field withheld>`,
   unless every credential in it is one of these, in which case only the
   value becomes `<REDACTED>` and the rest stays readable: a query or form
   parameter (`name=value` at the start or after `?` or `&`, the value
@@ -666,6 +667,9 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
+- **A Redis command** with credential context in its key or any argument
+  is withheld as one unit: key, arguments and reply text (below), even
+  where a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
@@ -754,7 +758,17 @@ argument or reply holding a word from the first list, alone or with a
 value next to it, masked or not (`CONFIG GET requirepass`,
 `CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
-whole: no Redis field has a bare name (above). Protocol and subscription
+whole: no Redis field has a bare name (above). A Redis command is
+protected as one unit: when its key or any argument has credential
+context, read together or one by one, the key (`path`), the arguments
+(`request_text`) and the reply text are all exported as
+`<field withheld>` (method, status, timing and sizes stay), and its
+result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
+300`, `SETEX password_reset_token:alice 3600 <token>` and
+`GET otp:+15551234567` export no key, value or reply, however opaque the
+value; field-by-field, the key would be withheld and the value next to it
+exported. This holds whatever `builtin` is set to; your own patterns
+still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
 command (a script returning an array of the
@@ -851,7 +865,8 @@ scanned at that moment finishes with the previous rules.
 
 `builtin = "names_only"` keeps the cheap built-in rules: credential-named
 headers, the certain structures above (credential-named form parameters
-and JSON members, URI userinfo) and SQL statement withholding. It skips
+and JSON members, URI userinfo), SQL statement withholding and Redis
+whole-command withholding (both decided by the parsers). It skips
 looking for credential context in the free text of other fields, so a
 body mentioning a token in prose, or a JSON array under a credential name,
 is exported. Use it when your own patterns cover the formats that matter

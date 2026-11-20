@@ -366,6 +366,18 @@ impl RedisParser {
         if parts.len() > 2 {
             msg.request_text = Some(parts[2..].join(" "));
         }
+        // The command is one unit for credential protection (security scan
+        // F4): field by field, `SET otp:<id> <code>` would withhold the key
+        // and export the code beside it. With credential context anywhere in
+        // the key or arguments, neither is exported, nor the reply text.
+        let withheld = super::mask_credentials_enabled() && command_has_credential_context(&parts);
+        if withheld {
+            super::count_builtin();
+            for field in [&mut msg.path, &mut msg.request_text].into_iter().flatten() {
+                zeroize::Zeroize::zeroize(field);
+                *field = super::FIELD_WITHHELD.to_string();
+            }
+        }
         msg.latency_ns = Some(timestamp_ns.saturating_sub(req_ts));
         match &expect {
             Expect::Subscription(_) if !ack && !matches!(value, RespValue::Error(_)) => {
@@ -394,6 +406,10 @@ impl RedisParser {
             RespValue::Error(e) => Some(e.clone()),
             v => resp_value_to_text(v),
         };
+        if withheld && let Some(text) = msg.payload_text.as_mut() {
+            zeroize::Zeroize::zeroize(text);
+            *text = super::FIELD_WITHHELD.to_string();
+        }
         Some(msg)
     }
 
@@ -520,12 +536,35 @@ fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
     }
 }
 
+/// Whether a command's key or any argument (`parts[1..]`) has credential
+/// context ([`super::has_credential_context`]), read together or one by
+/// one: the command is protected as one unit (USER-GUIDE §5.3), so a
+/// value written or read under a credential-named key (`SET otp:<id>
+/// <code>`, `GET password_reset_token:<user>`) is withheld with the key.
+fn command_has_credential_context(parts: &[String]) -> bool {
+    let Some(args) = parts.get(1..).filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    let mut joined = args.join(" ");
+    let found = super::has_credential_context(&joined)
+        || args.iter().any(|a| super::has_credential_context(a));
+    zeroize::Zeroize::zeroize(&mut joined);
+    found
+}
+
 /// `EXEC`'s array answers the queued commands in order; when it does not
-/// line up with them, all of it is masked.
+/// line up with them, all of it is masked. The result of a queued command
+/// with credential context ([`command_has_credential_context`]) is masked
+/// whole.
 fn mask_exec_reply(queued: &[Vec<String>], value: &mut RespValue) {
     match value {
         RespValue::Array(Some(items)) if items.len() == queued.len() => {
             for (cmd, item) in queued.iter().zip(items.iter_mut()) {
+                if command_has_credential_context(cmd) {
+                    // An error too: some quote the command's arguments.
+                    *item = redacted();
+                    continue;
+                }
                 mask_reply_credentials(cmd, item);
             }
         }
@@ -1022,7 +1061,13 @@ mod tests {
             let m = &msgs[0];
             let all = format!("{:?} {:?} {:?}", m.method, m.path, m.request_text);
             assert!(!all.contains("s3cretpw"), "{args:?} leaked: {all}");
-            assert!(all.contains(crate::protocol::REDACTED_CREDENTIAL), "{all}");
+            // Masked, or withheld whole when the command has credential
+            // context (`CONFIG SET requirepass …`).
+            assert!(
+                all.contains(crate::protocol::REDACTED_CREDENTIAL)
+                    || all.contains(crate::protocol::FIELD_WITHHELD),
+                "{all}"
+            );
         }
         // Ordinary arguments stay readable.
         let mut parser = RedisParser::new();
@@ -1060,7 +1105,8 @@ mod tests {
             b"*2\r\n$11\r\nrequirepass\r\n$8\r\ns3cretpw\r\n",
         );
         assert_eq!(m.method.as_deref(), Some("CONFIG"));
-        assert_eq!(m.path.as_deref(), Some("GET"));
+        // The command is one unit: its subcommand goes with it.
+        assert_eq!(m.path.as_deref(), withheld);
         assert_eq!(m.request_text.as_deref(), withheld);
         assert_eq!(m.payload_text.as_deref(), withheld);
         // Under `rename-command SET CONFIG`, a SET answered `+OK`.
@@ -1087,6 +1133,93 @@ mod tests {
             let m = exchange(&["GET", "user:alice:password"], reply.as_bytes());
             assert_eq!(m.payload_text.as_deref(), withheld, "{value}");
         }
+    }
+
+    /// Security scan F4: a Redis command is one unit for credential
+    /// protection. A credential-named key withholds the key, every
+    /// argument and the reply text, so an opaque value stored or read
+    /// under it (an OTP, a reset token) is never exported beside it.
+    #[test]
+    fn test_command_with_credential_context_is_withheld_whole() {
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let exchange = |args: &[&str], reply: &[u8]| {
+            let mut parser = RedisParser::new();
+            parser.feed(&resp(args), Direction::Egress, 1);
+            let ParseResult::Messages(mut msgs) = parser.feed(reply, Direction::Ingress, 2) else {
+                panic!("{args:?}")
+            };
+            let raw = msgs[0].clone();
+            crate::pii::mask_credentials(&mut msgs[0]);
+            (raw, msgs.remove(0))
+        };
+        let opaque = "Zx81kQp4Lr9";
+        for args in [
+            &["SET", "otp:+15551234567", "482913", "EX", "300"][..],
+            &["SET", "otp:alice", opaque],
+            &["SETEX", "otp:alice", "300", "482913"],
+            &["SET", "password_reset_token:alice", opaque],
+            &["SETEX", "password_reset_token:alice", "3600", opaque],
+            &["HSET", "user:1", "session_token", opaque],
+            &["MSET", "a", "1", "otp:bob", "771204"],
+        ] {
+            // Already in the parser's output, and after the masking pass.
+            let (raw, m) = exchange(args, b"+OK\r\n");
+            for m in [&raw, &m] {
+                assert_eq!(m.method.as_deref(), Some(args[0]), "{args:?}");
+                assert_eq!(m.path.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.request_text.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.payload_text.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.status, Some(0));
+            }
+        }
+        // Reads of such a key: the reply text too, whatever it holds.
+        for (args, reply) in [
+            (&["GET", "otp:+15551234567"][..], &b"$6\r\n482913\r\n"[..]),
+            (
+                &["GET", "password_reset_token:alice"],
+                b"$11\r\nZx81kQp4Lr9\r\n",
+            ),
+            (
+                &["MGET", "a", "otp:bob"],
+                b"*2\r\n$1\r\n1\r\n$6\r\n771204\r\n",
+            ),
+            (&["GETDEL", "otp:alice"], b"-ERR otp:alice 482913\r\n"),
+        ] {
+            let (raw, m) = exchange(args, reply);
+            for m in [&raw, &m] {
+                assert_eq!(m.path.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.payload_text.as_deref(), withheld, "{args:?}");
+            }
+        }
+        // Inside a transaction: the result under EXEC is masked.
+        let out = exchange_all(&[
+            (&["MULTI"], b"+OK\r\n"),
+            (&["GET", "otp:alice"], b"+QUEUED\r\n"),
+            (&["GET", "k"], b"+QUEUED\r\n"),
+            (&["EXEC"], b"*2\r\n$6\r\n482913\r\n$5\r\nvalue\r\n"),
+        ]);
+        assert_eq!(out[1].path.as_deref(), withheld);
+        let exec = out[3].payload_text.as_deref().unwrap();
+        assert!(!exec.contains("482913"), "{exec}");
+        assert!(exec.ends_with("value"), "{exec}");
+        // No credential context: exported as before.
+        let (raw, _) = exchange(&["SET", "user:1", "hello"], b"+OK\r\n");
+        assert_eq!(raw.path.as_deref(), Some("user:1"));
+        assert_eq!(raw.request_text.as_deref(), Some("hello"));
+        assert_eq!(raw.payload_text.as_deref(), Some("OK"));
+    }
+
+    /// Feed client commands and server bytes in order; every message.
+    fn exchange_all(steps: &[(&[&str], &[u8])]) -> Vec<L7Message> {
+        let mut parser = RedisParser::new();
+        let mut out = Vec::new();
+        for (cmd, reply) in steps {
+            parser.feed(&resp(cmd), Direction::Egress, 1);
+            if let ParseResult::Messages(msgs) = parser.feed(reply, Direction::Ingress, 2) {
+                out.extend(msgs);
+            }
+        }
+        out
     }
 
     /// Replies that carry a secret: `CONFIG GET` values of secret
@@ -1126,8 +1259,11 @@ mod tests {
             };
             let text = msgs[0].payload_text.clone().unwrap_or_default();
             assert!(!text.contains("s3cretpw"), "{args:?} leaked: {text}");
+            // Masked, or withheld whole with a command that has
+            // credential context (`CONFIG GET masterauth`).
             assert!(
-                text.contains(crate::protocol::REDACTED_CREDENTIAL),
+                text.contains(crate::protocol::REDACTED_CREDENTIAL)
+                    || text == crate::protocol::FIELD_WITHHELD,
                 "{text}"
             );
         }
