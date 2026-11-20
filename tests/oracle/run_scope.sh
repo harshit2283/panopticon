@@ -695,7 +695,9 @@ run_k8s_pods() {
   pod uns-tls b2other "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PU 0 /truth/PU.truth.jsonl"
   pods_ready
   k8s_env
-  conf "$d" $'[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
+  # The clients reach their pod's server over 127.0.0.1 (one netns per
+  # pod): node-local packets are captured only with capture_loopback.
+  conf "$d" $'capture_loopback = true\n[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"; sleep 6
   # Container restart in a selected pod: the client's container is killed
