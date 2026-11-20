@@ -210,7 +210,9 @@ production-hardened compliance platform.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
-    reported as `EXECUTE` without their SQL. PostgreSQL bound values are
+    reported as `EXECUTE` without their SQL, and so is a PostgreSQL
+    `Bind` of a statement whose SQL the agent does not know (prepared
+    before capture, or forgotten). PostgreSQL bound values are
     not exported on a connection the agent joined mid-stream or lost
     server bytes on, and a simple Query forgets every confirmed statement.
   - HTTP/2 headers are not decoded on a connection the agent did not see

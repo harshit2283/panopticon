@@ -549,16 +549,30 @@ impl PostgresParser {
                 true
             }
             b'B' => {
-                // Bind without Parse: execution of an already-prepared statement.
+                // Bind without Parse: execution of an already-prepared
+                // statement. Its SQL is known only while the statement is
+                // confirmed (`prepared`). Otherwise (forgotten, or prepared
+                // before capture) the exchange is still one record, as
+                // EXECUTE without SQL or bound values: dropping it would
+                // leave its answer to be paired with the next query.
                 let statement = extract_second_string(&payload);
                 let bind = self.bound(&payload);
-                if let Some(query) = self.prepared.get(&statement) {
-                    self.query_text = Some(query.to_string());
-                    self.query_ts = Some(ts);
-                    self.bind_params = bind;
-                    self.state = State::InExtendedQuery;
-                    self.absorb_extended_cycle();
+                match self.prepared.get(&statement) {
+                    Some(query) => {
+                        self.query_text = Some(query.to_string());
+                        self.bind_params = bind;
+                    }
+                    None => {
+                        self.query_text = Some("EXECUTE".into());
+                        self.bind_params = None;
+                        if let Some((_, mut values)) = bind {
+                            zeroize::Zeroize::zeroize(&mut values);
+                        }
+                    }
                 }
+                self.query_ts = Some(ts);
+                self.state = State::InExtendedQuery;
+                self.absorb_extended_cycle();
                 true
             }
             // Describe, Execute, Flush, Sync, Close outside a tracked cycle
@@ -1104,10 +1118,15 @@ mod tests {
             Direction::Egress,
             1,
         );
-        assert!(matches!(
-            p.feed(&insert_done(), Direction::Ingress, 2),
-            ParseResult::NeedMoreData
-        ));
+        // Reported (EXECUTE, SQL unknown), without its values.
+        match p.feed(&insert_done(), Direction::Ingress, 2) {
+            ParseResult::Messages(m) => {
+                assert_eq!(m.len(), 1, "{m:?}");
+                assert_eq!(m[0].method.as_deref(), Some("EXECUTE"));
+                assert_eq!(m[0].request_text, None);
+            }
+            other => panic!("expected the EXECUTE, got {other:?}"),
+        }
 
         let m = ConnectionFsmManager::new(4);
         m.get_or_create(1, Protocol::Postgres);
@@ -1452,6 +1471,62 @@ mod tests {
         assert!(p.prepared.contains_key(""));
         simple(&mut p, "SELECT 1");
         assert!(p.prepared.is_empty(), "{:?}", p.prepared);
+    }
+
+    /// A Bind/Execute cycle of a statement whose SQL the agent does not
+    /// know (forgotten, or prepared before capture) is still one exchange:
+    /// it is exported without SQL or bound values, never dropped, and its
+    /// answer is not paired with the next query.
+    #[test]
+    fn test_bind_of_unknown_statement_is_exported_without_sql() {
+        let mut p = setup_ready_parser();
+        let sql = "INSERT INTO users (id, email, note) VALUES ($1, $2, $3)";
+        p.feed(
+            &extended_cycle(Some(("_pg3_0", sql)), "_pg3_0", &["1", "a@x.io", "t1"]),
+            Direction::Egress,
+            1,
+        );
+        p.feed(&insert_done(), Direction::Ingress, 2);
+        // A simple Query: every statement is forgotten.
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT 1\0"),
+            Direction::Egress,
+            3,
+        );
+        let mut r = make_backend_msg(b'C', b"SELECT 1\0");
+        r.extend(make_backend_msg(b'Z', b"I"));
+        p.feed(&r, Direction::Ingress, 4);
+        // The driver reuses the statement: Bind/Execute/Sync only.
+        p.feed(
+            &extended_cycle(None, "_pg3_0", &["2", "b@x.io", "t2"]),
+            Direction::Egress,
+            5,
+        );
+        let mut done = make_backend_msg(b'2', b"");
+        done.extend(make_backend_msg(b'C', b"INSERT 0 1\0"));
+        done.extend(make_backend_msg(b'Z', b"I"));
+        let ParseResult::Messages(msgs) = p.feed(&done, Direction::Ingress, 9) else {
+            panic!("the Bind cycle must be exported");
+        };
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].request_text, None, "{msgs:?}");
+        assert_eq!(msgs[0].method.as_deref(), Some("EXECUTE"), "{msgs:?}");
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("EXECUTE"), "{msgs:?}");
+        assert_eq!(msgs[0].latency_ns, Some(4), "{msgs:?}");
+        assert_eq!(msgs[0].status, Some(0));
+        // The next query gets its own answer.
+        p.feed(
+            &make_frontend_msg(b'Q', b"SELECT 2\0"),
+            Direction::Egress,
+            10,
+        );
+        let mut r = make_backend_msg(b'E', b"SERROR\0Mboom\0\0");
+        r.extend(make_backend_msg(b'Z', b"I"));
+        let ParseResult::Messages(msgs) = p.feed(&r, Direction::Ingress, 11) else {
+            panic!("expected the SELECT");
+        };
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("boom"));
+        assert_eq!(msgs[0].status, Some(1));
     }
 
     /// Codex R7 #1: a Bind is judged by the SQL its statement had when the

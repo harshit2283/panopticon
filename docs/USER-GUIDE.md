@@ -842,7 +842,9 @@ consumed by their cycle), no bound value is exported on the connection. A `Parse
 does not replace a statement, and a re-`Parse` or `Close` forgets it
 until confirmed. A simple Query forgets every confirmed statement and
 cancels unanswered `Parse` messages: its SQL may `PREPARE` or
-`DEALLOCATE` any name, and it ends the unnamed statement. Several `Parse` messages may be sent before one `Sync`
+`DEALLOCATE` any name, and it ends the unnamed statement. A `Bind` of a
+statement whose SQL the agent does not know (prepared before capture, or
+forgotten) is still exported, as `EXECUTE` without SQL or bound values. Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
 unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
