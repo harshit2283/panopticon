@@ -95,7 +95,11 @@ production-hardened compliance platform.
   `"creator"`, a listener created by a listed process selects every
   connection accepted on it, also by processes not in the list; under
   `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
-  Both settings change on reload. Replay (`--replay-bench`) refuses every
+  Both settings change on reload. `pod_filter` takes a pod's cgroup only
+  from where kubelet makes it (a top-level kubepods root and its
+  `burstable` / `besteffort` level, either cgroup driver), with every
+  directory on the way owned by root; a pod with no such directory, or
+  with several (logged as an error), is not captured. Replay (`--replay-bench`) refuses every
   scope setting. The `client_pid` / `server_pid` export fields, filled
   from TC's connect / accept probes, are gone; packet events in the raw
   dump carry the kernel's `owner_tgid` / `acceptor_tgid`.

@@ -198,7 +198,20 @@ validated on x86_64 only and refused elsewhere.
   node's pods): capture the sockets of these cgroups and every cgroup
   below them. A socket's cgroup is fixed when it is created, so this has
   none of the accept-time gaps of `pid_filter` below and is the primary
-  selector. Pods
+  selector. A pod's cgroup is its directory where kubelet makes it, and
+  nowhere else: in a kubepods root at the top of the cgroup2 hierarchy
+  (`kubepods` with the cgroupfs driver, `kubepods.slice` with systemd, or
+  `<name>.slice/<name>-kubepods.slice` when kubelet's cgroup root is
+  `/<name>`, as in kind), directly (guaranteed QoS) or in its
+  `burstable` / `besteffort` level, named as that driver names it
+  (`pod<uid>`, `kubepods-burstable-pod<uid>.slice`). That directory and
+  every one above it up to the root must be owned by root, so a
+  directory another user creates (in a subtree delegated to them, such as
+  `user@<uid>.service`) is never taken for a pod's. A selected pod with
+  no such directory on this node is not captured (a warning names it);
+  one whose uid matches more than one directory is not captured either,
+  and is logged as an error, since only root can create those and
+  neither can be told to be the real one. Pods
   that start, stop or change labels are followed; a reload may change
   either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
   host (RHEL 8's default) the agent mounts a private cgroup2 at

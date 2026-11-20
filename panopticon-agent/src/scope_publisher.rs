@@ -49,7 +49,7 @@ use tracing::{error, info, warn};
 use crate::config::{PodFilter, ScopeOptions};
 use crate::k8s::K8sMetadata;
 use crate::pipeline::Scope;
-use crate::scope_select::{AllowMap, publish, resolve, select_pods};
+use crate::scope_select::{AllowMap, publish, resolve, resolve_owned_by, select_pods};
 
 pub enum ScopeMsg {
     /// A reload with these selectors. The reply comes once the change is
@@ -90,6 +90,9 @@ pub struct Publisher<M> {
     /// Kubernetes change notifications, subscribed at creation so that no
     /// change after the first reconciliation is missed.
     pods_rx: Option<watch::Receiver<u64>>,
+    /// The owner a pod's cgroup directories must have: root (unprivileged
+    /// tests set their own uid, [`Self::trust_pod_dirs_of`]).
+    pod_owner: u32,
 }
 
 impl<M: ScopeMaps> Publisher<M> {
@@ -124,7 +127,15 @@ impl<M: ScopeMaps> Publisher<M> {
             options,
             disabled: None,
             stopped: false,
+            pod_owner: 0,
         })
+    }
+
+    /// Trust pod directories owned by `uid` instead of root: for tests,
+    /// which cannot create root-owned directories.
+    #[cfg(test)]
+    pub fn trust_pod_dirs_of(&mut self, uid: u32) {
+        self.pod_owner = uid;
     }
 
     #[cfg(test)]
@@ -141,7 +152,7 @@ impl<M: ScopeMaps> Publisher<M> {
             bail!("pod_filter needs Kubernetes metadata, which is not available");
         };
         let pods = select_pods(&meta.pods(), filters, self.node.as_deref());
-        let r = resolve(&self.root, &[], &pods)?;
+        let r = resolve_owned_by(&self.root, &[], &pods, self.pod_owner)?;
         if !r.unresolved.is_empty() {
             warn!(
                 pods = ?r.unresolved,
