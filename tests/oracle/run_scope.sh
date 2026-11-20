@@ -188,7 +188,8 @@ conf() { # conf DIR SCOPE-LINES: privacy full, plus SCOPE-LINES
   # These checks were written for the creator rule (a listed server's
   # listener selects its children from the first byte); scope_lab.py t15
   # covers both rules.
-  printf '%s\npid_filter_listener = "creator"\n\n[privacy]\nmode = "full"\n' "$2" >"$1/agent.toml"
+  # Top-level keys first: SCOPE-LINES may open a [[pod_filter]] table.
+  printf 'pid_filter_listener = "creator"\n%s\n\n[privacy]\nmode = "full"\n' "$2" >"$1/agent.toml"
 }
 
 stop_pids() { for p in $PIDS; do kill "$p" 2>/dev/null; done; sleep 0.3; PIDS=""; }
@@ -700,7 +701,9 @@ run_k8s_pods() {
   pod uns-tls b2other "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PU 0 /truth/PU.truth.jsonl"
   pods_ready
   k8s_env
-  conf "$d" $'[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
+  # The clients reach their pod's server over 127.0.0.1 (one netns per
+  # pod): node-local packets are captured only with capture_loopback.
+  conf "$d" $'capture_loopback = true\n[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"; sleep 6
   # Container restart in a selected pod: the client's container is killed

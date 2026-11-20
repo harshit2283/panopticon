@@ -161,6 +161,8 @@ watch = true           # stream changes between re-lists; false = refresh only b
 # [[pod_filter]]       # default: unset; this node's pods, see "Capture scope" below
 # namespace = "payments"
 # labels = { app = "checkout" }   # or: name = "checkout-7d9f..."
+# pod_cgroup_root = "/custom/kubepods"  # top-level key, before any table:
+#                        # kubelet's kubepods directory under a custom --cgroup-root
 
 [capture]
 cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgroup,
@@ -207,11 +209,26 @@ validated on x86_64 only and refused elsewhere.
   (`pod<uid>`, `kubepods-burstable-pod<uid>.slice`). That directory and
   every one above it up to the root must be owned by root, so a
   directory another user creates (in a subtree delegated to them, such as
-  `user@<uid>.service`) is never taken for a pod's. A selected pod with
-  no such directory on this node is not captured (a warning names it);
+  `user@<uid>.service`) is never taken for a pod's. If kubelet runs with
+  another `--cgroup-root` (`cgroupRoot`), so that its kubepods directory
+  is elsewhere, name that directory in `pod_cgroup_root` (an absolute
+  cgroup path under the cgroup2 mount, such as `"/custom/kubepods"` or
+  `"/a.slice/a-b.slice/a-b-kubepods.slice"`; a last component ending in
+  `.slice` is read with the systemd driver's names, anything else with
+  cgroupfs's). It is searched the same way, besides the roots above; the
+  agent refuses to start unless it is a directory reached without a
+  symlink or mount crossing and owned by root at every level, and if it
+  stops being one at runtime, no selected pod is captured until it is
+  again (logged as an error). Changing it needs a restart. Nothing else widens
+  the search. A selected pod with no such directory on this node is not
+  captured: an error names the pod and the roots searched (with a hint
+  to set `pod_cgroup_root`), and
+  `panopticon_pod_filter_unresolved_total{reason="not_found"}` counts it;
   one whose uid matches more than one directory is not captured either,
-  and is logged as an error, since only root can create those and
-  neither can be told to be the real one. Pods
+  logged as a distinct error and counted as `reason="ambiguous"`, since
+  only root can create those and neither can be told to be the real one
+  (`reason="unusable"`: the one directory found could not be opened or
+  is not root's). Pods
   that start, stop or change labels are followed; a reload may change
   either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
   host (RHEL 8's default) the agent mounts a private cgroup2 at
@@ -680,9 +697,11 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
-- **A Redis command** with credential context in its key or any argument
-  is withheld as one unit: key, arguments and reply text (below), even
-  where a field alone would only have a value masked.
+- **A Redis command** with credential context in its key or any argument,
+  or a key name or hash field name that names a credential (a
+  credential word in it, or a short name as a whole segment), is
+  withheld as one unit: key, arguments and reply text (below), even where
+  a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
@@ -697,6 +716,15 @@ What is exported then:
   body). A Kafka request or response is decoded only up to a gap inside
   it, and a gap anywhere else restarts the parser, so its record text
   never joins bytes from both sides of a gap.
+- **AMQP after lost frame sync**: when a gap (or a malformed frame) loses
+  AMQP frame boundaries in one direction, the agent looks for the next
+  plausible frame, which may lie inside a message body (the gapped body's
+  own bytes, or frames forged in a message) and nothing later proves the
+  frames found real. For the rest of that connection, messages read from
+  that direction export no text: no path (exchange, routing key, queue),
+  header, content type or body, only method, status, timing and sizes;
+  a request read from it exports no text with its reply either. The other
+  direction is unaffected.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
@@ -793,14 +821,31 @@ value next to it, masked or not (`CONFIG GET requirepass`,
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
 whole: no Redis field has a bare name (above). A Redis command is
 protected as one unit: when its key or any argument has credential
-context, read together or one by one, the key (`path`), the arguments
+context, read together or one by one, or a key name or hash field name
+names a credential, the key (`path`), the arguments
 (`request_text`) and the reply text are all exported as
 `<field withheld>` (method, status, timing and sizes stay), and its
 result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
 300`, `SETEX password_reset_token:alice 3600 <token>` and
 `GET otp:+15551234567` export no key, value or reply, however opaque the
 value; field-by-field, the key would be withheld and the value next to it
-exported. This holds whatever `builtin` is set to; your own patterns
+exported. A key or field name has no free text around it to show that a
+short name is used as a name, so it is read by segments: case folded
+and with `-` and `.` read as `_`, a name that contains a word of the
+first list above anywhere (`u:1:apikey`, `session_token`), or one of
+whose segments (split on `:`, `.`, `_`, `-` and `/`) is a short name
+whole (`otp`, `user:1:pin`, `api-key`), names a credential. A short
+name inside a longer segment does not count, so `mykey`, `spinner` and
+`author` name no credential. The key names read this way are the key of
+every command,
+every key of `MSET`, `MSETNX`, `MGET`, `DEL`, `UNLINK`, `EXISTS`,
+`TOUCH` and `WATCH`, and the field names of every hash command (every
+argument after the key, except the values of `HSET`, `HSETNX` and
+`HMSET`). So `SET otp 482913`, `SET user:1:otp 482913`,
+`HSET u:1 pin 1234` and `SET session_token abc` are withheld whole,
+while `GET mykey`, `HSET book:1 author x` and `SET 2fa:alice 123456`
+are not (`2fa` is not in the lists). This holds
+whatever `builtin` is set to; your own patterns
 still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
@@ -971,6 +1016,7 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
+| `panopticon_pod_filter_unresolved_total` | Resolutions of a pod `pod_filter` selected that left it uncaptured, by `reason`: `not_found` (no cgroup directory in the kubepods roots searched: a pod not started yet, or a kubelet cgroup root to name in `pod_cgroup_root`), `ambiguous` (several), `unusable`. Rising → check the agent's errors |
 | `panopticon_active_connections` | Connections being parsed |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 

@@ -212,7 +212,26 @@ about 740 Kafka and 910 AMQP truth entries.
 | DNS | A, AAAA, CNAME chains, NXDOMAIN, SERVFAIL, TXT; 10% over TCP | 90.2% (TCP 0%) → **100%** | query name, type, rcode, answers 100% | — | 0 |
 
 Measured with seed 7 (500 operations) and seed 42 (1,000 operations, also
-100% everywhere, 0 duplicates). What was wrong before:
+100% everywhere, 0 duplicates).
+
+Re-measured on 2026-11-20 after AMQP stopped exporting text from a
+direction that lost frame sync (USER-GUIDE §5.3), with the CI invocation
+(`run_messaging.sh 300 7 0.99`): on Ubuntu 24.04, kernel 7.0, Kafka, AMQP
+(every method, deliveries 164/164) and DNS were 100% in three of three
+runs. On Rocky Linux 8.10 (4.18), seven runs: AMQP `Basic.Deliver` 17.1-28.7%
+(other AMQP methods 100%, AMQP overall 75.2-78.6%), Kafka 95.7-100%
+(`Fetch` 92.6-100%, five runs at 100%), DNS 100%, no raw PII exported. On
+8.10 frames past the 4 KB capture window are lost on the broker-to-consumer
+stream (GSO segments up to 18 KB); after the first lost frame boundary the
+deliveries on that connection are exported without exchange, routing key
+or body, so they no longer match ground truth (77-98% before the change).
+In these runs every operation matched two records, on both kernels (the
+0-duplicate runs above predate cgroup_skb as the only capture backend);
+the client and the server run on the same host, consistent with each
+packet being seen once leaving the client's socket and once reaching the
+server's. Not yet confirmed.
+
+What was wrong before:
 
 - **Kafka**: the topic was read at a fixed offset, wrong for every version
   current clients send (Produce v3+ starts with `transactional_id`; v9+,

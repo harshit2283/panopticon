@@ -123,6 +123,21 @@ const NAMES: &[&str] = &[
     "pin",
 ];
 
+/// Whether a name made of segments (a Redis key or hash field: no free text
+/// around it to show a short name is used as a name) names a credential,
+/// case folded, `-` and `.` read as `_`: it contains a word of [`PARTS`]
+/// anywhere (`u:1:apikey`, `session_token`, `client-assertion`), or one of
+/// its segments, split on `:` `.` `_` `-` `/`, is a word of [`NAMES`]
+/// whole (`otp`, `user:1:pin`, `api-key`; not `mykey`, `spinner` or
+/// `author`).
+pub fn segmented_name_has_credential_word(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase().replace(['-', '.'], "_");
+    PARTS.iter().any(|p| lower.contains(p))
+        || lower
+            .split([':', '.', '_', '-', '/'])
+            .any(|s| NAMES.contains(&s))
+}
+
 fn strong_word(w: &str) -> bool {
     PARTS.iter().any(|p| p.len() <= w.len() && w.contains(p))
         || w.ends_with("_pass")

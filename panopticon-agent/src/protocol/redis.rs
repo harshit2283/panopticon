@@ -538,7 +538,8 @@ fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
 
 /// Whether a command's key or any argument (`parts[1..]`) has credential
 /// context ([`super::has_credential_context`]), read together or one by
-/// one: the command is protected as one unit (USER-GUIDE §5.3), so a
+/// one, or a key or hash field name ([`name_args`]) names a credential by
+/// one of its segments: the command is protected as one unit (USER-GUIDE §5.3), so a
 /// value written or read under a credential-named key (`SET otp:<id>
 /// <code>`, `GET password_reset_token:<user>`) is withheld with the key.
 fn command_has_credential_context(parts: &[String]) -> bool {
@@ -547,9 +548,42 @@ fn command_has_credential_context(parts: &[String]) -> bool {
     };
     let mut joined = args.join(" ");
     let found = super::has_credential_context(&joined)
-        || args.iter().any(|a| super::has_credential_context(a));
+        || args.iter().any(|a| super::has_credential_context(a))
+        || name_args(parts)
+            .into_iter()
+            .any(super::segmented_name_has_credential_word);
     zeroize::Zeroize::zeroize(&mut joined);
     found
+}
+
+/// The arguments of a command that are key names or hash field names
+/// (never a value written): the key, every key of `MSET` / `MSETNX` and of
+/// the multi-key `MGET` / `DEL` / `UNLINK` / `EXISTS` / `TOUCH` / `WATCH`,
+/// the fields of `HSET` / `HSETNX` / `HMSET`, and every argument of any
+/// other hash command (`HGET`, `HMGET`, `HDEL`, `HGETDEL … FIELDS`, …),
+/// whose arguments are fields or numbers. A name has no free text around
+/// it, so it is read by segments
+/// ([`super::segmented_name_has_credential_word`]): `SET otp 482913`,
+/// `HSET u:1 pin 1234`.
+fn name_args(parts: &[String]) -> Vec<&str> {
+    let Some(rest) = parts.get(1..) else {
+        return Vec::new();
+    };
+    let cmd = parts[0].to_ascii_uppercase();
+    let mut out: Vec<&str> = Vec::new();
+    match cmd.as_str() {
+        "MSET" | "MSETNX" => out.extend(rest.iter().step_by(2).map(String::as_str)),
+        "MGET" | "DEL" | "UNLINK" | "EXISTS" | "TOUCH" | "WATCH" => {
+            out.extend(rest.iter().map(String::as_str))
+        }
+        "HSET" | "HSETNX" | "HMSET" => {
+            out.extend(rest.first().map(String::as_str));
+            out.extend(rest.iter().skip(1).step_by(2).map(String::as_str));
+        }
+        c if c.starts_with('H') && c != "HELLO" => out.extend(rest.iter().map(String::as_str)),
+        _ => out.extend(rest.first().map(String::as_str)),
+    }
+    out
 }
 
 /// `EXEC`'s array answers the queued commands in order; when it does not
@@ -1132,6 +1166,56 @@ mod tests {
             let reply = format!("${}\r\n{value}\r\n", value.len());
             let m = exchange(&["GET", "user:alice:password"], reply.as_bytes());
             assert_eq!(m.payload_text.as_deref(), withheld, "{value}");
+        }
+    }
+
+    /// A key name or hash field name names a credential when it contains a
+    /// long-list word anywhere, or when one of its segments (split on `:`
+    /// `.` `_` `-` `/`) is a short name whole: `otp` alone as a key or
+    /// field has no `otp=` or `otp:` around it in the free-text sense,
+    /// while `mykey`, `spinner` and `author` are one segment each.
+    #[test]
+    fn test_short_credential_names_in_keys_and_fields_withhold() {
+        let cmd = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for c in [
+            &["SET", "otp", "482913"][..],
+            &["SET", "user:1:otp", "482913"],
+            &["SET", "user.1.pin", "1234"],
+            &["SET", "user_1_otp_code", "482913"],
+            &["SET", "sess/alice-sid", "abc"],
+            &["SET", "u:1:apikey", "abc"],
+            &["SET", "u:1:client_assertion", "abc"],
+            &["SET", "u:1:client-assertion", "abc"],
+            &["SET", "session_token", "abc"],
+            &["SET", "api-key", "abc"],
+            &["SET", "u:1:refresh_tokens", "abc"],
+            &["GET", "otp"],
+            &["HSET", "u:1", "otp", "482913"],
+            &["HSET", "u:1", "name", "bob", "pin", "1234"],
+            &["HGET", "u:1", "pin"],
+            &["HMGET", "u:1", "name", "otp"],
+            &["MSET", "a", "1", "otp", "482913"],
+            &["MGET", "a", "user:2:pin"],
+            &["DEL", "a", "otp"],
+        ] {
+            assert!(command_has_credential_context(&cmd(c)), "{c:?}");
+        }
+        // No credential word (`2fa` is not one: the word list is the
+        // masking's own), a short name only inside a segment, or the word
+        // only in a value.
+        for c in [
+            &["SET", "2fa:alice", "123456"][..],
+            &["GET", "mykey"],
+            &["SET", "ui:spinner", "on"],
+            &["HSET", "book:1", "author", "Le Guin"],
+            &["SET", "user_1_otpcode", "1"],
+            &["SET", "cache:keys", "3"],
+            &["SET", "user:1:name", "bob"],
+            &["HSET", "u:1", "name", "pinto"],
+            &["MSET", "a", "otp-free", "b", "2"],
+            &["GET", "counter"],
+        ] {
+            assert!(!command_has_credential_context(&cmd(c)), "{c:?}");
         }
     }
 

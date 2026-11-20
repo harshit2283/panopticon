@@ -150,7 +150,8 @@ pub use credential_rules::{
 };
 pub use secrets::{
     Decision, FIELD_WITHHELD, FieldKind, STATEMENT_WITHHELD, decide, decide_as,
-    has_credential_context, is_credential_name, sql_verb, withheld_statement,
+    has_credential_context, is_credential_name, segmented_name_has_credential_word, sql_verb,
+    withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine

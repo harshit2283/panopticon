@@ -434,6 +434,7 @@ async fn main() -> Result<()> {
                     std::env::var("NODE_NAME").ok().filter(|n| !n.is_empty()),
                     agent_config.cgroup_filter.as_deref().unwrap_or_default(),
                     agent_config.pod_filter.as_deref().unwrap_or_default(),
+                    agent_config.pod_cgroup_root.clone(),
                     config::ScopeOptions::of(&agent_config),
                 )
                 .context("cannot start the scope publisher")?;

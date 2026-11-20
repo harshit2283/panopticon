@@ -98,8 +98,10 @@ production-hardened compliance platform.
   Both settings change on reload. `pod_filter` takes a pod's cgroup only
   from where kubelet makes it (a top-level kubepods root and its
   `burstable` / `besteffort` level, either cgroup driver), with every
-  directory on the way owned by root; a pod with no such directory, or
-  with several (logged as an error), is not captured. Replay (`--replay-bench`) refuses every
+  directory on the way owned by root, plus `pod_cgroup_root` when an
+  operator names a custom kubelet cgroup root; a pod with no such
+  directory, or with several, is not captured, logged as an error and
+  counted in `panopticon_pod_filter_unresolved_total{reason}`. Replay (`--replay-bench`) refuses every
   scope setting. The `client_pid` / `server_pid` export fields, filled
   from TC's connect / accept probes, are gone; packet events in the raw
   dump carry the kernel's `owner_tgid` / `acceptor_tgid`.
@@ -115,18 +117,27 @@ production-hardened compliance platform.
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
     PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
-    exported, every TLS exchange carrying its socket addresses (via fentry).
+    exported (Kafka on 8.10: see below), every TLS exchange carrying its
+    socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and
     captured nothing.
-  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 77-98% over seven lab
-    runs (other AMQP methods 100%). The broker-to-consumer stream there
-    carries GSO segments up to 18 KB, and frames past the 4 KB capture window
-    are lost. Retransmitted segments are now parsed once (see TCP stream
-    integrity below), so deliveries are no longer duplicated; replaying two
-    of these captures with and without sequence tracking gave the same
-    deliveries, so the remaining loss is the capture window.
-    RHEL 9 passed (100%, one earlier run at 85%).
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall is 17-29% over seven lab
+    runs of the CI messaging oracle (300 operations, seed 7; other AMQP
+    methods 100%, AMQP overall 75-79%, no raw PII exported). The
+    broker-to-consumer stream there carries GSO segments up to 18 KB, and
+    frames past the 4 KB capture window are lost. After the first lost frame
+    boundary the consumer direction of that connection exports no AMQP text
+    (fail closed, see USER-GUIDE §5.3), so the later deliveries are still
+    exported, with method, status, timing and sizes, but carry no exchange,
+    routing key or body to match against ground truth (before that change,
+    77-98%). Kafka `Fetch` on 8.10 was 92.6-100% in the same seven runs
+    (five at 100%). Retransmitted segments are parsed once (see TCP stream
+    integrity below), so deliveries are not duplicated by retransmission;
+    replaying two of these captures with and without sequence tracking gave
+    the same deliveries, so the loss is the capture window.
+    RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
+    fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
     every field by 8 bytes). The agent checks each tracepoint's tracefs
@@ -265,11 +276,16 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    A Redis command with credential context in its key or any argument
-    is withheld as one unit (key, arguments and reply text, and its
-    result inside `EXEC`), so `SET otp:<id> <code>` exports no value.
+    A Redis command with credential context in its key or any argument,
+    or a key or hash field name containing a credential word, or with a
+    short name as a whole segment (`user:1:otp`, not `mykey`), is
+    withheld as one unit (key, arguments and reply
+    text, and its result inside `EXEC`), so `SET otp:<id> <code>`,
+    `SET otp <code>` and `HSET u:1 pin <pin>` export no value.
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
-    message bodies; a cut end keeps its prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    message bodies; a cut end keeps its prefix), any AMQP text (path,
+    headers, body) of a direction after it lost frame sync, for the rest
+    of the connection, HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
     start, over TLS on a reused key only after the agent saw the library
