@@ -536,54 +536,30 @@ fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
     }
 }
 
-/// Whether a command's key or any argument (`parts[1..]`) has credential
-/// context ([`super::has_credential_context`]), read together or one by
-/// one, or a key or hash field name ([`name_args`]) names a credential by
-/// one of its segments: the command is protected as one unit (USER-GUIDE §5.3), so a
-/// value written or read under a credential-named key (`SET otp:<id>
-/// <code>`, `GET password_reset_token:<user>`) is withheld with the key.
+/// Whether any argument of a command (`parts[1..]`: key, names and values
+/// alike, whatever the command, known or not) has credential context
+/// ([`super::has_credential_context`], the arguments read together or one
+/// by one) or names a credential read as segments
+/// ([`super::segmented_name_has_credential_word`]). The command is
+/// protected as one unit (USER-GUIDE §5.3): `SET otp:<id> <code>`,
+/// `EVAL <script> 1 otp`, `XADD events * otp <code>`, `LMOVE src
+/// user:1:otp LEFT RIGHT` and `JSON.GET u:1 $.pin` withhold key, arguments
+/// and reply. No list of key positions per command: a value that only
+/// mentions a credential word withholds its command too.
 fn command_has_credential_context(parts: &[String]) -> bool {
     let Some(args) = parts.get(1..).filter(|a| !a.is_empty()) else {
         return false;
     };
+    if args
+        .iter()
+        .any(|a| super::segmented_name_has_credential_word(a) || super::has_credential_context(a))
+    {
+        return true;
+    }
     let mut joined = args.join(" ");
-    let found = super::has_credential_context(&joined)
-        || args.iter().any(|a| super::has_credential_context(a))
-        || name_args(parts)
-            .into_iter()
-            .any(super::segmented_name_has_credential_word);
+    let found = super::has_credential_context(&joined);
     zeroize::Zeroize::zeroize(&mut joined);
     found
-}
-
-/// The arguments of a command that are key names or hash field names
-/// (never a value written): the key, every key of `MSET` / `MSETNX` and of
-/// the multi-key `MGET` / `DEL` / `UNLINK` / `EXISTS` / `TOUCH` / `WATCH`,
-/// the fields of `HSET` / `HSETNX` / `HMSET`, and every argument of any
-/// other hash command (`HGET`, `HMGET`, `HDEL`, `HGETDEL … FIELDS`, …),
-/// whose arguments are fields or numbers. A name has no free text around
-/// it, so it is read by segments
-/// ([`super::segmented_name_has_credential_word`]): `SET otp 482913`,
-/// `HSET u:1 pin 1234`.
-fn name_args(parts: &[String]) -> Vec<&str> {
-    let Some(rest) = parts.get(1..) else {
-        return Vec::new();
-    };
-    let cmd = parts[0].to_ascii_uppercase();
-    let mut out: Vec<&str> = Vec::new();
-    match cmd.as_str() {
-        "MSET" | "MSETNX" => out.extend(rest.iter().step_by(2).map(String::as_str)),
-        "MGET" | "DEL" | "UNLINK" | "EXISTS" | "TOUCH" | "WATCH" => {
-            out.extend(rest.iter().map(String::as_str))
-        }
-        "HSET" | "HSETNX" | "HMSET" => {
-            out.extend(rest.first().map(String::as_str));
-            out.extend(rest.iter().skip(1).step_by(2).map(String::as_str));
-        }
-        c if c.starts_with('H') && c != "HELLO" => out.extend(rest.iter().map(String::as_str)),
-        _ => out.extend(rest.first().map(String::as_str)),
-    }
-    out
 }
 
 /// `EXEC`'s array answers the queued commands in order; when it does not
@@ -1169,11 +1145,12 @@ mod tests {
         }
     }
 
-    /// A key name or hash field name names a credential when it contains a
-    /// long-list word anywhere, or when one of its segments (split on `:`
-    /// `.` `_` `-` `/`) is a short name whole: `otp` alone as a key or
-    /// field has no `otp=` or `otp:` around it in the free-text sense,
-    /// while `mykey`, `spinner` and `author` are one segment each.
+    /// Any argument names a credential when it contains a long-list word
+    /// anywhere, or when one of its segments (split on any character that
+    /// is not an ASCII letter or digit, and at a lower-to-upper case
+    /// boundary) is a short name whole: `otp` alone as a key or field has
+    /// no `otp=` or `otp:` around it in the free-text sense, while `mykey`,
+    /// `spinner`, `author` and `otpcode` are one segment each.
     #[test]
     fn test_short_credential_names_in_keys_and_fields_withhold() {
         let cmd = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1197,12 +1174,37 @@ mod tests {
             &["MSET", "a", "1", "otp", "482913"],
             &["MGET", "a", "user:2:pin"],
             &["DEL", "a", "otp"],
+            // Review: any separator, and a case boundary.
+            &["SET", "u{1}otp", "1"],
+            &["SET", "u|otp", "1"],
+            &["SET", "u#otp", "1"],
+            &["SET", "u,otp", "1"],
+            &["SET", "u;pin", "1"],
+            &["SET", "u otp", "1"],
+            &["HSET", "u:1", "pinCode", "1234"],
+            &["HSET", "u:1", "clientAssertion", "x"],
+            &["SET", "masterUser", "x"],
+            // Review (HIGH): every argument of every command, known or not.
+            &["EVAL", "return redis.call('GET', KEYS[1])", "1", "otp"],
+            &["FCALL", "setit", "1", "user:1:pin", "1234"],
+            &["XADD", "events", "*", "otp", "482913"],
+            &["SUNION", "a", "user:1:otp"],
+            &["ZUNION", "1", "otp"],
+            &["LMOVE", "incoming", "user:1:otp", "LEFT", "RIGHT"],
+            &["BRPOPLPUSH", "src", "otp", "0"],
+            &["SMOVE", "tmp", "user:1:otp", "482913"],
+            &["JSON.SET", "u:1", "$.otp", "482913"],
+            &["JSON.GET", "u:1", "$.pin"],
+            &["SOMEMODULE.CMD", "x", "y", "otp"],
+            // A value that only mentions a credential word withholds too.
+            &["MSET", "a", "otp-free", "b", "2"],
+            &["SET", "note", "my api key"],
         ] {
             assert!(command_has_credential_context(&cmd(c)), "{c:?}");
         }
         // No credential word (`2fa` is not one: the word list is the
-        // masking's own), a short name only inside a segment, or the word
-        // only in a value.
+        // masking's own), or a short name only inside a segment with no
+        // boundary (`otpcode`, `Otpcode`).
         for c in [
             &["SET", "2fa:alice", "123456"][..],
             &["GET", "mykey"],
@@ -1212,7 +1214,9 @@ mod tests {
             &["SET", "cache:keys", "3"],
             &["SET", "user:1:name", "bob"],
             &["HSET", "u:1", "name", "pinto"],
-            &["MSET", "a", "otp-free", "b", "2"],
+            &["HSET", "u:1", "Otpcode", "1"],
+            &["SUNION", "a", "b"],
+            &["XADD", "events", "*", "kind", "click"],
             &["GET", "counter"],
         ] {
             assert!(!command_has_credential_context(&cmd(c)), "{c:?}");
@@ -1291,6 +1295,58 @@ mod tests {
         assert_eq!(raw.path.as_deref(), Some("user:1"));
         assert_eq!(raw.request_text.as_deref(), Some("hello"));
         assert_eq!(raw.payload_text.as_deref(), Some("OK"));
+    }
+
+    /// Review (HIGH): commands whose credential-named argument is not the
+    /// first (scripts, functions, streams, multi-key and module commands)
+    /// withhold key, arguments and reply, alone and inside `EXEC`.
+    #[test]
+    fn test_credential_argument_anywhere_withholds_the_command() {
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let cases: &[(&[&str], &[u8])] = &[
+            (
+                &["EVAL", "return redis.call('GET', KEYS[1])", "1", "otp"],
+                b"$6\r\n482913\r\n",
+            ),
+            (&["FCALL", "setit", "1", "user:1:pin", "1234"], b"+OK\r\n"),
+            (
+                &["XADD", "events", "*", "otp", "482913"],
+                b"$15\r\n1700000000000-0\r\n",
+            ),
+            (&["SUNION", "a", "user:1:otp"], b"*1\r\n$6\r\n482913\r\n"),
+            (&["ZUNION", "1", "otp"], b"*1\r\n$6\r\n482913\r\n"),
+            (
+                &["LMOVE", "incoming", "user:1:otp", "LEFT", "RIGHT"],
+                b"$6\r\n482913\r\n",
+            ),
+            (&["BRPOPLPUSH", "src", "otp", "0"], b"$6\r\n482913\r\n"),
+            (&["SMOVE", "tmp", "user:1:otp", "482913"], b":1\r\n"),
+            (&["JSON.SET", "u:1", "$.otp", "482913"], b"+OK\r\n"),
+            (&["JSON.GET", "u:1", "$.pin"], b"$6\r\n[1234]\r\n"),
+        ];
+        for (args, reply) in cases {
+            let out = exchange_all(&[(args, reply)]);
+            for m in &out {
+                assert_eq!(m.method.as_deref(), Some(args[0]), "{args:?}");
+                assert_eq!(m.path.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.request_text.as_deref(), withheld, "{args:?}");
+                assert_eq!(m.payload_text.as_deref(), withheld, "{args:?}");
+            }
+            assert_eq!(out.len(), 1, "{args:?}");
+            // Queued in a transaction: its result under EXEC is masked.
+            let mut steps: Vec<(&[&str], &[u8])> = vec![(&["MULTI"], b"+OK\r\n")];
+            steps.push((args, b"+QUEUED\r\n"));
+            steps.push((&["GET", "k"], b"+QUEUED\r\n"));
+            steps.push((&["EXEC"], b"*2\r\n$6\r\n482913\r\n$5\r\nvalue\r\n"));
+            let out = exchange_all(&steps);
+            let exec = out.last().unwrap().payload_text.as_deref().unwrap();
+            assert!(!exec.contains("482913"), "{args:?}: {exec}");
+            assert!(exec.ends_with("value"), "{args:?}: {exec}");
+            for m in &out {
+                let all = format!("{:?} {:?} {:?}", m.path, m.request_text, m.payload_text);
+                assert!(!all.contains("1234") && !all.contains("otp"), "{all}");
+            }
+        }
     }
 
     /// Feed client commands and server bytes in order; every message.
