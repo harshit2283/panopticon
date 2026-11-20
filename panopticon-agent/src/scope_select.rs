@@ -141,14 +141,29 @@ impl Naming {
     }
 }
 
+/// What the owner check says of one directory of the pod search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Trust {
+    /// Owned by the trusted owner (root) and not group- or other-writable;
+    /// its identity `(st_dev, st_ino)`.
+    Yes(u64, u64),
+    /// No longer there (removed since it was listed): skipped, not
+    /// reported as untrusted.
+    Gone,
+    /// There, but not taken, and why (not owned by root, group- or
+    /// other-writable, not reachable without a symlink or mount crossing).
+    No(String),
+}
+
 /// What the pod search reads of the cgroup2 tree. Paths are relative to
 /// the root (empty is the root itself).
 trait PodTree {
     /// The subdirectory names of `rel` (none when it cannot be read).
     fn subdirs(&self, rel: &Path) -> Vec<String>;
-    /// Whether `rel` is a directory owned by the trusted owner (root),
-    /// checked on the directory itself, never through a symlink.
-    fn trusted(&self, rel: &Path) -> bool;
+    /// Whether `rel` is a directory owned by the trusted owner (root) that
+    /// no group or other user can write to, checked on the directory
+    /// itself, never through a symlink.
+    fn trust(&self, rel: &Path) -> Trust;
 }
 
 /// Pod directories by uid, searched only where kubelet puts them (security
@@ -158,11 +173,15 @@ trait PodTree {
 /// cgroup root is `/<name>`, as kind sets it), directly in it (guaranteed
 /// QoS) or in its `burstable` / `besteffort` level, named as that driver
 /// names them. Every directory on the way and the pod directory itself
-/// must be owned by root: no other user can create one there, while a
-/// subtree delegated to a user (`user@<uid>.service`, a rootless
-/// container) is neither searched nor trusted. A pod directory is never
-/// searched below. A directory that fails the owner check is skipped and
-/// listed in [`PodSearch::untrusted`].
+/// must be owned by root and writable by root alone: no other user can
+/// create one there, while a subtree delegated to a user
+/// (`user@<uid>.service`, a rootless container) is neither searched nor
+/// trusted. A pod directory is never searched below. A directory that
+/// fails the check is skipped and listed, with why, in
+/// [`PodSearch::untrusted`]; one removed while the search runs is skipped
+/// silently. A pod directory reached twice (a configured root inside a
+/// recognised one) is the same directory, told by its identity, and
+/// counted once.
 ///
 /// `configured` is the operator's `pod_cgroup_root` (relative to the
 /// root, already checked: root-owned at every level, no symlink or mount
@@ -171,13 +190,15 @@ trait PodTree {
 fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
     let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut untrusted = Vec::new();
-    let mut trusted = |p: &Path| {
-        let ok = tree.trusted(p);
-        if !ok {
-            untrusted.push(p.to_path_buf());
+    let mut trusted = |p: &Path| match tree.trust(p) {
+        Trust::Yes(dev, ino) => Some((dev, ino)),
+        Trust::Gone => None,
+        Trust::No(why) => {
+            untrusted.push((p.to_path_buf(), why));
+            None
         }
-        ok
     };
+    let mut seen_pods = std::collections::HashSet::new();
     let mut roots: Vec<(PathBuf, Naming)> = Vec::new();
     if let Some(root) = configured {
         roots.push((root.to_path_buf(), root_naming(root)));
@@ -196,7 +217,7 @@ fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
                 };
                 let child = format!("{stem}-kubepods.slice");
                 let top = PathBuf::from(&name);
-                if tree.subdirs(&top).contains(&child) && trusted(&top) {
+                if tree.subdirs(&top).contains(&child) && trusted(&top).is_some() {
                     roots.push((top.join(child), Naming::Systemd(format!("{stem}-kubepods"))));
                 }
             }
@@ -207,7 +228,7 @@ fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
     roots.retain(|(p, _)| seen.insert(p.clone()));
     let searched: Vec<PathBuf> = roots.iter().map(|(p, _)| p.clone()).collect();
     for (root, naming) in roots {
-        if !trusted(&root) {
+        if trusted(&root).is_none() {
             continue;
         }
         let mut levels = vec![(root, naming)];
@@ -219,12 +240,14 @@ fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
             for name in tree.subdirs(&dir) {
                 let p = dir.join(&name);
                 if let Some(uid) = naming.pod(&name) {
-                    if trusted(&p) {
+                    if let Some(id) = trusted(&p)
+                        && seen_pods.insert(id)
+                    {
                         out.entry(uid).or_default().push(p);
                     }
                 } else if is_root
                     && let Some(qos) = naming.qos(&name)
-                    && trusted(&p)
+                    && trusted(&p).is_some()
                 {
                     levels.push((p, qos));
                 }
@@ -242,9 +265,10 @@ fn pod_dirs(tree: &dyn PodTree, configured: Option<&Path>) -> PodSearch {
 struct PodSearch {
     /// Pod directories by uid.
     dirs: HashMap<String, Vec<PathBuf>>,
-    /// Directories skipped: not owned by root, or not reachable without a
-    /// symlink or mount crossing.
-    untrusted: Vec<PathBuf>,
+    /// Directories skipped, and why: not owned by root, group- or
+    /// other-writable, or not reachable without a symlink or mount
+    /// crossing.
+    untrusted: Vec<(PathBuf, String)>,
     /// The kubepods roots searched, for the not-found error.
     searched: Vec<PathBuf>,
 }
@@ -264,7 +288,10 @@ fn root_naming(root: &Path) -> Naming {
 
 /// `panopticon_pod_filter_unresolved_total{reason}`: resolutions of a
 /// selected pod that found no cgroup (`not_found`), several (`ambiguous`)
-/// or one that could not be used (`unusable`). Numbers only.
+/// or one that could not be used (`unusable`). Numbers only. Every
+/// resolution counts, and the selected pods are resolved again on every
+/// pod change the Kubernetes watch reports, so a pod that stays
+/// unresolved (Pending, say) adds one per re-resolution.
 static POD_UNRESOLVED: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// The reason labels of [`POD_UNRESOLVED`], in its order.
@@ -280,6 +307,28 @@ pub fn pod_unresolved() -> [u64; 3] {
         .each_ref()
         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
+
+/// Which unresolved pods were already reported: each pod uid and reason
+/// is logged as an error once, then at debug level on every
+/// re-resolution, until the uid resolves or leaves the selection.
+#[derive(Debug, Default)]
+struct ReportOnce(BTreeSet<(String, usize)>);
+
+impl ReportOnce {
+    /// Whether `uid` unresolved for `reason` is reported for the first time.
+    fn first(&mut self, uid: &str, reason: usize) -> bool {
+        self.0.insert((uid.to_owned(), reason))
+    }
+
+    /// Forget every uid not in `still`: it resolved or left the selection,
+    /// so failing again is news.
+    fn keep_only(&mut self, still: &BTreeSet<&str>) {
+        self.0.retain(|(uid, _)| still.contains(uid.as_str()));
+    }
+}
+
+static POD_REPORTED: std::sync::Mutex<ReportOnce> =
+    std::sync::Mutex::new(ReportOnce(BTreeSet::new()));
 
 /// Where a pod's uid led.
 #[derive(Debug, PartialEq, Eq)]
@@ -320,10 +369,12 @@ pub struct Resolved {
 /// not the one discovered, an unresolvable `cgroup_filter` path, and the
 /// root cgroup (id 1) or the attach root itself (§3.2). An unresolvable pod
 /// is not selected: one with no directory where kubelet makes it, owned by
-/// root ([`pod_dirs`]), or with several; each is logged as an error and
-/// counted ([`pod_unresolved`]). `pod_root` is `pod_cgroup_root`: refused
-/// unless it is a directory reached without a symlink or mount crossing
-/// and owned by root at every level.
+/// root ([`pod_dirs`]), or with several; each is counted
+/// ([`pod_unresolved`]) and logged as an error the first time for its uid
+/// and reason ([`ReportOnce`]), at debug level after that. `pod_root` is
+/// `pod_cgroup_root`: refused unless it is a directory reached without a
+/// symlink or mount crossing, owned by root and writable by root alone at
+/// every level.
 ///
 /// Other targets have no cgroup v2 and no openat2: always refuses.
 pub fn resolve(
@@ -359,28 +410,24 @@ pub(crate) fn resolve_owned_by(
     use crate::config::{cgroup_filter_rel, pod_cgroup_root_rel};
     let r = beneath::Root::open(root)?;
     // `pod_cgroup_root`: every level from the cgroup2 root down must be a
-    // root-owned directory reached without a symlink or mount crossing.
+    // directory reached without a symlink or mount crossing, owned by root
+    // and writable by root alone.
     let configured = match pod_root {
         Some(p) => {
             let rel = Path::new(pod_cgroup_root_rel(p)?);
             let mut at = PathBuf::new();
             for c in rel.components() {
                 at.push(c);
-                match r.dir_stat(&at) {
-                    Ok((dev, _, uid)) if dev == r.dev && uid == owner => {}
-                    Ok((dev, ..)) if dev != r.dev => bail!(
-                        "refusing pod_cgroup_root = \"{p}\": {} is on another mount",
-                        at.display()
-                    ),
-                    Ok(_) => bail!(
-                        "refusing pod_cgroup_root = \"{p}\": {} is not owned by root",
-                        at.display()
-                    ),
-                    Err(e) => bail!(
-                        "refusing pod_cgroup_root = \"{p}\": no directory {} under {} reachable \
-                         without a symlink or mount crossing ({e})",
+                match r.owned_dir(&at, owner) {
+                    Ok(_) => {}
+                    Err(beneath::NotOwned::Gone(e)) => bail!(
+                        "refusing pod_cgroup_root = \"{p}\": no directory {} under {} ({e})",
                         at.display(),
                         root.display()
+                    ),
+                    Err(beneath::NotOwned::Bad(why)) => bail!(
+                        "refusing pod_cgroup_root = \"{p}\": {} is {why}",
+                        at.display()
                     ),
                 }
             }
@@ -388,27 +435,25 @@ pub(crate) fn resolve_owned_by(
         }
         None => None,
     };
-    // The pod's directory is opened once: the owner checked and the id
-    // taken on the same descriptor.
-    let pod_id = |rel: &Path| -> std::io::Result<(u64, u64)> {
-        let (dev, ino, uid) = r.dir_stat(rel)?;
-        if uid != owner {
-            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
-        }
-        Ok((dev, ino))
-    };
-    let id_of = |rel: &Path, what: &str, pod: bool| -> Result<std::io::Result<u64>> {
+    // A pod's directory is opened once: the owner and mode checked and the
+    // id taken on the same descriptor. A cgroup_filter path is the
+    // operator's own and is not checked.
+    let id_of = |rel: &Path, what: &str, pod: bool| -> Result<std::result::Result<u64, String>> {
         let found = if pod {
-            pod_id(rel)
+            r.owned_dir(rel, owner).map_err(|e| e.to_string())
         } else {
-            r.dir_stat(rel).map(|(dev, ino, _)| (dev, ino))
+            r.dir_stat(rel)
+                .map(|(dev, ino, ..)| (dev, ino))
+                .map_err(|e| e.to_string())
         };
         let (dev, ino) = match found {
             Ok(v) => v,
             Err(e) => return Ok(Err(e)),
         };
         if dev != r.dev {
-            return Ok(Err(std::io::Error::from_raw_os_error(libc::EXDEV)));
+            return Ok(Err(
+                std::io::Error::from_raw_os_error(libc::EXDEV).to_string()
+            ));
         }
         if ino == 1 || ino == r.ino {
             bail!(
@@ -441,54 +486,70 @@ pub(crate) fn resolve_owned_by(
         if !untrusted.is_empty() {
             warn!(
                 dirs = ?untrusted,
-                "pod_filter: cgroup directories under the kubepods hierarchy not owned by root, or not \
-                 reachable without a symlink or mount crossing, were skipped"
+                "pod_filter: cgroup directories under the kubepods hierarchy that are not owned \
+                 by root, are group- or other-writable, or are not reachable without a symlink \
+                 or mount crossing were skipped"
             );
         }
+        // Error once per uid and reason, then debug: the selected pods are
+        // resolved again on every pod change, and a Pending pod stays
+        // unresolved through each.
+        macro_rules! report {
+            ($first:expr, $($t:tt)*) => {
+                if $first { tracing::error!($($t)*) } else { tracing::debug!($($t)*) }
+            };
+        }
+        let mut reported = POD_REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut still = BTreeSet::new();
         // A pod that does not resolve to exactly one root-owned directory
         // stays unselected (fail closed): a guess between candidates could
         // capture another workload, while an unselected pod only loses its
         // own capture.
         for pod in pods {
             let what = format!("pod_filter pod {}", pod.key);
-            match pod_dir(&dirs, &pod.uid) {
+            let reason = match pod_dir(&dirs, &pod.uid) {
                 PodDir::One(rel) => match id_of(rel, &what, true)? {
                     Ok(id) => {
                         out.ids.insert(id);
+                        continue;
                     }
                     Err(e) => {
-                        tracing::error!(pod = %pod.key, dir = %rel.display(), error = %e,
+                        report!(reported.first(&pod.uid, 2),
+                            pod = %pod.key, dir = %rel.display(), error = %e,
                             "pod_filter: the pod's cgroup directory cannot be used; not captured");
-                        count_unresolved(2);
-                        out.unresolved.push(pod.key.clone());
+                        2
                     }
                 },
                 PodDir::Several(found) => {
-                    count_unresolved(1);
-                    tracing::error!(
+                    report!(reported.first(&pod.uid, 1),
                         pod = %pod.key,
                         uid = %pod.uid,
                         dirs = ?found,
                         "pod_filter: several cgroup directories for one pod uid; the pod is not \
                          captured until exactly one remains"
                     );
-                    out.unresolved.push(pod.key.clone());
+                    1
                 }
                 PodDir::None => {
-                    count_unresolved(0);
-                    tracing::error!(
+                    report!(reported.first(&pod.uid, 0),
                         pod = %pod.key,
                         uid = %pod.uid,
                         searched = ?searched,
                         cgroup2_root = %root.display(),
                         "pod_filter: no cgroup directory for this pod in the kubepods roots \
-                         searched; the pod is not captured. If kubelet uses another cgroup root \
-                         (--cgroup-root), name its kubepods directory in pod_cgroup_root"
+                         searched; the pod is not captured (resolved again when it changes). \
+                         If kubelet uses another cgroup root (--cgroup-root), name its kubepods \
+                         directory in pod_cgroup_root. Static (mirror) pods are not supported: \
+                         kubelet names their cgroup by the manifest's hash, not the API uid"
                     );
-                    out.unresolved.push(pod.key.clone());
+                    0
                 }
-            }
+            };
+            count_unresolved(reason);
+            still.insert(pod.uid.as_str());
+            out.unresolved.push(pod.key.clone());
         }
+        reported.keep_only(&still);
     }
     let max = panopticon_common::MAX_CGROUP_ALLOW as usize;
     if out.ids.len() > max {
@@ -551,22 +612,45 @@ mod beneath {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
     }
 
-    /// `(st_dev, st_ino, st_uid)` of an open descriptor.
-    fn stat(fd: &OwnedFd) -> io::Result<(u64, u64, u32)> {
+    /// `(st_dev, st_ino, st_uid, st_mode)` of an open descriptor.
+    fn stat(fd: &OwnedFd) -> io::Result<(u64, u64, u32, u32)> {
         // SAFETY: fstat writes into the zeroed struct; fd is open.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok((st.st_dev as u64, st.st_ino as u64, st.st_uid))
+        Ok((
+            st.st_dev as u64,
+            st.st_ino as u64,
+            st.st_uid,
+            st.st_mode as u32,
+        ))
     }
 
     fn dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
-        stat(fd).map(|(dev, ino, _)| (dev, ino))
+        stat(fd).map(|(dev, ino, ..)| (dev, ino))
+    }
+
+    /// Why [`Root::owned_dir`] did not take a directory.
+    #[derive(Debug)]
+    pub enum NotOwned {
+        /// Not there (`ENOENT`): removed since it was listed, or never made.
+        Gone(io::Error),
+        /// There, but not taken: why, as "<path> is …" ends.
+        Bad(String),
+    }
+
+    impl std::fmt::Display for NotOwned {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                NotOwned::Gone(e) => write!(f, "gone ({e})"),
+                NotOwned::Bad(why) => f.write_str(why),
+            }
+        }
     }
 
     /// The pod search's view of the tree: directories beneath the root,
-    /// trusted when owned by `owner`.
+    /// trusted when owned by `owner` and writable by it alone.
     pub struct Owned<'a> {
         pub root: &'a Root,
         pub owner: u32,
@@ -577,10 +661,12 @@ mod beneath {
             self.root.subdirs(rel)
         }
 
-        fn trusted(&self, rel: &Path) -> bool {
-            self.root
-                .dir_stat(rel)
-                .is_ok_and(|(_, _, uid)| uid == self.owner)
+        fn trust(&self, rel: &Path) -> super::Trust {
+            match self.root.owned_dir(rel, self.owner) {
+                Ok((dev, ino)) => super::Trust::Yes(dev, ino),
+                Err(NotOwned::Gone(_)) => super::Trust::Gone,
+                Err(NotOwned::Bad(why)) => super::Trust::No(why),
+            }
         }
     }
 
@@ -616,10 +702,41 @@ mod beneath {
             Ok(Self { fd, dev, ino })
         }
 
-        /// `(st_dev, st_ino, st_uid)` of the directory `rel` beneath the
-        /// root, by fstat on its `O_PATH` descriptor.
-        pub fn dir_stat(&self, rel: &Path) -> io::Result<(u64, u64, u32)> {
+        /// `(st_dev, st_ino, st_uid, st_mode)` of the directory `rel`
+        /// beneath the root, by fstat on its `O_PATH` descriptor.
+        pub fn dir_stat(&self, rel: &Path) -> io::Result<(u64, u64, u32, u32)> {
             stat(&openat2(self.fd.as_raw_fd(), rel, libc::O_PATH, BENEATH)?)
+        }
+
+        /// `(st_dev, st_ino)` of the directory `rel` beneath the root if it
+        /// is on the root's mount, owned by `owner` (root) and not group-
+        /// or other-writable (only its owner can create a directory in
+        /// it), all read from one descriptor.
+        pub fn owned_dir(&self, rel: &Path, owner: u32) -> Result<(u64, u64), NotOwned> {
+            let (dev, ino, uid, mode) = match self.dir_stat(rel) {
+                Ok(s) => s,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    return Err(NotOwned::Gone(e));
+                }
+                Err(e) => {
+                    return Err(NotOwned::Bad(format!(
+                        "not reachable without a symlink or mount crossing ({e})"
+                    )));
+                }
+            };
+            if dev != self.dev {
+                return Err(NotOwned::Bad("on another mount".into()));
+            }
+            if uid != owner {
+                return Err(NotOwned::Bad("not owned by root".into()));
+            }
+            if mode & 0o022 != 0 {
+                return Err(NotOwned::Bad(format!(
+                    "group- or other-writable (mode {:o})",
+                    mode & 0o7777
+                )));
+            }
+            Ok((dev, ino))
         }
 
         /// Subdirectory names of `rel` beneath the root (symlinks are not
@@ -940,10 +1057,13 @@ mod tests {
     const UID_: &str = "0f3c1a2b_4d5e_6f70_8192_a3b4c5d6e7f8";
 
     /// A cgroup2 tree of these directories (and their ancestors), every one
-    /// owned by root except those in `untrusted`.
+    /// owned by root except those in `untrusted`; those in `gone` are
+    /// listed but removed before they are checked. A directory's identity
+    /// is its path.
     struct Tree {
         paths: Vec<PathBuf>,
         untrusted: Vec<PathBuf>,
+        gone: Vec<PathBuf>,
     }
 
     impl PodTree for Tree {
@@ -960,8 +1080,17 @@ mod tests {
             v
         }
 
-        fn trusted(&self, rel: &Path) -> bool {
-            !self.untrusted.iter().any(|u| u == rel)
+        fn trust(&self, rel: &Path) -> Trust {
+            if self.gone.iter().any(|g| g == rel) {
+                Trust::Gone
+            } else if self.untrusted.iter().any(|u| u == rel) {
+                Trust::No("not owned by root".into())
+            } else {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                rel.hash(&mut h);
+                Trust::Yes(1, h.finish())
+            }
         }
     }
 
@@ -973,6 +1102,7 @@ mod tests {
         Tree {
             paths: paths.iter().map(PathBuf::from).collect(),
             untrusted: untrusted.iter().map(PathBuf::from).collect(),
+            gone: Vec::new(),
         }
     }
 
@@ -1074,7 +1204,7 @@ mod tests {
             assert_eq!(found(&t, UID), None, "{untrusted}");
             assert_eq!(
                 pod_dirs(&t, None).untrusted,
-                [PathBuf::from(untrusted)],
+                [(PathBuf::from(untrusted), "not owned by root".to_string())],
                 "{untrusted}"
             );
             assert!(found(&tree(&[paths.as_str()]), UID).is_some());
@@ -1083,6 +1213,53 @@ mod tests {
         let dup = format!("kubepods/pod{UID}");
         let t = owned_tree(&[&pod, &dup], &[&dup]);
         assert_eq!(found(&t, UID).as_deref(), Some(Path::new(&pod)));
+        // A directory removed while the search runs is skipped, and not
+        // reported as untrusted (it was never seen to be someone else's).
+        for gone in ["kubepods", "kubepods/burstable", pod.as_str()] {
+            let mut t = tree(&[&pod]);
+            t.gone.push(PathBuf::from(gone));
+            let s = pod_dirs(&t, None);
+            assert!(s.untrusted.is_empty(), "{gone}: {:?}", s.untrusted);
+            assert_eq!(pod_dir(&s.dirs, UID), PodDir::None, "{gone}");
+        }
+    }
+
+    /// `pod_cgroup_root` inside a recognised root (`kubepods/burstable` in
+    /// `kubepods`) reaches each of its pod directories twice: the same
+    /// directory, by identity, so one pod, not an ambiguous one.
+    #[test]
+    fn pod_dir_search_with_an_overlapping_configured_root() {
+        let pod = format!("kubepods/burstable/pod{UID}");
+        let spod =
+            format!("kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{UID_}.slice");
+        for (root, pod) in [
+            ("kubepods/burstable", &pod),
+            ("kubepods", &pod),
+            ("kubepods.slice/kubepods-burstable.slice", &spod),
+        ] {
+            let s = pod_dirs(&tree(&[pod]), Some(Path::new(root)));
+            assert_eq!(pod_dir(&s.dirs, UID), PodDir::One(Path::new(pod)), "{root}");
+        }
+        // Two directories for one uid are still ambiguous.
+        let dup = format!("kubepods/pod{UID}");
+        let s = pod_dirs(&tree(&[&pod, &dup]), Some(Path::new("kubepods/burstable")));
+        assert!(matches!(pod_dir(&s.dirs, UID), PodDir::Several(d) if d.len() == 2));
+    }
+
+    /// An unresolved pod is reported once per uid and reason, until it
+    /// resolves or leaves the selection.
+    #[test]
+    fn unresolved_pods_are_reported_once() {
+        let mut r = ReportOnce::default();
+        assert!(r.first(UID, 0));
+        assert!(!r.first(UID, 0));
+        assert!(r.first(UID, 1), "another reason is news");
+        assert!(r.first(UID2, 0));
+        r.keep_only(&BTreeSet::from([UID2]));
+        assert!(r.first(UID, 0), "resolved, then unresolved again");
+        assert!(!r.first(UID2, 0));
+        r.keep_only(&BTreeSet::new());
+        assert!(r.0.is_empty());
     }
 
     /// A kubelet `--cgroup-root` other than `/` (or `/<name>` under
@@ -1145,6 +1322,12 @@ mod tests {
             panic!("not ambiguous")
         };
         assert_eq!(both.len(), 2);
+        // A static pod's cgroup is named by its config hash (32 hex digits,
+        // no dashes), never taken for a pod uid.
+        assert_eq!(
+            Naming::Cgroupfs.pod("pod0f3c1a2b4d5e6f708192a3b4c5d6e7f8"),
+            None
+        );
         // look-alikes
         for name in [
             format!("xpod{UID}"),
@@ -1239,6 +1422,23 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
     }
+    /// Create `rel` and its ancestors below `root`, each 0755 whatever the
+    /// umask: a group- or other-writable directory is never trusted.
+    #[cfg(target_os = "linux")]
+    fn mkdirs(root: &Path, rel: impl AsRef<Path>) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut at = root.to_path_buf();
+        for c in rel.as_ref().components() {
+            at.push(c);
+            let _ = std::fs::create_dir(&at);
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn chmod(root: &Path, rel: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
     #[cfg(target_os = "linux")]
     fn ino(root: &Path, rel: &str) -> u64 {
         std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(root.join(rel)).unwrap())
@@ -1263,8 +1463,8 @@ mod tests {
         let t = temp("resolve");
         let root = &t.0;
         let pod = format!("kubepods/burstable/pod{UID}");
-        std::fs::create_dir_all(root.join(&pod).join("ctr")).unwrap();
-        std::fs::create_dir_all(root.join("system.slice")).unwrap();
+        mkdirs(root, format!("{pod}/ctr"));
+        mkdirs(root, "system.slice");
 
         let pods = [sel("pay/co-1", UID), sel("pay/gone", UID2)];
         let r = resolve_owned_by(root, &["/system.slice".into()], &pods, None, me()).unwrap();
@@ -1283,15 +1483,31 @@ mod tests {
 
         // A second directory for the uid: neither is taken.
         let dup = format!("kubepods/pod{UID}");
-        std::fs::create_dir_all(root.join(&dup)).unwrap();
+        mkdirs(root, &dup);
         let r = resolve_owned_by(root, &[], &pods, None, me()).unwrap();
         assert!(r.ids.is_empty());
         assert_eq!(r.unresolved, ["pay/co-1", "pay/gone"]);
         // A duplicate outside the kubepods hierarchy changes nothing.
         std::fs::remove_dir(root.join(&dup)).unwrap();
-        std::fs::create_dir_all(root.join(format!("user.slice/user@1000.service/pod{UID}")))
-            .unwrap();
+        mkdirs(root, format!("user.slice/user@1000.service/pod{UID}"));
         let r = resolve_owned_by(root, &[], &pods, None, me()).unwrap();
+        assert_eq!(r.ids, BTreeSet::from([ino(root, &pod)]));
+
+        // A group- or other-writable pod directory, or one on the way, is
+        // not taken: anyone with that access could have made it.
+        for (dir, mode) in [
+            (pod.as_str(), 0o775),
+            (pod.as_str(), 0o757),
+            ("kubepods/burstable", 0o777),
+            ("kubepods", 0o775),
+        ] {
+            chmod(root, dir, mode);
+            let r = resolve_owned_by(root, &[], &pods[..1], None, me()).unwrap();
+            assert!(r.ids.is_empty(), "{dir} {mode:o}");
+            assert_eq!(r.unresolved, ["pay/co-1"], "{dir} {mode:o}");
+            chmod(root, dir, 0o755);
+        }
+        let r = resolve_owned_by(root, &[], &pods[..1], None, me()).unwrap();
         assert_eq!(r.ids, BTreeSet::from([ino(root, &pod)]));
 
         // A missing path refuses to start and names it.
@@ -1313,8 +1529,8 @@ mod tests {
         let t = temp("podroot");
         let root = &t.0;
         let pod = format!("custom/kubepods/burstable/pod{UID}");
-        std::fs::create_dir_all(root.join(&pod)).unwrap();
-        std::fs::create_dir_all(root.join("elsewhere/kubepods")).unwrap();
+        mkdirs(root, &pod);
+        mkdirs(root, "elsewhere/kubepods");
         std::os::unix::fs::symlink("custom", root.join("linked")).unwrap();
         let pods = [sel("pay/co-1", UID)];
 
@@ -1344,6 +1560,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("not owned by root"), "{e}");
+        chmod(root, "custom", 0o775);
+        let e = resolve_owned_by(root, &[], &pods, Some("/custom/kubepods"), me())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("custom is group- or other-writable (mode 775)"),
+            "{e}"
+        );
+        chmod(root, "custom", 0o755);
+
+        // Inside a recognised root: each pod found once, not ambiguous.
+        let inner = format!("kubepods/burstable/pod{UID2}");
+        mkdirs(root, &inner);
+        let both = [sel("pay/co-1", UID), sel("pay/inner", UID2)];
+        let r = resolve_owned_by(root, &[], &both, Some("/kubepods/burstable"), me()).unwrap();
+        assert_eq!(r.ids, BTreeSet::from([ino(root, &inner)]));
+        assert_eq!(r.unresolved, ["pay/co-1"]);
     }
 
     /// Symlinks are never followed: as a `cgroup_filter` path or component
@@ -1353,9 +1586,9 @@ mod tests {
     fn resolve_refuses_symlinks() {
         let t = temp("symlink");
         let root = &t.0;
-        std::fs::create_dir_all(root.join("system.slice/sshd.service")).unwrap();
+        mkdirs(root, "system.slice/sshd.service");
         let real = format!("kubepods/burstable/pod{UID}");
-        std::fs::create_dir_all(root.join(&real)).unwrap();
+        mkdirs(root, &real);
         use std::os::unix::fs::symlink as link;
         link(".", root.join("self")).unwrap();
         link("system.slice", root.join("sys")).unwrap();
@@ -1396,9 +1629,9 @@ mod tests {
         let root = &t.0;
         let a = format!("kubepods/pod{UID}");
         let b = format!("kubepods/pod{UID2}");
-        std::fs::create_dir_all(root.join(&a)).unwrap();
-        std::fs::create_dir_all(root.join(&b)).unwrap();
-        std::fs::create_dir_all(root.join("plain")).unwrap();
+        mkdirs(root, &a);
+        mkdirs(root, &b);
+        mkdirs(root, "plain");
         let cs = |rel: &str| {
             std::ffi::CString::new(root.join(rel).into_os_string().into_encoded_bytes()).unwrap()
         };

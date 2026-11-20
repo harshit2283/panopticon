@@ -215,7 +215,9 @@ impl AgentMetrics {
             "panopticon_pod_filter_unresolved",
             "Resolutions of a pod pod_filter selected that left it uncaptured: no cgroup \
              directory in the kubepods roots searched (not_found), several (ambiguous), or one \
-             that could not be used (unusable)",
+             that could not be used (unusable). Every resolution counts: the selected pods are \
+             resolved again on each pod change, so a pod that stays unresolved (Pending) keeps \
+             adding",
             unresolved.clone(),
         );
         let pod_unresolved = crate::scope_select::POD_UNRESOLVED_REASONS

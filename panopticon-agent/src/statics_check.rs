@@ -63,6 +63,12 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "counters of pod_filter resolutions that left a pod uncaptured (numbers, never names)",
     ),
     (
+        "scope_select.rs",
+        "POD_REPORTED",
+        "uids (from the Kubernetes API, not traffic) of selected pods now unresolved, already \
+         logged; forgotten once they resolve or leave the selection",
+    ),
+    (
         "protocol/secrets.rs",
         "HINT_SEARCH",
         "a regex compiled from a constant word list",

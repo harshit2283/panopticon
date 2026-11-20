@@ -1099,10 +1099,16 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
         anyhow::bail!("pod_filter needs Kubernetes metadata, but [kubernetes] enabled = false");
     }
     if let Some(root) = &config.pod_cgroup_root {
-        if config.pod_filter.is_none() {
-            anyhow::bail!("pod_cgroup_root is only used by pod_filter, which is not set");
-        }
         pod_cgroup_root_rel(root)?;
+        // Accepted without pod_filter: it is restart-only, so a reload that
+        // removes every [[pod_filter]] (a narrowing) must not have to
+        // remove it too.
+        if config.pod_filter.is_none() {
+            tracing::warn!(
+                pod_cgroup_root = %root,
+                "pod_cgroup_root is set but unused: it is only used by pod_filter, which is not set"
+            );
+        }
     }
     if config.kubernetes.relist_interval < Duration::from_secs(5) {
         return Err(anyhow::anyhow!(
@@ -1679,13 +1685,22 @@ mod tests {
             (format!("pod_cgroup_root = \"/\"\n{pf}"), "cgroup2 root"),
             (format!("pod_cgroup_root = \"/a/../b\"\n{pf}"), "plain path"),
             (format!("pod_cgroup_root = \"/a//b\"\n{pf}"), "plain path"),
-            (
-                "pod_cgroup_root = \"/custom/kubepods\"\n".to_string(),
-                "only used by pod_filter",
-            ),
+            ("pod_cgroup_root = \"custom\"\n".to_string(), "absolute"),
         ] {
             assert!(err(&toml).contains(what), "{toml}: {}", err(&toml));
         }
+        // Without pod_filter it is unused (logged), not refused: a reload
+        // that removes every [[pod_filter]] while cgroup_filter stays (a
+        // narrowing) keeps the restart-only pod_cgroup_root as it is.
+        let root = "pod_cgroup_root = \"/custom/kubepods\"\ncgroup_filter = [\"/b2/a\"]\n";
+        let running = ok(&format!("{root}{pf}"));
+        let narrowed = ok(root);
+        assert!(narrowed.pod_filter.is_none());
+        assert_eq!(
+            narrowed.pod_cgroup_root.as_deref(),
+            Some("/custom/kubepods")
+        );
+        assert_eq!(check_restart_only(&running, &narrowed), Ok(()));
         for (toml, what) in [
             (
                 "[[pod_filter]]\nlabels = { a = \"b\" }\n",
