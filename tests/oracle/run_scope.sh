@@ -188,7 +188,8 @@ conf() { # conf DIR SCOPE-LINES: privacy full, plus SCOPE-LINES
   # These checks were written for the creator rule (a listed server's
   # listener selects its children from the first byte); scope_lab.py t15
   # covers both rules.
-  printf '%s\npid_filter_listener = "creator"\n\n[privacy]\nmode = "full"\n' "$2" >"$1/agent.toml"
+  # Top-level keys first: SCOPE-LINES may open a [[pod_filter]] table.
+  printf 'pid_filter_listener = "creator"\n%s\n\n[privacy]\nmode = "full"\n' "$2" >"$1/agent.toml"
 }
 
 stop_pids() { for p in $PIDS; do kill "$p" 2>/dev/null; done; sleep 0.3; PIDS=""; }
