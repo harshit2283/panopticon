@@ -1347,8 +1347,12 @@ mod tests {
             probe_file: real,
             ..ssl_target(pid, "/proc/x/root/app", Some((dev, 1_585_382, 1_700, 4096)))
         };
-        let real = Some((64_769, 1_585_382));
-        let targets = vec![ctr(1, 49, real), ctr(2, 52, real), ctr(3, 55, None)];
+        let real = (64_769, 1_585_382);
+        let targets = vec![
+            ctr(1, 49, Some(real)),
+            ctr(2, 52, Some(real)),
+            ctr(3, 55, None),
+        ];
         let mut attached = std::collections::HashSet::new();
         let mut tried = Vec::new();
         attach_each(&targets, &mut attached, |t| {
@@ -1356,7 +1360,7 @@ mod tests {
             1
         });
         assert_eq!(tried, vec![1, 3]);
-        assert!(attached.contains(&real.unwrap()));
+        assert!(attached.contains(&real));
         assert!(attached.contains(&(55, 1_585_382)));
     }
 
