@@ -322,8 +322,12 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 4096;
 /// Upper bound for `max_body_bytes` (what parsers buffer).
 pub const MAX_BODY_BYTES_LIMIT: usize = 64 * 1024;
 
-/// Default `max_packet_bytes`.
-pub const DEFAULT_MAX_PACKET_BYTES: u32 = 64 * 1024;
+/// Default `max_packet_bytes`: four records. Covers the large responses
+/// measured (PostgreSQL results in 8 KB packets, most RHEL 8 AMQP delivery
+/// packets) at 1.6 against 1.3 µs of kernel time per packet; 64 KiB cost
+/// the sending application 45% of its throughput at saturation
+/// (BENCHMARKS.md, "Large packets").
+pub const DEFAULT_MAX_PACKET_BYTES: u32 = 16 * 1024;
 /// Bounds of `max_packet_bytes`: one record, and the 16 records the kernel
 /// program sends at most (sock_capture.rs `MAX_SKB_CHUNKS`).
 pub const MIN_PACKET_BYTES: u32 = panopticon_common::MAX_PAYLOAD_SIZE as u32;
@@ -1525,7 +1529,8 @@ mod tests {
     fn max_packet_bytes_is_clamped_and_restart_only() {
         let load = |toml: &str| load_config_from_str(toml).unwrap();
         assert_eq!(load("").max_packet_bytes, DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(load("max_packet_bytes = 16384\n").max_packet_bytes, 16384);
+        assert_eq!(DEFAULT_MAX_PACKET_BYTES, 16384);
+        assert_eq!(load("max_packet_bytes = 65536\n").max_packet_bytes, 65536);
         assert_eq!(
             load("max_packet_bytes = 1\n").max_packet_bytes,
             MIN_PACKET_BYTES
