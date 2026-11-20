@@ -698,7 +698,8 @@ What is exported then:
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
 - **A Redis command** with credential context in its key or any argument,
-  or a credential word in a segment of a key name or hash field name, is
+  or a key name or hash field name that names a credential (a
+  credential word in it, or a short name as a whole segment), is
   withheld as one unit: key, arguments and reply text (below), even where
   a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
@@ -809,16 +810,21 @@ result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
 `GET otp:+15551234567` export no key, value or reply, however opaque the
 value; field-by-field, the key would be withheld and the value next to it
 exported. A key or field name has no free text around it to show that a
-short name is used as a name, so it is read by segments: split on `:`,
-`.`, `_`, `-` and `/`, case folded, a segment that equals or contains
-any word of either list above (the short names included) names a
-credential. The key names read this way are the key of every command,
+short name is used as a name, so it is read by segments: case folded
+and with `-` and `.` read as `_`, a name that contains a word of the
+first list above anywhere (`u:1:apikey`, `session_token`), or one of
+whose segments (split on `:`, `.`, `_`, `-` and `/`) is a short name
+whole (`otp`, `user:1:pin`, `api-key`), names a credential. A short
+name inside a longer segment does not count, so `mykey`, `spinner` and
+`author` name no credential. The key names read this way are the key of
+every command,
 every key of `MSET`, `MSETNX`, `MGET`, `DEL`, `UNLINK`, `EXISTS`,
 `TOUCH` and `WATCH`, and the field names of every hash command (every
 argument after the key, except the values of `HSET`, `HSETNX` and
 `HMSET`). So `SET otp 482913`, `SET user:1:otp 482913`,
-`HSET u:1 pin 1234` and `GET mykey` are withheld whole, while
-`SET 2fa:alice 123456` is not (`2fa` is not in the lists). This holds
+`HSET u:1 pin 1234` and `SET session_token abc` are withheld whole,
+while `GET mykey`, `HSET book:1 author x` and `SET 2fa:alice 123456`
+are not (`2fa` is not in the lists). This holds
 whatever `builtin` is set to; your own patterns
 still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription

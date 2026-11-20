@@ -258,8 +258,9 @@ production-hardened compliance platform.
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
     A Redis command with credential context in its key or any argument,
-    or a credential word (short names included) in a segment of a key or
-    hash field name, is withheld as one unit (key, arguments and reply
+    or a key or hash field name containing a credential word, or with a
+    short name as a whole segment (`user:1:otp`, not `mykey`), is
+    withheld as one unit (key, arguments and reply
     text, and its result inside `EXEC`), so `SET otp:<id> <code>`,
     `SET otp <code>` and `HSET u:1 pin <pin>` export no value.
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP

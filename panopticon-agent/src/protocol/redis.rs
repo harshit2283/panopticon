@@ -1169,10 +1169,11 @@ mod tests {
         }
     }
 
-    /// A key segment (split on `:` `.` `_` `-` `/`) or a hash field that
-    /// equals or contains a credential word, short names included, is
-    /// credential context: `otp` alone as a key or field has no `otp=` or
-    /// `otp:` around it in the free-text sense.
+    /// A key name or hash field name names a credential when it contains a
+    /// long-list word anywhere, or when one of its segments (split on `:`
+    /// `.` `_` `-` `/`) is a short name whole: `otp` alone as a key or
+    /// field has no `otp=` or `otp:` around it in the free-text sense,
+    /// while `mykey`, `spinner` and `author` are one segment each.
     #[test]
     fn test_short_credential_names_in_keys_and_fields_withhold() {
         let cmd = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1180,12 +1181,15 @@ mod tests {
             &["SET", "otp", "482913"][..],
             &["SET", "user:1:otp", "482913"],
             &["SET", "user.1.pin", "1234"],
-            &["SET", "user_1_otpcode", "482913"],
+            &["SET", "user_1_otp_code", "482913"],
             &["SET", "sess/alice-sid", "abc"],
             &["SET", "u:1:apikey", "abc"],
             &["SET", "u:1:client_assertion", "abc"],
+            &["SET", "u:1:client-assertion", "abc"],
+            &["SET", "session_token", "abc"],
+            &["SET", "api-key", "abc"],
+            &["SET", "u:1:refresh_tokens", "abc"],
             &["GET", "otp"],
-            &["GET", "mykey"],
             &["HSET", "u:1", "otp", "482913"],
             &["HSET", "u:1", "name", "bob", "pin", "1234"],
             &["HGET", "u:1", "pin"],
@@ -1197,9 +1201,15 @@ mod tests {
             assert!(command_has_credential_context(&cmd(c)), "{c:?}");
         }
         // No credential word (`2fa` is not one: the word list is the
-        // masking's own), or the word only in a value.
+        // masking's own), a short name only inside a segment, or the word
+        // only in a value.
         for c in [
             &["SET", "2fa:alice", "123456"][..],
+            &["GET", "mykey"],
+            &["SET", "ui:spinner", "on"],
+            &["HSET", "book:1", "author", "Le Guin"],
+            &["SET", "user_1_otpcode", "1"],
+            &["SET", "cache:keys", "3"],
             &["SET", "user:1:name", "bob"],
             &["HSET", "u:1", "name", "pinto"],
             &["MSET", "a", "otp-free", "b", "2"],
@@ -1662,7 +1672,7 @@ mod tests {
     fn test_get_command() {
         let mut parser = RedisParser::new();
 
-        let cmd = b"*2\r\n$3\r\nGET\r\n$5\r\nmyval\r\n";
+        let cmd = b"*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n";
         parser.feed(cmd, Direction::Egress, 1000);
 
         let resp = b"$5\r\nhello\r\n";
@@ -1671,7 +1681,7 @@ mod tests {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("GET"));
-                assert_eq!(msgs[0].path.as_deref(), Some("myval"));
+                assert_eq!(msgs[0].path.as_deref(), Some("mykey"));
                 assert_eq!(msgs[0].payload_text.as_deref(), Some("hello"));
             }
             other => panic!("expected Messages, got {other:?}"),
