@@ -65,7 +65,7 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoReadPr
 }
 
 /// Writes plaintext; its entry probe emits before Write runs an implicit
-/// handshake, so it is guarded (tls_probes.rs `go_tls_guard_entry`).
+/// handshake, so it is guarded (tls_probes.rs `go_tls_write_guarded`).
 pub const WRITE: &str = "crypto/tls.(*Conn).Write";
 /// Calls `clientHandshake` again on a live connection: guarded.
 pub const RENEGOTIATE: &str = "crypto/tls.(*Conn).handleRenegotiation";

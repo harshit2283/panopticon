@@ -859,7 +859,7 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
 /// record is reserved in the same shard as both objects' events
 /// (`shard_for(conn)`), and reservations are serialised.
 ///
-/// Two exceptions, guarded by `GO_GUARD_CONNS` (see `go_tls_guard_entry`):
+/// Two exceptions, guarded by `GO_GUARD_CONNS` (see `guard_call`):
 /// a `Write` entry probe emits its plaintext before Write runs an implicit
 /// handshake (data of the new object before this record), and
 /// `handleRenegotiation` calls `clientHandshake` again on a live
@@ -899,34 +899,55 @@ fn try_go_tls_handshake_entry(ctx: &ProbeContext) -> Result<(), ()> {
     send_tls_new(conn, pid_tgid, TlsLibrary::GoTls)
 }
 
-/// Entry of `(*Conn).Write` or `(*Conn).handleRenegotiation` (attached at
-/// the same offset as `go_tls_write_entry`, never instead of it): guard
-/// the receiver while the call is in flight, so a handshake it runs or
-/// waits for sends no `TlsNew` (`go_tls_handshake_entry`). A guard that
-/// cannot be recorded sets `GO_GUARD_LOST`. Runs whether or not capture
-/// is on: a Write that emits after capture turns on must be guarded.
+/// Entry of `(*Conn).handleRenegotiation`: guard the receiver while the
+/// call is in flight, so the `clientHandshake` it runs on the live
+/// connection sends no `TlsNew` (`go_tls_handshake_entry`). A guard that
+/// cannot be recorded sets `GO_GUARD_LOST`.
 #[uprobe]
 pub fn go_tls_guard_entry(ctx: ProbeContext) {
-    if try_go_tls_guard_entry(&ctx).is_err() {
+    if guard_call(&ctx, go_receiver(&ctx)).is_err() {
         guard_lost();
     }
 }
 
+/// Guard connection `conn` for the call this goroutine is entering
+/// (`GO_GUARD_CALLS`, `GO_GUARD_CONNS`); its RETs clear it
+/// (`go_tls_guard_ret`). Ok(true) when the goroutine is already in a
+/// guarded call on `conn` at the same frame depth: the same call entered
+/// again. A Go function's stack-growth prologue (`morestack`, also how a
+/// goroutine is preempted at a function entry) jumps back to the entry
+/// with the stack copied, so an entry probe fires again for one call; the
+/// frame's depth from the stack top is unchanged by the copy. Runs whether
+/// or not capture is on: a call that emits after capture turns on must be
+/// guarded.
 #[inline(always)]
-fn try_go_tls_guard_entry(ctx: &ProbeContext) -> Result<(), ()> {
-    let conn = go_receiver(ctx);
+fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
     if conn == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let key = go_read_key(ctx, true)?;
-    let call = GoReadCall { conn, depth: 0 };
+    let (lo, hi) = go_stack(key.goroutine)?;
+    let sp = user_sp(ctx.regs);
+    if !(lo < sp && sp < hi) {
+        return Err(());
+    }
+    let depth = hi.wrapping_sub(sp);
+    // SAFETY: this goroutine's own slot, copied out at once.
+    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&key) }.copied()
+        && c.conn == conn
+        && c.depth == depth
+    {
+        return Ok(true);
+    }
+    let call = GoReadCall { conn, depth };
     GO_GUARD_CALLS.insert(&key, &call, 0).map_err(|_| ())?;
     let guard = GoGuardKey {
         conn,
         tgid: key.tgid,
         _pad: 0,
     };
-    GO_GUARD_CONNS.insert(&guard, &1, 0).map_err(|_| ())
+    GO_GUARD_CONNS.insert(&guard, &1, 0).map_err(|_| ())?;
+    Ok(false)
 }
 
 #[inline(always)]
@@ -955,6 +976,40 @@ pub fn go_tls_guard_ret(ctx: ProbeContext) {
         tgid: key.tgid,
         _pad: 0,
     });
+}
+
+/// `(*Conn).Write`'s entry where its RETs are probed (`go_tls_guard_ret`):
+/// guards the receiver (`guard_call`: Write's entry probe emits before
+/// Write runs an implicit handshake), then emits like `go_tls_write_entry`,
+/// once per call: an entry seen again for the same call (the stack-growth
+/// prologue re-entering it) emits nothing, where the unguarded probe would
+/// emit the same bytes twice. A guard that cannot be recorded sets
+/// `GO_GUARD_LOST` and the bytes are emitted as by the unguarded probe.
+#[uprobe]
+pub fn go_tls_write_guarded(ctx: ProbeContext) {
+    let _ = try_go_tls_write_guarded(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
+    let (conn, buf, len) = read_go_write_args(ctx)?;
+    let again = guard_call(ctx, conn).unwrap_or_else(|()| {
+        guard_lost();
+        false
+    });
+    if again || len == 0 || !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    mark_active(conn);
+    emit_tls_event(
+        ctx,
+        conn,
+        buf,
+        len,
+        Direction::Egress,
+        TlsLibrary::GoTls,
+        NO_ADDR,
+    )
 }
 
 // ── Go TLS: received plaintext, at crypto/tls.(*halfConn).decrypt ─────────

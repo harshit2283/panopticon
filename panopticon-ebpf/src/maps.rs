@@ -425,7 +425,7 @@ pub static GO_READ_CALLS: HashMap<GoReadKey, GoReadCall> =
 const BPF_F_NO_PREALLOC: u32 = 1;
 
 /// Go calls that can precede or contain a handshake of their own
-/// connection, in flight, by goroutine (tls_probes.rs `go_tls_guard_entry`,
+/// connection, in flight, by goroutine (tls_probes.rs `guard_call`,
 /// `go_tls_guard_ret`): `(*Conn).Write`, whose entry probe emits the
 /// plaintext before Write runs an implicit handshake, and
 /// `(*Conn).handleRenegotiation`, which calls `clientHandshake` on a live

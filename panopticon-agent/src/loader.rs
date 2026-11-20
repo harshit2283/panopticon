@@ -558,8 +558,9 @@ fn attach_tls_uprobes_to(
             // No PID filter: like libssl, the probes cover every process
             // running this binary (every replica on the node).
             let path = &target.library_path;
-            // The guards go first, before the Write entry that emits: a
-            // Write whose data is emitted is then always guarded.
+            // Where Write's RETs are probed, its entry is the guarded probe
+            // (guards the connection, emits once per call); otherwise the
+            // unguarded one, and no handshake entry is attached.
             let guarded = match boundary {
                 Some(b) if go_reads && b.write_entry == *write_offset => {
                     attach_go_guards(ebpf, path, b, links)
@@ -568,8 +569,7 @@ fn attach_tls_uprobes_to(
             };
             if let Some((n, _)) = guarded {
                 attached += n;
-            }
-            if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
+            } else if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
                 attached += 1;
             }
             if let Some(read) = read
@@ -623,13 +623,15 @@ fn attach_go_read(
     rets + attach_all("go_tls_rrc_entry", &[read.read_record_entry])
 }
 
-/// Go connection guards (tls_probes.rs `go_tls_guard_entry`): every RET
-/// of `Write` and of `handleRenegotiation` first, then their entries, so a
-/// guard set is always cleared. Returns the probes attached and whether
-/// `handleRenegotiation` is guarded, or None when `Write` is not fully
-/// guarded: then no handshake entry may be attached (a reused key stays
-/// latched). Shares `PROC_EPOCH` and the sweep with Go reads, so it is
-/// attached only where they are (`go_reads`).
+/// Go connection guards (tls_probes.rs `guard_call`): every RET of `Write`
+/// first, then `Write`'s entry as `go_tls_write_guarded` (which also emits
+/// its plaintext), then `handleRenegotiation`'s RETs and entry
+/// (`go_tls_guard_entry`), so a guard set is always cleared. Returns the
+/// probes attached and whether `handleRenegotiation` is guarded, or None
+/// when `Write` is not guarded (its plaintext probe is then the caller's
+/// unguarded one): no handshake entry may then be attached, and a reused
+/// key stays latched. Shares `PROC_EPOCH` and the sweep with Go reads, so
+/// it is attached only where they are (`go_reads`).
 fn attach_go_guards(
     ebpf: &mut Ebpf,
     path: &str,
@@ -650,7 +652,7 @@ fn attach_go_guards(
         );
         return None;
     }
-    let write_entry = attach_all(ebpf, "go_tls_guard_entry", &[b.write_entry]);
+    let write_entry = attach_all(ebpf, "go_tls_write_guarded", &[b.write_entry]);
     n += write_entry;
     if write_entry == 0 {
         warn!(

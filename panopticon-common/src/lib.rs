@@ -325,7 +325,7 @@ pub struct ConnInfo {
 
 /// `GO_GUARD_CONNS` key: a Go `*tls.Conn` of one process (tgid) that has a
 /// guarded call in flight (`(*Conn).Write` or `handleRenegotiation`,
-/// tls_probes.rs `go_tls_guard_entry`): no `TlsNew` is sent for it.
+/// tls_probes.rs `guard_call`): no `TlsNew` is sent for it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GoGuardKey {
