@@ -955,7 +955,8 @@ pub(crate) async fn worker_task(
             // like any record): it frees the connection's state and reaches
             // no sink. Counted processed (it is consumed here).
             //
-            // A TlsNew record (SSL_new returned the object, every mode):
+            // A TlsNew record (SSL_new returned the object, or a Go
+            // connection's first handshake entered, every mode):
             // any earlier object at that address was destroyed, so the key's
             // connection ends and the next one starts with no state. Kept in
             // the raw dump, so a replay ends the same connections.
@@ -2108,7 +2109,8 @@ mod tests {
     /// Codex R8 #1 / R9: TLS writes inside one DATA payload that start with
     /// the client preface (an upload of captured HTTP/2 bytes) must not
     /// restart the connection clean: the second embedded preface is no
-    /// proof either. Only a TlsNew record (`SSL_new`) starts a new
+    /// proof either. Only a TlsNew record (`SSL_new`, or a Go handshake
+    /// entry) starts a new
     /// connection on the key: not a socket seen during a call (R9), nor
     /// `SSL_free` (R10: it may drop one reference of several).
     #[test]

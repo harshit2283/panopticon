@@ -97,10 +97,12 @@ pub enum EventType {
     SockClose = 6,
     UdpSend = 7,
     UdpRecv = 8,
-    /// The TLS library created a connection object (`SSL_new` returned it):
-    /// the header only, keyed like that object's `TlsData` events. Any
-    /// earlier object at that address was destroyed: a new connection
-    /// starts on its key.
+    /// The TLS library started a new connection object: OpenSSL's `SSL_new`
+    /// returned it, or Go `crypto/tls` entered its first handshake
+    /// (`(*Conn).clientHandshake` / `serverHandshake`, with no guarded call
+    /// in flight on it, tls_probes.rs `go_tls_handshake_entry`). The header
+    /// only, keyed like that object's `TlsData` events. Any earlier object
+    /// at that address was destroyed: a new connection starts on its key.
     TlsNew = 9,
 }
 
@@ -321,6 +323,34 @@ pub struct ConnInfo {
     pub _pad: [u8; 4],
 }
 
+/// `GO_GUARD_CONNS` key: a Go `*tls.Conn` of one process (tgid) that has a
+/// guarded call in flight (`(*Conn).Write` or `handleRenegotiation`,
+/// tls_probes.rs `guard_call`): no `TlsNew` is sent for it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GoGuardKey {
+    pub conn: u64,
+    pub tgid: u32,
+    pub _pad: u32,
+}
+
+/// Guarded calls one goroutine can be inside at once (`GO_GUARD_CALLS`):
+/// a `Write` on TLS inside TLS (an HTTPS proxy) runs the inner
+/// connection's `Write` inside the outer one's.
+pub const GO_GUARD_NEST: usize = 4;
+
+/// `GO_GUARD_CALLS` value: the guarded calls (tls_probes.rs `guard_call`)
+/// a goroutine is in, outermost first: each one's `*tls.Conn` and frame
+/// depth (top of the goroutine's stack minus SP at its entry, which equals
+/// SP at its RET instructions and survives a stack copy).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GoGuardCalls {
+    pub conn: [u64; GO_GUARD_NEST],
+    pub depth: [u64; GO_GUARD_NEST],
+    pub n: u64,
+}
+
 // ── Pod Impls (user-space only) ────────────────────────────────────────────
 
 // SAFETY: DataEvent is #[repr(C)], Copy, contains no pointers.
@@ -345,6 +375,10 @@ unsafe impl aya::Pod for scope::SockState {}
 unsafe impl aya::Pod for GoReadKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GoReadCall {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoGuardKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoGuardCalls {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 

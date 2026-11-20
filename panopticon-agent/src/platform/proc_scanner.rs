@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
 use object::{Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef};
 
-pub use super::go_read::GoReadProbes;
-use super::go_read::{go_read_probes_from, symbol_file_offset};
+pub use super::go_read::{GoBoundaryProbes, GoReadProbes};
+use super::go_read::{go_boundary_probes_from, go_read_probes_from, symbol_file_offset};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
@@ -209,6 +209,9 @@ pub enum TlsType {
         write_offset: u64,
         /// Go TLS read probe offsets (go_read.rs), if found.
         read: Option<GoReadProbes>,
+        /// New-connection boundary probes (go_read.rs), if found: without
+        /// them a reused `*tls.Conn` key stays latched.
+        boundary: Option<GoBoundaryProbes>,
     },
 }
 
@@ -367,6 +370,11 @@ fn collect_symbols<'data, Elf: FileHeader, R: ReadRef<'data>>(
 /// The Go TLS read probe offsets in an ELF (go_read.rs).
 pub fn go_read_probes(path: &str) -> Option<GoReadProbes> {
     with_untrusted_elf(path, |data| go_read_probes_from(data)).ok()?
+}
+
+/// The Go new-connection boundary probe offsets of the ELF at `path`.
+pub fn go_boundary_probes(path: &str) -> Option<GoBoundaryProbes> {
+    with_untrusted_elf(path, |data| go_boundary_probes_from(data)).ok()?
 }
 
 /// Whether the Go probes can read a Go binary's functions: Ok(toolchain
@@ -654,10 +662,19 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
             && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
         {
             let read = go_read_probes(namespace_path);
-            debug!(path, target = %namespace_path, %version, read = read.is_some(), "Found Go TLS binary");
+            let boundary = go_boundary_probes(namespace_path);
+            debug!(
+                path,
+                target = %namespace_path,
+                %version,
+                read = read.is_some(),
+                boundary = boundary.is_some(),
+                "Found Go TLS binary"
+            );
             return Some(TlsType::GoTls {
                 write_offset: write_off,
                 read,
+                boundary,
             });
         }
         debug!(
@@ -800,7 +817,20 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
         let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
         super::go_read::Sweep::open(&state.ebpf)
     };
-    match opened.and_then(|mut sweep| sweep.run()) {
+    /// Whether the lost-guard warning was logged (once per agent run).
+    static GUARD_LOST_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    match opened.and_then(|mut sweep| {
+        let removed = sweep.run();
+        if sweep.guard_lost && !GUARD_LOST_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "Go TLS: a connection guard could not be recorded, or may have been \
+                 removed live (PID reuse); new Go connections on reused keys stay \
+                 latched (HTTP/2 headers and bodies withheld) until the agent restarts"
+            );
+        }
+        removed
+    }) {
         Ok((0, 0)) => {}
         Ok((slots, epochs)) => debug!(
             slots,
@@ -992,6 +1022,7 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 0x1000,
                 read: None,
+                boundary: None,
             },
             file_key: key,
         };
@@ -1035,6 +1066,7 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 3,
                 read: None,
+                boundary: None,
             },
             file_key: Some((1, 7, 5, 6)),
         };
@@ -1260,6 +1292,7 @@ mod tests {
                 tls_type: TlsType::GoTls {
                     write_offset: 0,
                     read: None,
+                    boundary: None,
                 },
                 file_key: Some((0, 0, 0, 0)),
             };

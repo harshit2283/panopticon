@@ -5,8 +5,9 @@
 //! `crypto/tls.(*Conn).Write`. Captures the plaintext buffer contents and
 //! emits TlsData events tagged with the connection object pointer (`SSL*`,
 //! `*tls.Conn`) so user space can tell connections apart. `SSL_new`'s
-//! return sends a TlsNew record, so a connection that gets a destroyed
-//! object's address is not read as the old one.
+//! return, and the entry of a Go connection's first handshake, send a
+//! TlsNew record, so a connection that gets a destroyed object's address
+//! is not read as the old one.
 //!
 //! Go received plaintext is not taken from the caller's `Read` buffer, whose
 //! lifetime a probe cannot establish, but from each record as
@@ -28,13 +29,14 @@ use panopticon_common::{
 };
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple,
-    TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR,
-    TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed, shard_for,
-    shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_GUARD_CALLS, GO_GUARD_CONNS, GO_GUARD_LOST,
+    GO_READ_CALLS, PROC_EPOCH, SizedEvent, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY,
+    TLS_CALL_FILLED, TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_NEW_CALL, TLS_SCRATCH, TlsCall,
+    TlsConnKey, TlsReadArgs, pid_allowed, shard_for, shard_reserve, shard_reserve_as,
+    shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_capture::read_sock_tuple;
-use panopticon_common::{GoReadCall, GoReadKey};
+use panopticon_common::{GO_GUARD_NEST, GoGuardCalls, GoGuardKey, GoReadCall, GoReadKey};
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
 /// socket hooks below can attach its addresses.
@@ -749,6 +751,15 @@ fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     {
         return Ok(());
     }
+    send_tls_new(ssl, pid_tgid, TlsLibrary::OpenSsl)
+}
+
+/// Send the header-only `TlsNew` record of connection object `conn`, keyed
+/// like its data events (same address and pid: the same ring shard and
+/// worker), gated like them per process.
+#[inline(always)]
+fn send_tls_new(conn: u64, pid_tgid: u64, library: TlsLibrary) -> Result<(), ()> {
+    let ssl = conn;
     let pid = (pid_tgid >> 32) as u32;
     // The new object has its own sockets: no address of an earlier one.
     let _ = TLS_CONN_ADDR.remove(&TlsConnKey {
@@ -787,7 +798,7 @@ fn try_ssl_new_ret(ctx: &RetProbeContext) -> Result<(), ()> {
         (*event).src_port = 0;
         (*event).dst_port = 0;
         (*event).ip_proto = 0;
-        (*event).tls_library = TlsLibrary::OpenSsl;
+        (*event).tls_library = library;
         (*event).payload_len = 0;
         (*event).orig_len = 0;
         (*event).tcp_flags = 0;
@@ -824,6 +835,266 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     }
     mark_active(conn);
 
+    emit_tls_event(
+        ctx,
+        conn,
+        buf,
+        len,
+        Direction::Egress,
+        TlsLibrary::GoTls,
+        NO_ADDR,
+    )
+}
+
+// ── Go TLS: a new connection object, at its first handshake ─────────────
+
+/// Entry of `crypto/tls.(*Conn).clientHandshake` or `serverHandshake`
+/// (receiver: the `*tls.Conn`). Go has no `SSL_new` to probe: `tls.Client`
+/// and `tls.Server`, which allocate the object, are inlined. The handshake
+/// function (`c.handshakeFn`) runs once per object, from
+/// `handshakeContext`, before any application data of it is read or
+/// written: every `Read` and `Write` calls `Handshake` first, and only one
+/// call runs it (`handshakeMutex`). So when it enters, any earlier object
+/// at that address was garbage collected, after its last data event; this
+/// record is reserved in the same shard as both objects' events
+/// (`shard_for(conn)`), and reservations are serialised.
+///
+/// Two exceptions, guarded (see `guard_call`): a `Write` entry probe emits
+/// its plaintext before Write runs an implicit handshake (data of the new
+/// object before this record), and `handleRenegotiation` calls
+/// `clientHandshake` again on a live connection. While either is in
+/// flight on the connection (`GO_GUARD_CONNS`, any goroutine) or on this
+/// goroutine (`GO_GUARD_CALLS`), or once a guard was lost
+/// (`GO_GUARD_LOST`), nothing is sent: the key keeps its latches. The function's stack-growth prologue jumps back to its entry,
+/// so this probe can fire twice for one call; a second record, with no
+/// data between, ends a connection with no state again.
+#[uprobe]
+pub fn go_tls_handshake_entry(ctx: ProbeContext) {
+    let _ = try_go_tls_handshake_entry(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_handshake_entry(ctx: &ProbeContext) -> Result<(), ()> {
+    if !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    let conn = go_receiver(ctx);
+    if conn == 0 {
+        return Ok(());
+    }
+    match GO_GUARD_LOST.get(0) {
+        Some(&0) => {}
+        _ => return Ok(()),
+    }
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let key = GoGuardKey {
+        conn,
+        tgid: (pid_tgid >> 32) as u32,
+        _pad: 0,
+    };
+    // SAFETY: a presence check; the value is not read.
+    if unsafe { GO_GUARD_CONNS.get(&key) }.is_some() {
+        return Ok(());
+    }
+    // This goroutine's own guarded call on `conn` (the Write or
+    // handleRenegotiation this handshake runs inside). Checked apart from
+    // GO_GUARD_CONNS, which another goroutine's Write returning on the same
+    // live connection can clear while a renegotiation is under way. No
+    // process instance yet (`PROC_EPOCH`): no guard could be read, so
+    // nothing is sent (no Go TLS call of this instance ran before, so no
+    // entry exists on the key anyway).
+    let call = go_read_key(ctx, false)?;
+    // SAFETY: this goroutine's own slot, copied out at once.
+    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&call) }.copied() {
+        // Constant indices: the verifier refuses a variable stack offset.
+        let n = c.n;
+        if (n > 0 && c.conn[0] == conn)
+            || (n > 1 && c.conn[1] == conn)
+            || (n > 2 && c.conn[2] == conn)
+            || (n > 3 && c.conn[3] == conn)
+        {
+            return Ok(());
+        }
+    }
+    send_tls_new(conn, pid_tgid, TlsLibrary::GoTls)
+}
+
+/// Entry of `(*Conn).handleRenegotiation`: guard the receiver while the
+/// call is in flight, so the `clientHandshake` it runs on the live
+/// connection sends no `TlsNew` (`go_tls_handshake_entry`). A guard that
+/// cannot be recorded sets `GO_GUARD_LOST`.
+#[uprobe]
+pub fn go_tls_guard_entry(ctx: ProbeContext) {
+    if guard_call(&ctx, go_receiver(&ctx)).is_err() {
+        guard_lost();
+    }
+}
+
+/// Guard connection `conn` for the call this goroutine is entering
+/// (`GO_GUARD_CALLS`, `GO_GUARD_CONNS`); its RETs clear it
+/// (`go_tls_guard_ret`). Ok(true) when the goroutine's innermost guarded
+/// call is on `conn` at the same frame depth: the same call entered again.
+/// A Go function's stack-growth prologue (`morestack`, also how a
+/// goroutine is preempted at a function entry) jumps back to the entry
+/// with the stack copied, so an entry probe fires again for one call; the
+/// frame's depth from the stack top is unchanged by the copy. Calls nest
+/// (TLS inside TLS: the outer `Write` runs the inner connection's): a
+/// deeper call is pushed after the ones it runs inside; recorded calls at
+/// this depth or deeper ended without a RET seen and are dropped, their
+/// connections unguarded. More than `GO_GUARD_NEST` nested, or a guard
+/// that cannot be stored, is an error (the caller sets `GO_GUARD_LOST`).
+/// Runs whether or not capture is on: a call that emits after capture
+/// turns on must be guarded.
+#[inline(always)]
+fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
+    if conn == 0 {
+        return Ok(false);
+    }
+    let key = go_read_key(ctx, true)?;
+    let depth = frame_depth(ctx, &key)?;
+    // SAFETY: this goroutine's own slot, copied out at once.
+    let mut calls = unsafe { GO_GUARD_CALLS.get(&key) }
+        .copied()
+        .unwrap_or(GoGuardCalls {
+            conn: [0; GO_GUARD_NEST],
+            depth: [0; GO_GUARD_NEST],
+            n: 0,
+        });
+    let mut n = calls.n.min(GO_GUARD_NEST as u64);
+    if let Some((c, d)) = guard_at(&calls, n)
+        && c == conn
+        && d == depth
+    {
+        return Ok(true);
+    }
+    n = pop_from(&calls, n, depth, key.tgid);
+    match n {
+        0 => (calls.conn[0], calls.depth[0]) = (conn, depth),
+        1 => (calls.conn[1], calls.depth[1]) = (conn, depth),
+        2 => (calls.conn[2], calls.depth[2]) = (conn, depth),
+        3 => (calls.conn[3], calls.depth[3]) = (conn, depth),
+        _ => return Err(()),
+    }
+    calls.n = n + 1;
+    GO_GUARD_CALLS.insert(&key, &calls, 0).map_err(|_| ())?;
+    let guard = GoGuardKey {
+        conn,
+        tgid: key.tgid,
+        _pad: 0,
+    };
+    GO_GUARD_CONNS.insert(&guard, &1, 0).map_err(|_| ())?;
+    Ok(false)
+}
+
+/// Top of the goroutine's stack minus SP: at a function's entry and at its
+/// RET instructions SP is the same (the return address), and a stack copy
+/// keeps the difference.
+#[inline(always)]
+fn frame_depth(ctx: &ProbeContext, key: &GoReadKey) -> Result<u64, ()> {
+    let (lo, hi) = go_stack(key.goroutine)?;
+    let sp = user_sp(ctx.regs);
+    if !(lo < sp && sp < hi) {
+        return Err(());
+    }
+    Ok(hi.wrapping_sub(sp))
+}
+
+/// The innermost of the first `n` recorded calls (conn, depth), if any.
+/// Constant indices only: the verifier refuses a variable stack offset.
+#[inline(always)]
+fn guard_at(calls: &GoGuardCalls, n: u64) -> Option<(u64, u64)> {
+    match n {
+        1 => Some((calls.conn[0], calls.depth[0])),
+        2 => Some((calls.conn[1], calls.depth[1])),
+        3 => Some((calls.conn[2], calls.depth[2])),
+        4 => Some((calls.conn[3], calls.depth[3])),
+        _ => None,
+    }
+}
+
+/// Drop the recorded calls at `depth` or deeper from the first `n`,
+/// unguarding their connections; the count left.
+#[inline(always)]
+fn pop_from(calls: &GoGuardCalls, mut n: u64, depth: u64, tgid: u32) -> u64 {
+    for _ in 0..GO_GUARD_NEST {
+        match guard_at(calls, n) {
+            Some((c, d)) if d >= depth => {
+                unguard(tgid, c);
+                n -= 1;
+            }
+            _ => break,
+        }
+    }
+    n
+}
+
+#[inline(always)]
+fn unguard(tgid: u32, conn: u64) {
+    let _ = GO_GUARD_CONNS.remove(&GoGuardKey {
+        conn,
+        tgid,
+        _pad: 0,
+    });
+}
+
+#[inline(always)]
+fn guard_lost() {
+    if let Some(lost) = GO_GUARD_LOST.get_ptr_mut(0) {
+        // SAFETY: a u32 store; only ever set to 1.
+        unsafe { *lost = 1 };
+    }
+}
+
+/// A RET instruction of a guarded function (attached at every one): the
+/// call at this frame depth is over, its connection unguarded, and so are
+/// recorded calls deeper than it (ended without a RET seen). Calls it runs
+/// inside (shallower) stay guarded. A depth that cannot be read leaves the
+/// goroutine's calls guarded (only withholds).
+#[uprobe]
+pub fn go_tls_guard_ret(ctx: ProbeContext) {
+    let _ = try_go_tls_guard_ret(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_guard_ret(ctx: &ProbeContext) -> Result<(), ()> {
+    // No epoch: the slot, if any, is left to the sweep.
+    let key = go_read_key(ctx, false)?;
+    // SAFETY: this goroutine's own slot, copied out at once.
+    let mut calls = unsafe { GO_GUARD_CALLS.get(&key) }.copied().ok_or(())?;
+    let depth = frame_depth(ctx, &key)?;
+    let n = pop_from(&calls, calls.n.min(GO_GUARD_NEST as u64), depth, key.tgid);
+    if n == 0 {
+        let _ = GO_GUARD_CALLS.remove(&key);
+    } else if n != calls.n {
+        calls.n = n;
+        let _ = GO_GUARD_CALLS.insert(&key, &calls, 0);
+    }
+    Ok(())
+}
+
+/// `(*Conn).Write`'s entry where its RETs are probed (`go_tls_guard_ret`):
+/// guards the receiver (`guard_call`: Write's entry probe emits before
+/// Write runs an implicit handshake), then emits like `go_tls_write_entry`,
+/// once per call: an entry seen again for the same call (the stack-growth
+/// prologue re-entering it) emits nothing, where the unguarded probe would
+/// emit the same bytes twice. A guard that cannot be recorded sets
+/// `GO_GUARD_LOST` and the bytes are emitted as by the unguarded probe.
+#[uprobe]
+pub fn go_tls_write_guarded(ctx: ProbeContext) {
+    let _ = try_go_tls_write_guarded(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
+    let (conn, buf, len) = read_go_write_args(ctx)?;
+    let again = guard_call(ctx, conn).unwrap_or_else(|()| {
+        guard_lost();
+        false
+    });
+    if again || len == 0 || !crate::sock_capture::tls_capture_on() {
+        return Ok(());
+    }
+    mark_active(conn);
     emit_tls_event(
         ctx,
         conn,

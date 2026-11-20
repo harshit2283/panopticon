@@ -89,6 +89,9 @@ measurements (kernel 7.0, 32 vCPU VM, unscoped `full`).
 | HTTP/2 (`go-h2` stack), before | 300 | 55–65% / 55–65% | — | — | 0 |
 | HTTP/2 (`go-h2` stack), earlier read design, seeds 7, 14, 42 | 300–500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
 | HTTP/2 (`go-h2` stack), 2026-11-12, seeds 7, 42 | 500 | **100% / 100%** (one other seed 7 run: 99.4% / 100%, see below) | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), 2026-11-20, credential masking latch, no Go boundary (CI, seed 42) | 500 | 56.6% / 41.6% | 100% / 100% / 100% (matched) | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack), 2026-11-20, Go handshake boundary and Write re-entry fix, seeds 42–51, Go 1.22.2 and Go 1.25.4 (20 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/1.1 (`go` stack), 2026-11-20, same build, seeds 42–51, Go 1.22.2 (10 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
 
 Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
 64 vCPUs) are not always clean. In 2 runs of 10, the client view scores
@@ -99,7 +102,15 @@ behaves the same (also 2 of 10), so this is not new. The cause is not
 established yet. One other 2026-11-12 seed 7 run of the HTTP/2 stack shows a
 similar client-view signature (3 exchanges in 500 missing after large
 responses on the same connection, 1 duplicate, server view 100%); the
-repeat run scored 100% in both views.
+repeat run scored 100% in both views. A cause found on 2026-11-20 fits
+both: Go's stack-growth prologue (`morestack`, also used to preempt a
+goroutine at a function entry) jumps back to a function's entry, so the
+`(*Conn).Write` entry probe fired two or three times for one call and
+emitted the same bytes again (seen in a lab raw dump as one client
+preface emitted three times, which cost that `go-h2` connection; 98.8% in
+one run of seven). The guarded Write probe now emits once per call; the
+30 runs above (kernel 7.0, 16 vCPU VM) show no missing, duplicate or
+mispaired exchange.
 
 HTTP/2 over TLS had two problems of its own:
 
@@ -108,8 +119,16 @@ HTTP/2 over TLS had two problems of its own:
   `SSL*` key. Its preface then landed in the old connection's parser, along
   with its stale HPACK state. A client preface now restarts the parser.
   Since then (credential masking, USER-GUIDE §5.3) a reused key starts
-  clean only after the agent saw OpenSSL's `SSL_new` return the new
-  object; otherwise the restarted parser stays latched.
+  clean only after the agent saw the library create the new object;
+  otherwise the restarted parser stays latched. OpenSSL's `SSL_new`
+  return had that record from the start; Go had none, so on this branch
+  every `go-h2` connection after the first on a reused `*tls.Conn` key
+  was exported with no path, status or headers (CI, 2026-11-20: 56.6% /
+  41.6%; lab: 46.4% / 38.4%, every phantom on a reused key and every
+  match on a key's first connection, the 119 connections sharing 59 keys
+  in one process and 49 in the other). The entry of the connection's first
+  handshake (`clientHandshake` / `serverHandshake`) is now Go's record,
+  with `Write` and `handleRenegotiation` guarded (USER-GUIDE §5.3).
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
@@ -1373,7 +1392,9 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   lost outside a DATA frame): HPACK state is unknown, so no header,
   including the path, is decoded for the rest of that connection (a later
   client preface on it does not lift this; over TLS a reused key starts
-  clean only after `SSL_new` returned the new object, USER-GUIDE §5.3), and while credential masking
+  clean only after the agent saw the library create the new object:
+  `SSL_new` returned it, or a Go connection's first handshake entered,
+  USER-GUIDE §5.3), and while credential masking
   is on its bodies are not exported (nor are bodies after any lost header
   block, or with a content type repeated or over 256 bytes).
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
