@@ -79,6 +79,14 @@ pub struct PostgresParser {
     /// The last statement built names a credential (bare names included):
     /// its error text is withheld ([`super::export_error_text`]).
     error_withheld: bool,
+    /// The current cycle runs a statement confirmed in an earlier cycle,
+    /// which a server-side function may have redefined unseen (dynamic
+    /// PREPARE / DEALLOCATE): its bound values are exported only if the
+    /// server's CommandComplete names the command of the SQL it was
+    /// confirmed with ([`tag_matches`]).
+    verify_tag: bool,
+    /// The last CommandComplete tag of the current cycle.
+    command_tag: Option<String>,
 }
 
 /// Max named statements remembered per connection.
@@ -180,6 +188,8 @@ impl PostgresParser {
             binds: VecDeque::new(),
             next_parse: 0,
             error_withheld: false,
+            verify_tag: false,
+            command_tag: None,
             query_ts: None,
             query_text: None,
             pending_error: None,
@@ -443,6 +453,11 @@ impl PostgresParser {
                     let name = extract_string(payload);
                     self.prepared.remove(&name);
                     let sql = extract_second_string(payload);
+                    if may_redefine_statements(&sql) {
+                        // Executed later, it may PREPARE, DEALLOCATE or
+                        // DISCARD any name: forget them all now.
+                        Self::forget_statements(&mut self.prepared, &mut self.pending, |_| true);
+                    }
                     self.next_parse += 1;
                     Pending::Parse(self.next_parse, name, Some(sql.into()))
                 }
@@ -477,15 +492,15 @@ impl PostgresParser {
                 }
                 b'S' => Pending::Sync,
                 b'Q' => {
-                    // SQL PREPARE / DEALLOCATE may redefine any name, and a
-                    // simple Query ends the unnamed statement: forget every
-                    // statement, confirmed or pending.
-                    self.prepared.clear();
-                    for p in self.pending.iter_mut() {
-                        if let Pending::Parse(_, _, sql) = p {
-                            *sql = None;
-                        }
-                    }
+                    // A simple Query ends the unnamed statement; its SQL
+                    // may PREPARE, DEALLOCATE or DISCARD any name only if
+                    // it names one of those commands (as a word, anywhere:
+                    // comments and literals included): then every
+                    // statement is forgotten, confirmed or pending.
+                    let all = may_redefine_statements(&extract_string(payload));
+                    Self::forget_statements(&mut self.prepared, &mut self.pending, |name| {
+                        all || name.is_empty()
+                    });
                     Pending::Sync
                 }
                 b'C' if payload.first() == Some(&b'S') => {
@@ -521,6 +536,24 @@ impl PostgresParser {
         self.parses_lost = true;
         self.pending.clear();
         self.binds.clear();
+    }
+
+    /// Forget the statements whose name `which` selects: confirmed ones,
+    /// and the SQL of unanswered Parses of them (never committed). Takes
+    /// the two fields, not `self`: callers hold `client_buf` borrowed.
+    fn forget_statements(
+        prepared: &mut HashMap<String, Arc<str>>,
+        pending: &mut VecDeque<Pending>,
+        which: impl Fn(&str) -> bool,
+    ) {
+        prepared.retain(|name, _| !which(name));
+        for p in pending.iter_mut() {
+            if let Pending::Parse(_, name, sql) = p
+                && which(name)
+            {
+                *sql = None;
+            }
+        }
     }
 
     fn handle_ready(&mut self, ts: u64) -> bool {
@@ -561,6 +594,7 @@ impl PostgresParser {
                     Some(query) => {
                         self.query_text = Some(query.to_string());
                         self.bind_params = bind;
+                        self.verify_tag = true;
                     }
                     None => {
                         self.query_text = Some("EXECUTE".into());
@@ -608,9 +642,9 @@ impl PostgresParser {
                 b'T' => {} // RowDescription — skip
                 b'D' => {} // DataRow — skip
                 b'C' => {
-                    // CommandComplete: tag\0
-                    let _tag = extract_string(&payload);
-                    // Don't emit yet — wait for ReadyForQuery
+                    // CommandComplete: tag\0. Don't emit yet: wait for
+                    // ReadyForQuery.
+                    self.command_tag = Some(extract_string(&payload));
                 }
                 b'1' if !self.parses_lost => {
                     // ParseComplete answers the oldest Parse pending (the
@@ -699,8 +733,12 @@ impl PostgresParser {
         // confirmed, and only when that is the SQL this event shows: a Bind
         // of another statement, or of one the server did not confirm,
         // exports none, and values are never paired with other SQL.
+        let tag = self.command_tag.take();
+        let tag_ok = !std::mem::take(&mut self.verify_tag)
+            || tag_matches(tag.as_deref(), self.query_text.as_deref());
         let bound = self.bind_params.take().and_then(|(bind, values)| {
-            (!self.parses_lost
+            (tag_ok
+                && !self.parses_lost
                 && bind.awaits.is_none()
                 && bind.sql.is_some()
                 && bind.sql.as_deref() == self.query_text.as_deref())
@@ -734,6 +772,33 @@ impl PostgresParser {
             State::Encrypted => "encrypted",
         }
     }
+}
+
+/// Whether SQL may create, redefine or destroy prepared statements:
+/// it names PREPARE, DEALLOCATE or DISCARD as a word, in any case,
+/// anywhere (comments and string literals included, so a dynamic
+/// `EXECUTE 'DEALLOCATE s'` counts). Words are runs of ASCII letters and
+/// digits: any other byte separates, which errs toward forgetting.
+fn may_redefine_statements(sql: &str) -> bool {
+    sql.as_bytes()
+        .split(|b| !b.is_ascii_alphanumeric())
+        .any(|w| {
+            [&b"PREPARE"[..], b"DEALLOCATE", b"DISCARD"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+        })
+}
+
+/// Whether a CommandComplete tag names the command of `sql` (its first
+/// keyword: `INSERT 0 1` for an INSERT). No tag (an error) or no known
+/// keyword is no match.
+fn tag_matches(tag: Option<&str>, sql: Option<&str>) -> bool {
+    let (Some(tag), Some(verb)) = (tag, sql.and_then(super::secrets::sql_verb)) else {
+        return false;
+    };
+    tag.split(' ')
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case(verb))
 }
 
 fn extract_string(data: &[u8]) -> String {
@@ -1427,8 +1492,8 @@ mod tests {
     }
 
     /// Codex R6 N3: a simple Query can redefine or destroy statements
-    /// (PREPARE / DEALLOCATE, and any Query ends the unnamed one): every
-    /// confirmed statement is forgotten.
+    /// (PREPARE / DEALLOCATE: every confirmed statement is forgotten), and
+    /// any Query ends the unnamed one.
     #[test]
     fn test_simple_query_forgets_statements() {
         let simple = |p: &mut PostgresParser, sql: &str| {
@@ -1473,6 +1538,166 @@ mod tests {
         assert!(p.prepared.is_empty(), "{:?}", p.prepared);
     }
 
+    /// SQL that names PREPARE, DEALLOCATE or DISCARD as a word, in any
+    /// case and anywhere (comments and literals included), may redefine
+    /// statements; other SQL, and longer words containing them, may not.
+    #[test]
+    fn test_may_redefine_statements() {
+        for sql in [
+            "PREPARE s2(text) AS SELECT $1",
+            "DEALLOCATE s",
+            "DEALLOCATE ALL",
+            "DISCARD ALL",
+            "dEaLlOcAtE s",
+            "discard plans",
+            "SELECT 1 /* deallocate s */",
+            "SELECT 1 -- PREPARE\n",
+            "SELECT 'prepare'",
+            "SELECT f($$DEALLOCATE s$$)",
+            "DO $x$BEGIN EXECUTE 'deallocate s'; END$x$",
+            "SELECT x_prepare_y",
+        ] {
+            assert!(may_redefine_statements(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT prepared_at, discarded FROM t",
+            "INSERT INTO users (note) VALUES ('preparation')",
+            "UPDATE t SET deallocated = true",
+        ] {
+            assert!(!may_redefine_statements(sql), "{sql}");
+        }
+    }
+
+    /// A simple Query always forgets the unnamed statement; it forgets the
+    /// named ones only when its SQL may redefine statements. The same SQL
+    /// sent through Parse (the extended protocol) forgets them too.
+    #[test]
+    fn test_statement_redefining_sql_forgets_named_statements() {
+        // `s` (named) and the unnamed statement, both confirmed.
+        let confirmed = || {
+            let mut p = setup_ready_parser();
+            p.feed(
+                &extended_cycle(Some(("s", "SELECT $1::text")), "s", &["x"]),
+                Direction::Egress,
+                1,
+            );
+            p.feed(&insert_done(), Direction::Ingress, 2);
+            p.feed(
+                &extended_cycle(Some(("", "SELECT $1::int")), "", &["1"]),
+                Direction::Egress,
+                3,
+            );
+            p.feed(&insert_done(), Direction::Ingress, 4);
+            assert!(p.prepared.contains_key("s") && p.prepared.contains_key(""));
+            p
+        };
+        let simple = |p: &mut PostgresParser, sql: &str| {
+            p.feed(
+                &make_frontend_msg(b'Q', format!("{sql}\0").as_bytes()),
+                Direction::Egress,
+                5,
+            );
+            let mut r = make_backend_msg(b'C', b"OK\0");
+            r.extend(make_backend_msg(b'Z', b"I"));
+            p.feed(&r, Direction::Ingress, 6);
+        };
+        let extended = |p: &mut PostgresParser, sql: &str| {
+            p.feed(
+                &extended_cycle(Some(("", sql)), "", &[]),
+                Direction::Egress,
+                5,
+            );
+            p.feed(&insert_done(), Direction::Ingress, 6);
+        };
+        let forgetting = [
+            "PREPARE s2(text) AS INSERT INTO users(password) VALUES ($1)",
+            "DEALLOCATE s",
+            "Deallocate ALL",
+            "DISCARD ALL",
+            "SELECT 1 /* DEALLOCATE */",
+            "SELECT 'prepare'",
+        ];
+        for sql in forgetting {
+            let mut p = confirmed();
+            simple(&mut p, sql);
+            assert!(p.prepared.is_empty(), "simple {sql}: {:?}", p.prepared);
+
+            let mut p = confirmed();
+            extended(&mut p, sql);
+            assert!(!p.prepared.contains_key("s"), "extended {sql}");
+        }
+        // Plain SQL: the named statement stays; a simple Query still ends
+        // the unnamed one.
+        let mut p = confirmed();
+        simple(&mut p, "SELECT id FROM users WHERE note = 'x'");
+        assert!(p.prepared.contains_key("s"), "{:?}", p.prepared);
+        assert!(!p.prepared.contains_key(""), "{:?}", p.prepared);
+        let mut p = confirmed();
+        extended(&mut p, "SELECT prepared_at FROM t");
+        assert!(p.prepared.contains_key("s"), "{:?}", p.prepared);
+
+        // The closed hole: Parse("", "DEALLOCATE s"), then a Bind of `s`
+        // (which the client may have re-PREPAREd) exports no values.
+        let mut p = confirmed();
+        extended(&mut p, "DEALLOCATE s");
+        p.feed(
+            &extended_cycle(None, "s", &["s7Kf2v9LmQ8z"]),
+            Direction::Egress,
+            7,
+        );
+        let mut done = make_backend_msg(b'2', b"");
+        done.extend(make_backend_msg(b'C', b"SELECT 1\0"));
+        done.extend(make_backend_msg(b'Z', b"I"));
+        let out = format!("{:?}", p.feed(&done, Direction::Ingress, 8));
+        assert!(!out.contains("s7Kf"), "{out}");
+    }
+
+    /// A statement confirmed in an earlier cycle may have been redefined
+    /// by a server-side function (dynamic PREPARE / DEALLOCATE, which the
+    /// agent cannot see): its values are exported only when the server's
+    /// CommandComplete names the command of the SQL it was confirmed with.
+    #[test]
+    fn test_reused_statement_values_need_a_matching_command_tag() {
+        let run = |answer: Vec<u8>| -> Option<String> {
+            let mut p = setup_ready_parser();
+            let sql = "INSERT INTO users (email) VALUES ($1)";
+            p.feed(
+                &extended_cycle(Some(("s", sql)), "s", &["a@x.io"]),
+                Direction::Egress,
+                1,
+            );
+            p.feed(&insert_done(), Direction::Ingress, 2);
+            p.feed(
+                &extended_cycle(None, "s", &["s7Kf2v9LmQ8z"]),
+                Direction::Egress,
+                3,
+            );
+            match p.feed(&answer, Direction::Ingress, 4) {
+                ParseResult::Messages(m) => m[0].request_text.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let answer = |tag: Option<&[u8]>| {
+            let mut r = make_backend_msg(b'2', b"");
+            match tag {
+                Some(t) => r.extend(make_backend_msg(b'C', t)),
+                None => r.extend(make_backend_msg(b'E', b"SERROR\0Mfailed\0\0")),
+            }
+            r.extend(make_backend_msg(b'Z', b"I"));
+            r
+        };
+        assert_eq!(
+            run(answer(Some(b"INSERT 0 1\0"))).as_deref(),
+            Some("s7Kf2v9LmQ8z")
+        );
+        // Redefined to another command (PREPARE takes only SELECT, INSERT,
+        // UPDATE, DELETE, MERGE and VALUES): UPDATE users SET password = $1.
+        assert_eq!(run(answer(Some(b"UPDATE 1\0"))), None);
+        // No tag (an error): unverified, withheld.
+        assert_eq!(run(answer(None)), None);
+    }
+
     /// A Bind/Execute cycle of a statement whose SQL the agent does not
     /// know (forgotten, or prepared before capture) is still one exchange:
     /// it is exported without SQL or bound values, never dropped, and its
@@ -1487,13 +1712,13 @@ mod tests {
             1,
         );
         p.feed(&insert_done(), Direction::Ingress, 2);
-        // A simple Query: every statement is forgotten.
+        // DISCARD ALL in a simple Query: every statement is forgotten.
         p.feed(
-            &make_frontend_msg(b'Q', b"SELECT 1\0"),
+            &make_frontend_msg(b'Q', b"DISCARD ALL\0"),
             Direction::Egress,
             3,
         );
-        let mut r = make_backend_msg(b'C', b"SELECT 1\0");
+        let mut r = make_backend_msg(b'C', b"DISCARD ALL\0");
         r.extend(make_backend_msg(b'Z', b"I"));
         p.feed(&r, Direction::Ingress, 4);
         // The driver reuses the statement: Bind/Execute/Sync only.

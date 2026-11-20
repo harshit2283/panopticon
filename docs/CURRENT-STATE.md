@@ -214,7 +214,13 @@ production-hardened compliance platform.
     `Bind` of a statement whose SQL the agent does not know (prepared
     before capture, or forgotten). PostgreSQL bound values are
     not exported on a connection the agent joined mid-stream or lost
-    server bytes on, and a simple Query forgets every confirmed statement.
+    server bytes on. A simple Query forgets the unnamed statement, and SQL
+    naming `PREPARE`, `DEALLOCATE` or `DISCARD` (simple Query or `Parse`)
+    forgets every statement. Known limit: a server-side function that
+    runs `PREPARE` / `DEALLOCATE` dynamically redefines a statement
+    unseen; a reused statement's values then need a `CommandComplete` of
+    the same command, which misses a same-command redefinition
+    (USER-GUIDE §5.3).
   - HTTP/2 headers are not decoded on a connection the agent did not see
     whole: one already open when the agent started, a side whose start
     was not captured, or one whose parser restarted after lost bytes; a
@@ -278,7 +284,9 @@ production-hardened compliance platform.
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their
     statement had when the Bind was sent, once confirmed, even if it is
-    redefined later (a simple Query forgets every statement), and not at
+    redefined later (SQL naming `PREPARE`, `DEALLOCATE` or `DISCARD`
+    forgets every statement, a simple Query the unnamed one; a reused
+    statement needs a `CommandComplete` of the same command), and not at
     all on a connection joined mid-stream, after lost server bytes or
     past 4096 retained Bind snapshots;
     only known SQL keywords are exported as methods. `[credentials]
