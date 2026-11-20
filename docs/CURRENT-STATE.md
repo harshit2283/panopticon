@@ -28,10 +28,17 @@ production-hardened compliance platform.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol and
-  prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
-  every request that carried it, and no raw PII values in the export
-  (`tests/oracle/run_protocols.sh`).
+- Redis, MySQL (text protocol and prepared statements, plaintext) and
+  gRPC are scored the same way: 100% recall, PII flagged in every request
+  that carried it, and no raw PII values in the export
+  (`tests/oracle/run_protocols.sh`). PostgreSQL (simple, extended,
+  prepared): 83.8-84.6% recall over seeds 7, 11 and 23 (simple and
+  extended 100%, reused prepared statements 39-60 of 118-141), PII flagged
+  in 38-42% of the operations that sent it, no raw PII values. Every
+  exchange is exported; what is missing is bound values, where the oracle
+  sends the prepared statements' token and the PII: they stop for the
+  rest of a connection once server bytes are lost, which a large result
+  causes about 200 operations into each run.
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
   `redacted`, `metrics_only`) are checked with planted PII and credentials
   in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
@@ -117,6 +124,8 @@ production-hardened compliance platform.
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
     PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
+    (2026-11-04, before the PostgreSQL bound-value rules of 2026-11-13;
+    see the PostgreSQL oracle above for current figures)
     exported (Kafka on 8.10: see below), every TLS exchange carrying its
     socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
@@ -225,7 +234,13 @@ production-hardened compliance platform.
     `Bind` of a statement whose SQL the agent does not know (prepared
     before capture, or forgotten). PostgreSQL bound values are
     not exported on a connection the agent joined mid-stream or lost
-    server bytes on, and a simple Query forgets every confirmed statement.
+    server bytes on. A simple Query forgets the unnamed statement, and SQL
+    naming `PREPARE`, `DEALLOCATE` or `DISCARD` (simple Query or `Parse`)
+    forgets every statement. Known limit: a server-side function that
+    runs `PREPARE` / `DEALLOCATE` dynamically redefines a statement
+    unseen; a reused statement's values then need a `CommandComplete` of
+    the same command, which misses a same-command redefinition
+    (USER-GUIDE §5.3).
   - HTTP/2 headers are not decoded on a connection the agent did not see
     whole: one already open when the agent started, a side whose start
     was not captured, or one whose parser restarted after lost bytes; a
@@ -294,7 +309,9 @@ production-hardened compliance platform.
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their
     statement had when the Bind was sent, once confirmed, even if it is
-    redefined later (a simple Query forgets every statement), and not at
+    redefined later (SQL naming `PREPARE`, `DEALLOCATE` or `DISCARD`
+    forgets every statement, a simple Query the unnamed one; a reused
+    statement needs a `CommandComplete` of the same command), and not at
     all on a connection joined mid-stream, after lost server bytes or
     past 4096 retained Bind snapshots;
     only known SQL keywords are exported as methods. `[credentials]

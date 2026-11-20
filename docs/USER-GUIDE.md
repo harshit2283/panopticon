@@ -885,9 +885,26 @@ than the cycle's `Parse`, or of one the server rejected, exports no
 values. Past 4096 retained `Bind` snapshots (Binds read but not yet
 consumed by their cycle), no bound value is exported on the connection. A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
-until confirmed. A simple Query forgets every confirmed statement and
-cancels unanswered `Parse` messages: its SQL may `PREPARE` or
-`DEALLOCATE` any name, and it ends the unnamed statement. A `Bind` of a
+until confirmed. A simple Query ends the unnamed statement, so the agent
+forgets it. SQL that names `PREPARE`, `DEALLOCATE` or `DISCARD` as a
+word, in any case and anywhere in its text (comments and string literals
+included), may create, redefine or destroy any named statement: when a
+simple Query or a `Parse` carries such SQL, every statement is forgotten,
+confirmed or pending (unanswered `Parse` messages are cancelled). Other
+SQL leaves named statements as they are. Known limit: a server-side
+function can run `PREPARE` or `DEALLOCATE` dynamically (a PL/pgSQL
+`EXECUTE` of a string built at run time) and redefine a named statement
+the agent cannot see. A `Bind` of a statement confirmed in an earlier
+cycle therefore exports its values only when the server's
+`CommandComplete` names the same command as the SQL it was confirmed
+with (`INSERT 0 1` for an `INSERT`; no values after an error, or for SQL
+whose first keyword is not the command, such as `WITH`). That catches a
+redefinition to another command, not one to the same command: a
+statement redefined unseen from `INSERT INTO users (note) VALUES ($1)`
+to `INSERT INTO accounts (password) VALUES ($1)` would export the
+password under the first SQL. `PREPARE` accepts only `SELECT`,
+`INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES`, so a statement
+cannot become `ALTER ROLE ... PASSWORD`. A `Bind` of a
 statement whose SQL the agent does not know (prepared before capture, or
 forgotten) is still exported, as `EXECUTE` without SQL or bound values. Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
