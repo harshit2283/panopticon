@@ -26,7 +26,10 @@
 //! The connection handshake (Start/Tune and their replies, which carry the
 //! credentials) is not exported beyond Connection.Open. Capture gaps inside
 //! a frame are counted against the frame size; anything else resyncs on the
-//! next plausible frame.
+//! next plausible frame. A body with bytes kept after a gap inside it (a
+//! gap in a body frame that is not its last, or frame sync lost while it
+//! was assembled) exports no body text, only its size; a gap that only
+//! cuts its end keeps the captured prefix.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -246,6 +249,15 @@ struct Content {
     body: Vec<u8>,
     /// Basic.GetOk: completes the channel's pending Basic.Get.
     get_ok: bool,
+    /// Bytes of this content's body may have been lost (a capture gap
+    /// inside a body frame, or frame sync lost while it was assembled);
+    /// it becomes `gapped` if more body bytes follow.
+    gap_pending: bool,
+    /// Body bytes were kept after a gap inside the body: what is left may
+    /// hold a credential's value without its name, so no body text is
+    /// exported (sizes are), as for HTTP/1 and HTTP/2 (security scan F3).
+    /// A gap that only cuts the body's end keeps the captured prefix.
+    gapped: bool,
 }
 
 /// A synchronous request waiting for its reply.
@@ -306,6 +318,28 @@ impl AmqpParser {
         self.channels.entry(id).or_default()
     }
 
+    /// Frame sync lost on `direction`: scan for the next plausible frame.
+    /// The bytes skipped meanwhile may belong to any content being
+    /// assembled in that direction, on any channel.
+    fn lose_sync(&mut self, direction: Direction) {
+        self.side(direction).resync = true;
+        self.gap_in_contents(direction);
+    }
+
+    /// Bytes of `direction` were lost where the channel is not known: every
+    /// content being assembled in that direction may miss body bytes.
+    fn gap_in_contents(&mut self, direction: Direction) {
+        for ch in self.channels.values_mut() {
+            let content = match direction {
+                Direction::Egress => ch.publish.as_mut(),
+                Direction::Ingress => ch.delivery.as_mut(),
+            };
+            if let Some(c) = content {
+                c.gap_pending = true;
+            }
+        }
+    }
+
     /// Parse the frames buffered for `direction`.
     fn drain(&mut self, direction: Direction, ts: u64) -> ParseResult {
         let mut buf = std::mem::take(&mut self.side(direction).buf);
@@ -342,7 +376,7 @@ impl AmqpParser {
             }
             let size = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
             if size > MAX_FRAME_SIZE {
-                self.side(direction).resync = true;
+                self.lose_sync(direction);
                 buf.consume(1);
                 continue;
             }
@@ -351,7 +385,7 @@ impl AmqpParser {
                 break;
             }
             if data[total - 1] != FRAME_END {
-                self.side(direction).resync = true;
+                self.lose_sync(direction);
                 buf.consume(1);
                 continue;
             }
@@ -404,10 +438,15 @@ impl AmqpParser {
             }
             FRAME_BODY => {
                 if let Some(c) = self.content(direction, channel) {
+                    // Body bytes after a gap inside this body.
+                    c.gapped |= c.gap_pending && !payload.is_empty();
                     let room = MAX_BODY_TEXT.saturating_sub(c.body.len());
                     c.body
                         .extend_from_slice(&payload[..payload.len().min(room)]);
                     c.received += size as u64;
+                    // A frame cut by a capture gap ([`ProtocolParser::skip`]):
+                    // the rest of it was lost.
+                    c.gap_pending |= payload.len() < size;
                 }
                 self.complete(direction, channel, ts, out);
             }
@@ -445,7 +484,10 @@ impl AmqpParser {
         };
         let Some(mut c) = content else { return };
         let size = c.body_size.unwrap_or(c.received);
-        if !c.body.is_empty() {
+        if c.gapped {
+            // Sizes only ([`Content::gapped`]).
+            zeroize::Zeroize::zeroize(&mut c.body);
+        } else if !c.body.is_empty() {
             let text = String::from_utf8_lossy(&c.body).into_owned();
             match direction {
                 Direction::Egress => c.msg.request_text = Some(text),
@@ -651,6 +693,8 @@ impl AmqpParser {
             received: 0,
             body: Vec::new(),
             get_ok,
+            gap_pending: false,
+            gapped: false,
         };
         let ch = self.channel(channel);
         match direction {
@@ -771,8 +815,8 @@ impl ProtocolParser for AmqpParser {
         if side.buf.extend(data).is_err() {
             // Cannot be a valid frame (> MAX_FRAME_SIZE): resync.
             side.buf.clear();
-            side.resync = true;
             let _ = side.buf.extend(&data[data.len().saturating_sub(7)..]);
+            self.lose_sync(direction);
         }
         self.drain(direction, timestamp_ns)
     }
@@ -780,7 +824,9 @@ impl ProtocolParser for AmqpParser {
     /// `n` bytes were not captured. Inside a frame of known size the frame
     /// is processed from what was seen (a body frame counts all of its bytes
     /// towards the message) and the rest of it is dropped; otherwise the
-    /// parser resyncs on the next plausible frame.
+    /// parser resyncs on the next plausible frame. Either way a content
+    /// that may have lost body bytes exports no body text once more body
+    /// bytes follow ([`Content::gapped`]).
     fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
         let side = self.side(direction);
         if side.discard >= n {
@@ -798,7 +844,7 @@ impl ProtocolParser for AmqpParser {
         let Some((size, total)) = whole else {
             side.buf.clear();
             side.discard = 0;
-            side.resync = true;
+            self.lose_sync(direction);
             return Some(ParseResult::NeedMoreData);
         };
         let seen = data.to_vec();
@@ -1104,6 +1150,101 @@ mod tests {
         wire.clear();
         let m = msgs(p.feed(&next, Direction::Egress, 2));
         assert_eq!(m[0].path.as_deref(), Some("ex/rk.tok_6_"));
+    }
+
+    /// Publish method + header for a body of `size` bytes, sent as the
+    /// body frames that follow.
+    fn publish_head(channel: u16, size: u64) -> Vec<u8> {
+        let mut args = 0u16.to_be_bytes().to_vec();
+        args.extend(s("ex"));
+        args.extend(s("rk"));
+        args.push(0);
+        let mut f = method(channel, 60, 40, &args);
+        f.extend(header(channel, size, Some("application/json")));
+        f
+    }
+
+    /// Security scan F3: a gap inside a body frame that is not the last
+    /// may remove a credential's name and keep its value in a later frame:
+    /// the joined body is not exported, its size is.
+    #[test]
+    fn gap_inside_a_multi_frame_body_withholds_its_text() {
+        let mut p = connected();
+        let first = frame(FRAME_BODY, 1, &[b'a'; 3000]);
+        let second = frame(FRAME_BODY, 1, b"\"hunter2-value\"}");
+        let size = 3000 + 16;
+        let mut wire = publish_head(1, size);
+        wire.extend(&first[..1000]); // 7-byte header + 993 body bytes
+        assert!(msgs(p.feed(&wire, Direction::Egress, 1)).is_empty());
+        let lost = first.len() - 1000;
+        assert!(msgs(p.skip(Direction::Egress, lost, 2).unwrap()).is_empty());
+        let m = msgs(p.feed(&second, Direction::Egress, 3));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].request_text, None, "no body text after a gap");
+        assert_eq!(m[0].request_size_bytes, size);
+        assert_eq!(m[0].path.as_deref(), Some("ex/rk"));
+
+        // The same on the server side (Basic.Deliver).
+        let mut args = s("ctag1.0");
+        args.extend_from_slice(&7u64.to_be_bytes());
+        args.push(0);
+        args.extend(s("ex"));
+        args.extend(s("rk"));
+        let mut wire = method(2, 60, 60, &args);
+        wire.extend(header(2, size, None));
+        let first = frame(FRAME_BODY, 2, &[b'a'; 3000]);
+        wire.extend(&first[..1000]);
+        assert!(msgs(p.feed(&wire, Direction::Ingress, 4)).is_empty());
+        assert!(msgs(p.skip(Direction::Ingress, lost, 5).unwrap()).is_empty());
+        let m = msgs(p.feed(
+            &frame(FRAME_BODY, 2, b"\"hunter2-value\"}"),
+            Direction::Ingress,
+            6,
+        ));
+        assert_eq!(m[0].method.as_deref(), Some("Basic.Deliver"));
+        assert_eq!(m[0].payload_text, None);
+        assert_eq!(m[0].response_size_bytes, size);
+    }
+
+    /// A gap that loses frame sync (here: whole frames between two body
+    /// frames) withholds the body text too, whatever channel it was on.
+    #[test]
+    fn lost_frame_sync_inside_a_body_withholds_its_text() {
+        let mut p = connected();
+        let mut wire = publish_head(3, 30);
+        wire.extend(frame(FRAME_BODY, 3, b"0123456789"));
+        assert!(msgs(p.feed(&wire, Direction::Egress, 1)).is_empty());
+        // The next body frame (10 bytes + 8 framing) is lost whole.
+        assert!(msgs(p.skip(Direction::Egress, 18, 2).unwrap()).is_empty());
+        let third = frame(FRAME_BODY, 3, b"abcdefghij");
+        assert!(msgs(p.feed(&third, Direction::Egress, 3)).is_empty());
+        // The lost frame never counted: the next method ends the content.
+        let m = msgs(p.feed(&publish(3, "ex", "rk", b"next"), Direction::Egress, 4));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].request_text, None, "no body text after the gap");
+        assert_eq!(m[0].request_size_bytes, 30);
+        assert_eq!(m[1].request_text.as_deref(), Some("next"));
+    }
+
+    /// A gap that only cuts the body's end keeps the captured prefix, as
+    /// for HTTP: no byte after the gap is joined to it.
+    #[test]
+    fn gap_in_the_last_body_frame_keeps_the_prefix() {
+        let mut p = connected();
+        let head = b"{\"id\":\"tok_9_\",\"x\":";
+        let mut wire = publish_head(1, (head.len() + 3000) as u64);
+        wire.extend(frame(FRAME_BODY, 1, head));
+        let last = frame(FRAME_BODY, 1, &[b'z'; 3000]);
+        wire.extend(&last[..507]); // 7-byte header + 500 body bytes
+        assert!(msgs(p.feed(&wire, Direction::Egress, 1)).is_empty());
+        let m = msgs(p.skip(Direction::Egress, last.len() - 507, 2).unwrap());
+        assert_eq!(m.len(), 1);
+        let text = m[0].request_text.as_deref().expect("prefix kept");
+        assert!(text.starts_with("{\"id\":\"tok_9_\""), "{text}");
+        assert_eq!(text.len(), head.len() + 500);
+        // A method frame after it starts clean.
+        let m = msgs(p.feed(&publish(1, "ex", "rk", b"clean"), Direction::Egress, 3));
+        assert_eq!(m[0].request_text.as_deref(), Some("clean"));
     }
 
     #[test]

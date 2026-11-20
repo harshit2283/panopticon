@@ -251,8 +251,8 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
+    message bodies; a cut end keeps its prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
     start, over TLS on a reused key only after `SSL_new` returned

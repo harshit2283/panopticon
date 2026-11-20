@@ -671,10 +671,15 @@ What is exported then:
 - **A body with bytes captured after a gap** (bytes lost to ring drops
   or the capture cap, then more of the same body kept), or an HTTP/2 body
   whose stream's headers the agent did not see, is not exported (its size
-  is): what is left may hold a credential's value without its name. A gap
+  is): what is left may hold a credential's value without its name. This
+  covers HTTP/1, HTTP/2 and AMQP message bodies; for AMQP, a gap inside a
+  body frame that is not the body's last, or a gap that loses frame sync
+  while a body is being assembled, followed by more of that body. A gap
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
-  body).
+  body). A Kafka request or response is decoded only up to a gap inside
+  it, and a gap anywhere else restarts the parser, so its record text
+  never joins bytes from both sides of a gap.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
