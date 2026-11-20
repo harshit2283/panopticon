@@ -205,7 +205,13 @@ pub fn load_and_attach(
     // before arm); the selector's refusals come first.
     let select = |ebpf: &mut Ebpf, root: &scope_loader::CgroupRoot| {
         if cgroup_sel {
-            crate::scope_select::startup_publish(ebpf, root.path(), paths, pods)
+            crate::scope_select::startup_publish(
+                ebpf,
+                root.path(),
+                paths,
+                pods,
+                config.pod_cgroup_root.as_deref(),
+            )
         } else {
             Ok(())
         }

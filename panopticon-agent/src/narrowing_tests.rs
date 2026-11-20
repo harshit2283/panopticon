@@ -1906,6 +1906,7 @@ mod publisher {
                 Some("n1".into()),
                 cgroup_filter,
                 pods,
+                None,
                 crate::config::ScopeOptions::default(),
             )
             .unwrap();

@@ -40,6 +40,9 @@ pub struct AgentMetrics {
     /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
     pub credential_matches_user: Counter<u64>,
     pub credential_matches_builtin: Counter<u64>,
+    /// `panopticon_pod_filter_unresolved_total{reason}`, one per
+    /// `scope_select::POD_UNRESOLVED_REASONS` entry in that order.
+    pub pod_unresolved: Vec<Counter<u64>>,
     /// Kernel scope drops ([`Self::register_scope_drops`]), one per
     /// `SCOPE_DROP_NAMES` entry in that order; empty until registered.
     pub scope_drops: Vec<Counter<u64>>,
@@ -185,6 +188,19 @@ impl AgentMetrics {
             .get_or_create(&[("source", "builtin")])
             .clone();
 
+        let unresolved = Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_pod_filter_unresolved",
+            "Resolutions of a pod pod_filter selected that left it uncaptured: no cgroup \
+             directory in the kubepods roots searched (not_found), several (ambiguous), or one \
+             that could not be used (unusable)",
+            unresolved.clone(),
+        );
+        let pod_unresolved = crate::scope_select::POD_UNRESOLVED_REASONS
+            .iter()
+            .map(|r| unresolved.get_or_create(&[("reason", *r)]).clone())
+            .collect();
+
         let metrics = Self {
             events_received,
             events_dropped,
@@ -202,6 +218,7 @@ impl AgentMetrics {
             tcp_segments_ignored,
             credential_matches_user,
             credential_matches_builtin,
+            pod_unresolved,
             scope_drops: Vec::new(),
             drops_stale_scope_gen: None,
             parse_latency,
@@ -308,6 +325,13 @@ impl AgentMetrics {
         self.credential_matches_builtin
             .inner()
             .store(builtin, Ordering::Relaxed);
+        for (counter, value) in self
+            .pod_unresolved
+            .iter()
+            .zip(crate::scope_select::pod_unresolved())
+        {
+            counter.inner().store(value, Ordering::Relaxed);
+        }
         for (counter, value) in self.scope_drops.iter().zip(&stats.scope_drops) {
             counter
                 .inner()

@@ -93,6 +93,8 @@ pub struct Publisher<M> {
     /// The owner a pod's cgroup directories must have: root (unprivileged
     /// tests set their own uid, [`Self::trust_pod_dirs_of`]).
     pod_owner: u32,
+    /// `pod_cgroup_root` (restart-only).
+    pod_root: Option<String>,
 }
 
 impl<M: ScopeMaps> Publisher<M> {
@@ -107,6 +109,7 @@ impl<M: ScopeMaps> Publisher<M> {
         node: Option<String>,
         cgroup_filter: &[String],
         pod_filter: &[PodFilter],
+        pod_root: Option<String>,
         options: ScopeOptions,
     ) -> Result<Self> {
         let mut current = BTreeSet::new();
@@ -116,7 +119,7 @@ impl<M: ScopeMaps> Publisher<M> {
         })?;
         Ok(Self {
             pods_rx: k8s.as_ref().map(|m| m.subscribe()),
-            cgroup_ids: resolve(&root, cgroup_filter, &[])?.ids,
+            cgroup_ids: resolve(&root, cgroup_filter, &[], None)?.ids,
             maps,
             scope,
             root,
@@ -128,6 +131,7 @@ impl<M: ScopeMaps> Publisher<M> {
             disabled: None,
             stopped: false,
             pod_owner: 0,
+            pod_root,
         })
     }
 
@@ -152,7 +156,13 @@ impl<M: ScopeMaps> Publisher<M> {
             bail!("pod_filter needs Kubernetes metadata, which is not available");
         };
         let pods = select_pods(&meta.pods(), filters, self.node.as_deref());
-        let r = resolve_owned_by(&self.root, &[], &pods, self.pod_owner)?;
+        let r = resolve_owned_by(
+            &self.root,
+            &[],
+            &pods,
+            self.pod_root.as_deref(),
+            self.pod_owner,
+        )?;
         if !r.unresolved.is_empty() {
             warn!(
                 pods = ?r.unresolved,
@@ -198,6 +208,7 @@ impl<M: ScopeMaps> Publisher<M> {
                     &self.root,
                     cgroup_filter.as_deref().unwrap_or_default(),
                     &[],
+                    None,
                 )
                 .and_then(|r| Ok((r.ids, self.pod_ids(&pod_filter)?)));
                 let (cgroup_ids, pod_ids) = match resolved {

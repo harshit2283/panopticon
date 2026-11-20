@@ -196,6 +196,12 @@ pub struct AgentConfig {
     /// `[[pod_filter]]`: pods on this node whose pod-level cgroup is
     /// captured (DESIGN §3.2). Restart-only for now.
     pub pod_filter: Option<Vec<PodFilter>>,
+    /// `pod_cgroup_root`: kubelet's kubepods directory when it is not one
+    /// `pod_filter` recognises (a custom kubelet `--cgroup-root`), as an
+    /// absolute cgroup path under the cgroup2 mount
+    /// (`/custom/kubepods`, `/a.slice/a-b.slice/a-b-kubepods.slice`).
+    /// Searched besides the recognised roots. Restart-only.
+    pub pod_cgroup_root: Option<String>,
     /// `capture_loopback` (default false): capture packets on node-local
     /// paths (`lo`, VRF; DESIGN §3.7). TLS plaintext is scoped by process regardless.
     /// A reload may change it.
@@ -317,6 +323,7 @@ impl Default for AgentConfig {
             pid_filter: None,
             cgroup_filter: None,
             pod_filter: None,
+            pod_cgroup_root: None,
             capture_loopback: false,
             pid_filter_listener: ListenerRule::Acceptor,
             cgroup2_path: "auto".into(),
@@ -511,6 +518,7 @@ pub struct AgentConfigFile {
     pub pid_filter: Option<Vec<u32>>,
     pub cgroup_filter: Option<Vec<String>>,
     pub pod_filter: Option<Vec<PodFilterFile>>,
+    pub pod_cgroup_root: Option<String>,
     pub capture_loopback: Option<bool>,
     pub pid_filter_listener: Option<String>,
     pub capture: Option<CaptureConfigFile>,
@@ -651,6 +659,32 @@ pub fn cgroup_filter_rel(path: &str) -> anyhow::Result<&str> {
     Ok(rel)
 }
 
+/// A `pod_cgroup_root` value as a path relative to the cgroup2 root: it
+/// must be absolute (a cgroup path, as kubelet and `/proc/<pid>/cgroup`
+/// spell it), not the root itself, and plain (no `.`, `..` or empty
+/// components). That it is a root-owned directory reached without a
+/// symlink or mount crossing is checked when it is resolved.
+pub fn pod_cgroup_root_rel(path: &str) -> anyhow::Result<&str> {
+    let Some(rel) = path.strip_prefix('/') else {
+        anyhow::bail!(
+            "pod_cgroup_root = \"{path}\": use an absolute cgroup path under the cgroup2 mount \
+             (e.g. \"/custom/kubepods\")"
+        );
+    };
+    if rel.is_empty() {
+        anyhow::bail!("pod_cgroup_root = \"/\" names the cgroup2 root, not kubelet's kubepods");
+    }
+    if rel
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == ".." || c.contains('\0'))
+    {
+        anyhow::bail!(
+            "pod_cgroup_root = \"{path}\": use a plain path (no `.`, `..` or empty components)"
+        );
+    }
+    Ok(rel)
+}
+
 /// `[capture]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -740,6 +774,9 @@ impl AgentConfigFile {
                     .map(PodFilterFile::validate)
                     .collect::<anyhow::Result<_>>()?,
             );
+        }
+        if let Some(v) = self.pod_cgroup_root {
+            base.pod_cgroup_root = Some(v);
         }
         if let Some(capture) = self.capture {
             match capture.backend.as_deref() {
@@ -1039,6 +1076,12 @@ fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     if config.pod_filter.is_some() && config.kubernetes.mode == KubernetesMode::Disabled {
         anyhow::bail!("pod_filter needs Kubernetes metadata, but [kubernetes] enabled = false");
     }
+    if let Some(root) = &config.pod_cgroup_root {
+        if config.pod_filter.is_none() {
+            anyhow::bail!("pod_cgroup_root is only used by pod_filter, which is not set");
+        }
+        pod_cgroup_root_rel(root)?;
+    }
     if config.kubernetes.relist_interval < Duration::from_secs(5) {
         return Err(anyhow::anyhow!(
             "kubernetes.relist_interval_secs must be >= 5"
@@ -1074,6 +1117,9 @@ pub fn check_restart_only(running: &AgentConfig, new: &AgentConfig) -> Result<()
     }
     if running.cgroup2_path != new.cgroup2_path {
         return Err("changing [capture] cgroup2_path needs a restart".into());
+    }
+    if running.pod_cgroup_root != new.pod_cgroup_root {
+        return Err("changing pod_cgroup_root needs a restart".into());
     }
     if running.sampling_mode != new.sampling_mode || running.sample_rate != new.sample_rate {
         return Err(
@@ -1490,6 +1536,16 @@ mod tests {
                 "{err}"
             );
         }
+        let pf = "[[pod_filter]]\nnamespace = \"pay\"\nname = \"co-1\"\n";
+        let err = check_restart_only(
+            &load(pf),
+            &load(&format!("pod_cgroup_root = \"/custom/kubepods\"\n{pf}")),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("pod_cgroup_root") && err.contains("needs a restart"),
+            "{err}"
+        );
         let head = load("sampling_mode = \"head_only\"\n");
         let err = check_restart_only(
             &head,
@@ -1568,6 +1624,25 @@ mod tests {
         assert_eq!(pods[0].namespace, "pay");
         assert!(matches!(&pods[0].select, PodSelect::Labels(l) if l.len() == 2));
         assert_eq!(pods[1].select, PodSelect::Name("co-1".into()));
+        // pod_cgroup_root: an absolute, plain cgroup path, with pod_filter.
+        let pf = "[[pod_filter]]\nnamespace = \"pay\"\nname = \"co-1\"\n";
+        let c = ok(&format!("pod_cgroup_root = \"/custom/kubepods\"\n{pf}"));
+        assert_eq!(c.pod_cgroup_root.as_deref(), Some("/custom/kubepods"));
+        for (toml, what) in [
+            (
+                format!("pod_cgroup_root = \"custom/kubepods\"\n{pf}"),
+                "absolute",
+            ),
+            (format!("pod_cgroup_root = \"/\"\n{pf}"), "cgroup2 root"),
+            (format!("pod_cgroup_root = \"/a/../b\"\n{pf}"), "plain path"),
+            (format!("pod_cgroup_root = \"/a//b\"\n{pf}"), "plain path"),
+            (
+                "pod_cgroup_root = \"/custom/kubepods\"\n".to_string(),
+                "only used by pod_filter",
+            ),
+        ] {
+            assert!(err(&toml).contains(what), "{toml}: {}", err(&toml));
+        }
         for (toml, what) in [
             (
                 "[[pod_filter]]\nlabels = { a = \"b\" }\n",
