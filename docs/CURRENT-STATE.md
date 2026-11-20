@@ -123,9 +123,9 @@ production-hardened compliance platform.
     ring buffer and 5.5+ probe-read helpers. Measured on Rocky Linux 8.10
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
-    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
+    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall
     (2026-11-04, before the PostgreSQL bound-value rules of 2026-11-13;
-    see the PostgreSQL oracle above for current figures)
+    see the PostgreSQL oracle above for current figures) with no raw PII
     exported (Kafka on 8.10: see below), every TLS exchange carrying its
     socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
