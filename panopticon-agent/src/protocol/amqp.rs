@@ -32,7 +32,10 @@
 //! cuts its end keeps the captured prefix. Once a direction loses frame
 //! sync, the frames the resync finds are not proven real (they may lie
 //! inside a body), so its messages export no text for the rest of the
-//! connection ([`Side::unsynced`]).
+//! connection ([`Side::unsynced`]). A parser that joins a stream after its
+//! first byte (capture attached to an open connection, protocol detected
+//! mid-stream) treats both directions so from the start
+//! ([`ProtocolParser::joined_late`]).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -302,6 +305,12 @@ pub struct AmqpParser {
     client: Side,
     server: Side,
     channels: HashMap<u16, Channel>,
+    /// The last call was [`ProtocolParser::skip`], which accounted for the
+    /// gap on its direction itself (kept the frame size or lost sync).
+    /// The connection manager follows every skip with
+    /// [`ProtocolParser::joined_late`], which this flag lets through once
+    /// without latching both directions.
+    skip_accounted: bool,
 }
 
 impl AmqpParser {
@@ -311,6 +320,7 @@ impl AmqpParser {
             client: Side::default(),
             server: Side::default(),
             channels: HashMap::new(),
+            skip_accounted: false,
         }
     }
 
@@ -852,7 +862,23 @@ fn find_frame(data: &[u8]) -> Option<usize> {
 }
 
 impl ProtocolParser for AmqpParser {
+    /// The stream was not seen from its first byte: a frame boundary found
+    /// from here may lie inside a body (a forged frame in a message), so
+    /// neither direction exports text for the rest of the connection
+    /// ([`Side::unsynced`]). Not after a [`skip`](Self::skip), which
+    /// already handled its own direction (`skip_accounted`).
+    fn joined_late(&mut self) {
+        if std::mem::take(&mut self.skip_accounted) {
+            return;
+        }
+        for direction in [Direction::Egress, Direction::Ingress] {
+            self.side(direction).unsynced = true;
+            self.gap_in_contents(direction);
+        }
+    }
+
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
+        self.skip_accounted = false;
         let side = self.side(direction);
         let n = side.discard.min(data.len());
         side.discard -= n;
@@ -874,6 +900,7 @@ impl ProtocolParser for AmqpParser {
     /// content that may have lost body bytes exports no body text once more
     /// body bytes follow ([`Content::gapped`]).
     fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
+        self.skip_accounted = true;
         let side = self.side(direction);
         if side.discard >= n {
             side.discard -= n;
@@ -1381,6 +1408,125 @@ mod tests {
         // text ([`Side::unsynced`]).
         assert_eq!(m[0].path, None);
         assert_eq!(m[0].request_text, None);
+    }
+
+    fn all_text(m: &L7Message) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?}",
+            m.path, m.request_text, m.payload_text, m.headers
+        )
+    }
+
+    /// A body that holds a whole Basic.Publish forged by the sender.
+    fn body_with_forged_publish() -> (Vec<u8>, Vec<u8>) {
+        let forged = publish(5, "leak", "rk.S3CRET", b"S3CRET-tail");
+        let mut body = b"{\"x\":\"".to_vec();
+        body.extend(&forged);
+        body.extend(b"\"}");
+        (publish(1, "ex", "rk", &body), forged)
+    }
+
+    /// Review (MED): capture joined mid-stream (attached to an open
+    /// connection, or detected after its first bytes), right at a forged
+    /// frame inside a body. Nothing parsed from it may export text, in
+    /// either direction, for the rest of the connection.
+    #[test]
+    fn joined_late_inside_a_body_exports_no_forged_frame() {
+        let (wire, forged) = body_with_forged_publish();
+        let at = wire
+            .windows(forged.len())
+            .position(|w| w == forged)
+            .unwrap();
+        let mut p = AmqpParser::new();
+        p.joined_late();
+        let mut out = msgs(p.feed(&wire[at..], Direction::Egress, 1));
+        out.extend(msgs(p.feed(
+            &publish(1, "ex", "rk.later", b"later"),
+            Direction::Egress,
+            2,
+        )));
+        assert!(
+            out.iter()
+                .any(|m| m.method.as_deref() == Some("Basic.Publish"))
+        );
+        for m in &out {
+            let all = all_text(m);
+            assert!(!all.contains("S3CRET") && !all.contains("later"), "{all}");
+            assert_eq!(m.path, None);
+        }
+        let mut d = method(2, 60, 60, &{
+            let mut a = s("ctag1.0");
+            a.extend_from_slice(&7u64.to_be_bytes());
+            a.push(0);
+            a.extend(s("ex"));
+            a.extend(s("rk"));
+            a
+        });
+        d.extend(header(2, 2, None));
+        d.extend(frame(FRAME_BODY, 2, b"ok"));
+        for m in msgs(p.feed(&d, Direction::Ingress, 3)) {
+            assert_eq!(m.payload_text, None, "{}", all_text(&m));
+            assert_eq!(m.path, None);
+        }
+    }
+
+    /// The same through the connection manager: a connection first seen
+    /// mid-stream (`mark_joined_late`, as the event loop does for a
+    /// connection it did not see open) exports nothing of the forged frame.
+    #[test]
+    fn manager_join_mid_stream_exports_no_forged_frame() {
+        use super::super::fsm::{ConnectionFsmManager, FsmResult};
+        let (wire, forged) = body_with_forged_publish();
+        let at = wire
+            .windows(forged.len())
+            .position(|w| w == forged)
+            .unwrap();
+        let m = ConnectionFsmManager::new(16);
+        let (client, server) = ((1, 40000), (2, 5672));
+        m.get_or_create_with_server(7, Protocol::Amqp, Some(server));
+        m.mark_joined_late(7);
+        let out = match m.process_packet_from(7, client, Direction::Egress, &wire[at..], 1) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        };
+        assert!(!out.is_empty());
+        for msg in &out {
+            assert!(!all_text(msg).contains("S3CRET"), "{}", all_text(msg));
+        }
+    }
+
+    /// A gap inside a frame of known size, through the manager (which
+    /// follows every skip with `joined_late`): the parser accounted for it,
+    /// so the connection keeps exporting text.
+    #[test]
+    fn manager_gap_inside_a_known_frame_keeps_text() {
+        use super::super::fsm::{ConnectionFsmManager, FsmResult};
+        let m = ConnectionFsmManager::new(16);
+        let (client, server) = ((1, 40000), (2, 5672));
+        m.get_or_create_with_server(8, Protocol::Amqp, Some(server));
+        m.process_packet_from(8, client, Direction::Egress, AMQP_PROTOCOL_HEADER, 1);
+        let wire = publish(1, "ex", "rk", &[b'a'; 100]);
+        let cut = wire.len() - 1 - 40; // 40 body bytes and the end marker lost
+        m.process_packet_from(8, client, Direction::Egress, &wire[..cut], 2);
+        m.skip_from(8, client, Direction::Egress, 41, 3);
+        let out = match m.process_packet_from(
+            8,
+            client,
+            Direction::Egress,
+            &publish(1, "ex", "rk.next", b"next"),
+            4,
+        ) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        };
+        let next = out.iter().find(|x| x.path.as_deref() == Some("ex/rk.next"));
+        assert!(
+            next.is_some(),
+            "{:?}",
+            out.iter().map(all_text).collect::<Vec<_>>()
+        );
     }
 
     #[test]

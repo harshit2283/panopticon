@@ -311,16 +311,21 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    A Redis command with credential context in its key or any argument,
-    or a key or hash field name containing a credential word, or with a
-    short name as a whole segment (`user:1:otp`, not `mykey`), is
-    withheld as one unit (key, arguments and reply
-    text, and its result inside `EXEC`), so `SET otp:<id> <code>`,
-    `SET otp <code>` and `HSET u:1 pin <pin>` export no value.
+    A Redis command with credential context in any argument, or with any
+    argument (key, name or value, of any command) containing a credential
+    word or a short name as a whole segment (segments split on every
+    character that is not an ASCII letter or digit and at a case boundary:
+    `user:1:otp`, `u|otp`, `pinCode`; not `mykey` or `otpcode`), is
+    withheld as one unit (key, arguments and reply text, and its result
+    inside `EXEC`), so `SET otp:<id> <code>`, `SET otp <code>`,
+    `HSET u:1 pin <pin>`, `EVAL <script> 1 otp` and `XADD s * otp <code>`
+    export no value. A value that only mentions a credential word
+    withholds its command too.
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
     message bodies; a cut end keeps its prefix), any AMQP text (path,
     headers, body) of a direction after it lost frame sync, for the rest
-    of the connection, HTTP/2 headers after a lost HPACK block or on a connection
+    of the connection, and of both directions of an AMQP connection the
+    agent did not see from its first byte, HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
     start, over TLS on a reused key only after the agent saw the library
