@@ -8,7 +8,7 @@ metadata:
     {{- include "panopticon.labels" . | nindent 4 }}
   annotations:
     prometheus.io/scrape: "true"
-    prometheus.io/port: {{ (split ":" .Values.agent.metricsBind)._1 | default "9090" | quote }}
+    prometheus.io/port: {{ .Values.metrics.port | quote }}
     prometheus.io/path: "/metrics"
 spec:
   type: ClusterIP
@@ -17,6 +17,6 @@ spec:
     {{- include "panopticon.selectorLabels" . | nindent 4 }}
   ports:
     - name: metrics
-      port: {{ (split ":" .Values.agent.metricsBind)._1 | default 9090 }}
-      targetPort: {{ (split ":" .Values.agent.metricsBind)._1 | default 9090 }}
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
       protocol: TCP

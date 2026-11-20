@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
 
 ENV BPF_TOOLCHAIN=nightly-2026-02-17
 RUN rustup toolchain install nightly-2026-02-17 --component rust-src \
-    && cargo +nightly-2026-02-17 install bpf-linker --locked
+    && cargo +nightly-2026-02-17 install bpf-linker --locked --version 0.10.3
 
 WORKDIR /build
 COPY . .

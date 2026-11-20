@@ -25,6 +25,10 @@ compose() {
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+# A fresh PostgreSQL superuser password per run (docker-compose.yaml).
+E2E_PG_PASSWORD="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export E2E_PG_PASSWORD
+
 wait_for_url() {
   local url="$1"
   local attempts="${2:-60}"
@@ -126,7 +130,7 @@ record_host_debug() {
 print_agent_attach_summary() {
   echo "Agent attach summary:"
   compose logs --no-color agent 2>/dev/null \
-    | grep -E "Kernel capabilities detected|TC classifier attached|Failed to attach TC classifier|eBPF programs loaded and attached|Initial TLS scan complete" \
+    | grep -E "Kernel capabilities detected|eBPF programs loaded and attached|Initial TLS scan complete" \
     || true
 }
 
@@ -213,7 +217,7 @@ for _ in $(seq 1 3); do
 done
 
 echo "Generating PostgreSQL traffic..."
-PGPASSWORD=test psql -h localhost -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
+PGPASSWORD="${E2E_PG_PASSWORD}" psql -h 127.0.0.1 -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
 
 echo "Generating Redis traffic..."
 redis-cli -h localhost PING || echo "redis-cli not installed, skipping"

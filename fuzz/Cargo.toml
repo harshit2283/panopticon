@@ -1,0 +1,37 @@
+[package]
+name = "panopticon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+dashmap = { version = "6", default-features = false }
+# Same versions/features as the agent (root Cargo.toml [workspace.dependencies]).
+tracing = "0.1"
+httparse = { version = "1", default-features = false }
+hpack = { package = "hpack-patched", version = "0.3.0", default-features = false }
+panopticon-common = { path = "../panopticon-common" }
+
+# Standalone workspace: the fuzz crate is built with nightly + sanitizers and
+# must not join the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parsers"
+path = "fuzz_targets/parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect"
+path = "fuzz_targets/detect.rs"
+test = false
+doc = false
+bench = false

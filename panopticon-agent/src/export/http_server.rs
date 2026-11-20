@@ -2,14 +2,15 @@
 //!
 //! Serves on `metrics_bind` address (e.g. "0.0.0.0:9090"):
 //! - `/healthz`  — liveness probe (always 200)
-//! - `/readyz`   — readiness probe (200 if events flowing, 503 otherwise)
+//! - `/readyz`   — readiness probe (200 once probes are attached; 503 during
+//!   shutdown and after capture was stopped for good)
 //! - `/metrics`  — Prometheus text exposition format
 //! - `/debug/state` — JSON dump of internal state
 
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -28,6 +29,11 @@ pub struct AppState {
     pub stats: Arc<EventStats>,
     pub metrics: AgentMetrics,
     pub worker_count: usize,
+    /// True once eBPF programs are attached; cleared when shutdown begins.
+    pub ready: Arc<AtomicBool>,
+    /// The raw capture file, when enabled (for its drop counter, which
+    /// spans every capture pipeline).
+    pub raw_capture: Option<Arc<crate::io_gate::RecordFile>>,
 }
 
 /// Start the HTTP server on the given bind address.
@@ -52,13 +58,35 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness probe — 200 if we've received any events (RingBuf attached and producing),
-/// 503 otherwise.
+/// Readiness probe — 200 once programs are attached, 503 otherwise.
+///
+/// Deliberately not tied to "events seen": a quiet node would otherwise never
+/// become Ready and would stall DaemonSet rolling updates. Traffic volume is
+/// observable via `panopticon_events_received_total` instead.
+///
+/// Parser / PII panics are caught per step and the workers keep running, so
+/// they do not make the agent unready; the body reports how many there were.
+///
+/// After a fatal scope publication failure capture is stopped for good (the
+/// kernel disarmed, the pipeline revoked) and the agent reports not ready
+/// rather than exiting: a restart would re-arm capture until the failure
+/// recurs, and the stop must err toward not capturing.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    if state.stats.events_received.load(Ordering::Relaxed) > 0 {
-        (StatusCode::OK, "ready")
+    let panics = state.stats.worker_panics.load(Ordering::Relaxed);
+    let note = if panics > 0 {
+        format!(" (worker panics caught: {panics})")
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        String::new()
+    };
+    if state.stats.capture_stopped.load(Ordering::Relaxed) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: capture stopped (scope publication failed){note}"),
+        )
+    } else if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, format!("ready{note}"))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, format!("not ready{note}"))
     }
 }
 
@@ -66,6 +94,13 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Sync latest stats into prometheus counters before encoding
     state.metrics.sync_from_stats(&state.stats);
+    if let Some(raw) = state.raw_capture.as_ref() {
+        state
+            .metrics
+            .raw_capture_dropped
+            .inner()
+            .store(raw.dropped(), Ordering::Relaxed);
+    }
     let body = super::metrics::encode_metrics(&state.registry);
     (
         StatusCode::OK,
@@ -83,6 +118,7 @@ async fn debug_state(State(state): State<AppState>) -> Json<serde_json::Value> {
     let drops_rate = state.stats.drops_rate_limit.load(Ordering::Relaxed);
     let drops_channel = state.stats.drops_channel_full.load(Ordering::Relaxed);
     let drops_parser = state.stats.drops_parser_error.load(Ordering::Relaxed);
+    let worker_panics = state.stats.worker_panics.load(Ordering::Relaxed);
     let ringbuf_pending = received.saturating_sub(processed);
 
     Json(serde_json::json!({
@@ -91,6 +127,7 @@ async fn debug_state(State(state): State<AppState>) -> Json<serde_json::Value> {
         "events_processed": processed,
         "active_connections": active,
         "worker_count": state.worker_count,
+        "worker_panics": worker_panics,
         "drops": {
             "rate_limit": drops_rate,
             "channel_full": drops_channel,
@@ -114,6 +151,9 @@ mod tests {
             stats: Arc::new(EventStats::new()),
             metrics,
             worker_count: 4,
+            ready: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            raw_capture: None,
         }
     }
 
@@ -151,14 +191,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_readyz_ready() {
+        // Ready as soon as probes are attached, even with zero traffic.
         let state = make_test_state();
-        state.stats.events_received.fetch_add(1, Ordering::Relaxed);
+        state.ready.store(true, Ordering::Relaxed);
+        assert_eq!(state.stats.events_received.load(Ordering::Relaxed), 0);
         let app = make_app(state);
         let resp = app
             .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_not_ready_once_capture_stopped() {
+        let state = make_test_state();
+        state.ready.store(true, Ordering::Relaxed);
+        state.stats.capture_stopped.store(true, Ordering::Relaxed);
+        let resp = make_app(state)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_reports_caught_worker_panics() {
+        let state = make_test_state();
+        state.ready.store(true, Ordering::Relaxed);
+        state.stats.worker_panics.fetch_add(3, Ordering::Relaxed);
+        let resp = make_app(state)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"ready (worker panics caught: 3)");
     }
 
     #[tokio::test]

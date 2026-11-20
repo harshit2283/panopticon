@@ -7,6 +7,7 @@
 //! Parsers handle Keep-Alive reset internally (no separate reset method).
 
 pub mod amqp;
+mod credential_rules;
 pub mod detect;
 pub mod dns;
 pub mod fsm;
@@ -17,6 +18,7 @@ pub mod kafka;
 pub mod mysql;
 pub mod postgres;
 pub mod redis;
+mod secrets;
 
 pub use panopticon_common::Direction;
 
@@ -74,11 +76,29 @@ pub struct L7Message {
     /// HTTP status code, MySQL/PG error code.
     pub status: Option<u32>,
     pub content_type: Option<String>,
-    /// Decoded payload text for PII scanning (Phase 5).
+    /// Decoded payload text for PII scanning (Phase 5). For HTTP this is the
+    /// response body.
     pub payload_text: Option<String>,
+    /// Decoded request body (e.g. HTTP POST/PUT payload, form data), when the
+    /// protocol has one. Scanned and redacted like `payload_text`.
+    pub request_text: Option<String>,
+    /// Wire headers (HTTP, HTTP/2, gRPC metadata, AMQP/Kafka fields).
     pub headers: Vec<(String, String)>,
+    /// DNS A answers, filled only by the DNS parser: kept apart from wire
+    /// headers, which a peer controls.
+    pub dns_answers: Vec<DnsAnswer>,
     pub request_size_bytes: u64,
     pub response_size_bytes: u64,
+}
+
+/// An A record answering a query seen on the same flow: feeds the DNS
+/// cache that names services in the graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DnsAnswer {
+    pub name: String,
+    /// IPv4 address as a host-order integer, like `src_addr`.
+    pub ip: u32,
+    pub ttl_secs: u32,
 }
 
 impl L7Message {
@@ -94,10 +114,127 @@ impl L7Message {
             status: None,
             content_type: None,
             payload_text: None,
+            request_text: None,
             headers: Vec::new(),
+            dns_answers: Vec::new(),
             request_size_bytes: 0,
             response_size_bytes: 0,
         }
+    }
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary (slicing a
+/// `&str` at an arbitrary byte index panics inside a multi-byte character).
+pub fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// What a masked credential value is replaced with, at the parser and in
+/// the PII engine.
+pub const REDACTED_CREDENTIAL: &str = "<REDACTED>";
+
+// Installed by main's (Linux-only) startup and reload.
+#[cfg(test)]
+pub use credential_rules::LOADS as CREDENTIAL_RULE_LOADS;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub use credential_rules::{
+    Builtin, CredentialRules, count_builtin, credential_matches, credential_rules,
+    set_credential_rules,
+};
+pub use secrets::{
+    Decision, FIELD_WITHHELD, FieldKind, STATEMENT_WITHHELD, decide, decide_as,
+    has_credential_context, is_credential_name, sql_verb, withheld_statement,
+};
+
+// ponytail: process-wide switch so parsers need no config plumbing; fine
+// while there is one agent per process. Set once at startup by
+// `set_mask_credentials`; only ever flipped false -> true at runtime.
+static MASK_CREDENTIALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether known credential forms (Redis AUTH, SQL credential statements,
+/// credential headers, fields with credential context, `[credentials]`
+/// patterns) are protected before any sink: best effort in the modes that
+/// export fields (USER-GUIDE §5.3). `[privacy] mask_credentials`, default
+/// true; false is only allowed in `full` mode.
+pub fn mask_credentials_enabled() -> bool {
+    MASK_CREDENTIALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_mask_credentials(on: bool) {
+    MASK_CREDENTIALS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A SQL statement (query text and its bound values) as a parser exports
+/// it, and whether its error text must be withheld. With credential
+/// context and `mask_credentials` on: only its verb as method and
+/// `VERB <statement withheld>` as text, no bound value, and `true`. The
+/// query is wiped. A statement whose credential words are all bare names
+/// is exported as written but without its bound values (nothing ties them
+/// to a column), and its error text is withheld too: the server may echo
+/// a bound value in it (`malformed record literal: "(alice,hunter2)"`).
+pub fn export_statement(
+    mut query: String,
+    mut bound: Option<String>,
+) -> (Option<String>, String, Option<String>, bool) {
+    let names_credential =
+        mask_credentials_enabled() && secrets::has_any_sql_credential_context(&query);
+    if names_credential && let Some(mut b) = bound.take() {
+        zeroize::Zeroize::zeroize(&mut b);
+    }
+    if mask_credentials_enabled() && secrets::has_sql_credential_context(&query) {
+        count_builtin();
+        let shown = withheld_statement(&query);
+        zeroize::Zeroize::zeroize(&mut query);
+        if let Some(mut b) = bound {
+            zeroize::Zeroize::zeroize(&mut b);
+        }
+        let verb = sql_verb(&shown).map(str::to_string);
+        return (verb, shown, None, true);
+    }
+    let verb = sql_verb(&query).map(str::to_string);
+    let shown = truncate_utf8(&query, 4096).to_string();
+    (verb, shown, bound, names_credential)
+}
+
+/// A server error message as a SQL parser exports it: withheld when its
+/// statement names a credential (`error_withheld`, from
+/// [`export_statement`]), bare names included, or when it shows credential
+/// context itself.
+pub fn export_error_text(text: String, error_withheld: bool) -> String {
+    if mask_credentials_enabled() && (error_withheld || has_credential_context(&text)) {
+        let mut text = text;
+        zeroize::Zeroize::zeroize(&mut text);
+        STATEMENT_WITHHELD.to_string()
+    } else {
+        text
+    }
+}
+
+/// Protect `text` in place under `rules` (see [`decide`]; the built-in
+/// rules only when `builtin`): credential values masked, or the field
+/// replaced by [`FIELD_WITHHELD`].
+pub fn protect_text_in(rules: &CredentialRules, text: &mut String, builtin: bool) {
+    replace_with(text, decide(rules, text, builtin));
+}
+
+/// [`protect_text_in`], built-in rules on, for a field of a known kind
+/// (an HTTP request path or a SQL statement may hold a bare name; see
+/// [`decide_as`]).
+pub fn protect_field_in(rules: &CredentialRules, text: &mut String, kind: FieldKind) {
+    replace_with(text, decide_as(rules, text, true, kind));
+}
+
+fn replace_with(text: &mut String, decision: Decision) {
+    if let Some(out) = decision.apply(text) {
+        zeroize::Zeroize::zeroize(text);
+        *text = out;
     }
 }
 
@@ -133,9 +270,36 @@ pub trait ProtocolParser: Send {
     /// Human-readable FSM state name (for debugging/logging).
     fn state_name(&self) -> &'static str;
 
+    /// `n` bytes of the stream in `direction` were never captured (the packet
+    /// or TLS buffer was larger than the capture cap). Account for them if the
+    /// parser can stay in sync — e.g. by counting them against a known body
+    /// length — and return the result. `None` means the parser cannot resync
+    /// and must be replaced with a fresh one.
+    fn skip(
+        &mut self,
+        _direction: Direction,
+        _n: usize,
+        _timestamp_ns: u64,
+    ) -> Option<ParseResult> {
+        None
+    }
+
     /// Protocol version string, if detected (e.g., "8.0.32" for MySQL).
     fn protocol_version(&self) -> Option<&str> {
         None
+    }
+
+    /// The parser did not see a direction of the stream from its first
+    /// byte (capture joined an open connection, TLS, or bytes were lost).
+    /// A parser that pairs replies with requests by order must stop
+    /// trusting that pairing.
+    fn joined_late(&mut self) {}
+
+    /// The parser holds a latch that withholds what it can no longer
+    /// read with certainty (HTTP/2: header state lost). The connection
+    /// keeps it for its lifetime, past any parser replacement.
+    fn uncertain(&self) -> bool {
+        false
     }
 }
 
@@ -146,7 +310,8 @@ pub trait ProtocolParser: Send {
 /// # Panics
 /// Panics if called with `Protocol::Unknown` — detect_protocol() should
 /// never return Unknown; it returns `None` instead.
-pub fn create_parser(proto: Protocol) -> Box<dyn ProtocolParser> {
+/// `topics` is the pipeline's Kafka topic ID map.
+pub fn create_parser(proto: Protocol, topics: &kafka::KafkaTopics) -> Box<dyn ProtocolParser> {
     match proto {
         Protocol::Http1 => Box::new(http1::Http1Parser::new()),
         Protocol::Http2 => Box::new(http2::Http2Parser::new(false)),
@@ -155,7 +320,7 @@ pub fn create_parser(proto: Protocol) -> Box<dyn ProtocolParser> {
         Protocol::Postgres => Box::new(postgres::PostgresParser::new()),
         Protocol::Redis => Box::new(redis::RedisParser::new()),
         Protocol::Dns => Box::new(dns::DnsParser::new()),
-        Protocol::Kafka => Box::new(kafka::KafkaParser::new()),
+        Protocol::Kafka => Box::new(kafka::KafkaParser::with_topics(topics.clone())),
         Protocol::Amqp => Box::new(amqp::AmqpParser::new()),
         Protocol::Unknown => unreachable!("create_parser called with Unknown protocol"),
     }
@@ -164,6 +329,43 @@ pub fn create_parser(proto: Protocol) -> Box<dyn ProtocolParser> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex round 1 #3: a SELECT exported because its credential columns
+    /// are bare names drops its bound values, which nothing ties to a
+    /// column (`WHERE users = $1` binding `(alice,hunter2)`); a SELECT
+    /// without a credential word keeps them.
+    #[test]
+    fn test_bare_select_drops_bound_values() {
+        let (verb, shown, bound, withheld) = export_statement(
+            "SELECT password, email FROM users WHERE id = $1".into(),
+            Some("(alice,hunter2)".into()),
+        );
+        assert_eq!(verb.as_deref(), Some("SELECT"));
+        assert_eq!(shown, "SELECT password, email FROM users WHERE id = $1");
+        // Its error text is withheld: the server may echo a bound value.
+        assert_eq!((bound, withheld), (None, true));
+        assert_eq!(
+            export_error_text(
+                "malformed record literal: \"(alice,hunter2,extra)\"".into(),
+                withheld
+            ),
+            STATEMENT_WITHHELD
+        );
+        let (_, shown, bound, withheld) = export_statement(
+            "SELECT password FROM users WHERE users = $1::users".into(),
+            Some("(alice,hunter2)".into()),
+        );
+        assert_eq!(
+            (shown.as_str(), bound, withheld),
+            ("SELECT <statement withheld>", None, true)
+        );
+        let (_, _, bound, withheld) = export_statement(
+            "SELECT email FROM users WHERE id = $1".into(),
+            Some("7".into()),
+        );
+        assert_eq!((bound.as_deref(), withheld), (Some("7"), false));
+        assert_eq!(export_error_text("bad value".into(), withheld), "bad value");
+    }
 
     #[test]
     fn test_protocol_display() {
@@ -185,19 +387,19 @@ mod tests {
 
     #[test]
     fn test_create_parser_http1() {
-        let parser = create_parser(Protocol::Http1);
+        let parser = create_parser(Protocol::Http1, &Default::default());
         assert_eq!(parser.protocol(), Protocol::Http1);
     }
 
     #[test]
     fn test_create_parser_redis() {
-        let parser = create_parser(Protocol::Redis);
+        let parser = create_parser(Protocol::Redis, &Default::default());
         assert_eq!(parser.protocol(), Protocol::Redis);
     }
 
     #[test]
     #[should_panic(expected = "Unknown protocol")]
     fn test_create_parser_unknown_panics() {
-        create_parser(Protocol::Unknown);
+        create_parser(Protocol::Unknown, &Default::default());
     }
 }

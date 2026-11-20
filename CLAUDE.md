@@ -1,5 +1,16 @@
 # Panopticon-rs
 
+## Repository Owner Preferences (always apply)
+
+- **Commit attribution**: end commit messages with exactly
+  `Co-Authored-By: Claude <noreply@anthropic.com>`. No model names or
+  versions, and no `Claude-Session:` (or other session/link) trailers.
+- **Docs in commits**: only commit documentation that is user-facing
+  (README, install/usage docs, `docs/CURRENT-STATE.md`) or proper
+  architecture docs where the repo already has them (`docs/adr/`). Do not
+  commit audit reports, plans, scratch notes or other internal write-ups;
+  share those outside the repo.
+
 > Historical/internal engineering reference. For the current open-source MVP
 > status, use `README.md` and `docs/CURRENT-STATE.md`. This file still contains
 > planning notes and should not be treated as the public release report.
@@ -39,7 +50,7 @@ Single-binary agent deployed as a Kubernetes DaemonSet.
 
 **eBPF programs** (`panopticon-ebpf/src/`):
 - `tc_capture.rs` — TC ingress/egress classifiers, packet parsing, payload capture
-- `tls_probes.rs` — OpenSSL SSL_write/SSL_read uprobes, Go TLS write uprobe
+- `tls_probes.rs` — OpenSSL SSL_write/SSL_read uprobes, Go TLS write uprobe, read uprobes (readRecordOrCCS entry + RETs, halfConn.decrypt RETs)
 - `sock_monitor.rs` — TCP connect/accept/close kprobes, UDP send/recv
 - `process_monitor.rs` — sched_process_exec/exit tracepoints
 - `maps.rs` — All BPF maps (RingBuf, PerfEventArray, HashMap, Array, PerCpuArray)
@@ -70,7 +81,7 @@ cargo xtask build-ebpf --release
 cargo build -p panopticon-agent  # Build user-space agent
 cargo build -p panopticon-agent --release
 cargo test --workspace           # Run all tests (eBPF crate excluded - no test harness)
-cargo test -p panopticon-agent   # Agent tests only (291 tests)
+cargo test -p panopticon-agent   # Agent tests only (433 tests)
 cargo clippy -p panopticon-agent -p panopticon-common -p xtask  # Lint (excludes eBPF)
 cargo fmt --all -- --check       # Format check
 cargo bench -p panopticon-agent  # Run Criterion benchmarks
@@ -79,7 +90,7 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 
 ## Prerequisites
 
-- **Linux kernel**: 4.15+ minimum (TC eBPF + PerfEventArray), 5.8+ recommended (RingBuf support)
+- **Linux kernel**: 5.8+ (RingBuf and 5.5+ probe-read helpers). Validated on 5.15, 6.8, 7.0; 5.4 does not load
 - **Toolchain**: Rust nightly, `rust-src` component, bpf-linker (`cargo install bpf-linker`)
 - **System packages**: clang-18, llvm-18, libelf-dev, linux-headers, pkg-config, libssl-dev
 - **ONNX Runtime** (optional): v1.19.2+ at `/opt/onnxruntime` (set `ORT_LIB_LOCATION`)
@@ -89,13 +100,13 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 ## Key Design Decisions
 
 - **`#[repr(C)]` for all shared types** — Required for kernel↔user space ABI compatibility. `DataEvent` is ~4.2KB; must use RingBuf reserve or PerCpuArray scratch (not stack, 512-byte limit).
-- **RingBuf primary, PerfEventArray fallback** — RingBuf (kernel 5.8+) is zero-copy and ordered. PerfEventArray for older kernels uses PerCpuArray scratch maps for the large DataEvent struct.
+- **Sharded RingBuf** — `DATA_EVENTS_0..15`, one active ring per 4 CPUs, shard chosen by connection cookie (`ring_shard`) so each connection's events stay ordered in one ring; one drain thread per ring. TC copies header + captured bytes via `bpf_ringbuf_output` from `EVENT_SCRATCH`; TLS/socket events reserve fixed records. RingBuf support is probed, not version-gated (RHEL 8's 4.18 has it). The PerfEventArray branches exist but are not a working fallback.
 - **FSM-based protocol parsers** — Single-packet parsers fail on real traffic (e.g., PostgreSQL queries spanning 17+ packets). Each connection gets its own `ProtocolFsm` instance managed by `ConnectionFsmManager` (DashMap-backed).
 - **PII pipeline: regex first, then ML** — Regex prefilter (RegexSet, ~1µs) skips ~90% of traffic. Only suspicious payloads go to DistilBERT-NER (ONNX, batched). Inference sampler limits budget per second.
 - **DNS cache for service graph** — Without it, graph shows IPs not names. Fallback chain: observed DNS events → reverse lookup → raw IP. TTL-aware with DashMap.
 - **Query template normalization** — SQL literals → `?`, HTTP UUIDs → `?`. Achieves ~90% event reduction via deduplication before export.
 - **TC_ACT_OK always** — Never drop packets; passive observer only.
-- **PerCpuArray scratch for PerfEventArray path** — DataEvent is ~4.2KB, far exceeding the 512-byte BPF stack limit. All eBPF files use `PERF_SCRATCH: PerCpuArray<DataEvent>` for the fallback path.
+- **PerCpuArray scratch for PerfEventArray path** — DataEvent is ~4.2KB, far exceeding the 512-byte BPF stack limit. TC builds events in `EVENT_SCRATCH: PerCpuArray<DataEvent>`.
 - **Generic `EbpfContext` in emit functions** — `emit_tls_event<C: EbpfContext>` and `emit_sock_event<C: EbpfContext>` handle both ProbeContext and RetProbeContext callers.
 
 ## Code Conventions
@@ -105,14 +116,14 @@ cargo xtask test-ebpf            # Instructions for eBPF testing on Linux
 - **All buffer accesses bounded** — Explicit length checks before every read in eBPF to pass the verifier.
 - **Error handling**: `anyhow::Result` in agent, `Result<(), ()>` in eBPF. Probe failures log and skip, never crash the agent.
 - **Logging**: `tracing` crate with structured fields.
-- **Testing**: 319 tests total (291 agent + 21 common + 5 ABI + 2 xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
+- **Testing**: ~470 tests total (433 agent on macOS, more on Linux; plus common, ABI, xtask). Unit tests in each module, integration tests in `tests/integration/`, E2E with docker-compose.
 - **Backpressure**: Bounded mpsc channels everywhere. If full, drop event + increment counter. Never block the event loop.
-- **Performance targets**: 500K events/sec sustained, P99 < 5ms kernel→user-space, < 200MB RSS (excluding ML model).
+- **Performance targets** (targets, not all measured): 500K events/sec, P99 < 5ms kernel→user-space, < 200MB RSS. Measured on 64 vCPU: ~470K events/s at 99.8% recall (load-bound), RSS 129–215 MiB up to 4K conns; kernel→worker P99 2–4 ms up to 20K req/s, 8–10 ms at 4K conns × 50K req/s (preliminary). See docs/BENCHMARKS.md.
 - **Benchmarks**: Criterion benchmarks in `panopticon-agent/benches/` for protocol detection, parser throughput, PII regex.
 
 ## Testing Infrastructure
 
-- **Unit tests**: In each module, run via `cargo test --workspace` (319 tests)
+- **Unit tests**: In each module, run via `cargo test --workspace`
 - **Benchmarks**: `panopticon-agent/benches/` — protocol_detect, parser_throughput, pii_regex (Criterion)
 - **Replay**: `replay.rs` — binary capture format (PNCAP magic) for deterministic event replay
 - **Integration**: `tests/integration/` — docker-compose with nginx, MySQL, PostgreSQL, Redis, traffic generators with PII data, automated validation
@@ -149,7 +160,7 @@ and should not be treated as the canonical public release report.
 
 ## Known Issues
 
-- **macOS development**: eBPF programs compile but cannot be loaded (Linux only). All 319 tests pass on macOS.
+- **macOS development**: eBPF programs compile but cannot be loaded (Linux only). Agent tests pass on macOS.
 - **eBPF tests**: Disabled via `test = false` in Cargo.toml (no test harness for `bpfel-unknown-none` target). Use `cargo xtask test-ebpf` for instructions.
 - **`ort` version**: Pinned to `2.0.0-rc.11` (only RC available for ort 2.x)
 - **Rust 2024 compatibility warnings**: `unsafe_op_in_unsafe_fn` warnings in eBPF crate — cosmetic only, does not affect correctness

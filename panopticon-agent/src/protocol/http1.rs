@@ -33,6 +33,8 @@ struct PendingRequest {
     timestamp_ns: u64,
     request_size: u64,
     headers: Vec<(String, String)>,
+    /// Request body (POST/PUT/PATCH payload), capped at MAX_CAPTURED_BODY.
+    body: Vec<u8>,
 }
 
 /// HTTP/1.1 parser with Keep-Alive support.
@@ -41,11 +43,85 @@ pub struct Http1Parser {
     client_buf: StreamBuffer,
     server_buf: StreamBuffer,
     pending_request: Option<PendingRequest>,
-    /// Accumulated response body (for payload_text).
+    /// Accumulated response body (for payload_text), capped at
+    /// `MAX_CAPTURED_BODY` so a large download is never held in memory.
     response_body: Vec<u8>,
+    /// Full response body size, including bytes beyond the capture cap.
+    response_size: u64,
     response_headers: Vec<(String, String)>,
     response_status: Option<u32>,
     response_content_type: Option<String>,
+    /// Body bytes were kept after bytes of the same body were lost: they
+    /// may hold a credential's value without its name, so the body is not
+    /// exported (sizes are). A gap that only cuts a body's end (the capture
+    /// cap on a large segment) keeps the captured prefix.
+    request_gap: bool,
+    response_gap: bool,
+    /// A gap inside the body; it becomes `*_gap` if more body bytes follow.
+    request_gap_pending: bool,
+    response_gap_pending: bool,
+}
+
+/// Request-line prefixes; anything else at the start of the client buffer is
+/// junk (e.g. body bytes we lost track of after a capture gap).
+const REQUEST_STARTS: [&[u8]; 8] = [
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"CONNECT ",
+];
+const RESPONSE_START: &[u8] = b"HTTP/1.";
+
+/// Offset of the earliest occurrence of any of `starts` in `data`.
+fn find_start(data: &[u8], starts: &[&[u8]]) -> Option<usize> {
+    (0..data.len()).find(|&i| starts.iter().any(|s| data[i..].starts_with(s)))
+}
+
+/// Drop leading junk so `buf` begins at the next plausible message start.
+/// Keeps a short tail if no start is found, in case a start token is split
+/// across packets. Returns true if anything was dropped.
+fn resync(buf: &mut StreamBuffer, starts: &[&[u8]]) -> bool {
+    let data = buf.data();
+    if data.is_empty()
+        || starts
+            .iter()
+            .any(|s| data.starts_with(s) || s.starts_with(data))
+    {
+        return false;
+    }
+    let drop = match find_start(data, starts) {
+        Some(off) => off,
+        None => data.len().saturating_sub(8),
+    };
+    if drop == 0 {
+        return false;
+    }
+    buf.consume(drop);
+    true
+}
+
+/// Max response body bytes retained for payload_text / PII scanning.
+const MAX_CAPTURED_BODY: usize = 64 * 1024;
+
+/// Body as text for PII scanning: `None` if empty or not UTF-8. The capture
+/// cap can split a multi-byte character at the end; keep the valid prefix then.
+fn body_text(body: &[u8]) -> Option<String> {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => Some(t),
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&body[..e.valid_up_to()]).ok(),
+        Err(_) => None,
+    };
+    text.filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+/// Append to the captured body without exceeding `MAX_CAPTURED_BODY`.
+fn append_capped(body: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_CAPTURED_BODY.saturating_sub(body.len());
+    body.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
 impl Http1Parser {
@@ -56,9 +132,14 @@ impl Http1Parser {
             server_buf: StreamBuffer::new(),
             pending_request: None,
             response_body: Vec::new(),
+            response_size: 0,
             response_headers: Vec::new(),
             response_status: None,
             response_content_type: None,
+            request_gap: false,
+            response_gap: false,
+            request_gap_pending: false,
+            response_gap_pending: false,
         }
     }
 
@@ -84,6 +165,10 @@ impl Http1Parser {
                 }
                 State::ReadingRequestBody { remaining } => {
                     let avail = self.client_buf.data().len();
+                    let take = avail.min(remaining);
+                    if let Some(req) = self.pending_request.as_mut() {
+                        append_capped(&mut req.body, &self.client_buf.data()[..take]);
+                    }
                     if avail >= remaining {
                         self.client_buf.consume(remaining);
                         self.state = State::WaitingForResponse;
@@ -111,7 +196,8 @@ impl Http1Parser {
                 State::ReadingResponseBody { remaining } => {
                     let data = self.server_buf.data();
                     let to_read = data.len().min(remaining);
-                    self.response_body.extend_from_slice(&data[..to_read]);
+                    append_capped(&mut self.response_body, &data[..to_read]);
+                    self.response_size += to_read as u64;
                     self.server_buf.consume(to_read);
 
                     if to_read >= remaining {
@@ -150,8 +236,12 @@ impl Http1Parser {
     /// Try to parse an HTTP request from the client buffer.
     /// Returns true if a request was successfully parsed (state advanced).
     fn try_parse_request(&mut self, timestamp_ns: u64) -> bool {
+        // httparse accepts any token as a method, so leftover body bytes glued
+        // to the next request line ("pppGET /x") would parse as a bogus
+        // request. Only parse from a real request-line start.
+        resync(&mut self.client_buf, &REQUEST_STARTS);
         let data = self.client_buf.data();
-        if data.is_empty() {
+        if data.is_empty() || !REQUEST_STARTS.iter().any(|s| data.starts_with(s)) {
             return false;
         }
 
@@ -181,6 +271,7 @@ impl Http1Parser {
                     timestamp_ns,
                     request_size: header_len as u64,
                     headers,
+                    body: Vec::new(),
                 });
 
                 self.client_buf.consume(header_len);
@@ -202,15 +293,21 @@ impl Http1Parser {
                 true
             }
             Ok(httparse::Status::Partial) => false,
-            Err(_) => false,
+            Err(_) => {
+                // Malformed request line: drop its first byte so resync moves
+                // on to the next candidate instead of blocking forever.
+                self.client_buf.consume(1);
+                false
+            }
         }
     }
 
     /// Try to parse an HTTP response from the server buffer.
     /// Returns true if response headers were successfully parsed (state advanced).
     fn try_parse_response(&mut self, _timestamp_ns: u64) -> bool {
+        resync(&mut self.server_buf, &[RESPONSE_START]);
         let data = self.server_buf.data();
-        if data.is_empty() {
+        if data.is_empty() || !data.starts_with(RESPONSE_START) {
             return false;
         }
 
@@ -242,6 +339,7 @@ impl Http1Parser {
 
                 self.server_buf.consume(header_len);
                 self.response_body.clear();
+                self.response_size = 0;
 
                 if is_chunked {
                     self.state = State::ReadingChunkedResponse;
@@ -264,7 +362,10 @@ impl Http1Parser {
                 true
             }
             Ok(httparse::Status::Partial) => false,
-            Err(_) => false,
+            Err(_) => {
+                self.server_buf.consume(1);
+                false
+            }
         }
     }
 
@@ -289,7 +390,7 @@ impl Http1Parser {
 
             let chunk_size = match usize::from_str_radix(size_str, 16) {
                 Ok(n) => n,
-                Err(_) => return ChunkResult::Error(format!("invalid chunk size: {size_str}")),
+                Err(_) => return ChunkResult::Error("invalid chunk size".into()),
             };
 
             // Last chunk (size=0)
@@ -303,15 +404,22 @@ impl Http1Parser {
                 return ChunkResult::NeedMoreData;
             }
 
-            // Need: chunk_size_line + chunk_data + trailing \r\n
-            let total = crlf_pos + 2 + chunk_size + 2;
+            // Need: chunk_size_line + chunk_data + trailing \r\n.
+            // chunk_size is peer-controlled: a size like FFFFFFFFFFFFFFFF must
+            // not overflow (debug panic / release wrap + slice panic).
+            let Some(total) = chunk_size.checked_add(crlf_pos + 4) else {
+                return ChunkResult::Error("chunk size overflow".into());
+            };
             if data.len() < total {
                 return ChunkResult::NeedMoreData;
             }
 
             let chunk_start = crlf_pos + 2;
-            self.response_body
-                .extend_from_slice(&data[chunk_start..chunk_start + chunk_size]);
+            append_capped(
+                &mut self.response_body,
+                &data[chunk_start..chunk_start + chunk_size],
+            );
+            self.response_size += chunk_size as u64;
             self.server_buf.consume(total);
         }
     }
@@ -322,7 +430,7 @@ impl Http1Parser {
 
         msg.status = self.response_status;
         msg.content_type = self.response_content_type.clone();
-        msg.response_size_bytes = self.response_body.len() as u64;
+        msg.response_size_bytes = self.response_size;
 
         if let Some(req) = self.pending_request.as_ref() {
             msg.method = Some(req.method.clone());
@@ -339,14 +447,12 @@ impl Http1Parser {
             msg.headers = self.response_headers.clone();
         }
 
-        // Attempt UTF-8 decode for PII scanning
-        if !self.response_body.is_empty()
-            && let Ok(text) = std::str::from_utf8(&self.response_body)
-        {
-            // Cap at 64KB for PII scanning
-            let cap = text.len().min(65536);
-            msg.payload_text = Some(text[..cap].to_string());
-        }
+        msg.payload_text = body_text(&self.response_body).filter(|_| !self.response_gap);
+        msg.request_text = self
+            .pending_request
+            .as_ref()
+            .and_then(|req| body_text(&req.body))
+            .filter(|_| !self.request_gap);
 
         Some(msg)
     }
@@ -366,9 +472,14 @@ impl Http1Parser {
         self.state = State::WaitingForRequest;
         self.pending_request = None;
         self.response_body.clear();
+        self.response_size = 0;
         self.response_headers.clear();
         self.response_status = None;
         self.response_content_type = None;
+        self.request_gap = false;
+        self.response_gap = false;
+        self.request_gap_pending = false;
+        self.response_gap_pending = false;
     }
 }
 
@@ -396,6 +507,22 @@ impl ProtocolParser for Http1Parser {
             }
         };
 
+        // Body bytes after a gap inside that body.
+        match target {
+            BufferTarget::Client
+                if self.request_gap_pending
+                    && matches!(self.state, State::ReadingRequestBody { .. }) =>
+            {
+                self.request_gap = true
+            }
+            BufferTarget::Server
+                if self.response_gap_pending
+                    && matches!(self.state, State::ReadingResponseBody { .. }) =>
+            {
+                self.response_gap = true
+            }
+            _ => {}
+        }
         match target {
             BufferTarget::Client => {
                 if self.client_buf.extend(data).is_err() {
@@ -409,6 +536,53 @@ impl ProtocolParser for Http1Parser {
             }
         }
         self.process(timestamp_ns)
+    }
+
+    fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
+        match (direction, self.state.clone()) {
+            // Gap inside a request body of known length: just count it.
+            (Direction::Egress, State::ReadingRequestBody { remaining })
+                if n <= remaining && self.client_buf.is_empty() =>
+            {
+                self.request_gap_pending |= n < remaining;
+                self.state = if n == remaining {
+                    State::WaitingForResponse
+                } else {
+                    State::ReadingRequestBody {
+                        remaining: remaining - n,
+                    }
+                };
+                Some(ParseResult::NeedMoreData)
+            }
+            // Gap inside a response body of known length: count it, and emit
+            // the message if the gap finished the body.
+            (Direction::Ingress, State::ReadingResponseBody { remaining })
+                if n <= remaining && self.server_buf.is_empty() =>
+            {
+                self.response_gap_pending |= n < remaining;
+                self.response_size += n as u64;
+                if n == remaining {
+                    let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
+                    self.reset_for_next_transaction();
+                    Some(ParseResult::Messages(msgs))
+                } else {
+                    self.state = State::ReadingResponseBody {
+                        remaining: remaining - n,
+                    };
+                    Some(ParseResult::NeedMoreData)
+                }
+            }
+            // Chunk framing is lost: emit what we have (status, headers,
+            // partial body), then resync on the next response line.
+            (Direction::Ingress, State::ReadingChunkedResponse) => {
+                self.response_size += n as u64;
+                let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
+                self.reset_for_next_transaction();
+                self.server_buf.clear();
+                Some(ParseResult::Messages(msgs))
+            }
+            _ => None,
+        }
     }
 
     fn protocol(&self) -> Protocol {
@@ -443,6 +617,67 @@ fn is_http1_response(payload: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// A capture gap inside a body can remove a credential's name and keep
+    /// its value: a body with a gap is withheld (sizes kept).
+    #[test]
+    fn test_body_with_a_gap_is_withheld() {
+        let body = br#"{"password":"s7Kf2v9LmQ8z","n":1}"#;
+        let mut p = Http1Parser::new();
+        let head = format!(
+            "POST /login HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        p.feed(head.as_bytes(), Direction::Egress, 1);
+        assert!(p.skip(Direction::Egress, 13, 2).is_some()); // {"password":"
+        p.feed(&body[13..], Direction::Egress, 3);
+        let tail = r#"{"token_hint":"s7Kf2v9LmQ8z"}"#;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", tail.len());
+        p.feed(head.as_bytes(), Direction::Ingress, 4);
+        assert!(p.skip(Direction::Ingress, 2, 5).is_some());
+        let ParseResult::Messages(m) = p.feed(&tail.as_bytes()[2..], Direction::Ingress, 6) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].request_text, None, "{m:?}");
+        assert_eq!(m[0].payload_text, None, "{m:?}");
+        assert_eq!(m[0].status, Some(200));
+
+        // The next exchange on the connection is exported normally.
+        p.feed(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n", Direction::Egress, 7);
+        let ParseResult::Messages(m) = p.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            Direction::Ingress,
+            8,
+        ) else {
+            panic!("expected the message");
+        };
+        assert_eq!(m[0].payload_text.as_deref(), Some("ok"));
+    }
+
+    /// A gap that only cuts the end of a body (the capture cap on a large
+    /// segment) keeps the captured prefix: names come before values, and
+    /// the export scans and trims a cut value.
+    #[test]
+    fn test_body_cut_at_its_end_keeps_its_prefix() {
+        let mut p = Http1Parser::new();
+        p.feed(
+            b"POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nhead of the body",
+            Direction::Egress,
+            1,
+        );
+        assert!(p.skip(Direction::Egress, 84, 2).is_some());
+        p.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\nfirst part",
+            Direction::Ingress,
+            3,
+        );
+        let Some(ParseResult::Messages(m)) = p.skip(Direction::Ingress, 9990, 4) else {
+            panic!("the gap finishes the response");
+        };
+        assert_eq!(m[0].request_text.as_deref(), Some("head of the body"));
+        assert_eq!(m[0].payload_text.as_deref(), Some("first part"));
+        assert_eq!(m[0].response_size_bytes, 10000);
+    }
+
     #[test]
     fn test_simple_get() {
         let mut parser = Http1Parser::new();
@@ -470,7 +705,7 @@ mod tests {
     fn test_post_with_body() {
         let mut parser = Http1Parser::new();
 
-        let req = b"POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 13\r\n\r\n{\"name\":\"bob\"}";
+        let req = b"POST /api/users HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 14\r\n\r\n{\"name\":\"bob\"}";
         parser.feed(req, Direction::Egress, 1000);
 
         let resp = b"HTTP/1.1 201 Created\r\nContent-Length: 11\r\n\r\n{\"id\": 123}";
@@ -480,6 +715,30 @@ mod tests {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("POST"));
                 assert_eq!(msgs[0].status, Some(201));
+                assert_eq!(msgs[0].request_text.as_deref(), Some("{\"name\":\"bob\"}"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some("{\"id\": 123}"));
+            }
+            other => panic!("expected Messages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_body_across_packets_is_kept() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"POST /signup HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 38\r\n\r\nemail=jane%40example.com",
+            Direction::Egress,
+            1000,
+        );
+        parser.feed(b"&ssn=123-45-", Direction::Egress, 1001);
+        parser.feed(b"67", Direction::Egress, 1002);
+        let result = parser.feed(b"HTTP/1.1 204 No Content\r\n\r\n", Direction::Ingress, 2000);
+        match result {
+            ParseResult::Messages(msgs) => {
+                assert_eq!(
+                    msgs[0].request_text.as_deref(),
+                    Some("email=jane%40example.com&ssn=123-45-67")
+                );
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -501,6 +760,85 @@ mod tests {
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_chunked_size_overflow_does_not_panic() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        let resp =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nabc\r\n";
+        // Must not panic (previously integer overflow / out-of-bounds slice).
+        let _ = parser.feed(resp, Direction::Ingress, 2000);
+    }
+
+    #[test]
+    fn test_parse_errors_do_not_quote_input() {
+        // Errors are logged: they must not carry captured bytes.
+        let mut parser = Http1Parser::new();
+        parser.feed(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", Direction::Egress, 1);
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nssn=123-45-6789\r\nx\r\n";
+        match parser.feed(resp, Direction::Ingress, 2) {
+            ParseResult::Error(e) => assert!(!e.contains("123-45"), "{e}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_large_body_capped_but_size_counted() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        let body_len = MAX_CAPTURED_BODY + 10_000;
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n");
+        parser.feed(header.as_bytes(), Direction::Ingress, 2000);
+        let body = vec![b'a'; body_len];
+        let mut msgs = Vec::new();
+        for chunk in body.chunks(4096) {
+            if let ParseResult::Messages(m) = parser.feed(chunk, Direction::Ingress, 3000) {
+                msgs.extend(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].response_size_bytes, body_len as u64);
+        assert_eq!(
+            msgs[0].payload_text.as_ref().unwrap().len(),
+            MAX_CAPTURED_BODY
+        );
+    }
+
+    #[test]
+    fn test_body_cap_splitting_utf8_char_keeps_prefix() {
+        let mut parser = Http1Parser::new();
+        parser.feed(
+            b"GET /u HTTP/1.1\r\nHost: x\r\n\r\n",
+            Direction::Egress,
+            1000,
+        );
+        // Two ASCII bytes then 3-byte chars: 65536 - 2 is not a multiple of
+        // 3, so the 64KB cap lands mid-char.
+        let mut body = vec![b'a', b'a'];
+        while body.len() < MAX_CAPTURED_BODY + 3 {
+            body.extend_from_slice("€".as_bytes());
+        }
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        parser.feed(header.as_bytes(), Direction::Ingress, 2000);
+        let mut msgs = Vec::new();
+        for chunk in body.chunks(4096) {
+            if let ParseResult::Messages(m) = parser.feed(chunk, Direction::Ingress, 3000) {
+                msgs.extend(m);
+            }
+        }
+        assert_eq!(msgs.len(), 1);
+        let text = msgs[0].payload_text.as_ref().expect("valid prefix kept");
+        assert!(text.len() < MAX_CAPTURED_BODY && text.len() > MAX_CAPTURED_BODY - 4);
     }
 
     #[test]

@@ -6,7 +6,10 @@ license.workspace = true
 
 [features]
 default = ["compression"]
-ml = ["dep:ort", "dep:tokenizers"]
+# Named pause points for the narrowing tests (DESIGN §10 T-2); always on
+# in unit tests.
+scope-test-hooks = []
+ml = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 compression = ["dep:flate2", "dep:snap", "dep:zstd"]
 
 [dependencies]
@@ -31,19 +34,24 @@ serde_json = { workspace = true }
 
 # Stream buffer optimization
 bytes = "1"
+base64 = "0.22"
 
 # Graceful shutdown
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # PII detection
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 fxhash = { workspace = true }
+mimalloc = { workspace = true }
+iced-x86 = { workspace = true }
 reqwest = { workspace = true }
 zeroize = { version = "1", features = ["derive"] }
 
 # ML inference (optional — requires ONNX Runtime)
 ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+ndarray = { version = "0.17", optional = true, default-features = false, features = ["std"] }
 
 # Service graph
 petgraph = { workspace = true }
@@ -56,17 +64,29 @@ prometheus-client = { workspace = true }
 opentelemetry = { version = "0.28", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.28", default-features = false, features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = ["trace", "grpc-tonic"] }
+# Gated transports (io_gate.rs): OTLP's gRPC channel and the external PII
+# client are built on a connector whose socket writes go through the
+# pipeline's IoGate, beneath TLS and HTTP buffering.
+tonic = { version = "0.12", default-features = false, features = ["transport"] }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "client-legacy", "http1"] }
+http = "1"
+http-body-util = "0.1"
+tower-service = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 
 # Compression support (optional)
 flate2 = { version = "1", optional = true }
 snap = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
 
+libc = { workspace = true }
+
 # Linux-only dependencies (aya doesn't compile on macOS)
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
 aya-log = { workspace = true }
-libc = { workspace = true }
 # Adds the `user` feature (aya::Pod impls + utility methods) only on Linux.
 # On macOS the base dep above is used without `user`, avoiding the aya transitive dep.
 panopticon-common = { path = "../panopticon-common", features = ["user"] }
@@ -77,7 +97,12 @@ aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 
 [dev-dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 tower = { version = "0.5", features = ["util"] }
+futures-util = { version = "0.3", default-features = false }
+proc-macro2 = { version = "1", default-features = false }
+h2 = "0.4"
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic", "trace"] }
 criterion = { workspace = true }
 
 [[bench]]
@@ -90,4 +115,8 @@ harness = false
 
 [[bench]]
 name = "pii_regex"
+harness = false
+
+[[bench]]
+name = "credential_rules"
 harness = false

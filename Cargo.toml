@@ -22,7 +22,7 @@ aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "211bb0da9e4d766f9
 anyhow = { version = "1", default-features = false, features = ["std"] }
 dashmap = { version = "6", default-features = false }
 cargo_metadata = { version = "0.23", default-features = false }
-clap = { version = "4", default-features = false, features = ["std", "derive", "env"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 libc = { version = "0.2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = { version = "6.0", default-features = false }
 
 # ELF parsing (Phase 4 — TLS interception)
-object = { version = "0.36", default-features = false, features = ["read", "elf"] }
+object = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
 
 # Protocol parsing (Phase 3)
 nom = { version = "7", default-features = false, features = ["std"] }
@@ -43,11 +43,14 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 
 # PII detection (Phase 5)
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 fxhash = { version = "0.2", default-features = false }
+mimalloc = { version = "0.1", default-features = false }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
 # ML inference (Phase 5 — optional)
-ort = { version = "2.0.0-rc.11", default-features = false }
-tokenizers = { version = "0.20", default-features = false }
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "std"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 # Service graph (Phase 6)
 petgraph = { version = "0.6", default-features = false }

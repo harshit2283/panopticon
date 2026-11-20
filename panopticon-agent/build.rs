@@ -2,6 +2,8 @@ use std::env;
 
 use anyhow::Result;
 
+const DEFAULT_BPF_TOOLCHAIN: &str = "nightly-2026-02-17";
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=BPF_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=AYA_BUILD_SKIP");
@@ -19,11 +21,11 @@ fn main() -> Result<()> {
     // This allows `cargo build` on macOS for development/testing of
     // non-eBPF code while requiring Linux for the full build.
     if cfg!(target_os = "linux") {
-        let bpf_toolchain = env::var("BPF_TOOLCHAIN").ok();
-        let toolchain = bpf_toolchain
-            .as_deref()
-            .map(aya_build::Toolchain::Custom)
-            .unwrap_or_default();
+        // Default to the same pinned nightly used by xtask, CI and the Dockerfile
+        // so a plain `cargo build` is reproducible without extra env vars.
+        let bpf_toolchain =
+            env::var("BPF_TOOLCHAIN").unwrap_or_else(|_| DEFAULT_BPF_TOOLCHAIN.to_string());
+        let toolchain = aya_build::Toolchain::Custom(&bpf_toolchain);
         aya_build::build_ebpf(
             [aya_build::Package {
                 name: "panopticon-ebpf",

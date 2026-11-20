@@ -4,8 +4,8 @@ This directory contains the ONNX model and tokenizer for Named Entity Recognitio
 
 ## Model
 
-- **Name**: `dslim/distilbert-ner`
-- **Source**: [HuggingFace](https://huggingface.co/dslim/distilbert-ner)
+- **Name**: `dslim/distilbert-NER` (ONNX export in its `onnx/` folder)
+- **Source**: [HuggingFace](https://huggingface.co/dslim/distilbert-NER)
 - **Type**: DistilBERT fine-tuned for Named Entity Recognition (CoNLL-2003)
 - **Purpose**: Detect PII entities (PER, ORG, LOC, MISC) in network payloads
 
@@ -14,8 +14,8 @@ This directory contains the ONNX model and tokenizer for Named Entity Recognitio
 | File | Size | Description |
 |------|------|-------------|
 | `model.onnx` | ~265MB | ONNX-optimized model weights |
-| `tokenizer.json` | ~450KB | HuggingFace tokenizer configuration |
-| `config.json` | ~1KB | Model configuration (optional) |
+| `tokenizer.json` | ~650KB | HuggingFace tokenizer configuration |
+| `config.json` | ~1KB | Model configuration |
 
 ## Download
 
@@ -24,26 +24,30 @@ This directory contains the ONNX model and tokenizer for Named Entity Recognitio
 ./scripts/download_model.sh
 ```
 
-The script will:
-1. Check if model already exists (skip if present)
-2. Download model.onnx and tokenizer.json from HuggingFace
-3. Verify file sizes
+The script downloads `model.onnx`, `tokenizer.json` and `config.json` from
+the `onnx/` folder of the HuggingFace repo, pinned to commit
+`dfa2838a127384aabb82ed7719e16dab84c42a2a`, over HTTPS only. Each file goes
+to a temporary name and is moved into place only after its SHA-256 matches
+the digest in the script; an existing file is kept only if it matches.
 
 ## Manual Download
 
+Use the same pinned revision and check the digests before using the files:
+
 ```bash
-# Create directory
 mkdir -p models/distilbert-ner
+REV=dfa2838a127384aabb82ed7719e16dab84c42a2a
+BASE="https://huggingface.co/dslim/distilbert-NER/resolve/$REV/onnx"
+for f in model.onnx tokenizer.json config.json; do
+    curl -fL --proto '=https' --proto-redir '=https' \
+        -o "models/distilbert-ner/$f" "$BASE/$f"
+done
 
-# Download from HuggingFace
-curl -L -o models/distilbert-ner/model.onnx \
-    "https://huggingface.co/dslim/distilbert-ner/resolve/main/model.onnx"
-
-curl -L -o models/distilbert-ner/tokenizer.json \
-    "https://huggingface.co/dslim/distilbert-ner/resolve/main/tokenizer.json"
-
-curl -L -o models/distilbert-ner/config.json \
-    "https://huggingface.co/dslim/distilbert-ner/resolve/main/config.json"
+cd models/distilbert-ner && shasum -a 256 -c - <<'EOF'
+4440f9fc64cd28ac75d83a38d89716f25947799640cd0e5f1f9f6e57b9c14160  model.onnx
+cb26b43c98e8266ae3e99c2a583cf8315d73b33a17e6b20b4df7ff1f22392d34  tokenizer.json
+8f9f01d47f61087197f9fa85185d4a7a6248333c15af1b221aa5e8b9b76462b5  config.json
+EOF
 ```
 
 ## Usage in Panopticon

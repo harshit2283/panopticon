@@ -26,21 +26,25 @@ Panopticon must detect personally identifiable information (PII) in captured net
 | Memory overhead | < 250MB (including model) |
 | Precision | > 95% (minimize false positives) |
 | Recall | > 85% (minimize false negatives) |
-| PII types | 11 categories |
+| PII types | 16 regex categories + 4 ML (NER) categories |
 
 ### PII Categories
 
 | Category | Examples | Detection Method |
 |----------|----------|------------------|
-| Email | user@example.com | Regex |
-| Phone (US) | +1-555-123-4567 | Regex |
+| Email | user@example.com | Regex (asset names like logo@2x.png rejected) |
+| Phone (US / IN / intl) | +1-415-555-0142, +91 98765 43210 | Regex + NANP rules; bare 10 digits need a phone keyword |
 | SSN (US) | 123-45-6789 | Regex |
-| Credit Card | 4532-1234-5678-9010 | Regex + Luhn |
+| Credit Card | 4111 1111 1111 1111 | Regex + Luhn + issuer prefix/length |
 | JWT | eyJhbGciOiJIUzI1NiI... | Regex |
-| API Key | sk-xxx, api_key=xxx | Regex |
-| Aadhaar (IN) | 1234-5678-9012 | Regex + Verhoeff |
-| PAN (IN) | ABCDE1234F | Regex |
-| IP Address | 192.168.1.1, 2001:db8::1 | Regex |
+| API Key / AWS key | sk-xxx, AKIA... | Regex |
+| Aadhaar (IN) | 2345 6789 0124 | Regex + Verhoeff, first digit 2-9 |
+| PAN (IN) | ABCPE1234F | Regex + holder-type letter |
+| UPI ID (IN) | name@okaxis | Regex + known bank handles |
+| GSTIN (IN) | 27ABCPE1234F1Z5 | Regex + checksum |
+| Passport (IN) | passport: K1234567 | Regex + "passport" keyword |
+| IBAN | DE89 3704 0044 0532 0130 00 | Regex + mod-97 |
+| IPv4 Address | 192.168.1.1 | Regex (not part of a longer dotted run) |
 | Date of Birth | 1990-01-15 | ML (context) |
 | Person Name | John Smith | ML (NER) |
 
@@ -67,7 +71,7 @@ We will use a **3-stage pipeline**: Regex prefilter → ML inference → Redacti
 │       ▼                                                                      │
 │   ┌─────────────────────────────────────────────────┐                       │
 │   │  STAGE 1: REGEX PREFILTER                       │                       │
-│   │  • RegexSet (11 patterns, ~1µs)                 │                       │
+│   │  • RegexSet + validators, ~1µs                  │                       │
 │   │  • Output: Vec<PatternMatch>                    │                       │
 │   │  • ~90% of traffic rejected here (no match)     │                       │
 │   └──────────────────────┬──────────────────────────┘                       │
@@ -491,7 +495,7 @@ fn normalize_template(payload: &[u8]) -> String {
 
 ### Testing Requirements
 
-1. **Regex accuracy**: Unit tests for all 11 patterns
+1. **Regex accuracy**: Unit tests per pattern plus the labelled-corpus accuracy gate (`pii::accuracy`)
 2. **ML model loading**: Integration test with ONNX Runtime
 3. **Sampler budget enforcement**: Verify max_inferences_per_sec respected
 4. **Template deduplication**: Verify identical templates deduplicated

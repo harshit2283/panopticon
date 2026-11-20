@@ -132,16 +132,11 @@ impl ServiceDag {
     pub fn prune_stale(&mut self, max_age: Duration, now_ns: u64) {
         let cutoff = now_ns.saturating_sub(max_age.as_nanos() as u64);
 
-        // Collect stale edge indices
-        let stale: Vec<_> = self
-            .graph
-            .edge_indices()
-            .filter(|&e| self.graph[e].last_seen < cutoff)
-            .collect();
-
-        for edge_id in stale {
-            self.graph.remove_edge(edge_id);
-        }
+        // DiGraph::remove_edge swaps the last edge into the removed slot, so
+        // removing a pre-collected list of indices hits the wrong edges.
+        // retain_edges handles the index shuffling correctly.
+        self.graph
+            .retain_edges(|g, e| g.edge_weight(e).is_some_and(|w| w.last_seen >= cutoff));
 
         // Remove orphaned nodes (no incoming or outgoing edges)
         let orphans: Vec<_> = self
@@ -306,6 +301,27 @@ mod tests {
         assert_eq!(dag.edge_count(), 1);
         assert!(dag.get_dependencies("nginx").is_empty());
         assert_eq!(dag.get_dependencies("worker").len(), 1);
+    }
+
+    #[test]
+    fn test_prune_stale_non_contiguous_edges() {
+        // Edge layout [stale, fresh, stale]: removing pre-collected indices
+        // one by one moved the last stale edge into slot 0 and left it alive.
+        let mut dag = ServiceDag::new();
+        dag.update_edges(&[
+            make_flow("a", "b", Protocol::Http1, 1, 100),
+            make_flow("c", "d", Protocol::Http1, 1, 900),
+            make_flow("e", "f", Protocol::Http1, 1, 100),
+        ]);
+        assert_eq!(dag.edge_count(), 3);
+
+        dag.prune_stale(Duration::from_nanos(500), 1000);
+
+        assert_eq!(dag.edge_count(), 1);
+        assert_eq!(dag.get_dependencies("c").len(), 1);
+        assert!(dag.get_dependencies("a").is_empty());
+        assert!(dag.get_dependencies("e").is_empty());
+        assert_eq!(dag.node_count(), 2);
     }
 
     #[test]

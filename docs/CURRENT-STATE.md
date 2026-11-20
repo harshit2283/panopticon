@@ -17,33 +17,286 @@ production-hardened compliance platform.
   and Kafka in the integration harness.
 - Prometheus and OTLP exporter behavior has unit-test coverage.
 - Host-mode TLS E2E exists for local Linux debugging.
+- Capture is by `cgroup_skb` programs on the host's cgroup v2 root, the
+  only backend: every local socket, in every network namespace, with every
+  scope decision made in the kernel per socket
+  ([ADR-014](adr/ADR-014-cgroup-skb-capture-scope.md); its trade-offs are
+  listed in docs/USER-GUIDE.md §4.2, "Capture scope"). The TC backend, which
+  captured on network interfaces, was removed. The ground-truth accuracy,
+  load and overhead figures below were measured with TC unless they say
+  `cgroup_skb` or name the scope tests, and have not been re-run since.
+- HTTP/1.1 capture is scored against a ground-truth traffic generator on a
+  veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
+  across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
+- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol and
+  prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
+  every request that carried it, and no raw PII values in the export
+  (`tests/oracle/run_protocols.sh`).
+- The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
+  `redacted`, `metrics_only`) are checked with planted PII and credentials
+  in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
+  Content-Type parameter, an X-Vault-Token, a JWT behind an overlapping
+  `access_token=`) and in Redis AUTH / HELLO AUTH and Kafka client ids,
+  searched for in every output (export, raw dump and
+  its pcap conversion, audit log, agent log at debug level, `/metrics`,
+  `/debug/state`): values appear only where the mode allows, recall 100%
+  (`tests/oracle/run_modes.sh`, kernel 7.0).
+- The capture-scope settings are checked the same way, with every sink on
+  (`tests/oracle/run_sampling.sh`, kernel 7.0): `pid_filter` naming the
+  HTTP and TLS servers captures 100% of their exchanges and nothing of the
+  TLS client process; naming an unrelated process exports nothing and
+  leaves none of 6,440 planted values in any sink. `connection_sample`
+  at 0.0, 0.5 and 1.0 kept 0, 47 and 96 of 96 connections, never part of
+  one. `head_only` kept no direction past its limit, captured every
+  connection's first request, and left none of the values planted past
+  the limit in any sink. Not yet run on 5.15 or the RHEL kernels. Measured
+  when TC was the default backend; the kernel scope rules are checked on
+  five kernels by `tests/oracle/run_scope.sh`, `tests/oracle/scope_lab.py`
+  and the `scope_attach` lab test.
+- Sustained load is measured (`tests/load/`): 23K HTTP requests/s over 64
+  connections with 99.99% recall, and 8K new connections/s with 99.98%
+  recall and bounded connection state, on 4 vCPUs. On 64 vCPUs (agent
+  pinned to 16 of them): 223K requests/s over 1K connections at 100%
+  recall, 237K over 4K connections at 99.8% (about 470K events/s, limited
+  by the load generator), and 200 KB bodies at 99.7-99.9%. Drops are
+  counted per cause, including in the kernel ring buffers.
+- Agent overhead is measured: about 1.2-2µs of kernel time per captured
+  packet, 2.3% of one core and 122 MiB peak RSS under the HTTP load run on
+  4 vCPUs; about 0.7µs per packet under 1K-4K connections on 64 vCPUs,
+  with 176-252 MiB peak RSS (above the 200 MB target at 4K connections and
+  200 KB bodies). At fixed rates the agent costs about 0.37 cores at 20K
+  requests/s (64 or 4K connections). Kernel-to-worker P99 latency
+  (preliminary) is 2-4 ms at 64 connections and at 4K connections up to
+  20K requests/s, and 8-10 ms at 4K connections from 50K requests/s
+  (docs/BENCHMARKS.md, scaling study). These figures are for the TC
+  backend (removed; historical).
+- The `cgroup_skb` capture (the only backend) is measured on five kernels
+  (preliminary), against TC in the same runs: scoped by `pid_filter`, it
+  matches TC's throughput, recall
+  and agent CPU at 64 keep-alive connections, and at 1K uses slightly less agent CPU
+  than TC with no kernel ring drops (records are sized to what they carry),
+  at 1.4-1.8x TC's kernel time per request. Unscoped, it also captures
+  both ends of node-local connections, about twice the events and agent
+  CPU; node-local packets (127/8, the host's own address, and sockets
+  seen on a VRF device) only with
+  `capture_loopback = true` (default false; it covers packets only: TLS
+  plaintext over loopback is scoped by process either way). IPv6 is not
+  captured. `pid_filter` matches TC's
+  recall only for a server whose listener was created after the agent
+  started, with `pid_filter_listener = "creator"`; under the default
+  `"acceptor"` every listener loses the bytes before `accept()`, like a
+  pre-agent listener. On a listener that predates
+  the agent (any server not restarted since), a connection is captured from
+  the moment a listed process accepts it, and earlier bytes are dropped:
+  56.6% recall with a new connection per request (TC 100%), 100% with
+  keep-alive connections. Use `cgroup_filter` / `pod_filter`, which has
+  no such gap, or `pid_filter_listener = "creator"` with the server
+  restarted after the agent. Under
+  `"creator"`, a listener created by a listed process selects every
+  connection accepted on it, also by processes not in the list; under
+  `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
+  Both settings change on reload. Replay (`--replay-bench`) refuses every
+  scope setting. The `client_pid` / `server_pid` export fields, filled
+  from TC's connect / accept probes, are gone; packet events in the raw
+  dump carry the kernel's `owner_tgid` / `acceptor_tgid`.
+- All parsers are fuzzed with libFuzzer (`fuzz/`): 16M+ executions without a
+  crash after the fixes in this release.
 
 ## Partial
 
 - Linux kernel support:
-  - 5.8+ is the primary path.
-  - 4.15-5.7 works through the PerfEventArray fallback.
-  - ARM64 support exists but validation remains limited.
+  - 5.8+ is the supported floor. Full accuracy suites pass on 5.15, 6.8 and 7.0 (also loaded on 6.18).
+  - RHEL 8 and 9 are supported: their 4.18 and 5.14 kernels carry the BPF
+    ring buffer and 5.5+ probe-read helpers. Measured on Rocky Linux 8.10
+    (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
+    (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
+    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
+    exported, every TLS exchange carrying its socket addresses (via fentry).
+    The agent probes the ring buffer by creating one rather than trusting the
+    version number; before that, RHEL 8 fell to the PerfEventArray path and
+    captured nothing.
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 77-98% over seven lab
+    runs (other AMQP methods 100%). The broker-to-consumer stream there
+    carries GSO segments up to 18 KB, and frames past the 4 KB capture window
+    are lost. Retransmitted segments are now parsed once (see TCP stream
+    integrity below), so deliveries are no longer duplicated; replaying two
+    of these captures with and without sequence tracking gave the same
+    deliveries, so the remaining loss is the capture window.
+    RHEL 9 passed (100%, one earlier run at 85%).
+  - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
+    different record layout (an extra `common_preempt_lazy_count` field moves
+    every field by 8 bytes). The agent checks each tracepoint's tracefs
+    `format` against the offsets its programs read and uses fentry instead
+    when they differ.
+  - Upstream 4.15-5.7 does not load today: the PerfEventArray fallback exists
+    in code, but the object always creates a RingBuf map and uses 5.5+ helpers.
+  - ARM64 support exists but validation remains limited; no arm64 image yet.
 - TLS plaintext capture:
-  - OpenSSL is supported on targeted attach paths.
-  - Go TLS is write-path only.
+  - OpenSSL via a shared `libssl` (including the `_ex` API) is validated
+    against ground truth: 100% recall from both client and server processes
+    (`tests/oracle/run_tls.sh`). Statically linked TLS libraries are not
+    found. A workload's mapped file is first pinned without being opened
+    (`O_PATH`, resolved inside the workload's own root with `openat2`; a
+    kernel without `openat2` gets no workload file opened, and every lab
+    kernel, RHEL 8.10 included, has it), and that same file is opened for
+    reading only if it is a regular file; a mapping whose file was deleted,
+    or whose process root the agent cannot use, is skipped. A FIFO or
+    device put at a mapped path is refused without being opened, so it can
+    neither hang the agent nor run a driver's open.
+  - TLS exchanges carry their socket addresses and join the service graph:
+    validated via the `sock_send/recv_length` tracepoints (kernel 6.3+) and
+    via the fentry fallback (RHEL 8 and 9); the kprobe fallback for kernels
+    without BTF is not validated yet.
+  - Go `crypto/tls` reads and writes, for binaries whose build information
+    (`.go.buildinfo`) shows the gc toolchain at Go 1.18+, `GOARCH` amd64 or
+    arm64 matching the node, and the register ABI not turned off by a
+    `GOEXPERIMENT`; any other Go binary gets no Go probe at all. Received
+    plaintext is taken per TLS record as `(*halfConn).decrypt` returns it,
+    decrypted in place in the connection's own input buffer, never from the
+    caller's `Read` buffer, whose lifetime a probe cannot establish. The
+    entry of `(*Conn).readRecordOrCCS` names the connection, keyed by
+    goroutine and process instance (no uretprobe: Go moves goroutine stacks,
+    so returns are probed at their `RET` instructions). A record that
+    decrypts as application data but that the connection then refuses (sent
+    before the handshake completed) is still emitted. Validated on kernels
+    7.0, 6.8, 5.15, RHEL 9 and RHEL 8 (`scope_attach` `go_tls_reads`:
+    records captured byte-exact over TLS 1.3 and TLS 1.2 with AEAD and CBC
+    suites, including while the reader's stack moved; nothing from an
+    out-of-scope process, after a narrowing or after capture is switched
+    off; no slots left after goroutine churn or process exit) and with the
+    scope oracle
+    (`tests/oracle/run_scope.sh`: 100% of reads from both processes in
+    unscoped `full`, `pid_filter` and `cgroup_filter`, the last not on
+    RHEL 8, where `cgroup_filter` is refused); `run_tls.sh` scores 100%
+    recall in both views, except the known client-view flake (one to three
+    exchanges in 500 in some runs, docs/BENCHMARKS.md). Record reads in flight at once are
+    capped at 65,536 node-wide (a goroutine parked waiting for a record on
+    an idle keep-alive connection holds one); past that, further reads are
+    not captured until some return; likewise past 8,192 processes doing Go TLS reads at once
+    (new ones are not captured until some exit). Reads in flight when their process's main thread exits, or
+    when it execs, are not captured. Go TLS events carry no socket address
+    under a restricted capture scope. Binaries built with `-s` (no symbol
+    table) are not found; arm64 is untested. Reads need `readRecordOrCCS`
+    and `decrypt` as functions of their own: a build where the compiler
+    inlined them (possible with profile-guided optimisation) or that lacks
+    their symbols has its reads lost, never wrongly attributed; its writes
+    are unaffected.
+- TCP stream integrity:
+  - Each direction's next expected sequence number is tracked
+    (`protocol/fsm.rs` `TcpTracker`): retransmitted bytes are parsed once,
+    segments whose sequence or acknowledgment number is far from the stream
+    (blind forgeries) are ignored, and an RST counts only at the next
+    expected byte. Bytes the agent never saw are skipped as a gap, up to
+    8 MiB ahead, or further once the peer acknowledges them.
+  - TCP and IP checksums are not checked by the agent. Whether a segment
+    with a bad checksum reaches the capture hook before the kernel discards
+    it has not been measured on `cgroup_skb` (on TC it did: such a segment
+    was parsed and the genuine retransmission dropped as a duplicate).
+    Forging one needs the connection's current sequence numbers (an
+    on-path attacker).
+  - Segments are not reordered: one that arrives before an earlier one is
+    taken as a gap, and the earlier one is then ignored. The kernel's
+    stream offset places each direction's first byte. A connection is
+    keyed by its socket, so a new connection on a reused 5-tuple is a new
+    socket with no state from the old one.
 - Protocol depth:
-  - HTTP/2, gRPC, MySQL, PostgreSQL, Redis, AMQP, and DNS still have feature
-    gaps even where parsing exists.
+  - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
+    parsed. MySQL statements prepared before the agent started are
+    reported as `EXECUTE` without their SQL. PostgreSQL bound values are
+    not exported on a connection the agent joined mid-stream or lost
+    server bytes on, and a simple Query forgets every confirmed statement.
+  - HTTP/2 headers are not decoded on a connection the agent did not see
+    whole: one already open when the agent started, a side whose start
+    was not captured, or one whose parser restarted after lost bytes; a
+    later client preface on it does not lift this. Over TLS a new
+    connection that reuses a closed one's key starts clean only once the
+    agent has seen OpenSSL's `SSL_new` return the new object; with Go TLS
+    (no such hook), a static or renamed libssl, `SSL_clear` reuse, I/O
+    inside `SSL_new` (a creation callback), or when that record was lost,
+    it is not decoded either. While credential masking is on its bodies are not exported
+    either.
+  - Kafka, AMQP and DNS are scored against ground truth
+    (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
+    not decoded, and Kafka is recognised on port 9092 only.
 - PII detection:
-  - Regex-first scanning is the stable baseline.
+  - Regex-first scanning is the stable baseline: 16 validated patterns
+    (checksums, issuer prefixes, context keywords), including Indian
+    identifiers. On the labelled corpus (`tests/pii/`), 1.1% of clean
+    payloads produce a finding, down from 54%. Remaining misses are numbers
+    with no context; see `BENCHMARKS.md` §3.
   - ONNX-backed ML inference is optional and throughput-sensitive.
+  - In `redacted` mode, header names and values are scanned for every
+    protocol. Credentials are protected by withholding: a SQL statement
+    with credential context is exported as its verb and `<statement
+    withheld>`, without bound values; any other field with credential
+    context is exported as `<field withheld>` unless each credential is a
+    form parameter, a scalar JSON member or URI userinfo, whose value is
+    then masked; credential-named headers are masked, and Redis
+    credential commands and replies are masked before the same rule (so
+    `AUTH` stays readable, while `CONFIG GET requirepass` and its reply
+    are withheld: with renamed commands a reply cannot be tied to its
+    request). A credential word that is a bare name is not credential
+    context, by an allowlist tied to the field's kind: in an HTTP/1 or
+    HTTP/2 request path, the last segment of a captured path part
+    (before any `?` or `#`) of ASCII letters-only segments, any query or
+    fragment after it replaced by `?<query withheld>`; in a MySQL or PostgreSQL statement, a projection item of
+    `SELECT item, … FROM table [rest]` read on its raw tokens, each item
+    `*` or a plain identifier (not a value keyword such as `TRUE`) and
+    no credential word from the table on
+    (exported without bound values or error text). No other field has a
+    bare name; anything outside the allowlist is withheld as before.
+    Short credential names are also matched with `.` and `-` as
+    boundaries (`users.pwd`). A letters-only segment before the word
+    (`/reset/abcdef/token`) is a known limit.
+    Redis reply text is exported only on connections seen from their
+    first byte (the kernel's stream offset, no bytes lost):
+    not on connections open before the agent started, nor over TLS.
+    Bodies with bytes kept after a capture gap (a cut end keeps its
+    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    the agent did not see whole (and, while masking is on, HTTP/2 bodies
+    on such a connection until a new connection is observed from its
+    start, over TLS on a reused key only after `SSL_new` returned
+    the new object as above,
+    and bodies whose content type is repeated or over 256 bytes),
+    over-long header names and gRPC/protobuf body text are not exported;
+    PostgreSQL bound values are exported only under the SQL their
+    statement had when the Bind was sent, once confirmed, even if it is
+    redefined later (a simple Query forgets every statement), and not at
+    all on a connection joined mid-stream, after lost server bytes or
+    past 4096 retained Bind snapshots;
+    only known SQL keywords are exported as methods. `[credentials]
+    patterns` adds the user's own formats (masked in every field, matching
+    DNS answers dropped, counted in `panopticon_credential_matches_total`;
+    every rule sees the field as captured and one rule set covers a whole
+    message), and `builtin = "names_only"`
+    skips the free-text scan. `full` does this too, with or without PII
+    detection, unless `[privacy] mask_credentials = false`.
+  - Credential protection is a hard guarantee only in `metrics_only`
+    (no path, header or body leaves the agent). In `redacted` and `full`
+    it is best-effort defence in depth for known credential forms: it does
+    not catch opaque secrets under unrecognised names, base64 `Basic`
+    credentials outside `Authorization`, compressed or non-ASCII UTF-16/32
+    bodies, PostgreSQL `U&` identifiers, or packets forged into a
+    connection (USER-GUIDE §5.3). The leak test covers HTTP, OpenSSL TLS,
+    Redis AUTH and Kafka client ids; withheld SQL statements and AMQP
+    metadata are covered by unit tests only.
 - Service graphing:
-  - DNS/IP-based identity works.
-  - Kubernetes-aware identity does not.
+  - DNS/IP-based identity works. DNS names come only from answers to
+    queries seen on the same flow, are validated hostnames, last at most an
+    hour, and are dropped when they hold PII (except in `full`); there is no
+    list of trusted resolvers, so a workload can still name an address of
+    its choosing through a resolver it runs. The audit log records the
+    address beside the name (`service_addr`).
+  - Kubernetes-aware identity (`namespace/workload`, `svc:namespace/service`,
+    `node:name`) is implemented and tested against a fake API server only;
+    not yet validated on a real cluster.
 - CI coverage:
   - Multi-kernel coverage is a smoke layer, not complete feature validation.
 
 ## Not Done
 
 - IPv6 capture
-- Kubernetes pod or service identity resolution
-- Go TLS read-path capture
+- Kubernetes identity validated on a real cluster (and for IPv6 pods)
 - Broad TLS library support beyond the current OpenSSL and partial Go paths
 - Full runtime hot-reload for all tunable settings
 - Complete connection-state cleanup on process exit
