@@ -240,6 +240,12 @@ json.dump(n, open(d + "/narrowed.json", "w"))' "$d"
 
 # ── T-10 ──────────────────────────────────────────────────────────────────
 
+# Every T-10 run is over 127.0.0.1, so it captures loopback (off by
+# default). Without it a scoped run's loopback packets are dropped before
+# any socket gets a verdict, so OpenSSL calls carry no address (USER-GUIDE
+# "Capture scope") and HP's plain HTTP is not captured at all.
+T10_LO='capture_loopback = true'
+
 tls_server() { # tls_server PORT [env...]
   local p=$1; shift
   bg env "$@" TLS=1 TLS_CERT="$OUT/cert.pem" TLS_KEY="$OUT/key.pem" $TRAFFIC server $p
@@ -260,7 +266,7 @@ run_tls_full() {
   go_pair "$d" 31201 GS 200
   sleep 0.5
   tls_client "$d" 31101 OS 200
-  conf "$d" ''
+  conf "$d" "$T10_LO"
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"; sleep 14
   stop_pids; sleep 2
@@ -290,9 +296,9 @@ run_tls_scoped() {
   bg sleep 1000; local dummy=$!; L="$L $dummy"
   sleep 0.5
   if [[ $how == pid ]]; then
-    conf "$d" "pid_filter = [$(echo $L | tr ' ' ',')]"
+    conf "$d" "$T10_LO"$'\n'"pid_filter = [$(echo $L | tr ' ' ',')]"
   else
-    conf "$d" 'cgroup_filter = ["b2/a"]'
+    conf "$d" "$T10_LO"$'\ncgroup_filter = ["b2/a"]'
   fi
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"
@@ -327,9 +333,9 @@ run_tls_mode() {
   bg env GO=$d/go EVERY=5 GAP=0.02 $TRAFFIC client 31021 HP 200 "$d/HP.truth.jsonl"
   if [[ $1 == sample ]]; then
     # 0.99: sample_rate = 1.0 is full mode (DESIGN §3.4)
-    conf "$d" $'sampling_mode = "connection_sample"\nsample_rate = 0.99'
+    conf "$d" "$T10_LO"$'\nsampling_mode = "connection_sample"\nsample_rate = 0.99'
   else
-    conf "$d" $'sampling_mode = "head_only"\nhead_only_bytes = 1048576'
+    conf "$d" "$T10_LO"$'\nsampling_mode = "head_only"\nhead_only_bytes = 1048576'
   fi
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"; sleep 14
