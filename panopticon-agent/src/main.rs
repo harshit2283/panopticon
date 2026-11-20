@@ -336,7 +336,6 @@ async fn main() -> Result<()> {
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
-        let mut go_attach = loader::GoAttach::default();
         if agent_config.tls_scan_enabled {
             let targets = platform::proc_scanner::scan_all_processes();
             // Tracked by the file the probes land on (the real inode under
@@ -350,7 +349,6 @@ async fn main() -> Result<()> {
                         target,
                         &mut programs._links,
                         programs.go_reads,
-                        &mut go_attach,
                     )
                 });
             info!(
@@ -367,7 +365,6 @@ async fn main() -> Result<()> {
             links: programs._links,
             attached_libs,
             go_reads: programs.go_reads,
-            go_attach,
         }));
         let cgroup_root = programs_cgroup_root;
 

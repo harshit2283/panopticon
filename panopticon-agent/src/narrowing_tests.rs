@@ -1768,10 +1768,10 @@ fn ssl_rec(kind: EventType, dir: Direction, payload: &[u8]) -> DataEvent {
     e
 }
 
-/// Through the real worker loop: only a TlsNew record (here `SSL_new`
-/// returned the object; for Go TLS, see
-/// `go_tls_handshake_starts_a_new_connection_on_a_reused_key`) starts a
-/// new connection on a TLS key. Codex R10's up-ref
+/// Through the real worker loop: only a TlsNew record (`SSL_new`
+/// returned the object; Go TLS has none, see
+/// `go_tls_reused_key_stays_latched`) starts a new connection on a TLS
+/// key. Codex R10's up-ref
 /// schedule (`SSL_up_ref`, a non-final `SSL_free`, the object still in
 /// use, no new object) sends no TlsNew: a latched connection followed by
 /// a preface stays withheld. After a TlsNew the next connection exports,
@@ -1845,20 +1845,16 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
 }
 
 /// A Go `crypto/tls` record on `*tls.Conn` 0xc000_1a2b_c000 of pid 70,
-/// between 127.0.0.1:41000 and 127.0.0.1:`port` (`kind` TlsNew: the
-/// entry of the object's first handshake, tls_probes.rs
-/// `go_tls_handshake_entry`).
-fn go_rec(kind: EventType, dir: Direction, port: u16, payload: &[u8]) -> DataEvent {
-    let mut e = ssl_rec(kind, dir, payload);
+/// between 127.0.0.1:41000 and 127.0.0.1:`port`.
+fn go_rec(dir: Direction, port: u16, payload: &[u8]) -> DataEvent {
+    let mut e = ssl_rec(EventType::TlsData, dir, payload);
     e.tls_library = panopticon_common::TlsLibrary::GoTls;
     e.socket_cookie = 0xc000_1a2b_c000;
-    if kind == EventType::TlsData {
-        (e.src_addr, e.dst_addr) = (0x7f00_0001, 0x7f00_0001);
-        (e.src_port, e.dst_port) = match dir {
-            Direction::Egress => (41000, port),
-            Direction::Ingress => (port, 41000),
-        };
-    }
+    (e.src_addr, e.dst_addr) = (0x7f00_0001, 0x7f00_0001);
+    (e.src_port, e.dst_port) = match dir {
+        Direction::Egress => (41000, port),
+        Direction::Ingress => (port, 41000),
+    };
     e
 }
 
@@ -1880,107 +1876,32 @@ async fn h2_records(env: &Env) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The `go-h2` TLS oracle (tests/oracle/run_tls.sh) as the worker sees it.
-/// Go's allocator hands a closed connection's `*tls.Conn` address to the
-/// next one, so connections share a key. With the entry of each
-/// connection's handshake sent as a TlsNew record, each connection starts
-/// clean and exports its `:path`. Without it (a binary whose handshake is
-/// not probed: stripped, or a probe that did not attach) the second
-/// connection on the key restarts its parser latched and exports an
-/// HTTP/2 record with no path, status or headers: what the oracle scored
-/// as a phantom plus a miss before Go had a boundary.
+/// The `go-h2` TLS oracle's reuse variant (tests/oracle/run_tls.sh) as the
+/// worker sees it. Go's allocator hands a closed connection's `*tls.Conn`
+/// address to the next one, so connections share a key, and Go has no
+/// connection boundary: the second connection on the key restarts its
+/// parser latched and exports an HTTP/2 record with no path, status or
+/// headers, and none of its values.
 #[test]
-fn go_tls_handshake_starts_a_new_connection_on_a_reused_key() {
-    t2(
-        "go_tls_handshake_starts_a_new_connection_on_a_reused_key",
-        4,
-        async {
-            for boundary in [true, false] {
-                let env = Env::new(if boundary { "gonew" } else { "gonone" }).await;
-                let rec = |kind, dir, p: &[u8]| go_rec(kind, dir, 18444, p);
-                let reply = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]); // :status 200
-                let qs = ["goreuse-q1", "goreuse-q2", "goreuse-q3"];
-                let mut events = vec![];
-                for q in qs {
-                    if boundary {
-                        events.push(rec(EventType::TlsNew, Direction::Egress, b""));
-                    }
-                    let get = h2_get(1, &format!("/len/10?id={q}"));
-                    events.push(rec(EventType::TlsData, Direction::Egress, &h2_start(&get)));
-                    events.push(rec(EventType::TlsData, Direction::Ingress, &reply));
-                }
-                env.feed(&events);
-                env.wait_for("goreuse-q1", &["json"]).await;
-                if boundary {
-                    env.wait_for("goreuse-q3", &["json"]).await;
-                }
-                let h2 = h2_records(&env).await;
-                let paths: Vec<_> = h2.iter().map(|e| e["path"].as_str()).collect();
-                if boundary {
-                    let want: Vec<_> = qs.iter().map(|q| format!("/len/10?id={q}")).collect();
-                    let want: Vec<_> = want.iter().map(|p| Some(p.as_str())).collect();
-                    assert_eq!(paths, want, "{h2:?}");
-                    assert!(h2.iter().all(|e| e["status"] == 200), "{h2:?}");
-                } else {
-                    assert_eq!(paths, [Some("/len/10?id=goreuse-q1"), None, None], "{h2:?}");
-                    assert!(h2[1..].iter().all(|e| e["status"].is_null()), "{h2:?}");
-                    let json = env.file("events.jsonl");
-                    assert!(!contains(&json, "goreuse-q2") && !contains(&json, "goreuse-q3"));
-                }
-            }
-        },
-    );
-}
-
-/// Fail closed: a TlsNew on a live Go key that no client preface follows
-/// (a boundary the bytes do not start at, which the kernel's guards are
-/// there to rule out) never decodes the next header blocks against an empty
-/// HPACK table. On a port without a fallback the bytes after it are not
-/// parsed at all; on gRPC's port (50051) the entry the fallback creates is
-/// latched, so no header of it, path included, is exported.
-#[test]
-fn go_tls_boundary_without_a_preface_withholds() {
-    t2("go_tls_boundary_without_a_preface_withholds", 4, async {
-        for port in [18444u16, 50051] {
-            let env = Env::new(&format!("gomid{port}")).await;
-            let rec = |kind, dir, p: &[u8]| go_rec(kind, dir, port, p);
-            let first = h2_start(&h2_get(1, "/len/10?id=gomid-q1"));
-            env.feed(&[
-                rec(EventType::TlsNew, Direction::Egress, b""),
-                rec(EventType::TlsData, Direction::Egress, &first),
-                rec(
-                    EventType::TlsData,
-                    Direction::Ingress,
-                    &h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]),
-                ),
-                // A boundary mid-connection, then the connection goes on.
-                rec(EventType::TlsNew, Direction::Egress, b""),
-                rec(
-                    EventType::TlsData,
-                    Direction::Egress,
-                    &h2_get(3, "/len/10?id=gomid-q2"),
-                ),
-                rec(
-                    EventType::TlsData,
-                    Direction::Ingress,
-                    &h2_frame(0x1, 0x4 | 0x1, 3, &[0x88]),
-                ),
-            ]);
-            env.wait_for("gomid-q1", &["json"]).await;
-            let h2 = h2_records(&env).await;
-            let json = env.file("events.jsonl");
-            assert!(!contains(&json, "gomid-q2"), "port {port}: {h2:?}");
-            assert_eq!(h2[0]["path"], "/len/10?id=gomid-q1", "port {port}: {h2:?}");
-            // 18444: nothing after the boundary is parsed. 50051: exactly
-            // one record of the latched entry, with no header.
-            let withheld = if port == 50051 { 1 } else { 0 };
-            assert_eq!(h2.len(), 1 + withheld, "port {port}: {h2:?}");
-            for e in &h2[1..] {
-                let no_headers = e["headers"].as_array().is_none_or(|h| h.is_empty());
-                assert!(e["path"].is_null() && no_headers, "port {port}: {e:?}");
-                assert_eq!(e["protocol"], "grpc", "port {port}: {e:?}");
-            }
+fn go_tls_reused_key_stays_latched() {
+    t2("go_tls_reused_key_stays_latched", 4, async {
+        let env = Env::new("goreuse").await;
+        let rec = |dir, p: &[u8]| go_rec(dir, 18444, p);
+        let reply = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]); // :status 200
+        let mut events = vec![];
+        for q in ["goreuse-q1", "goreuse-q2", "goreuse-q3"] {
+            let get = h2_get(1, &format!("/len/10?id={q}"));
+            events.push(rec(Direction::Egress, &h2_start(&get)));
+            events.push(rec(Direction::Ingress, &reply));
         }
+        env.feed(&events);
+        env.wait_for("goreuse-q1", &["json"]).await;
+        let h2 = h2_records(&env).await;
+        let paths: Vec<_> = h2.iter().map(|e| e["path"].as_str()).collect();
+        assert_eq!(paths, [Some("/len/10?id=goreuse-q1"), None, None], "{h2:?}");
+        assert!(h2[1..].iter().all(|e| e["status"].is_null()), "{h2:?}");
+        let json = env.file("events.jsonl");
+        assert!(!contains(&json, "goreuse-q2") && !contains(&json, "goreuse-q3"));
     });
 }
 

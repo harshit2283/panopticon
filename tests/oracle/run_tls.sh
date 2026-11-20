@@ -60,9 +60,7 @@ for stack in $STACKS; do
   echo "==== $stack"
   # A copy of the server (another port) runs before the agent starts so
   # the initial TLS scan finds its library. The measured server starts
-  # after the probes are attached: a Go process running before its binary's
-  # probes attach never gets connection boundaries (reused keys stay
-  # latched), as in production (docs/USER-GUIDE.md §5.3).
+  # after the probes are attached.
   if [[ $stack == openssl ]]; then holder=("${server[@]}" $((PORT + 1000))); else holder=("${server[@]}" "127.0.0.1:$((PORT + 1000))"); fi
   if [[ $stack == openssl ]]; then server+=("$PORT"); else server+=("127.0.0.1:$PORT"); fi
   "${holder[@]}" &
@@ -70,12 +68,8 @@ for stack in $STACKS; do
   sleep 1
   "$AGENT" --json-export "$D/agent.jsonl" >"$D/agent.log" 2>&1 &
   AP=$!
-  # Wait for the attach (for Go, also its boundary generation step), not
-  # a fixed time: a Go server started before it would be withheld.
-  ready() {
-    grep -q 'Initial TLS scan complete' "$D/agent.log" &&
-      { [[ $stack == openssl ]] || grep -q 'Go TLS boundary generation step' "$D/agent.log"; }
-  }
+  # Wait for the attach, not a fixed time.
+  ready() { grep -q 'Initial TLS scan complete' "$D/agent.log"; }
   for _ in $(seq 120); do
     ready && break
     kill -0 "$AP" 2>/dev/null || break

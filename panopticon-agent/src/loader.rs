@@ -91,11 +91,8 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
 /// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_CALLS,
-/// PROC_EPOCH, GO_GUARD_CALLS, GO_GUARD_CONNS, GO_GUARD_LOST, GO_EXEC,
-/// GO_BOUNDARY_GEN, GO_BOUNDARY_OK): owner-only maps whose entries belong
-/// to this run's probes. A restarted agent saw no process start, so no
-/// process running then gets Go boundaries (tls_probes.rs
-/// `handshake_is_boundary`).
+/// PROC_EPOCH, GO_GUARD_CALLS): owner-only maps whose entries belong to
+/// this run's probes.
 const PINNED_MAP_NAMES: [&str; 9] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",
@@ -145,30 +142,11 @@ pub struct EbpfState {
     /// real inode under a container's overlay root and otherwise the file
     /// examined (never a fresh stat of a workload path). Never pruned: the
     /// links stay attached for the agent's life, so forgetting a file
-    /// attached it again (duplicate probes, and for Go a generation step
-    /// that withholds its running processes) when a process mapped it
+    /// attached it again (duplicate probes) when a process mapped it
     /// again.
     pub attached_libs: HashSet<(u64, u64)>,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,
-    /// Go boundary attach state ([`GoAttach`]).
-    pub go_attach: GoAttach,
-}
-
-/// Go boundary attach state kept across attaches.
-#[derive(Default)]
-pub struct GoAttach {
-    /// Go handshake probes that did not attach after their binary's guards
-    /// did, retried at each background scan ([`retry_go_handshakes`]).
-    pub handshake_retry: Vec<GoHandshakeRetry>,
-}
-
-/// A Go binary whose guards are attached and whose handshake probes (some
-/// of them) are not: attaching them later is safe, since the guards and
-/// the generation step that admit a process do not depend on them.
-pub struct GoHandshakeRetry {
-    pub target: TlsTarget,
-    pub offsets: Vec<u64>,
 }
 
 /// Detect kernel capabilities from /proc/version, sysfs and a BPF map probe.
@@ -416,7 +394,6 @@ pub fn attach_tls_uprobes(
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
     go_reads: bool,
-    go: &mut GoAttach,
 ) -> usize {
     use std::os::fd::AsRawFd;
     let file = match crate::platform::proc_scanner::open_examined(target) {
@@ -430,15 +407,8 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
-    let mut out = GoAttachOut::default();
-    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads, &mut out);
+    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads);
     drop(file); // the uprobes hold the inode now
-    if !out.missing.is_empty() {
-        go.handshake_retry.push(GoHandshakeRetry {
-            target: target.clone(),
-            offsets: out.missing,
-        });
-    }
     if attached > 0 {
         info!(
             pid = target.pid,
@@ -461,20 +431,12 @@ fn restricted_kernel_scope(ebpf: &Ebpf) -> bool {
     read().is_none_or(|mode| !scope::is_unscoped_full(mode))
 }
 
-/// Go attach results of one target ([`attach_tls_uprobes_to`]).
-#[derive(Default)]
-struct GoAttachOut {
-    /// Handshake offsets that did not attach (retried).
-    missing: Vec<u64>,
-}
-
 /// Attach the target's probes at `target.library_path` (an fd path).
 fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
     go_reads: bool,
-    go: &mut GoAttachOut,
 ) -> usize {
     let mut attached = 0;
     // Restricted modes emit SSL_write* at return, with that call's own
@@ -556,8 +518,9 @@ fn attach_tls_uprobes_to(
             }
             // SSL_new, entry and return: without them a reused SSL*
             // address stays latched (HTTP/2 headers and bodies withheld)
-            // in user space (Go: `attach_go_handshakes`). The return sends nothing for a call whose
-            // entry it did not see.
+            // in user space, as a reused Go `*tls.Conn` address always is.
+            // The return sends nothing for a call whose entry it did not
+            // see.
             if let Some(offset) = *ssl_new_offset
                 && attach_uprobe(
                     ebpf,
@@ -604,15 +567,14 @@ fn attach_tls_uprobes_to(
         TlsType::GoTls {
             write_offset,
             read,
-            boundary,
+            write_guard,
         } => {
             // No PID filter: like libssl, the probes cover every process
             // running this binary (every replica on the node).
             let path = &target.library_path;
             // Where Write's RETs are probed, its entry is the guarded probe
-            // (guards the connection, emits once per call); otherwise the
-            // unguarded one, and no handshake entry is attached.
-            let guarded = match boundary {
+            // (emits once per call); otherwise the unguarded one.
+            let guarded = match write_guard {
                 Some(b) if go_reads && b.write_entry == *write_offset => {
                     attach_go_guards(ebpf, path, b, links)
                 }
@@ -628,96 +590,17 @@ fn attach_tls_uprobes_to(
             {
                 attached += attach_go_read(ebpf, path, read, links);
             }
-            if let (Some(_), Some(b)) = (guarded, boundary) {
-                attached += attach_go_boundary(ebpf, target, b, links, go);
-            }
         }
     }
 
     attached
 }
 
-/// After a Go binary's guards attached: the generation step (processes
-/// already running it may be inside a Write no guard saw enter, so only
-/// images started after this point, or proven not to run it, get
-/// boundaries: proc_scanner.rs `step_generation`), then the handshake
-/// probes. Returns the probes attached; offsets that did not attach go to
-/// `go.missing` (retried).
-fn attach_go_boundary(
-    ebpf: &mut Ebpf,
-    target: &TlsTarget,
-    b: &crate::platform::proc_scanner::GoBoundaryProbes,
-    links: &mut Vec<Box<dyn std::any::Any + Send>>,
-    go: &mut GoAttachOut,
-) -> usize {
-    let path = &target.library_path;
-    let Some((_, _, mtime_ns, size)) = target.file_key else {
-        warn!(
-            path,
-            "Go TLS connection boundary not probed: no file identity"
-        );
-        return 0;
-    };
-    match crate::platform::proc_scanner::step_generation(ebpf, (size, mtime_ns)) {
-        Ok(step) => info!(
-            path,
-            kept = step.kept,
-            withheld = step.withheld,
-            "Go TLS boundary generation step: processes running this binary keep \
-             latched reused keys"
-        ),
-        Err(e) => {
-            warn!(
-                path,
-                error = %format!("{e:#}"),
-                "Go TLS connection boundary not probed: the generation step failed"
-            );
-            return 0;
-        }
-    }
-    let (n, failed) = attach_go_handshakes(ebpf, path, b, links);
-    go.missing.extend(failed);
-    n
-}
-
 /// Attach TLS uprobes operating on shared `EbpfState` directly.
 /// Caller is responsible for locking the mutex.
 pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) -> usize {
     let go_reads = state.go_reads;
-    attach_tls_uprobes(
-        &mut state.ebpf,
-        target,
-        &mut state.links,
-        go_reads,
-        &mut state.go_attach,
-    )
-}
-
-/// Attach the Go handshake probes that did not attach with their binary
-/// ([`GoHandshakeRetry`]), through the file examined then: a binary
-/// replaced since is dropped (its probes went with the old file).
-pub fn retry_go_handshakes(state: &mut EbpfState) {
-    use std::os::fd::AsRawFd;
-    let pending = std::mem::take(&mut state.go_attach.handshake_retry);
-    for mut r in pending {
-        let Ok(file) = crate::platform::proc_scanner::open_examined(&r.target) else {
-            continue;
-        };
-        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
-        r.offsets.retain(|&off| {
-            !attach_uprobe(
-                &mut state.ebpf,
-                "go_tls_handshake_entry",
-                &path,
-                off,
-                None,
-                &mut state.links,
-            )
-        });
-        if !r.offsets.is_empty() {
-            state.go_attach.handshake_retry.push(r);
-        }
-    }
+    attach_tls_uprobes(&mut state.ebpf, target, &mut state.links, go_reads)
 }
 
 /// Go TLS reads (go_read.rs): every RET probe of `readRecordOrCCS` and of
@@ -750,19 +633,19 @@ fn attach_go_read(
     rets + attach_all("go_tls_rrc_entry", &[read.read_record_entry])
 }
 
-/// Go connection guards (tls_probes.rs `guard_call`): every RET of `Write`
+/// Go Write guards (tls_probes.rs `guard_call`): every RET of `Write`
 /// first, then `Write`'s entry as `go_tls_write_guarded` (which also emits
-/// its plaintext), so a guard set is always cleared. All or nothing: if
-/// any of them fails, the RET probes attached are detached again and None
-/// is returned; the caller then attaches the unguarded `go_tls_write_entry`
-/// and no handshake entry, and a reused key stays latched. Not retried: a
-/// later swap of the live plaintext probe would emit a Write twice or not
-/// at all. Shares `PROC_EPOCH` and the sweep with Go reads, so it is
-/// attached only where they are (`go_reads`). Returns the probes attached.
+/// its plaintext), so a recorded call is always cleared. All or nothing:
+/// if any of them fails, the RET probes attached are detached again and
+/// None is returned; the caller then attaches the unguarded
+/// `go_tls_write_entry`. Not retried: a later swap of the live plaintext
+/// probe would emit a Write twice or not at all. Shares `PROC_EPOCH` and
+/// the sweep with Go reads, so it is attached only where they are
+/// (`go_reads`). Returns the probes attached.
 fn attach_go_guards(
     ebpf: &mut Ebpf,
     path: &str,
-    b: &crate::platform::proc_scanner::GoBoundaryProbes,
+    b: &crate::platform::proc_scanner::GoWriteProbes,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
 ) -> Option<usize> {
     let mut rets = Vec::with_capacity(b.write_rets.len());
@@ -774,7 +657,7 @@ fn attach_go_guards(
                     path,
                     offset = off,
                     error = %e,
-                    "Go TLS connection boundary not probed: a Write RET probe did not attach"
+                    "Go TLS Write not guarded: a Write RET probe did not attach"
                 );
                 detach_uprobes(ebpf, "go_tls_guard_ret", rets);
                 return None;
@@ -795,7 +678,7 @@ fn attach_go_guards(
             warn!(
                 path,
                 error = %e,
-                "Go TLS connection boundary not probed: the Write guard did not attach"
+                "Go TLS Write not guarded: the guarded entry probe did not attach"
             );
             detach_uprobes(ebpf, "go_tls_guard_ret", rets);
             None
@@ -816,23 +699,6 @@ fn detach_uprobes(ebpf: &mut Ebpf, prog: &str, ids: Vec<aya::programs::uprobe::U
             warn!(prog, error = %e, "Failed to detach uprobe");
         }
     }
-}
-
-/// The handshake wrapper entries that send a Go `TlsNew` (tls_probes.rs
-/// `go_tls_handshake_entry`), after the guards and the generation step.
-/// Each one is a boundary on its own (client or server side). Returns the
-/// probes attached and the offsets that did not attach (to retry).
-fn attach_go_handshakes(
-    ebpf: &mut Ebpf,
-    path: &str,
-    b: &crate::platform::proc_scanner::GoBoundaryProbes,
-    links: &mut Vec<Box<dyn std::any::Any + Send>>,
-) -> (usize, Vec<u64>) {
-    let (ok, missing): (Vec<u64>, Vec<u64>) = b
-        .handshakes
-        .iter()
-        .partition(|&&off| attach_uprobe(ebpf, "go_tls_handshake_entry", path, off, None, links));
-    (ok.len(), missing)
 }
 
 fn attach_uprobe(

@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use object::read::elf::{ElfFile, FileHeader};
 use object::{Object, ObjectSection, ObjectSymbol, ReadCache, ReadRef};
 
-pub use super::go_read::{GoBoundaryProbes, GoReadProbes};
-use super::go_read::{go_boundary_probes_from, go_read_probes_from, symbol_file_offset};
+pub use super::go_read::{GoReadProbes, GoWriteProbes};
+use super::go_read::{go_read_probes_from, go_write_probes_from, symbol_file_offset};
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
 
@@ -214,9 +214,9 @@ pub enum TlsType {
         write_offset: u64,
         /// Go TLS read probe offsets (go_read.rs), if found.
         read: Option<GoReadProbes>,
-        /// New-connection boundary probes (go_read.rs), if found: without
-        /// them a reused `*tls.Conn` key stays latched.
-        boundary: Option<GoBoundaryProbes>,
+        /// `Write`'s entry and RETs (go_read.rs), if found: without them
+        /// the unguarded entry probe is used.
+        write_guard: Option<GoWriteProbes>,
     },
 }
 
@@ -377,9 +377,9 @@ pub fn go_read_probes(path: &str) -> Option<GoReadProbes> {
     with_untrusted_elf(path, |data| go_read_probes_from(data)).ok()?
 }
 
-/// The Go new-connection boundary probe offsets of the ELF at `path`.
-pub fn go_boundary_probes(path: &str) -> Option<GoBoundaryProbes> {
-    with_untrusted_elf(path, |data| go_boundary_probes_from(data)).ok()?
+/// `(*Conn).Write`'s entry and RET offsets in the ELF at `path`.
+pub fn go_write_probes(path: &str) -> Option<GoWriteProbes> {
+    with_untrusted_elf(path, |data| go_write_probes_from(data)).ok()?
 }
 
 /// Whether the Go probes can read a Go binary's functions: Ok(toolchain
@@ -739,19 +739,19 @@ fn examine_binary(path: &str, namespace_path: &str) -> Option<TlsType> {
             && let Some(&write_off) = syms.get("crypto/tls.(*Conn).Write")
         {
             let read = go_read_probes(namespace_path);
-            let boundary = go_boundary_probes(namespace_path);
+            let write_guard = go_write_probes(namespace_path);
             debug!(
                 path,
                 target = %namespace_path,
                 %version,
                 read = read.is_some(),
-                boundary = boundary.is_some(),
+                write_guard = write_guard.is_some(),
                 "Found Go TLS binary"
             );
             return Some(TlsType::GoTls {
                 write_offset: write_off,
                 read,
-                boundary,
+                write_guard,
             });
         }
         debug!(
@@ -873,12 +873,6 @@ pub async fn tls_scanner_task(
             continue;
         };
         let newly_attached = attach_new_targets(&shared_ebpf, targets);
-        {
-            let mut state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
-            if !state.go_attach.handshake_retry.is_empty() {
-                crate::loader::retry_go_handshakes(&mut state);
-            }
-        }
         let shared = shared_ebpf.clone();
         let _ = tokio::task::spawn_blocking(move || sweep_go_reads(&shared)).await;
         if newly_attached > 0 {
@@ -890,46 +884,17 @@ pub async fn tls_scanner_task(
     }
 }
 
-/// Go TLS guard map entries after the last sweep (go_read.rs `Sweep`).
-static GO_GUARDED_CONNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Go process images whose boundaries a probe ended (`GO_GUARD_LOST`).
-static GO_BOUNDARY_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// (Go TLS connections guarded, Go processes whose boundaries ended), as
-/// of the last sweep, for the metrics.
-pub fn go_guard_stats() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        GO_GUARDED_CONNS.load(Relaxed),
-        GO_BOUNDARY_LOST.load(Relaxed),
-    )
-}
-
 /// Go TLS read slots of process instances that ended (go_read.rs `Sweep`).
 /// The shared state is locked only to open the map handles: the walk runs
 /// after the lock is released, so scope publication never waits on it, and
 /// on a blocking thread (`tls_scanner_task`), not an async worker.
 #[cfg(target_os = "linux")]
 fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::EbpfState>>) {
-    use std::sync::atomic::Ordering::Relaxed;
     let opened = {
         let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
         super::go_read::Sweep::open(&state.ebpf)
     };
-    match opened.and_then(|mut sweep| {
-        let removed = sweep.run();
-        GO_GUARDED_CONNS.store(sweep.guarded_conns as u64, Relaxed);
-        let before = GO_BOUNDARY_LOST.swap(sweep.guard_lost, Relaxed);
-        if sweep.guard_lost > before {
-            warn!(
-                processes = sweep.guard_lost - before,
-                "Go TLS: a Write guard could not be recorded; those processes' new \
-                 connections on reused keys stay latched (HTTP/2 headers and bodies \
-                 withheld) for the rest of their life"
-            );
-        }
-        removed
-    }) {
+    match opened.and_then(|mut sweep| sweep.run()) {
         Ok((0, 0)) => {}
         Ok((slots, epochs)) => debug!(
             slots,
@@ -937,119 +902,6 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
         ),
         Err(e) => warn!(error = %format!("{e:#}"), "Go TLS read sweep failed"),
     }
-}
-
-/// What a Go boundary generation step did ([`step_generation`]).
-#[derive(Debug, Default)]
-pub struct GenerationStep {
-    /// Images that had boundaries and keep them (proven not to map the
-    /// binary).
-    pub kept: usize,
-    /// Images that had boundaries and lose them (they map the binary, or
-    /// that could not be ruled out).
-    pub withheld: usize,
-}
-
-/// The Go boundary generation step, after a Go binary's guards attached
-/// and before its handshake probes do (maps.rs `GO_BOUNDARY_GEN`). A
-/// process already running the binary may be inside a `Write` whose entry
-/// no guard saw, so it must not get boundaries. Every image that has them
-/// now and is proven not to map the binary (`binary`: its size and mtime;
-/// one inode has one of each) keeps them through `GO_BOUNDARY_OK`; every
-/// other `GO_BOUNDARY_OK` entry is removed; then the generation steps, so
-/// only images whose exec reads the new generation, after the guards were
-/// in place, or kept here get boundaries. Anything not proven loses them
-/// (fail closed): an unreadable `/proc/<pid>/maps`, a deleted or
-/// unresolvable executable mapping, or one whose file matches.
-/// `GO_BOUNDARY_OK` is written only here, under the eBPF state lock, so
-/// its keys are known exactly. Runs a `/proc` pass under that lock: only
-/// when a new Go binary's guards attach.
-#[cfg(target_os = "linux")]
-pub fn step_generation(ebpf: &aya::Ebpf, binary: (u64, i64)) -> Result<GenerationStep> {
-    use aya::maps::{Array, HashMap, Map, MapData};
-    use panopticon_common::GoExec;
-    // Own handles (by map id), so the three maps can be used together.
-    let open = |name: &str| -> Result<Map> {
-        Ok(match ebpf.map(name) {
-            Some(Map::HashMap(d)) => Map::HashMap(MapData::from_id(d.info()?.id())?),
-            Some(Map::Array(d)) => Map::Array(MapData::from_id(d.info()?.id())?),
-            _ => anyhow::bail!("{name}: no such map"),
-        })
-    };
-    let (mut gen_map, mut exec_map, mut ok_map) = (
-        open("GO_BOUNDARY_GEN")?,
-        open("GO_EXEC")?,
-        open("GO_BOUNDARY_OK")?,
-    );
-    let mut gen_arr: Array<&mut MapData, u64> = Array::try_from(&mut gen_map)?;
-    let execs: HashMap<&mut MapData, u32, GoExec> = HashMap::try_from(&mut exec_map)?;
-    let mut ok: HashMap<&mut MapData, u32, u64> = HashMap::try_from(&mut ok_map)?;
-    let generation = gen_arr.get(&0, 0)?;
-    let images: Vec<(u32, GoExec)> = execs.iter().filter_map(|r| r.ok()).collect();
-    let ok_keys: Vec<u32> = ok.keys().filter_map(|k| k.ok()).collect();
-    let mut step = GenerationStep::default();
-    let mut kept = std::collections::HashSet::new();
-    for (tgid, exec) in images {
-        let has = exec.generation >= generation || ok.get(&tgid, 0).ok() == Some(exec.stamp);
-        if !has {
-            continue;
-        }
-        // The image ruled out is the one read: the same exec stamp after
-        // its maps were read. A later exec has another stamp, which the
-        // entry never matches.
-        if maps_binary_ruled_out(tgid, binary)
-            && execs.get(&tgid, 0).ok().map(|e| e.stamp) == Some(exec.stamp)
-            && ok.insert(tgid, exec.stamp, 0).is_ok()
-        {
-            kept.insert(tgid);
-            step.kept += 1;
-        } else {
-            step.withheld += 1;
-        }
-    }
-    for tgid in ok_keys {
-        if !kept.contains(&tgid) {
-            ok.remove(&tgid)?;
-        }
-    }
-    gen_arr.set(0, generation + 1, 0)?;
-    Ok(step)
-}
-
-/// Whether `/proc/<pid>/maps` proves the process maps no executable file
-/// with `binary`'s size and mtime: every executable file mapping resolves
-/// (inside the process's root) to a file of another size or mtime. Any
-/// doubt is false.
-#[cfg(target_os = "linux")]
-fn maps_binary_ruled_out(pid: u32, (size, mtime_ns): (u64, i64)) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return false;
-    };
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 || !parts[1].contains('x') {
-            continue; // not executable, or anonymous
-        }
-        let path = parts[5..].join(" ");
-        if !path.starts_with('/') {
-            continue; // [vdso], [vsyscall]: not a file
-        }
-        if path.ends_with(" (deleted)") {
-            return false;
-        }
-        let Ok(fd) = open_path_in_root(&namespace_resolved_path(pid, &path)) else {
-            return false;
-        };
-        let Ok(m) = std::fs::File::from(fd).metadata() else {
-            return false;
-        };
-        let m_mtime = m.mtime().saturating_mul(1_000_000_000) + m.mtime_nsec();
-        if m.size() == size && m_mtime == mtime_ns {
-            return false;
-        }
-    }
-    true
 }
 
 /// Attach uprobes for any new TLS targets not already tracked.
@@ -1209,7 +1061,7 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 0x1000,
                 read: None,
-                boundary: None,
+                write_guard: None,
             },
             file_key: key,
             probe_file: None,
@@ -1255,7 +1107,7 @@ mod tests {
             tls_type: TlsType::GoTls {
                 write_offset: 3,
                 read: None,
-                boundary: None,
+                write_guard: None,
             },
             file_key: Some((1, 7, 5, 6)),
             probe_file: None,
@@ -1569,7 +1421,7 @@ mod tests {
                 tls_type: TlsType::GoTls {
                     write_offset: 0,
                     read: None,
-                    boundary: None,
+                    write_guard: None,
                 },
                 file_key: Some((0, 0, 0, 0)),
                 probe_file: None,
@@ -1655,21 +1507,6 @@ mod tests {
             assert!(is_go_binary("/usr/local/bin/myserver"));
             assert!(!is_go_binary("/usr/lib/libssl.so.3"));
             assert!(!is_go_binary("/usr/lib/libc.so.6"));
-        }
-
-        /// The generation step keeps a process's Go boundaries only when its
-        /// maps rule the binary out: our own executable is not ruled out
-        /// (we map it), a file of another size is, a process that does not
-        /// exist is not (fail closed).
-        #[test]
-        fn test_maps_binary_ruled_out() {
-            use std::os::unix::fs::MetadataExt;
-            let pid = std::process::id();
-            let m = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
-            let me = (m.size(), m.mtime() * 1_000_000_000 + m.mtime_nsec());
-            assert!(!maps_binary_ruled_out(pid, me));
-            assert!(maps_binary_ruled_out(pid, (me.0 + 1, me.1)));
-            assert!(!maps_binary_ruled_out(u32::MAX - 1, (me.0 + 1, me.1)));
         }
 
         #[test]

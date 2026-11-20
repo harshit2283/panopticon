@@ -2579,18 +2579,9 @@ fn go_tls_reads() {
         probes.read_record_rets.len(),
         probes.decrypt_rets.len()
     );
-    let boundary = go_read::go_boundary_probes_from(&elf[..])
-        .expect("discovery finds Write and its RETs and a handshake wrapper");
-    assert_eq!(
-        boundary.handshakes.len(),
-        2,
-        "clientHandshake-fm and serverHandshake-fm found: {boundary:?}"
-    );
-    println!(
-        "GOBOUNDARY Write rets={} handshake wrappers={}",
-        boundary.write_rets.len(),
-        boundary.handshakes.len()
-    );
+    let write =
+        go_read::go_write_probes_from(&elf[..]).expect("discovery finds Write and its RETs");
+    println!("GOWRITE Write rets={}", write.write_rets.len());
 
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");

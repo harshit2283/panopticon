@@ -38,16 +38,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "per-binary TLS verdicts from ELF files on disk, not from traffic",
     ),
     (
-        "platform/proc_scanner.rs",
-        "GO_GUARDED_CONNS",
-        "a count of Go TLS guard map entries, read from a BPF map",
-    ),
-    (
-        "platform/proc_scanner.rs",
-        "GO_BOUNDARY_LOST",
-        "a count of Go processes whose boundaries a probe ended, read from a BPF map",
-    ),
-    (
         "export/otlp.rs",
         "OFFSET",
         "the monotonic-to-wall clock offset",

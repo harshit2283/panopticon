@@ -101,11 +101,9 @@ pub enum EventType {
     UdpSend = 7,
     UdpRecv = 8,
     /// The TLS library started a new connection object: OpenSSL's `SSL_new`
-    /// returned it, or Go `crypto/tls` entered its first handshake
-    /// (`clientHandshake-fm` / `serverHandshake-fm`, with no guarded Write
-    /// in flight on it, tls_probes.rs `go_tls_handshake_entry`). The header
-    /// only, keyed like that object's `TlsData` events. Any earlier object
-    /// at that address was destroyed: a new connection starts on its key.
+    /// returned it (tls_probes.rs `ssl_new_ret`). The header only, keyed
+    /// like that object's `TlsData` events. Any earlier object at that
+    /// address was destroyed: a new connection starts on its key.
     TlsNew = 9,
 }
 
@@ -329,39 +327,12 @@ pub struct ConnInfo {
     pub _pad: [u8; 4],
 }
 
-/// `GO_GUARD_CONNS` key: a Go `*tls.Conn` of one process instance (tgid
-/// and its `PROC_EPOCH`) with a guarded `(*Conn).Write` in flight
-/// (tls_probes.rs `guard_call`): no `TlsNew` is sent for it.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GoGuardKey {
-    pub conn: u64,
-    pub epoch: u64,
-    pub tgid: u32,
-    pub _pad: u32,
-}
-
-/// `GO_EXEC` value: a process image the agent saw start (the
-/// `sched_process_exec` tracepoint), the only kind a Go `TlsNew` may be
-/// sent for (tls_probes.rs `handshake_is_boundary`). `generation` is
-/// `GO_BOUNDARY_GEN` at the exec, `stamp` the boot-time ns of the exec
-/// (names this image), `epoch` the image's first `PROC_EPOCH` (0 until a Go
-/// probe creates it): an epoch created again later (the sweep removed a
-/// live one) no longer matches, which ends the image's boundaries.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GoExec {
-    pub generation: u64,
-    pub stamp: u64,
-    pub epoch: u64,
-}
-
-/// Guarded calls one goroutine can be inside at once (`GO_GUARD_CALLS`):
+/// Recorded `Write` calls one goroutine can be inside at once (`GO_GUARD_CALLS`):
 /// a `Write` on TLS inside TLS (an HTTPS proxy) runs the inner
 /// connection's `Write` inside the outer one's.
 pub const GO_GUARD_NEST: usize = 4;
 
-/// `GO_GUARD_CALLS` value: the guarded calls (tls_probes.rs `guard_call`)
+/// `GO_GUARD_CALLS` value: the recorded calls (tls_probes.rs `guard_call`)
 /// a goroutine is in, outermost first: each one's `*tls.Conn` and frame
 /// depth (top of the goroutine's stack minus SP at its entry, which equals
 /// SP at its RET instructions and survives a stack copy).
@@ -398,11 +369,7 @@ unsafe impl aya::Pod for GoReadKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GoReadCall {}
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for GoGuardKey {}
-#[cfg(feature = "user")]
 unsafe impl aya::Pod for GoGuardCalls {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for GoExec {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 

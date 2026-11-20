@@ -40,9 +40,6 @@ pub struct AgentMetrics {
     /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
     pub credential_matches_user: Counter<u64>,
     pub credential_matches_builtin: Counter<u64>,
-    /// Go TLS boundary guards (proc_scanner.rs `go_guard_stats`).
-    pub go_guarded_connections: Gauge<u64, AtomicU64>,
-    pub go_boundary_lost_images: Counter<u64>,
     /// `panopticon_pod_filter_unresolved_total{reason}`, one per
     /// `scope_select::POD_UNRESOLVED_REASONS` entry in that order.
     pub pod_unresolved: Vec<Counter<u64>>,
@@ -115,25 +112,6 @@ impl AgentMetrics {
             "panopticon_drops_export_full",
             "Parsed exchanges not written because the JSON exporter was behind",
             drops_export_full.clone(),
-        );
-
-        let go_guarded_connections: Gauge<u64, AtomicU64> = Gauge::default();
-        registry.register(
-            "panopticon_go_tls_guarded_connections",
-            "Go TLS connections with a guarded Write in flight, or left guarded by \
-             one that never returned (a panic), until their process ends; at the \
-             map's capacity new guards fail and their processes lose Go connection \
-             boundaries",
-            go_guarded_connections.clone(),
-        );
-
-        let go_boundary_lost_images = Counter::<u64>::default();
-        registry.register(
-            "panopticon_go_tls_boundary_lost_processes",
-            "Go processes whose connection boundaries ended because a Write guard \
-             could not be recorded; new connections on reused keys of them stay \
-             latched (HTTP/2 headers and bodies withheld)",
-            go_boundary_lost_images.clone(),
         );
 
         let worker_panics = Counter::<u64>::default();
@@ -240,8 +218,6 @@ impl AgentMetrics {
             tcp_segments_ignored,
             credential_matches_user,
             credential_matches_builtin,
-            go_guarded_connections,
-            go_boundary_lost_images,
             pod_unresolved,
             scope_drops: Vec::new(),
             drops_stale_scope_gen: None,
@@ -349,13 +325,6 @@ impl AgentMetrics {
         self.credential_matches_builtin
             .inner()
             .store(builtin, Ordering::Relaxed);
-        let (guarded, lost) = crate::platform::proc_scanner::go_guard_stats();
-        self.go_guarded_connections
-            .inner()
-            .store(guarded, Ordering::Relaxed);
-        self.go_boundary_lost_images
-            .inner()
-            .store(lost, Ordering::Relaxed);
         for (counter, value) in self
             .pod_unresolved
             .iter()
