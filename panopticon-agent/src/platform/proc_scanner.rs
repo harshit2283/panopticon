@@ -522,10 +522,22 @@ pub fn scan_all_processes() -> Vec<TlsTarget> {
     }
 
     dedup_targets(&mut targets);
+    // One resolution per examined file: every path to it shows the same
+    // overlay. A failed one (the process exited) is tried again with the
+    // next path.
+    let mut resolved = std::collections::HashMap::new();
     for t in &mut targets {
-        t.probe_file = resolve_probe_file(t);
+        let Some(examined) = target_file_id(t) else {
+            continue;
+        };
+        t.probe_file = match resolved.get(&examined) {
+            Some(real) => Some(*real),
+            None => resolve_probe_file(t),
+        };
+        if let Some(real) = t.probe_file {
+            resolved.insert(examined, real);
+        }
     }
-    dedup_targets(&mut targets);
 
     debug!(count = targets.len(), "TLS library scan complete");
     targets
@@ -568,20 +580,48 @@ fn resolve_probe_file(_target: &TlsTarget) -> Option<(u64, u64)> {
     None
 }
 
-/// Keep one target per file the uprobes land on ([`probe_file_id`]). TLS
-/// uprobes are attached without a PID filter, so they already cover every
-/// process mapping that file. Each PID reaches it through a different
-/// `/proc/<pid>/root/...` path, and each container of an image through an
-/// overlay device of its own. Attaching once per path or per device put
-/// a second copy of every probe on the file, so every TLS call was emitted
-/// twice. A target without an examined identity is kept per path (its
-/// attach is refused anyway: [`open_examined`]).
+/// Drop repeats of one path to one examined file, and keep every other
+/// path: each is a candidate for [`attach_each`]. A path's attach can be
+/// refused ([`open_examined`]: a co-tenant that shares the inode swapped a
+/// directory of its own path), and another path to the same file must
+/// then attach it.
 fn dedup_targets(targets: &mut Vec<TlsTarget>) {
     let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| {
-        let file = probe_file_id(t).ok_or_else(|| t.library_path.clone());
-        seen.insert(file)
-    });
+    targets.retain(|t| seen.insert((target_file_id(t), t.library_path.clone())));
+}
+
+/// Attach each file the uprobes land on ([`probe_file_id`]) once, trying
+/// its candidate paths in order until one attaches (`attach` returns the
+/// probes attached, 0 when refused). TLS uprobes are attached without a
+/// PID filter, so one attach covers every process mapping the file. Each
+/// PID reaches it through a different `/proc/<pid>/root/...` path, and
+/// each container of an image through an overlay device of its own.
+/// Attaching once per path or per device put a second copy of every probe
+/// on the file, so every TLS call was emitted twice. Only an attach
+/// records the file in `attached`, so a refused path never hides the
+/// file's other paths. A target without an identity is skipped (its
+/// attach is refused anyway). Returns (files attached, probes attached).
+pub fn attach_each(
+    targets: &[TlsTarget],
+    attached: &mut std::collections::HashSet<(u64, u64)>,
+    mut attach: impl FnMut(&TlsTarget) -> usize,
+) -> (usize, usize) {
+    let (mut files, mut probes) = (0, 0);
+    for target in targets {
+        let Some(id) = probe_file_id(target) else {
+            continue;
+        };
+        if attached.contains(&id) {
+            continue;
+        }
+        let n = attach(target);
+        if n > 0 {
+            attached.insert(id);
+            files += 1;
+            probes += n;
+        }
+    }
+    (files, probes)
 }
 
 /// Scan a single PID's `/proc/<pid>/maps` for TLS libraries.
@@ -1052,19 +1092,13 @@ fn attach_new_targets(
             e.into_inner()
         }
     };
-    let mut newly_attached = 0usize;
-    for target in &new_targets {
-        if let Some(file_id) = probe_file_id(target) {
-            // Double-check under lock (another scan may have raced)
-            if !state.attached_libs.contains(&file_id) {
-                let count = crate::loader::attach_tls_uprobes_on_state(&mut state, target);
-                if count > 0 {
-                    state.attached_libs.insert(file_id);
-                    newly_attached += 1;
-                }
-            }
-        }
-    }
+    // The set is checked again under the lock (another scan may have
+    // raced).
+    let mut attached = std::mem::take(&mut state.attached_libs);
+    let (newly_attached, _) = attach_each(&new_targets, &mut attached, |t| {
+        crate::loader::attach_tls_uprobes_on_state(&mut state, t)
+    });
+    state.attached_libs = attached;
     drop(state);
 
     newly_attached
@@ -1239,7 +1273,40 @@ mod tests {
         ];
         dedup_targets(&mut targets);
         let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
-        assert_eq!(kept, vec![10, 12, 20, 30, 32]);
+        assert_eq!(kept, vec![10, 11, 12, 20, 21, 30, 32], "one per path");
+        let mut attached = std::collections::HashSet::new();
+        let mut tried = Vec::new();
+        let (files, _) = attach_each(&targets, &mut attached, |t| {
+            tried.push(t.pid);
+            1
+        });
+        assert_eq!((files, tried), (3, vec![10, 12, 20]), "one per file");
+    }
+
+    /// The first path to a file is refused (a co-tenant sharing the inode
+    /// swapped a directory of its own path): the next path attaches it,
+    /// and only that attach records it.
+    #[test]
+    fn test_a_refused_path_falls_back_to_the_next() {
+        let key = Some((1, 42, 5, 6));
+        let targets = vec![
+            ssl_target(10, "/proc/10/root/usr/lib/libssl.so.3", key),
+            ssl_target(11, "/proc/11/root/usr/lib/libssl.so.3", key),
+            ssl_target(12, "/proc/12/root/usr/lib/libssl.so.3", key),
+        ];
+        let mut attached = std::collections::HashSet::new();
+        let mut tried = Vec::new();
+        let refuse_first = |t: &TlsTarget| {
+            tried.push(t.pid);
+            usize::from(t.pid != 10) * 7
+        };
+        assert_eq!(attach_each(&targets, &mut attached, refuse_first), (1, 7));
+        assert_eq!(tried, vec![10, 11]);
+        assert!(attached.contains(&(1, 42)));
+
+        let mut none = std::collections::HashSet::new();
+        assert_eq!(attach_each(&targets, &mut none, |_| 0), (0, 0));
+        assert!(none.is_empty(), "a refused attach records nothing");
     }
 
     /// Two different files with the same inode number, size and mtime on
@@ -1280,12 +1347,16 @@ mod tests {
             ..ssl_target(pid, "/proc/x/root/app", Some((dev, 1_585_382, 1_700, 4096)))
         };
         let real = Some((64_769, 1_585_382));
-        let mut targets = vec![ctr(1, 49, real), ctr(2, 52, real), ctr(3, 55, None)];
-        dedup_targets(&mut targets);
-        let kept: Vec<u32> = targets.iter().map(|t| t.pid).collect();
-        assert_eq!(kept, vec![1, 3]);
-        assert_eq!(probe_file_id(&ctr(2, 52, real)), real);
-        assert_eq!(probe_file_id(&targets[1]), Some((55, 1_585_382)));
+        let targets = vec![ctr(1, 49, real), ctr(2, 52, real), ctr(3, 55, None)];
+        let mut attached = std::collections::HashSet::new();
+        let mut tried = Vec::new();
+        attach_each(&targets, &mut attached, |t| {
+            tried.push(t.pid);
+            1
+        });
+        assert_eq!(tried, vec![1, 3]);
+        assert!(attached.contains(&real.unwrap()));
+        assert!(attached.contains(&(55, 1_585_382)));
     }
 
     /// Security scan F2: a workload swaps its library's directory for a
