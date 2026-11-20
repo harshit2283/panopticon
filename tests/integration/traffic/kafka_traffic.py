@@ -26,7 +26,6 @@ def wait_for_kafka_ready(timeout_seconds: int = 60) -> bool:
         try:
             admin = KafkaAdminClient(
                 bootstrap_servers=[BROKER],
-                api_version_auto_timeout_ms=3000,
                 request_timeout_ms=3000,
             )
             try:
@@ -40,7 +39,6 @@ def wait_for_kafka_ready(timeout_seconds: int = 60) -> bool:
             consumer = KafkaConsumer(
                 bootstrap_servers=[BROKER],
                 request_timeout_ms=3000,
-                api_version_auto_timeout_ms=3000,
             )
             partitions = consumer.partitions_for_topic(TOPIC)
             if partitions:
