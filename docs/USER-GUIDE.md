@@ -680,9 +680,10 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
-- **A Redis command** with credential context in its key or any argument
-  is withheld as one unit: key, arguments and reply text (below), even
-  where a field alone would only have a value masked.
+- **A Redis command** with credential context in its key or any argument,
+  or a credential word in a segment of a key name or hash field name, is
+  withheld as one unit: key, arguments and reply text (below), even where
+  a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
@@ -773,14 +774,26 @@ value next to it, masked or not (`CONFIG GET requirepass`,
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
 whole: no Redis field has a bare name (above). A Redis command is
 protected as one unit: when its key or any argument has credential
-context, read together or one by one, the key (`path`), the arguments
+context, read together or one by one, or a key name or hash field name
+names a credential, the key (`path`), the arguments
 (`request_text`) and the reply text are all exported as
 `<field withheld>` (method, status, timing and sizes stay), and its
 result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
 300`, `SETEX password_reset_token:alice 3600 <token>` and
 `GET otp:+15551234567` export no key, value or reply, however opaque the
 value; field-by-field, the key would be withheld and the value next to it
-exported. This holds whatever `builtin` is set to; your own patterns
+exported. A key or field name has no free text around it to show that a
+short name is used as a name, so it is read by segments: split on `:`,
+`.`, `_`, `-` and `/`, case folded, a segment that equals or contains
+any word of either list above (the short names included) names a
+credential. The key names read this way are the key of every command,
+every key of `MSET`, `MSETNX`, `MGET`, `DEL`, `UNLINK`, `EXISTS`,
+`TOUCH` and `WATCH`, and the field names of every hash command (every
+argument after the key, except the values of `HSET`, `HSETNX` and
+`HMSET`). So `SET otp 482913`, `SET user:1:otp 482913`,
+`HSET u:1 pin 1234` and `GET mykey` are withheld whole, while
+`SET 2fa:alice 123456` is not (`2fa` is not in the lists). This holds
+whatever `builtin` is set to; your own patterns
 still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription

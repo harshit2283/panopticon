@@ -255,9 +255,11 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    A Redis command with credential context in its key or any argument
-    is withheld as one unit (key, arguments and reply text, and its
-    result inside `EXEC`), so `SET otp:<id> <code>` exports no value.
+    A Redis command with credential context in its key or any argument,
+    or a credential word (short names included) in a segment of a key or
+    hash field name, is withheld as one unit (key, arguments and reply
+    text, and its result inside `EXEC`), so `SET otp:<id> <code>`,
+    `SET otp <code>` and `HSET u:1 pin <pin>` export no value.
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
     message bodies; a cut end keeps its prefix), HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
