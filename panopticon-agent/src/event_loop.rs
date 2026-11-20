@@ -2221,7 +2221,10 @@ mod tests {
         assert!(decoded(GO_EPOCH_EXEC | 1_000), "proven: the control");
         for (what, stamp) in [
             ("instance not seen starting", 1_000),
-            ("instance lost a record", GO_EPOCH_EXEC | GO_EPOCH_LOST | 1_000),
+            (
+                "instance lost a record",
+                GO_EPOCH_EXEC | GO_EPOCH_LOST | 1_000,
+            ),
             ("no stamp", STREAM_OFF_UNKNOWN),
         ] {
             assert!(!decoded(stamp), "{what}");
