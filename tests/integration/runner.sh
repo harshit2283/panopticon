@@ -79,11 +79,42 @@ wait_for_service_exit() {
     return 1
 }
 
+# The agent runs as root and creates its JSON export owner-only (0600), a
+# privacy control. Hand the file to the user running this script (the
+# validator and the CI artifact upload read it as that user) by chowning it
+# from a throwaway container on the agent image; the mode stays.
+release_export() {
+    local cid image
+    [[ -e output/events.jsonl && ! -r output/events.jsonl ]] || return 0
+    cid="$(docker compose ps -aq agent 2>/dev/null || true)"
+    [[ -n "${cid}" ]] || return 0
+    image="$(docker inspect --format '{{.Image}}' "${cid}" 2>/dev/null || true)"
+    [[ -n "${image}" ]] || return 0
+    docker run --rm --network none --entrypoint chown \
+        -v "${SCRIPT_DIR}/output:/output" "${image}" \
+        "$(id -u):$(id -g)" /output/events.jsonl || true
+}
+
+save_logs() {
+    docker compose logs agent > output/agent.log 2>&1 || true
+    docker compose logs traffic-gen > output/traffic-gen.log 2>&1 || true
+}
+
+# Every exit path: release the export, then tear the stack down.
+cleanup() {
+    local exit_code=$?
+    release_export
+    docker compose down --remove-orphans || true
+    exit "${exit_code}"
+}
+
 # Clean up from previous runs
 docker compose down --remove-orphans 2>/dev/null || true
 rm -f output/events.jsonl
 rm -f output/kafka_traffic_ran
 rm -f output/agent_ready
+
+trap cleanup EXIT
 
 # Build and start all services
 if [[ "${PREBUILT_IMAGES:-0}" == "1" ]]; then
@@ -100,7 +131,6 @@ echo "Waiting for Kafka healthcheck..."
 wait_for_service_healthy kafka 120 || {
     echo "FAIL: Kafka did not become healthy"
     docker compose logs kafka > output/kafka.log 2>&1 || true
-    docker compose down --remove-orphans
     exit 1
 }
 
@@ -108,51 +138,53 @@ echo "Waiting for MySQL healthcheck..."
 wait_for_service_healthy mysql 120 || {
     echo "FAIL: MySQL did not become healthy"
     docker compose logs mysql > output/mysql.log 2>&1 || true
-    docker compose down --remove-orphans
     exit 1
 }
 
 echo "Waiting for services to initialize (5s)..."
 sleep 5
 
-# Start traffic generator and agent together so the agent shares traffic-gen namespaces.
+# The agent captures on the host cgroup v2 root, so it sees every
+# container's sockets whatever namespaces it runs in. The traffic generator
+# holds its traffic until output/agent_ready exists.
 echo "Starting traffic generator and agent..."
 docker compose up -d traffic-gen agent
-sleep 3
 
-traffic_id="$(docker compose ps -q traffic-gen)"
-agent_id="$(docker compose ps -q agent)"
-traffic_ns="$(docker inspect --format '{{.NetworkSettings.SandboxKey}}' "${traffic_id}")"
-agent_ns="$(docker inspect --format '{{.NetworkSettings.SandboxKey}}' "${agent_id}")"
-if [[ -n "${traffic_ns}" && -n "${agent_ns}" && "${traffic_ns}" != "${agent_ns}" ]]; then
-    echo "WARN: agent/traffic-gen network namespace mismatch detected"
-    echo "  traffic-gen ns: ${traffic_ns}"
-    echo "  agent ns:      ${agent_ns}"
-elif [[ -z "${traffic_ns}" || -z "${agent_ns}" ]]; then
-    echo "WARN: could not reliably inspect network namespace (continuing)"
-    echo "  traffic-gen ns: ${traffic_ns}"
-    echo "  agent ns:      ${agent_ns}"
+echo "Waiting for the agent to attach..."
+attached=0
+for _ in $(seq 1 90); do
+    agent_logs="$(docker compose logs --no-color agent 2>/dev/null || true)"
+    if grep -Fq "JSON export enabled" <<<"${agent_logs}" \
+        && grep -Fq "capture scope armed" <<<"${agent_logs}"; then
+        attached=1
+        break
+    fi
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$(docker compose ps -aq agent)" 2>/dev/null)" != "true" ]]; then
+        break
+    fi
+    sleep 1
+done
+if [[ "${attached}" != "1" ]]; then
+    echo "FAIL: agent did not attach"
+    save_logs
+    docker compose logs --tail=100 agent || true
+    exit 1
 fi
-
-echo "Waiting for agent attach stabilization (10s)..."
-sleep 10
 touch output/agent_ready
 
 # Wait for traffic generator completion with timeout.
 echo "Waiting for traffic generator to finish..."
 traffic_exit_code="$(wait_for_service_exit traffic-gen "${TIMEOUT}")" || {
     echo "FAIL: Traffic generator timed out or failed to exit"
-    docker compose logs agent > output/agent.log 2>&1 || true
-    docker compose logs traffic-gen > output/traffic-gen.log 2>&1 || true
-    docker compose down --remove-orphans
+    save_logs
+    docker compose logs --tail=100 traffic-gen || true
     exit 1
 }
 
 if [[ "${traffic_exit_code}" != "0" ]]; then
     echo "FAIL: Traffic generator failed (exit ${traffic_exit_code})"
-    docker compose logs agent > output/agent.log 2>&1 || true
-    docker compose logs traffic-gen > output/traffic-gen.log 2>&1 || true
-    docker compose down --remove-orphans
+    save_logs
+    docker compose logs --tail=100 traffic-gen || true
     exit 1
 fi
 
@@ -160,9 +192,10 @@ fi
 echo "Waiting for agent to flush (5s)..."
 sleep 5
 
-# Stop agent gracefully (SIGINT)
+# Stop agent gracefully (SIGINT) and wait for it to exit, so the export is final.
 docker compose kill -s SIGINT agent 2>/dev/null || true
-sleep 2
+wait_for_service_exit agent 30 >/dev/null || echo "WARN: agent did not exit after SIGINT"
+release_export
 
 # Validate results
 echo ""
@@ -179,14 +212,8 @@ fi
 if [ $EXIT_CODE -ne 0 ]; then
     echo ""
     echo "=== Collecting logs ==="
-    docker compose logs agent > output/agent.log 2>&1 || true
-    docker compose logs traffic-gen > output/traffic-gen.log 2>&1 || true
+    save_logs
     echo "Logs saved to output/"
 fi
-
-# Cleanup
-echo ""
-echo "Cleaning up..."
-docker compose down --remove-orphans
 
 exit $EXIT_CODE

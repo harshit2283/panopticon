@@ -271,6 +271,9 @@ log "Stopping agent"
 stop_agent
 
 [[ -f "${JSON_OUT}" ]] || fail "Expected JSON output file not found: ${JSON_OUT}"
+# The agent (root) creates its export owner-only (0600). Hand the file to the
+# user running this script so the checks below can read it; the mode stays.
+sudo chown "$(id -u):$(id -g)" "${JSON_OUT}"
 
 log "Validating JSON output contains HTTP protocol events"
 python3 - "${JSON_OUT}" <<'PY'

@@ -172,7 +172,7 @@ def validate(events_path: str) -> bool:
     if pid_events:
         print(f"  OK: pid present in {len(pid_events)} events")
     else:
-        print("  INFO: pid absent in all events (expected for TC/plaintext capture)")
+        print("  INFO: pid absent in all events")
 
     tls_libraries = Counter(
         str(e.get("tls_library")).lower()
