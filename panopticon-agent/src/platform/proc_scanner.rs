@@ -862,8 +862,8 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
 }
 
 /// Whether the real inode of `file` (an executable examined as a Go TLS
-/// binary) carries uprobes at `Write`'s entry and at every one of its RET
-/// instructions: the kernel's evidence, not a file identity. A uprobe
+/// binary) carries uprobes at every one of `offsets`: the kernel's
+/// evidence, not a file identity. A uprobe
 /// lives on the inode a mapping resolves to (overlayfs: the lower inode
 /// every container of the image shares), and the kernel writes its
 /// breakpoint into each executable mapping of that inode, the agent's own
@@ -872,7 +872,7 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
 /// else through `pread` of the file. Any doubt (a mapping refused, a
 /// noexec mount, a short read) is false.
 #[cfg(target_os = "linux")]
-pub fn go_guards_present(file: &std::fs::File, b: &GoBoundaryProbes) -> bool {
+pub fn go_probes_present(file: &std::fs::File, offsets: &[u64]) -> bool {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
     #[cfg(target_arch = "x86_64")]
@@ -884,10 +884,8 @@ pub fn go_guards_present(file: &std::fs::File, b: &GoBoundaryProbes) -> bool {
     let Ok(len) = file.metadata().map(|m| m.len()) else {
         return false;
     };
-    let offsets: Vec<u64> = std::iter::once(b.write_entry)
-        .chain(b.write_rets.iter().copied())
-        .collect();
-    if len == 0
+    if offsets.is_empty()
+        || len == 0
         || offsets
             .iter()
             .any(|&o| o.saturating_add(SWBP.len() as u64) > len)
@@ -1603,24 +1601,21 @@ mod tests {
         /// what the file holds, so neither an ordinary file nor one that
         /// holds the breakpoint byte itself at every offset proves guards.
         #[test]
-        fn test_go_guards_present_needs_a_kernel_breakpoint() {
+        fn test_go_probes_present_needs_a_kernel_breakpoint() {
             let dir = std::env::temp_dir().join(format!("panopticon-swbp-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let probes = GoBoundaryProbes {
-                write_entry: 16,
-                write_rets: vec![64, 128],
-                handshakes: vec![256],
-            };
+            let probes = [16u64, 64, 128, 256];
             for (name, byte) in [("plain", 0x90u8), ("forged", 0xcc)] {
                 let path = dir.join(name);
                 std::fs::write(&path, vec![byte; 4096]).unwrap();
                 let file = std::fs::File::open(&path).unwrap();
-                assert!(!go_guards_present(&file, &probes), "{name}");
+                assert!(!go_probes_present(&file, &probes), "{name}");
             }
             let short = dir.join("short");
             std::fs::write(&short, [0u8; 32]).unwrap();
             let file = std::fs::File::open(&short).unwrap();
-            assert!(!go_guards_present(&file, &probes), "offsets past the end");
+            assert!(!go_probes_present(&file, &probes), "offsets past the end");
+            assert!(!go_probes_present(&file, &[]), "no offsets");
             std::fs::remove_dir_all(&dir).ok();
         }
 

@@ -154,14 +154,18 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     own and retried at each scan if it did not attach. Files are known by
     the `(dev, ino)` of the file examined (never a fresh stat of a
     workload path), and never forgotten. A container's overlay root
-    shows an image file under its own device, so another container of
-    the image attaches it again (duplicate probes on the shared lower
-    inode); its generation step is skipped only on the kernel's evidence
-    that this inode already carries the agent's `Write` guard
-    (`go_guards_present`: the uprobe breakpoint at `Write`'s entry and
-    every RET in a fresh mapping, not in the file) and that the agent
-    guarded a file of the same inode number, size and mtime. A collision
-    on those never skips probing. A binary without
+    shows an image file under its own device while the uprobes sit on
+    the lower inode every container of the image shares. A Go binary seen
+    again through another mount is not attached again (which would
+    duplicate every probe and step the generation) only on the kernel's
+    evidence: the uprobe breakpoint at every offset the agent would probe,
+    read through a fresh mapping of the file examined and absent from
+    the file itself (loader.rs `attach_tls_uprobes`, proc_scanner.rs
+    `go_probes_present`), and only for a file of an inode number, size
+    and mtime the agent probed. Those three alone never skip anything (a
+    co-tenant can match them on another device); no unprivileged process
+    can place a breakpoint. OpenSSL files are always attached per
+    `(dev, ino)`: other TLS tracers probe the same functions. A binary without
     them (stripped, renamed, RETs not found, or no Go reads) keeps the
     latch on reused keys; the agent still starts and captures it. This
     is not a reason to refuse to start.

@@ -773,10 +773,10 @@ What is exported then:
     that finds it (every 60 s by default, `tls_scan_interval_secs`). New
     replicas and restarts of a binary already attached get boundaries,
     in containers too: each container's overlay root shows the image
-    file under a device of its own, so the agent attaches it again, but
-    it skips the step when the kernel shows the file's real inode
-    already carries the agent's `Write` guard (its breakpoints in a
-    mapping of the file, at `Write`'s entry and every return).
+    file under a device of its own, and the agent does not attach it
+    again (nor step) when the kernel shows the file's real inode already
+    carries every probe the agent would put on it (their breakpoints in
+    a mapping of the file).
     Processes running other binaries keep theirs when the agent proves,
     from their memory maps, that they do not map the new binary;
     otherwise they lose them too.
