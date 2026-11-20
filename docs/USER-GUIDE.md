@@ -730,11 +730,11 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
-- **A Redis command** with credential context in its key or any argument,
-  or a key name or hash field name that names a credential (a
-  credential word in it, or a short name as a whole segment), is
-  withheld as one unit: key, arguments and reply text (below), even where
-  a field alone would only have a value masked.
+- **A Redis command** with credential context in any argument, or any
+  argument (key, name or value, of any command) that names a credential
+  read by segments (a credential word in it, or a short name as a whole
+  segment), is withheld as one unit: key, arguments and reply text
+  (below), even where a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
@@ -757,7 +757,11 @@ What is exported then:
   that direction export no text: no path (exchange, routing key, queue),
   header, content type or body, only method, status, timing and sizes;
   a request read from it exports no text with its reply either. The other
-  direction is unaffected.
+  direction is unaffected. A connection the agent did not see from its
+  first byte (it was open before the agent started, the protocol was
+  recognised only after its first bytes, or a side's start was not
+  captured) is treated the same way in both directions from the start:
+  its first frame boundary may lie inside a body.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
@@ -883,31 +887,34 @@ value next to it, masked or not (`CONFIG GET requirepass`,
 `CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
 whole: no Redis field has a bare name (above). A Redis command is
-protected as one unit: when its key or any argument has credential
-context, read together or one by one, or a key name or hash field name
-names a credential, the key (`path`), the arguments
+protected as one unit: when any of its arguments has credential
+context, read together or one by one, or any argument names a credential
+read by segments (below), the key (`path`), the arguments
 (`request_text`) and the reply text are all exported as
 `<field withheld>` (method, status, timing and sizes stay), and its
 result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
 300`, `SETEX password_reset_token:alice 3600 <token>` and
 `GET otp:+15551234567` export no key, value or reply, however opaque the
 value; field-by-field, the key would be withheld and the value next to it
-exported. A key or field name has no free text around it to show that a
-short name is used as a name, so it is read by segments: case folded
-and with `-` and `.` read as `_`, a name that contains a word of the
-first list above anywhere (`u:1:apikey`, `session_token`), or one of
-whose segments (split on `:`, `.`, `_`, `-` and `/`) is a short name
-whole (`otp`, `user:1:pin`, `api-key`), names a credential. A short
-name inside a longer segment does not count, so `mykey`, `spinner` and
-`author` name no credential. The key names read this way are the key of
-every command,
-every key of `MSET`, `MSETNX`, `MGET`, `DEL`, `UNLINK`, `EXISTS`,
-`TOUCH` and `WATCH`, and the field names of every hash command (every
-argument after the key, except the values of `HSET`, `HSETNX` and
-`HMSET`). So `SET otp 482913`, `SET user:1:otp 482913`,
-`HSET u:1 pin 1234` and `SET session_token abc` are withheld whole,
-while `GET mykey`, `HSET book:1 author x` and `SET 2fa:alice 123456`
-are not (`2fa` is not in the lists). This holds
+exported. A key, field name or other argument has no free text around
+it to show that a short name is used as a name, so every argument of
+every command (key, names and values alike, known command or not) is
+also read by segments: every character that is not an ASCII letter or
+digit separates segments, and so does a lower-case letter or digit
+followed by an upper-case one (`pinCode` is `pin`, `Code`); case folded.
+An argument that contains a word of the first list above anywhere, with
+separators read as `_` (`u:1:apikey`, `session_token`,
+`clientAssertion`), or one of whose segments is a short name whole
+(`otp`, `user:1:pin`, `u|otp`, `u otp`, `api-key`, `pinCode`), names a
+credential. A short name inside a segment with no boundary does not
+count, so `mykey`, `spinner`, `author` and `otpcode` name no credential.
+So `SET otp 482913`, `SET user:1:otp 482913`, `HSET u:1 pin 1234`,
+`SET session_token abc`, `EVAL <script> 1 otp`, `XADD events * otp
+482913`, `LMOVE incoming user:1:otp LEFT RIGHT` and `JSON.GET u:1 $.pin`
+are withheld whole, and so is a command whose value only mentions a
+credential word (`SET note "my api key"`), while `GET mykey`,
+`HSET book:1 author x` and `SET 2fa:alice 123456` are not (`2fa` is not
+in the lists). This holds
 whatever `builtin` is set to; your own patterns
 still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
