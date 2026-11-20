@@ -192,7 +192,7 @@ for each.
 | Protocol | Traffic mix | Recall before → now | PII visibility before → now | Leaks |
 |---|---|---|---|---|
 | Redis 7.4 | SET/GET/HSET/LPUSH/INCRBY/DEL, errors, pipelined batches | 86.2% (GET 0%) → **100%** | 0% → **100%** | 0 |
-| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **100%** | 0% → **100%** | 0 |
+| PostgreSQL 16 | simple queries, extended protocol (Parse/Bind/Execute), named prepared statements, errors | 45.6% → **83.8-84.6%** (simple and extended 100%; reused prepared statements 39-60 of 118-141, see below) | 0% → **38-42%** | 0 |
 | MySQL 8.4 | COM_QUERY text protocol, errors, `caching_sha2_password` auth | 0% (see below) → **100%** | 0% → **100%** | 0 |
 | MySQL 8.4, prepared statements | mysql-connector-python prepared cursors (COM_STMT_PREPARE / EXECUTE / CLOSE, statements re-executed with new values), mixed with text queries | 66.7% → **100%** (re-executed statements 0% → 100%; verb accuracy 49.5% → 100%) | 0% → **100%** | 0 |
 | gRPC (HTTP/2) | unary, server-streaming, trailers-only errors (`NOT_FOUND`) | 100% → **100%** | 65% → **100%** | 0 |
@@ -201,8 +201,16 @@ gRPC field accuracy went from 21% to 100% for the method path and from 79% to
 100% for `grpc-status`. Before the fix, the HTTP status of 200 was reported
 even for failed calls.
 
-The latest full runs (seeds 7 and 42) have every protocol at 100%; Redis was
-also checked with seeds 21 and 99.
+The full runs at seeds 7 and 42 (2026-10-19) had every protocol at 100%;
+Redis was also checked with seeds 21 and 99. Re-run on 2026-11-20 (seeds 7,
+11 and 23, kernel 6.8) Redis, MySQL, MySQL prepared and gRPC are still at
+100%, and PostgreSQL scores 83.8%, 84.6% and 84.2%. Every PostgreSQL
+exchange is exported, verb and error flag 100%, but bound values stop for
+the rest of a connection once server bytes are lost (USER-GUIDE §5.3),
+and about 200 operations into each run a 500-row result loses some. The
+prepared statements before that point are all matched (60/60, 51/51,
+39/39), none after it; the extended protocol's PII, also a bound value,
+follows the same split.
 
 ### Kafka, AMQP (RabbitMQ), DNS
 
@@ -219,7 +227,26 @@ about 740 Kafka and 910 AMQP truth entries.
 | DNS | A, AAAA, CNAME chains, NXDOMAIN, SERVFAIL, TXT; 10% over TCP | 90.2% (TCP 0%) → **100%** | query name, type, rcode, answers 100% | — | 0 |
 
 Measured with seed 7 (500 operations) and seed 42 (1,000 operations, also
-100% everywhere, 0 duplicates). What was wrong before:
+100% everywhere, 0 duplicates).
+
+Re-measured on 2026-11-20 after AMQP stopped exporting text from a
+direction that lost frame sync (USER-GUIDE §5.3), with the CI invocation
+(`run_messaging.sh 300 7 0.99`): on Ubuntu 24.04, kernel 7.0, Kafka, AMQP
+(every method, deliveries 164/164) and DNS were 100% in three of three
+runs. On Rocky Linux 8.10 (4.18), seven runs: AMQP `Basic.Deliver` 17.1-28.7%
+(other AMQP methods 100%, AMQP overall 75.2-78.6%), Kafka 95.7-100%
+(`Fetch` 92.6-100%, five runs at 100%), DNS 100%, no raw PII exported. On
+8.10 frames past the 4 KB capture window are lost on the broker-to-consumer
+stream (GSO segments up to 18 KB); after the first lost frame boundary the
+deliveries on that connection are exported without exchange, routing key
+or body, so they no longer match ground truth (77-98% before the change).
+In these runs every operation matched two records, on both kernels (the
+0-duplicate runs above predate cgroup_skb as the only capture backend);
+the client and the server run on the same host, consistent with each
+packet being seen once leaving the client's socket and once reaching the
+server's. Not yet confirmed.
+
+What was wrong before:
 
 - **Kafka**: the topic was read at a fixed offset, wrong for every version
   current clients send (Produce v3+ starts with `transactional_id`; v9+,

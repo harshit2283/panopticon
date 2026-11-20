@@ -139,16 +139,32 @@ pub struct LoadedPrograms {
 pub struct EbpfState {
     pub ebpf: Ebpf,
     pub links: Vec<Box<dyn std::any::Any + Send>>,
-    /// Files already attached ([`crate::platform::proc_scanner::FileId`]).
-    /// Never pruned: their probes stay attached for the agent's life, so
-    /// forgetting one re-attached it (duplicate probes) when a process
-    /// mapped it again.
-    pub attached_libs: HashSet<crate::platform::proc_scanner::FileId>,
+    /// `(device_id, inode)` pairs of already-attached libraries, from the
+    /// file each was examined in
+    /// ([`crate::platform::proc_scanner::target_file_id`]) — handles
+    /// symlinks and mount namespace ambiguity. Never pruned: the probes
+    /// stay attached for the agent's life, so forgetting a file attached
+    /// it again (duplicate probes, and for Go a generation step that
+    /// withholds its running processes) when a process mapped it again.
+    pub attached_libs: HashSet<(u64, u64)>,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,
+    /// Go boundary attach state ([`GoAttach`]).
+    pub go_attach: GoAttach,
+}
+
+/// Go boundary attach state kept across attaches.
+#[derive(Default)]
+pub struct GoAttach {
     /// Go handshake probes that did not attach after their binary's guards
     /// did, retried at each background scan ([`retry_go_handshakes`]).
-    pub go_handshake_retry: Vec<GoHandshakeRetry>,
+    pub handshake_retry: Vec<GoHandshakeRetry>,
+    /// Inode number, size and mtime of each file whose Write guard this
+    /// agent attached. Never an identity for attaching (a co-tenant can
+    /// match all three on another device): only one condition of skipping
+    /// a generation step, with the kernel's own evidence
+    /// (proc_scanner.rs `go_guards_present`).
+    pub guarded: HashSet<(u64, u64, i64)>,
 }
 
 /// A Go binary whose guards are attached and whose handshake probes (some
@@ -220,7 +236,13 @@ pub fn load_and_attach(
     // before arm); the selector's refusals come first.
     let select = |ebpf: &mut Ebpf, root: &scope_loader::CgroupRoot| {
         if cgroup_sel {
-            crate::scope_select::startup_publish(ebpf, root.path(), paths, pods)
+            crate::scope_select::startup_publish(
+                ebpf,
+                root.path(),
+                paths,
+                pods,
+                config.pod_cgroup_root.as_deref(),
+            )
         } else {
             Ok(())
         }
@@ -398,7 +420,7 @@ pub fn attach_tls_uprobes(
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
     go_reads: bool,
-    retry: &mut Vec<GoHandshakeRetry>,
+    go: &mut GoAttach,
 ) -> usize {
     use std::os::fd::AsRawFd;
     let file = match crate::platform::proc_scanner::open_examined(target) {
@@ -412,13 +434,38 @@ pub fn attach_tls_uprobes(
         library_path: format!("/proc/self/fd/{}", file.as_raw_fd()),
         ..target.clone()
     };
-    let mut missing = Vec::new();
-    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads, &mut missing);
+    // A file whose real inode already carries this agent's Write guards
+    // (another overlayfs mount of one image file: another device, the same
+    // lower inode the uprobes are on) needs no generation step: its
+    // processes started under those guards. Proven before this attach adds
+    // probes of its own.
+    let content = target
+        .file_key
+        .map(|(_, ino, mtime, size)| (ino, size, mtime));
+    let preguarded = match (&target.tls_type, content) {
+        (
+            TlsType::GoTls {
+                boundary: Some(b), ..
+            },
+            Some(c),
+        ) => go.guarded.contains(&c) && crate::platform::proc_scanner::go_guards_present(&file, b),
+        _ => false,
+    };
+    let mut out = GoAttachOut {
+        preguarded,
+        ..GoAttachOut::default()
+    };
+    let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads, &mut out);
     drop(file); // the uprobes hold the inode now
-    if !missing.is_empty() {
-        retry.push(GoHandshakeRetry {
+    if out.guarded
+        && let Some(c) = content
+    {
+        go.guarded.insert(c);
+    }
+    if !out.missing.is_empty() {
+        go.handshake_retry.push(GoHandshakeRetry {
             target: target.clone(),
-            offsets: missing,
+            offsets: out.missing,
         });
     }
     if attached > 0 {
@@ -443,13 +490,24 @@ fn restricted_kernel_scope(ebpf: &Ebpf) -> bool {
     read().is_none_or(|mode| !scope::is_unscoped_full(mode))
 }
 
+/// Go attach input and results of one target ([`attach_tls_uprobes_to`]).
+#[derive(Default)]
+struct GoAttachOut {
+    /// In: the file's real inode already carries this agent's guards.
+    preguarded: bool,
+    /// Out: the Write guard attached.
+    guarded: bool,
+    /// Out: handshake offsets that did not attach (retried).
+    missing: Vec<u64>,
+}
+
 /// Attach the target's probes at `target.library_path` (an fd path).
 fn attach_tls_uprobes_to(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
     go_reads: bool,
-    missing_handshakes: &mut Vec<u64>,
+    go: &mut GoAttachOut,
 ) -> usize {
     let mut attached = 0;
     // Restricted modes emit SSL_write* at return, with that call's own
@@ -593,6 +651,7 @@ fn attach_tls_uprobes_to(
                 }
                 _ => None,
             };
+            go.guarded = guarded.is_some();
             if let Some(n) = guarded {
                 attached += n;
             } else if attach_uprobe(ebpf, "go_tls_write_entry", path, *write_offset, None, links) {
@@ -604,7 +663,7 @@ fn attach_tls_uprobes_to(
                 attached += attach_go_read(ebpf, path, read, links);
             }
             if let (Some(_), Some(b)) = (guarded, boundary) {
-                attached += attach_go_boundary(ebpf, target, b, links, missing_handshakes);
+                attached += attach_go_boundary(ebpf, target, b, links, go);
             }
         }
     }
@@ -615,15 +674,17 @@ fn attach_tls_uprobes_to(
 /// After a Go binary's guards attached: the generation step (processes
 /// already running it may be inside a Write no guard saw enter, so only
 /// images started after this point, or proven not to run it, get
-/// boundaries: proc_scanner.rs `step_generation`), then the handshake probes.
-/// Returns the probes attached; offsets that did not attach go to
-/// `missing` (retried).
+/// boundaries: proc_scanner.rs `step_generation`), unless the file's real
+/// inode carried this agent's guards before this attach
+/// ([`GoAttachOut::preguarded`]), then the handshake probes. Returns the
+/// probes attached; offsets that did not attach go to `go.missing`
+/// (retried).
 fn attach_go_boundary(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
     b: &crate::platform::proc_scanner::GoBoundaryProbes,
     links: &mut Vec<Box<dyn std::any::Any + Send>>,
-    missing: &mut Vec<u64>,
+    go: &mut GoAttachOut,
 ) -> usize {
     let path = &target.library_path;
     let Some((_, _, mtime_ns, size)) = target.file_key else {
@@ -633,25 +694,34 @@ fn attach_go_boundary(
         );
         return 0;
     };
-    match crate::platform::proc_scanner::step_generation(ebpf, (size, mtime_ns)) {
-        Ok(step) => info!(
+    if go.preguarded {
+        // run_tls.sh waits for this line or the generation step's.
+        info!(
             path,
-            kept = step.kept,
-            withheld = step.withheld,
-            "Go TLS boundary generation step: processes running this binary keep \
-             latched reused keys"
-        ),
-        Err(e) => {
-            warn!(
+            "Go TLS boundary generation step skipped: the file's inode already \
+             carried this agent's Write guard"
+        );
+    } else {
+        match crate::platform::proc_scanner::step_generation(ebpf, (size, mtime_ns)) {
+            Ok(step) => info!(
                 path,
-                error = %format!("{e:#}"),
-                "Go TLS connection boundary not probed: the generation step failed"
-            );
-            return 0;
+                kept = step.kept,
+                withheld = step.withheld,
+                "Go TLS boundary generation step: processes running this binary keep \
+                 latched reused keys"
+            ),
+            Err(e) => {
+                warn!(
+                    path,
+                    error = %format!("{e:#}"),
+                    "Go TLS connection boundary not probed: the generation step failed"
+                );
+                return 0;
+            }
         }
     }
     let (n, failed) = attach_go_handshakes(ebpf, path, b, links);
-    missing.extend(failed);
+    go.missing.extend(failed);
     n
 }
 
@@ -664,7 +734,7 @@ pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) ->
         target,
         &mut state.links,
         go_reads,
-        &mut state.go_handshake_retry,
+        &mut state.go_attach,
     )
 }
 
@@ -673,7 +743,7 @@ pub fn attach_tls_uprobes_on_state(state: &mut EbpfState, target: &TlsTarget) ->
 /// replaced since is dropped (its probes went with the old file).
 pub fn retry_go_handshakes(state: &mut EbpfState) {
     use std::os::fd::AsRawFd;
-    let pending = std::mem::take(&mut state.go_handshake_retry);
+    let pending = std::mem::take(&mut state.go_attach.handshake_retry);
     for mut r in pending {
         let Ok(file) = crate::platform::proc_scanner::open_examined(&r.target) else {
             continue;
@@ -690,7 +760,7 @@ pub fn retry_go_handshakes(state: &mut EbpfState) {
             )
         });
         if !r.offsets.is_empty() {
-            state.go_handshake_retry.push(r);
+            state.go_attach.handshake_retry.push(r);
         }
     }
 }

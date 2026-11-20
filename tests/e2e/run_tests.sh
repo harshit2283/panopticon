@@ -153,11 +153,28 @@ dump_debug() {
   compose logs --no-color || true
 }
 
+# The agent runs as root and creates its JSON export owner-only (0600), a
+# privacy control. Hand the file to the user running this script (the
+# validator below and the CI artifact upload read it as that user) by
+# chowning it from a throwaway container on the agent image; the mode stays.
+release_export() {
+  local cid image
+  [[ -e "${JSON_OUT}" && ! -r "${JSON_OUT}" ]] || return 0
+  cid="$(compose ps -aq agent 2>/dev/null || true)"
+  [[ -n "${cid}" ]] || return 0
+  image="$(docker inspect -f '{{.Image}}' "${cid}" 2>/dev/null || true)"
+  [[ -n "${image}" ]] || return 0
+  docker run --rm --network none --entrypoint chown \
+    -v "${OUTPUT_DIR}:/output" "${image}" \
+    "$(id -u):$(id -g)" /output/events.jsonl || true
+}
+
 cleanup() {
   local exit_code=$?
   if [[ ${exit_code} -ne 0 ]]; then
     dump_debug
   fi
+  release_export
   compose down --volumes --remove-orphans || true
   exit "${exit_code}"
 }
@@ -247,6 +264,8 @@ if [[ ${agent_exit} -ne 0 ]]; then
   compose logs --tail=200 agent || true
   exit 1
 fi
+
+release_export
 
 echo "Waiting for JSON export artifact..."
 wait_for_file_quiescence "${JSON_OUT}" 30 || {

@@ -336,20 +336,26 @@ async fn main() -> Result<()> {
 
         // 2. Initial TLS library scan (still has exclusive &mut access)
         let mut attached_libs = HashSet::new();
-        let mut go_handshake_retry = Vec::new();
+        let mut go_attach = loader::GoAttach::default();
         if agent_config.tls_scan_enabled {
             let targets = platform::proc_scanner::scan_all_processes();
             let mut tls_probes = 0;
             for target in &targets {
-                tls_probes += loader::attach_tls_uprobes(
+                let probes = loader::attach_tls_uprobes(
                     &mut programs.ebpf,
                     target,
                     &mut programs._links,
                     programs.go_reads,
-                    &mut go_handshake_retry,
+                    &mut go_attach,
                 );
-                // Track by file (FileId) to handle symlinks, namespaces, overlayfs
-                if let Some(file_id) = platform::proc_scanner::get_file_id(&target.library_path) {
+                tls_probes += probes;
+                // Tracked by the identity of the file examined (never a
+                // fresh stat of the workload's path), and only once
+                // attached: a refused attach is retried by the next scan,
+                // as the background scanner does.
+                if probes > 0
+                    && let Some(file_id) = platform::proc_scanner::target_file_id(target)
+                {
                     attached_libs.insert(file_id);
                 }
             }
@@ -367,7 +373,7 @@ async fn main() -> Result<()> {
             links: programs._links,
             attached_libs,
             go_reads: programs.go_reads,
-            go_handshake_retry,
+            go_attach,
         }));
         let cgroup_root = programs_cgroup_root;
 
@@ -431,6 +437,7 @@ async fn main() -> Result<()> {
                     std::env::var("NODE_NAME").ok().filter(|n| !n.is_empty()),
                     agent_config.cgroup_filter.as_deref().unwrap_or_default(),
                     agent_config.pod_filter.as_deref().unwrap_or_default(),
+                    agent_config.pod_cgroup_root.clone(),
                     config::ScopeOptions::of(&agent_config),
                 )
                 .context("cannot start the scope publisher")?;

@@ -28,10 +28,17 @@ production-hardened compliance platform.
 - HTTP/1.1 capture is scored against a ground-truth traffic generator on a
   veth (server-side view, keep-alive, chunked and >4KB bodies): 100% recall
   across 15,000+ exchanges (`tests/oracle/`, see `BENCHMARKS.md`).
-- Redis, PostgreSQL (simple, extended, prepared), MySQL (text protocol and
-  prepared statements, plaintext) and gRPC are scored the same way: 100% recall, PII flagged in
-  every request that carried it, and no raw PII values in the export
-  (`tests/oracle/run_protocols.sh`).
+- Redis, MySQL (text protocol and prepared statements, plaintext) and
+  gRPC are scored the same way: 100% recall, PII flagged in every request
+  that carried it, and no raw PII values in the export
+  (`tests/oracle/run_protocols.sh`). PostgreSQL (simple, extended,
+  prepared): 83.8-84.6% recall over seeds 7, 11 and 23 (simple and
+  extended 100%, reused prepared statements 39-60 of 118-141), PII flagged
+  in 38-42% of the operations that sent it, no raw PII values. Every
+  exchange is exported; what is missing is bound values, where the oracle
+  sends the prepared statements' token and the PII: they stop for the
+  rest of a connection once server bytes are lost, which a large result
+  causes about 200 operations into each run.
 - The privacy modes (`[privacy] mode` / `--privacy-mode`: `full`,
   `redacted`, `metrics_only`) are checked with planted PII and credentials
   in HTTP and OpenSSL TLS traffic (bodies, query strings, headers, a
@@ -95,7 +102,13 @@ production-hardened compliance platform.
   `"creator"`, a listener created by a listed process selects every
   connection accepted on it, also by processes not in the list; under
   `"acceptor"`, only what listed processes accept (docs/USER-GUIDE.md).
-  Both settings change on reload. Replay (`--replay-bench`) refuses every
+  Both settings change on reload. `pod_filter` takes a pod's cgroup only
+  from where kubelet makes it (a top-level kubepods root and its
+  `burstable` / `besteffort` level, either cgroup driver), with every
+  directory on the way owned by root, plus `pod_cgroup_root` when an
+  operator names a custom kubelet cgroup root; a pod with no such
+  directory, or with several, is not captured, logged as an error and
+  counted in `panopticon_pod_filter_unresolved_total{reason}`. Replay (`--replay-bench`) refuses every
   scope setting. The `client_pid` / `server_pid` export fields, filled
   from TC's connect / accept probes, are gone; packet events in the raw
   dump carry the kernel's `owner_tgid` / `acceptor_tgid`.
@@ -110,19 +123,30 @@ production-hardened compliance platform.
     ring buffer and 5.5+ probe-read helpers. Measured on Rocky Linux 8.10
     (4.18.0-553) and 9.8 (5.14.0-687), SELinux enforcing with no AVC denials
     (agent run as root from an unconfined shell): HTTP, HTTPS, Redis,
-    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall with no raw PII
-    exported, every TLS exchange carrying its socket addresses (via fentry).
+    PostgreSQL, MySQL, gRPC, Kafka and DNS at 99.4-100% recall
+    (2026-11-04, before the PostgreSQL bound-value rules of 2026-11-13;
+    see the PostgreSQL oracle above for current figures) with no raw PII
+    exported (Kafka on 8.10: see below), every TLS exchange carrying its
+    socket addresses (via fentry).
     The agent probes the ring buffer by creating one rather than trusting the
     version number; before that, RHEL 8 fell to the PerfEventArray path and
     captured nothing.
-  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall was 77-98% over seven lab
-    runs (other AMQP methods 100%). The broker-to-consumer stream there
-    carries GSO segments up to 18 KB, and frames past the 4 KB capture window
-    are lost. Retransmitted segments are now parsed once (see TCP stream
-    integrity below), so deliveries are no longer duplicated; replaying two
-    of these captures with and without sequence tracking gave the same
-    deliveries, so the remaining loss is the capture window.
-    RHEL 9 passed (100%, one earlier run at 85%).
+  - RHEL 8.10 caveat: AMQP `Basic.Deliver` recall is 17-29% over seven lab
+    runs of the CI messaging oracle (300 operations, seed 7; other AMQP
+    methods 100%, AMQP overall 75-79%, no raw PII exported). The
+    broker-to-consumer stream there carries GSO segments up to 18 KB, and
+    frames past the 4 KB capture window are lost. After the first lost frame
+    boundary the consumer direction of that connection exports no AMQP text
+    (fail closed, see USER-GUIDE §5.3), so the later deliveries are still
+    exported, with method, status, timing and sizes, but carry no exchange,
+    routing key or body to match against ground truth (before that change,
+    77-98%). Kafka `Fetch` on 8.10 was 92.6-100% in the same seven runs
+    (five at 100%). Retransmitted segments are parsed once (see TCP stream
+    integrity below), so deliveries are not duplicated by retransmission;
+    replaying two of these captures with and without sequence tracking gave
+    the same deliveries, so the loss is the capture window.
+    RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
+    fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
     every field by 8 bytes). The agent checks each tracepoint's tracefs
@@ -208,9 +232,17 @@ production-hardened compliance platform.
 - Protocol depth:
   - PostgreSQL COPY, gRPC schema decoding and compressed messages are not
     parsed. MySQL statements prepared before the agent started are
-    reported as `EXECUTE` without their SQL. PostgreSQL bound values are
+    reported as `EXECUTE` without their SQL, and so is a PostgreSQL
+    `Bind` of a statement whose SQL the agent does not know (prepared
+    before capture, or forgotten). PostgreSQL bound values are
     not exported on a connection the agent joined mid-stream or lost
-    server bytes on, and a simple Query forgets every confirmed statement.
+    server bytes on. A simple Query forgets the unnamed statement, and SQL
+    naming `PREPARE`, `DEALLOCATE` or `DISCARD` (simple Query or `Parse`)
+    forgets every statement. Known limit: a server-side function that
+    runs `PREPARE` / `DEALLOCATE` dynamically redefines a statement
+    unseen; a reused statement's values then need a `CommandComplete` of
+    the same command, which misses a same-command redefinition
+    (USER-GUIDE §5.3).
   - HTTP/2 headers are not decoded on a connection the agent did not see
     whole: one already open when the agent started, a side whose start
     was not captured, or one whose parser restarted after lost bytes; a
@@ -264,8 +296,16 @@ production-hardened compliance platform.
     Redis reply text is exported only on connections seen from their
     first byte (the kernel's stream offset, no bytes lost):
     not on connections open before the agent started, nor over TLS.
-    Bodies with bytes kept after a capture gap (a cut end keeps its
-    prefix), HTTP/2 headers after a lost HPACK block or on a connection
+    A Redis command with credential context in its key or any argument,
+    or a key or hash field name containing a credential word, or with a
+    short name as a whole segment (`user:1:otp`, not `mykey`), is
+    withheld as one unit (key, arguments and reply
+    text, and its result inside `EXEC`), so `SET otp:<id> <code>`,
+    `SET otp <code>` and `HSET u:1 pin <pin>` export no value.
+    Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
+    message bodies; a cut end keeps its prefix), any AMQP text (path,
+    headers, body) of a direction after it lost frame sync, for the rest
+    of the connection, HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
     start, over TLS on a reused key only after the agent saw the library
@@ -274,7 +314,9 @@ production-hardened compliance platform.
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their
     statement had when the Bind was sent, once confirmed, even if it is
-    redefined later (a simple Query forgets every statement), and not at
+    redefined later (SQL naming `PREPARE`, `DEALLOCATE` or `DISCARD`
+    forgets every statement, a simple Query the unnamed one; a reused
+    statement needs a `CommandComplete` of the same command), and not at
     all on a connection joined mid-stream, after lost server bytes or
     past 4096 retained Bind snapshots;
     only known SQL keywords are exported as methods. `[credentials]

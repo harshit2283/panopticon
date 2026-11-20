@@ -161,6 +161,8 @@ watch = true           # stream changes between re-lists; false = refresh only b
 # [[pod_filter]]       # default: unset; this node's pods, see "Capture scope" below
 # namespace = "payments"
 # labels = { app = "checkout" }   # or: name = "checkout-7d9f..."
+# pod_cgroup_root = "/custom/kubepods"  # top-level key, before any table:
+#                        # kubelet's kubepods directory under a custom --cgroup-root
 
 [capture]
 cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgroup,
@@ -198,7 +200,35 @@ validated on x86_64 only and refused elsewhere.
   node's pods): capture the sockets of these cgroups and every cgroup
   below them. A socket's cgroup is fixed when it is created, so this has
   none of the accept-time gaps of `pid_filter` below and is the primary
-  selector. Pods
+  selector. A pod's cgroup is its directory where kubelet makes it, and
+  nowhere else: in a kubepods root at the top of the cgroup2 hierarchy
+  (`kubepods` with the cgroupfs driver, `kubepods.slice` with systemd, or
+  `<name>.slice/<name>-kubepods.slice` when kubelet's cgroup root is
+  `/<name>`, as in kind), directly (guaranteed QoS) or in its
+  `burstable` / `besteffort` level, named as that driver names it
+  (`pod<uid>`, `kubepods-burstable-pod<uid>.slice`). That directory and
+  every one above it up to the root must be owned by root, so a
+  directory another user creates (in a subtree delegated to them, such as
+  `user@<uid>.service`) is never taken for a pod's. If kubelet runs with
+  another `--cgroup-root` (`cgroupRoot`), so that its kubepods directory
+  is elsewhere, name that directory in `pod_cgroup_root` (an absolute
+  cgroup path under the cgroup2 mount, such as `"/custom/kubepods"` or
+  `"/a.slice/a-b.slice/a-b-kubepods.slice"`; a last component ending in
+  `.slice` is read with the systemd driver's names, anything else with
+  cgroupfs's). It is searched the same way, besides the roots above; the
+  agent refuses to start unless it is a directory reached without a
+  symlink or mount crossing and owned by root at every level, and if it
+  stops being one at runtime, no selected pod is captured until it is
+  again (logged as an error). Changing it needs a restart. Nothing else widens
+  the search. A selected pod with no such directory on this node is not
+  captured: an error names the pod and the roots searched (with a hint
+  to set `pod_cgroup_root`), and
+  `panopticon_pod_filter_unresolved_total{reason="not_found"}` counts it;
+  one whose uid matches more than one directory is not captured either,
+  logged as a distinct error and counted as `reason="ambiguous"`, since
+  only root can create those and neither can be told to be the real one
+  (`reason="unusable"`: the one directory found could not be opened or
+  is not root's). Pods
   that start, stop or change labels are followed; a reload may change
   either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
   host (RHEL 8's default) the agent mounts a private cgroup2 at
@@ -656,7 +686,8 @@ What is exported then:
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
 - **Any other field** (path, header value, method, content type, bodies,
-  Redis arguments and replies, Kafka and AMQP fields): `<field withheld>`,
+  Redis replies with no credential context in their command (next item),
+  Kafka and AMQP fields): `<field withheld>`,
   unless every credential in it is one of these, in which case only the
   value becomes `<REDACTED>` and the rest stays readable: a query or form
   parameter (`name=value` at the start or after `?` or `&`, the value
@@ -666,15 +697,34 @@ What is exported then:
   exports `/login?password=<REDACTED>&q=1`, while a JSON array or object
   under a credential name, a password in prose or `Authorization: Bearer …`
   inside a body withholds the field.
+- **A Redis command** with credential context in its key or any argument,
+  or a key name or hash field name that names a credential (a
+  credential word in it, or a short name as a whole segment), is
+  withheld as one unit: key, arguments and reply text (below), even where
+  a field alone would only have a value masked.
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
   or the capture cap, then more of the same body kept), or an HTTP/2 body
   whose stream's headers the agent did not see, is not exported (its size
-  is): what is left may hold a credential's value without its name. A gap
+  is): what is left may hold a credential's value without its name. This
+  covers HTTP/1, HTTP/2 and AMQP message bodies; for AMQP, a gap inside a
+  body frame that is not the body's last, or a gap that loses frame sync
+  while a body is being assembled, followed by more of that body. A gap
   that only cuts a body's end, as the capture cap does to a large
   response, keeps the captured prefix (it is scanned and trimmed like any
-  body).
+  body). A Kafka request or response is decoded only up to a gap inside
+  it, and a gap anywhere else restarts the parser, so its record text
+  never joins bytes from both sides of a gap.
+- **AMQP after lost frame sync**: when a gap (or a malformed frame) loses
+  AMQP frame boundaries in one direction, the agent looks for the next
+  plausible frame, which may lie inside a message body (the gapped body's
+  own bytes, or frames forged in a message) and nothing later proves the
+  frames found real. For the rest of that connection, messages read from
+  that direction export no text: no path (exchange, routing key, queue),
+  header, content type or body, only method, status, timing and sizes;
+  a request read from it exports no text with its reply either. The other
+  direction is unaffected.
 - **HTTP/2 bodies** are not exported while credential masking is on when
   their content type is unknown, since they may be protobuf: on a
   direction of a connection that lost a header block (a block that failed
@@ -722,9 +772,11 @@ What is exported then:
     (re)starts, and a new binary's processes started before the scan
     that finds it (every 60 s by default, `tls_scan_interval_secs`). New
     replicas and restarts of a binary already attached get boundaries,
-    in containers too: the agent knows a file by inode, size and mtime,
-    which every container of one image shares (not by device, which
-    each container's overlay root has its own of).
+    in containers too: each container's overlay root shows the image
+    file under a device of its own, so the agent attaches it again, but
+    it skips the step when the kernel shows the file's real inode
+    already carries the agent's `Write` guard (its breakpoints in a
+    mapping of the file, at `Write`'s entry and every return).
     Processes running other binaries keep theirs when the agent proves,
     from their memory maps, that they do not map the new binary;
     otherwise they lose them too.
@@ -797,7 +849,34 @@ argument or reply holding a word from the first list, alone or with a
 value next to it, masked or not (`CONFIG GET requirepass`,
 `CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
 `requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
-whole: no Redis field has a bare name (above). Protocol and subscription
+whole: no Redis field has a bare name (above). A Redis command is
+protected as one unit: when its key or any argument has credential
+context, read together or one by one, or a key name or hash field name
+names a credential, the key (`path`), the arguments
+(`request_text`) and the reply text are all exported as
+`<field withheld>` (method, status, timing and sizes stay), and its
+result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
+300`, `SETEX password_reset_token:alice 3600 <token>` and
+`GET otp:+15551234567` export no key, value or reply, however opaque the
+value; field-by-field, the key would be withheld and the value next to it
+exported. A key or field name has no free text around it to show that a
+short name is used as a name, so it is read by segments: case folded
+and with `-` and `.` read as `_`, a name that contains a word of the
+first list above anywhere (`u:1:apikey`, `session_token`), or one of
+whose segments (split on `:`, `.`, `_`, `-` and `/`) is a short name
+whole (`otp`, `user:1:pin`, `api-key`), names a credential. A short
+name inside a longer segment does not count, so `mykey`, `spinner` and
+`author` name no credential. The key names read this way are the key of
+every command,
+every key of `MSET`, `MSETNX`, `MGET`, `DEL`, `UNLINK`, `EXISTS`,
+`TOUCH` and `WATCH`, and the field names of every hash command (every
+argument after the key, except the values of `HSET`, `HSETNX` and
+`HMSET`). So `SET otp 482913`, `SET user:1:otp 482913`,
+`HSET u:1 pin 1234` and `SET session_token abc` are withheld whole,
+while `GET mykey`, `HSET book:1 author x` and `SET 2fa:alice 123456`
+are not (`2fa` is not in the lists). This holds
+whatever `builtin` is set to; your own patterns
+still apply to every field. Protocol and subscription
 state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
 command (a script returning an array of the
@@ -836,9 +915,28 @@ than the cycle's `Parse`, or of one the server rejected, exports no
 values. Past 4096 retained `Bind` snapshots (Binds read but not yet
 consumed by their cycle), no bound value is exported on the connection. A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
-until confirmed. A simple Query forgets every confirmed statement and
-cancels unanswered `Parse` messages: its SQL may `PREPARE` or
-`DEALLOCATE` any name, and it ends the unnamed statement. Several `Parse` messages may be sent before one `Sync`
+until confirmed. A simple Query ends the unnamed statement, so the agent
+forgets it. SQL that names `PREPARE`, `DEALLOCATE` or `DISCARD` as a
+word, in any case and anywhere in its text (comments and string literals
+included), may create, redefine or destroy any named statement: when a
+simple Query or a `Parse` carries such SQL, every statement is forgotten,
+confirmed or pending (unanswered `Parse` messages are cancelled). Other
+SQL leaves named statements as they are. Known limit: a server-side
+function can run `PREPARE` or `DEALLOCATE` dynamically (a PL/pgSQL
+`EXECUTE` of a string built at run time) and redefine a named statement
+the agent cannot see. A `Bind` of a statement confirmed in an earlier
+cycle therefore exports its values only when the server's
+`CommandComplete` names the same command as the SQL it was confirmed
+with (`INSERT 0 1` for an `INSERT`; no values after an error, or for SQL
+whose first keyword is not the command, such as `WITH`). That catches a
+redefinition to another command, not one to the same command: a
+statement redefined unseen from `INSERT INTO users (note) VALUES ($1)`
+to `INSERT INTO accounts (password) VALUES ($1)` would export the
+password under the first SQL. `PREPARE` accepts only `SELECT`,
+`INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES`, so a statement
+cannot become `ALTER ROLE ... PASSWORD`. A `Bind` of a
+statement whose SQL the agent does not know (prepared before capture, or
+forgotten) is still exported, as `EXECUTE` without SQL or bound values. Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
 unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
@@ -894,7 +992,8 @@ scanned at that moment finishes with the previous rules.
 
 `builtin = "names_only"` keeps the cheap built-in rules: credential-named
 headers, the certain structures above (credential-named form parameters
-and JSON members, URI userinfo) and SQL statement withholding. It skips
+and JSON members, URI userinfo), SQL statement withholding and Redis
+whole-command withholding (both decided by the parsers). It skips
 looking for credential context in the free text of other fields, so a
 body mentioning a token in prose, or a JSON array under a credential name,
 is exported. Use it when your own patterns cover the formats that matter
@@ -964,6 +1063,7 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
+| `panopticon_pod_filter_unresolved_total` | Resolutions of a pod `pod_filter` selected that left it uncaptured, by `reason`: `not_found` (no cgroup directory in the kubepods roots searched: a pod not started yet, or a kubelet cgroup root to name in `pod_cgroup_root`), `ambiguous` (several), `unusable`. Rising → check the agent's errors |
 | `panopticon_active_connections` | Connections being parsed |
 | `panopticon_go_tls_guarded_connections` | Go TLS connections with a `Write` in flight, or left guarded by one that never returned (a panic), until their process ends. At the map's capacity (65,536) new guards fail and their processes lose Go connection boundaries (§5.3) |
 | `panopticon_go_tls_boundary_lost_processes_total` | Go processes whose connection boundaries ended because a `Write` guard could not be recorded; their reused connection keys stay latched (§5.3) |

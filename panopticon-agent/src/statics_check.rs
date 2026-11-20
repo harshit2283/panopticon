@@ -58,6 +58,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the [privacy] mask_credentials config flag",
     ),
     (
+        "scope_select.rs",
+        "POD_UNRESOLVED",
+        "counters of pod_filter resolutions that left a pod uncaptured (numbers, never names)",
+    ),
+    (
         "protocol/secrets.rs",
         "HINT_SEARCH",
         "a regex compiled from a constant word list",

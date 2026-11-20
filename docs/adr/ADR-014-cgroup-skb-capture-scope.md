@@ -151,7 +151,17 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     unguarded Write probe is used; not retried, since swapping the live
     plaintext probe would emit a Write twice or not at all), then the
     generation step, then the handshake wrappers, each a boundary on its
-    own and retried at each scan if it did not attach. A binary without
+    own and retried at each scan if it did not attach. Files are known by
+    the `(dev, ino)` of the file examined (never a fresh stat of a
+    workload path), and never forgotten. A container's overlay root
+    shows an image file under its own device, so another container of
+    the image attaches it again (duplicate probes on the shared lower
+    inode); its generation step is skipped only on the kernel's evidence
+    that this inode already carries the agent's `Write` guard
+    (`go_guards_present`: the uprobe breakpoint at `Write`'s entry and
+    every RET in a fresh mapping, not in the file) and that the agent
+    guarded a file of the same inode number, size and mtime. A collision
+    on those never skips probing. A binary without
     them (stripped, renamed, RETs not found, or no Go reads) keeps the
     latch on reused keys; the agent still starts and captures it. This
     is not a reason to refuse to start.
