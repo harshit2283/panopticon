@@ -181,7 +181,10 @@ sent in 8 KB packets, cost the bound values of the rest of its connection;
 the default covers it. A packet larger than the setting is still cut: on
 RHEL 8.10 one RabbitMQ packet in about 300 to a consumer carries several
 deliveries in 23 KB, and after it the consumer's deliveries are exported
-without exchange, routing key or body (§5.3); 32768 or 65536 covers it.
+without exchange, routing key or body (§5.3). AMQP consumers on RHEL 8
+should set `max_packet_bytes = 32768`: measured on 8.10 (seed 7),
+deliveries were 27-63% at 16384 (four runs) and 164/164 at 32768 (three
+runs).
 The cost is kernel time and ring space per large packet, paid in the
 sending application's context. Measured on a 16-vCPU VM (7.0) with 200 KB
 HTTP bodies over 200 connections, unscoped: at 2,000 requests/s every

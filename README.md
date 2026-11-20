@@ -57,7 +57,7 @@ current release report.
 | Capability | MVP Status | Notes |
 |---|---|---|
 | Linux x86_64 on kernel 5.8+ | Supported | Primary development path with RingBuf support. |
-| RHEL 8 / 9 (Rocky Linux 8.10 on 4.18, 9.8 on 5.14) | Supported | Red Hat backports the BPF ring buffer and the 5.5+ probe-read helpers; every accuracy suite passes except, on 8.10, AMQP deliveries and some Kafka fetch runs (see [current state](docs/CURRENT-STATE.md)). |
+| RHEL 8 / 9 (Rocky Linux 8.10 on 4.18, 9.8 on 5.14) | Supported | Red Hat backports the BPF ring buffer and the 5.5+ probe-read helpers; every accuracy suite passes except, on 8.10, AMQP deliveries at the default `max_packet_bytes` (AMQP consumers there should set 32768) and some Kafka fetch runs (see [current state](docs/CURRENT-STATE.md)). |
 | Linux x86_64 on upstream kernel 4.15-5.7 | Unsupported | A PerfEventArray fallback path exists, but the eBPF object always creates a RingBuf map and uses 5.5+ helpers, so it fails to load on kernels without them. |
 | Linux ARM64 | Partial | Build/runtime path exists, but validation coverage is still limited. |
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |

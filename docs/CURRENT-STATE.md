@@ -152,7 +152,8 @@ production-hardened compliance platform.
     deliveries at seed 7 were 27-63% in four runs (139/139 in one run at
     seed 42). At 32768 deliveries are 164/164 in three of three runs at
     seed 7, and at 65536 in six of six, with nothing truncated (see
-    BENCHMARKS.md); a RHEL 8 node carrying AMQP should set one of them.
+    BENCHMARKS.md). AMQP consumers on RHEL 8 should set
+    `max_packet_bytes = 32768` (USER-GUIDE §4.2).
     Kafka `Fetch` was 100% at 16384 (two runs at seed 7, one at seed 42)
     and at 65536 in five of six runs; the sixth, 94.9%, lost no bytes: its
     13 missing records were in one Fetch response of about 20 records,

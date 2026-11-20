@@ -266,7 +266,8 @@ crosses frame boundaries. Large packets are now sent as consecutive
 At 16384 one broker-to-consumer packet of the 292 in a seed-7 run's raw
 dump is over the cap (23,168 bytes, 6,784 of them not captured); the
 parser loses frame sync there and the consumer direction stops exporting
-AMQP text (fail closed). At 65536 every byte of both directions was
+AMQP text (fail closed). The default stays 16384; AMQP consumers on RHEL
+8 should set `max_packet_bytes = 32768` (USER-GUIDE §4.2). At 65536 every byte of both directions was
 captured. On 7.0 AMQP stays at 100% at 65536 (three runs), with
 truncated packets 180 → 0. Kafka `Fetch` on 8.10 was 100% at 16384 (two
 runs at seed 7, one at seed 42), and at 65536 in five of six runs and
@@ -1523,7 +1524,7 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   gap only occurs past 16 KB per read/write call.
 - **Capture is cut at `max_packet_bytes` per packet** (default 16 KiB, 4
   records of 4 KB; at most 64 KiB, and BIG TCP packets can be larger;
-  RHEL 8 AMQP needs 32 KiB, see Kafka, AMQP) **and 16 KB per TLS
+  AMQP consumers on RHEL 8 should set 32768, see Kafka, AMQP) **and 16 KB per TLS
   read/write** (four records).
   Larger messages are reassembled where the protocol allows it.
   `panopticon_capture_truncated` counts what was cut.
