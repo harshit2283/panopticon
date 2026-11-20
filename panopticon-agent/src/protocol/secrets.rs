@@ -123,19 +123,50 @@ const NAMES: &[&str] = &[
     "pin",
 ];
 
-/// Whether a name made of segments (a Redis key or hash field: no free text
-/// around it to show a short name is used as a name) names a credential,
-/// case folded, `-` and `.` read as `_`: it contains a word of [`PARTS`]
-/// anywhere (`u:1:apikey`, `session_token`, `client-assertion`), or one of
-/// its segments, split on `:` `.` `_` `-` `/`, is a word of [`NAMES`]
-/// whole (`otp`, `user:1:pin`, `api-key`; not `mykey`, `spinner` or
-/// `author`).
+/// Whether a string read as segments (a Redis argument: no free text
+/// around it to show a short name is used as a name) names a credential.
+/// Every character that is not an ASCII letter or digit separates segments
+/// (`u:1:otp`, `u|otp`, `u otp`, `u{1}otp`), and so does a lower-case
+/// letter or digit followed by an upper-case one (`pinCode` is `pin`,
+/// `Code`); case folded. It names a credential when it contains a word of
+/// [`PARTS`] anywhere, separators read as `_` (`u:1:apikey`,
+/// `session_token`, `client-assertion`, `clientAssertion`), or when one of
+/// its segments is a word of [`NAMES`] whole (`otp`, `user:1:pin`,
+/// `api-key`, `pinCode`). Both readings are tried, with and without the
+/// case boundary (`masterUser`). A short name inside a segment with no
+/// boundary does not count: `mykey`, `spinner`, `author` and `otpcode`
+/// name no credential.
 pub fn segmented_name_has_credential_word(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase().replace(['-', '.'], "_");
-    PARTS.iter().any(|p| lower.contains(p))
-        || lower
-            .split([':', '.', '_', '-', '/'])
-            .any(|s| NAMES.contains(&s))
+    [true, false].into_iter().any(|camel| {
+        let mut norm = segments_joined(name, camel);
+        let found =
+            PARTS.iter().any(|p| norm.contains(p)) || norm.split('_').any(|s| NAMES.contains(&s));
+        zeroize::Zeroize::zeroize(&mut norm);
+        found
+    })
+}
+
+/// `name` case folded, with `_` for each run of characters that are not
+/// ASCII letters or digits and, if `camel`, before an upper-case letter
+/// that follows a lower-case letter or digit.
+fn segments_joined(name: &str, camel: bool) -> String {
+    let mut out = String::with_capacity(name.len() + 8);
+    let mut after_lower = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            if camel && after_lower && c.is_ascii_uppercase() {
+                out.push('_');
+            }
+            after_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+            out.push(c.to_ascii_lowercase());
+        } else {
+            if !out.ends_with('_') {
+                out.push('_');
+            }
+            after_lower = false;
+        }
+    }
+    out
 }
 
 fn strong_word(w: &str) -> bool {
@@ -2265,6 +2296,52 @@ mod tests {
         }
         assert_eq!(p("?pwd=a?pwd=b&q=1"), "?pwd=<REDACTED>&q=1");
         assert_eq!(p("token=abc?def"), "token=<REDACTED>");
+    }
+
+    /// Review (LOW): segments split on every character that is not an
+    /// ASCII letter or digit, and at a lower-to-upper case boundary; a
+    /// short name inside a segment with no boundary does not count.
+    #[test]
+    fn segments_split_on_any_separator_and_case_boundary() {
+        for name in [
+            "otp",
+            "u:1:otp",
+            "u{1}otp",
+            "u|otp",
+            "u#otp",
+            "u,otp",
+            "u;pin",
+            "u otp",
+            "u\totp",
+            "u\u{e9}otp",
+            "$.otp",
+            "pinCode",
+            "userOtp",
+            "u1Otp",
+            "apiKey",
+            "clientAssertion",
+            "client-assertion",
+            "masterUser",
+            "SessionToken",
+            "API_KEY",
+            "u:1:apikey",
+        ] {
+            assert!(segmented_name_has_credential_word(name), "{name}");
+        }
+        for name in [
+            "mykey",
+            "spinner",
+            "author",
+            "otpcode",
+            "Otpcode",
+            "OTPCODE",
+            "pinto",
+            "2fa:alice",
+            "keys",
+            "",
+        ] {
+            assert!(!segmented_name_has_credential_word(name), "{name}");
+        }
     }
 
     /// Linear in the field size, whatever its shape.
