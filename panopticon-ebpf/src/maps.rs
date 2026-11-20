@@ -9,9 +9,9 @@ use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, RingBuf};
 use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, ConnInfo, DATA_EVENT_HEADER_LEN,
-    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoGuardKey, GoReadCall, GoReadKey,
-    MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER, TLS_SCRATCH_SIZE,
-    ring_shard,
+    DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoGuardCalls, GoGuardKey, GoReadCall,
+    GoReadKey, MAX_CGROUP_ALLOW, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE, MAX_PID_FILTER,
+    TLS_SCRATCH_SIZE, ring_shard,
     scope::{NETDEV_OFFS_LEN, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
@@ -429,12 +429,14 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 /// `go_tls_guard_ret`): `(*Conn).Write`, whose entry probe emits the
 /// plaintext before Write runs an implicit handshake, and
 /// `(*Conn).handleRenegotiation`, which calls `clientHandshake` on a live
-/// connection. The value names the connection, so the RET probe can clear
-/// its `GO_GUARD_CONNS` entry. Same ownership and sweep as GO_READ_CALLS
-/// (a slot whose epoch is not current is dead); a slot left by a call
-/// that never returned keeps its connection guarded, which only withholds.
+/// connection. The value lists the calls the goroutine is in (nested on
+/// TLS inside TLS), each with its connection and frame depth, so a RET
+/// clears exactly its own call's `GO_GUARD_CONNS` entry. Same ownership and
+/// sweep as GO_READ_CALLS (a slot whose epoch is not current is dead); a
+/// call that never returned keeps its connection guarded, which only
+/// withholds, until a RET of an outer call of the goroutine drops it.
 #[map]
-pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoReadCall> =
+pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoGuardCalls> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
 /// Go connections with a guarded call in flight (`GO_GUARD_CALLS`): a
@@ -453,7 +455,8 @@ pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoReadCall> =
 pub static GO_GUARD_CONNS: HashMap<GoGuardKey, u64> =
     HashMap::with_max_entries(GO_READS_IN_FLIGHT, BPF_F_NO_PREALLOC);
 
-/// Nonzero once a guard could not be recorded (a full map, no epoch) or
+/// Nonzero once a guard could not be recorded (a full map, more than
+/// GO_GUARD_NEST nested calls, an unreadable goroutine stack, no epoch) or
 /// the sweep may have removed a live one: no Go `TlsNew` is sent again
 /// until the agent restarts, so every reused Go key stays latched.
 #[map]

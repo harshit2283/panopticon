@@ -810,12 +810,16 @@ fn sweep_go_reads(shared_ebpf: &std::sync::Arc<std::sync::Mutex<crate::loader::E
         let state = shared_ebpf.lock().unwrap_or_else(|e| e.into_inner());
         super::go_read::Sweep::open(&state.ebpf)
     };
+    /// Whether the lost-guard warning was logged (once per agent run).
+    static GUARD_LOST_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     match opened.and_then(|mut sweep| {
         let removed = sweep.run();
-        if sweep.guard_lost {
+        if sweep.guard_lost && !GUARD_LOST_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
-                "Go TLS: a connection guard may have been removed live (PID reuse); \
-                 reused Go connection keys stay latched until the agent restarts"
+                "Go TLS: a connection guard could not be recorded, or may have been \
+                 removed live (PID reuse); new Go connections on reused keys stay \
+                 latched (HTTP/2 headers and bodies withheld) until the agent restarts"
             );
         }
         removed

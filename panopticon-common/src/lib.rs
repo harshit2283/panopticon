@@ -334,6 +334,23 @@ pub struct GoGuardKey {
     pub _pad: u32,
 }
 
+/// Guarded calls one goroutine can be inside at once (`GO_GUARD_CALLS`):
+/// a `Write` on TLS inside TLS (an HTTPS proxy) runs the inner
+/// connection's `Write` inside the outer one's.
+pub const GO_GUARD_NEST: usize = 4;
+
+/// `GO_GUARD_CALLS` value: the guarded calls (tls_probes.rs `guard_call`)
+/// a goroutine is in, outermost first: each one's `*tls.Conn` and frame
+/// depth (top of the goroutine's stack minus SP at its entry, which equals
+/// SP at its RET instructions and survives a stack copy).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GoGuardCalls {
+    pub conn: [u64; GO_GUARD_NEST],
+    pub depth: [u64; GO_GUARD_NEST],
+    pub n: u64,
+}
+
 // ── Pod Impls (user-space only) ────────────────────────────────────────────
 
 // SAFETY: DataEvent is #[repr(C)], Copy, contains no pointers.
@@ -360,6 +377,8 @@ unsafe impl aya::Pod for GoReadKey {}
 unsafe impl aya::Pod for GoReadCall {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GoGuardKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GoGuardCalls {}
 
 // ── Utility Methods (user-space only) ──────────────────────────────────────
 

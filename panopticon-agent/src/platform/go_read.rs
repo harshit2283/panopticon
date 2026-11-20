@@ -249,7 +249,9 @@ pub struct Sweep {
     guard_lost_map: aya::maps::Map,
     /// Whether the last pass walked with batched lookups ([`walk_map`]).
     pub batched: bool,
-    /// A pass set `GO_GUARD_LOST` (see [`Sweep::run`]).
+    /// `GO_GUARD_LOST` was set after the last pass, by a probe or by the
+    /// pass itself (see [`Sweep::run`]): Go connections on reused keys stay
+    /// latched until the agent restarts.
     pub guard_lost: bool,
 }
 
@@ -330,12 +332,13 @@ impl Sweep {
             .count();
 
         let guard_calls_fd = fd(&self.guard_calls);
-        let mut guards: HashMap<&mut MapData, GoReadKey, GoReadCall> =
+        let mut guards: HashMap<&mut MapData, GoReadKey, panopticon_common::GoGuardCalls> =
             HashMap::try_from(&mut self.guard_calls)?;
-        let (keys, _) =
-            walk_map::<GoReadKey, GoReadCall>(guard_calls_fd, GO_READS_IN_FLIGHT, |k| {
-                guards.get(k, 0).is_ok()
-            })?;
+        let (keys, _) = walk_map::<GoReadKey, panopticon_common::GoGuardCalls>(
+            guard_calls_fd,
+            GO_READS_IN_FLIGHT,
+            |k| guards.get(k, 0).is_ok(),
+        )?;
         dead += keys
             .iter()
             .filter(|k| epochs.get(&k.tgid, 0).ok() != Some(k.epoch) && guards.remove(k).is_ok())
@@ -356,12 +359,13 @@ impl Sweep {
                 lost |= alive(k.tgid);
             }
         }
+        let mut flag: aya::maps::Array<&mut MapData, u32> =
+            aya::maps::Array::try_from(&mut self.guard_lost_map)?;
         if lost {
-            let mut flag: aya::maps::Array<&mut MapData, u32> =
-                aya::maps::Array::try_from(&mut self.guard_lost_map)?;
             flag.set(0, 1, 0)?;
-            self.guard_lost = true;
         }
+        // Set here or by a probe (a guard that could not be stored).
+        self.guard_lost = flag.get(&0, 0)? != 0;
         Ok((dead, gone))
     }
 }

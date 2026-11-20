@@ -120,9 +120,14 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     goroutine cannot clear); a handshake on a guarded connection sends no
     record. `Write`'s guarded entry also emits each call once: Go's
     stack-growth prologue re-enters a function, which fired the entry
-    probe two or three times per call. A guard that cannot be recorded, or that
-    the sweep may have removed live (PID reuse), stops Go records until
-    the agent restarts (`GO_GUARD_LOST`).
+    probe two or three times per call. Guarded calls nest (TLS inside
+    TLS: the outer `Write` runs the inner connection's), so a goroutine's
+    slot holds up to four, each with its frame depth, and a RET clears
+    only its own call (SP at a RET equals SP at the entry). A guard that
+    cannot be recorded (a full map, deeper nesting, an unreadable stack,
+    no `PROC_EPOCH` room) or that the sweep may have removed live (PID
+    reuse) stops Go records node-wide until the agent restarts
+    (`GO_GUARD_LOST`, not pinned); the agent logs it once.
   - Per binary, all or nothing, in order: `Write`'s RETs, its guarded
     entry, `handleRenegotiation`'s RETs and entry, then the handshake
     entries (`clientHandshake` only with a guarded `handleRenegotiation`).

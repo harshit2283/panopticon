@@ -36,7 +36,7 @@ use crate::maps::{
     shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_capture::read_sock_tuple;
-use panopticon_common::{GoGuardKey, GoReadCall, GoReadKey};
+use panopticon_common::{GO_GUARD_NEST, GoGuardCalls, GoGuardKey, GoReadCall, GoReadKey};
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
 /// socket hooks below can attach its addresses.
@@ -905,10 +905,16 @@ fn try_go_tls_handshake_entry(ctx: &ProbeContext) -> Result<(), ()> {
     // entry exists on the key anyway).
     let call = go_read_key(ctx, false)?;
     // SAFETY: this goroutine's own slot, copied out at once.
-    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&call) }.copied()
-        && c.conn == conn
-    {
-        return Ok(());
+    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&call) }.copied() {
+        // Constant indices: the verifier refuses a variable stack offset.
+        let n = c.n;
+        if (n > 0 && c.conn[0] == conn)
+            || (n > 1 && c.conn[1] == conn)
+            || (n > 2 && c.conn[2] == conn)
+            || (n > 3 && c.conn[3] == conn)
+        {
+            return Ok(());
+        }
     }
     send_tls_new(conn, pid_tgid, TlsLibrary::GoTls)
 }
@@ -926,35 +932,51 @@ pub fn go_tls_guard_entry(ctx: ProbeContext) {
 
 /// Guard connection `conn` for the call this goroutine is entering
 /// (`GO_GUARD_CALLS`, `GO_GUARD_CONNS`); its RETs clear it
-/// (`go_tls_guard_ret`). Ok(true) when the goroutine is already in a
-/// guarded call on `conn` at the same frame depth: the same call entered
-/// again. A Go function's stack-growth prologue (`morestack`, also how a
+/// (`go_tls_guard_ret`). Ok(true) when the goroutine's innermost guarded
+/// call is on `conn` at the same frame depth: the same call entered again.
+/// A Go function's stack-growth prologue (`morestack`, also how a
 /// goroutine is preempted at a function entry) jumps back to the entry
 /// with the stack copied, so an entry probe fires again for one call; the
-/// frame's depth from the stack top is unchanged by the copy. Runs whether
-/// or not capture is on: a call that emits after capture turns on must be
-/// guarded.
+/// frame's depth from the stack top is unchanged by the copy. Calls nest
+/// (TLS inside TLS: the outer `Write` runs the inner connection's): a
+/// deeper call is pushed after the ones it runs inside; recorded calls at
+/// this depth or deeper ended without a RET seen and are dropped, their
+/// connections unguarded. More than `GO_GUARD_NEST` nested, or a guard
+/// that cannot be stored, is an error (the caller sets `GO_GUARD_LOST`).
+/// Runs whether or not capture is on: a call that emits after capture
+/// turns on must be guarded.
 #[inline(always)]
 fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
     if conn == 0 {
         return Ok(false);
     }
     let key = go_read_key(ctx, true)?;
-    let (lo, hi) = go_stack(key.goroutine)?;
-    let sp = user_sp(ctx.regs);
-    if !(lo < sp && sp < hi) {
-        return Err(());
-    }
-    let depth = hi.wrapping_sub(sp);
+    let depth = frame_depth(ctx, &key)?;
     // SAFETY: this goroutine's own slot, copied out at once.
-    if let Some(c) = unsafe { GO_GUARD_CALLS.get(&key) }.copied()
-        && c.conn == conn
-        && c.depth == depth
+    let mut calls = unsafe { GO_GUARD_CALLS.get(&key) }
+        .copied()
+        .unwrap_or(GoGuardCalls {
+            conn: [0; GO_GUARD_NEST],
+            depth: [0; GO_GUARD_NEST],
+            n: 0,
+        });
+    let mut n = calls.n.min(GO_GUARD_NEST as u64);
+    if let Some((c, d)) = guard_at(&calls, n)
+        && c == conn
+        && d == depth
     {
         return Ok(true);
     }
-    let call = GoReadCall { conn, depth };
-    GO_GUARD_CALLS.insert(&key, &call, 0).map_err(|_| ())?;
+    n = pop_from(&calls, n, depth, key.tgid);
+    match n {
+        0 => (calls.conn[0], calls.depth[0]) = (conn, depth),
+        1 => (calls.conn[1], calls.depth[1]) = (conn, depth),
+        2 => (calls.conn[2], calls.depth[2]) = (conn, depth),
+        3 => (calls.conn[3], calls.depth[3]) = (conn, depth),
+        _ => return Err(()),
+    }
+    calls.n = n + 1;
+    GO_GUARD_CALLS.insert(&key, &calls, 0).map_err(|_| ())?;
     let guard = GoGuardKey {
         conn,
         tgid: key.tgid,
@@ -962,6 +984,57 @@ fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
     };
     GO_GUARD_CONNS.insert(&guard, &1, 0).map_err(|_| ())?;
     Ok(false)
+}
+
+/// Top of the goroutine's stack minus SP: at a function's entry and at its
+/// RET instructions SP is the same (the return address), and a stack copy
+/// keeps the difference.
+#[inline(always)]
+fn frame_depth(ctx: &ProbeContext, key: &GoReadKey) -> Result<u64, ()> {
+    let (lo, hi) = go_stack(key.goroutine)?;
+    let sp = user_sp(ctx.regs);
+    if !(lo < sp && sp < hi) {
+        return Err(());
+    }
+    Ok(hi.wrapping_sub(sp))
+}
+
+/// The innermost of the first `n` recorded calls (conn, depth), if any.
+/// Constant indices only: the verifier refuses a variable stack offset.
+#[inline(always)]
+fn guard_at(calls: &GoGuardCalls, n: u64) -> Option<(u64, u64)> {
+    match n {
+        1 => Some((calls.conn[0], calls.depth[0])),
+        2 => Some((calls.conn[1], calls.depth[1])),
+        3 => Some((calls.conn[2], calls.depth[2])),
+        4 => Some((calls.conn[3], calls.depth[3])),
+        _ => None,
+    }
+}
+
+/// Drop the recorded calls at `depth` or deeper from the first `n`,
+/// unguarding their connections; the count left.
+#[inline(always)]
+fn pop_from(calls: &GoGuardCalls, mut n: u64, depth: u64, tgid: u32) -> u64 {
+    for _ in 0..GO_GUARD_NEST {
+        match guard_at(calls, n) {
+            Some((c, d)) if d >= depth => {
+                unguard(tgid, c);
+                n -= 1;
+            }
+            _ => break,
+        }
+    }
+    n
+}
+
+#[inline(always)]
+fn unguard(tgid: u32, conn: u64) {
+    let _ = GO_GUARD_CONNS.remove(&GoGuardKey {
+        conn,
+        tgid,
+        _pad: 0,
+    });
 }
 
 #[inline(always)]
@@ -973,23 +1046,30 @@ fn guard_lost() {
 }
 
 /// A RET instruction of a guarded function (attached at every one): the
-/// call is over, its connection unguarded. Guarded calls do not nest, so
-/// the goroutine's slot is this call's.
+/// call at this frame depth is over, its connection unguarded, and so are
+/// recorded calls deeper than it (ended without a RET seen). Calls it runs
+/// inside (shallower) stay guarded. A depth that cannot be read leaves the
+/// goroutine's calls guarded (only withholds).
 #[uprobe]
 pub fn go_tls_guard_ret(ctx: ProbeContext) {
-    let Ok(key) = go_read_key(&ctx, false) else {
-        return; // no epoch: the slot, if any, is left to the sweep
-    };
+    let _ = try_go_tls_guard_ret(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_guard_ret(ctx: &ProbeContext) -> Result<(), ()> {
+    // No epoch: the slot, if any, is left to the sweep.
+    let key = go_read_key(ctx, false)?;
     // SAFETY: this goroutine's own slot, copied out at once.
-    let Some(call) = (unsafe { GO_GUARD_CALLS.get(&key) }).copied() else {
-        return;
-    };
-    let _ = GO_GUARD_CALLS.remove(&key);
-    let _ = GO_GUARD_CONNS.remove(&GoGuardKey {
-        conn: call.conn,
-        tgid: key.tgid,
-        _pad: 0,
-    });
+    let mut calls = unsafe { GO_GUARD_CALLS.get(&key) }.copied().ok_or(())?;
+    let depth = frame_depth(ctx, &key)?;
+    let n = pop_from(&calls, calls.n.min(GO_GUARD_NEST as u64), depth, key.tgid);
+    if n == 0 {
+        let _ = GO_GUARD_CALLS.remove(&key);
+    } else if n != calls.n {
+        calls.n = n;
+        let _ = GO_GUARD_CALLS.insert(&key, &calls, 0);
+    }
+    Ok(())
 }
 
 /// `(*Conn).Write`'s entry where its RETs are probed (`go_tls_guard_ret`):

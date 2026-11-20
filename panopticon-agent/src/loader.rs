@@ -91,7 +91,9 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
 /// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_CALLS,
-/// PROC_EPOCH): owner-only maps whose entries belong to this run's probes.
+/// PROC_EPOCH, GO_GUARD_CALLS, GO_GUARD_CONNS, GO_GUARD_LOST): owner-only
+/// maps whose entries belong to this run's probes, so a restart clears a
+/// lost Go guard.
 const PINNED_MAP_NAMES: [&str; 9] = [
     "DATA_EVENTS_PERF",
     "PROCESS_EVENTS",

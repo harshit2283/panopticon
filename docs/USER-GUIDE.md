@@ -713,8 +713,14 @@ What is exported then:
   connection whose handshake runs inside its first `Write` (`tls.Client`
   then `Write` without `Handshake`: Write's data is captured before the
   handshake, so no record is sent), a TLS 1.2 renegotiation (never a
-  boundary), and every Go connection after a guard could not be recorded
-  (a full map) until the agent restarts.
+  boundary), and, on the whole node until the agent restarts, every Go
+  connection after a guard could not be recorded: a full guard map, more
+  than four guarded calls nested in one goroutine (TLS inside TLS
+  inside TLS...), a goroutine whose stack could not be read, no room for
+  the process in `PROC_EPOCH`, or a guard the sweep may have removed
+  live (PID reuse). Any Go workload on the node can cause this; the
+  agent logs a warning once when it happens, and a restart clears it
+  (the guard maps are never pinned).
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a

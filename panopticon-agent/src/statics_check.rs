@@ -38,6 +38,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "per-binary TLS verdicts from ELF files on disk, not from traffic",
     ),
     (
+        "platform/proc_scanner.rs",
+        "GUARD_LOST_LOGGED",
+        "whether the lost Go TLS guard warning was logged, a flag",
+    ),
+    (
         "export/otlp.rs",
         "OFFSET",
         "the monotonic-to-wall clock offset",
