@@ -21,6 +21,12 @@
 //! Frames larger than [`FRAME_PREFIX_CAP`] and frames with capture gaps are
 //! decoded from the bytes that were seen; the rest of the frame is counted
 //! and dropped, so the stream stays in sync.
+//!
+//! Responses are paired by correlation ID, never by order, so a request
+//! that gets no response (acks=0 Produce) cannot shift later pairs. A
+//! connection joined mid-stream, a correlation ID reused while pending, or
+//! SaslHandshake v0 (bare SASL token frames follow) makes the connection
+//! unsynced for good (`KafkaParser::unsynced`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -754,6 +760,18 @@ pub struct KafkaParser {
     /// Pending requests, matched to responses by correlation ID.
     pending_requests: VecDeque<PendingRequest>,
     topics: KafkaTopics,
+    /// Frames or their pairing are no longer known for certain: the
+    /// connection was joined mid-stream (a frame boundary found from there
+    /// may lie inside a record), a correlation ID was reused while pending
+    /// (a response could answer either request), or SaslHandshake v0 was
+    /// sent (raw SASL tokens follow, without Kafka headers). For the rest
+    /// of the connection messages keep the API name, its version and the
+    /// sizes only, and Metadata responses name no topic ID.
+    unsynced: bool,
+    /// The last call was [`ProtocolParser::skip`], which accounted for the
+    /// gap itself. The connection manager follows every skip with
+    /// [`ProtocolParser::joined_late`], which this flag lets through once.
+    skip_accounted: bool,
 }
 
 /// Frame complete in the buffer, or a prefix of it.
@@ -777,7 +795,41 @@ impl KafkaParser {
             server: Side::default(),
             pending_requests: VecDeque::new(),
             topics,
+            unsynced: false,
+            skip_accounted: false,
         }
+    }
+
+    /// The topic ID map a body decoded now may write to: the pipeline's,
+    /// or a throwaway once frames are unproven (a forged Metadata response
+    /// must not name topics on other connections).
+    fn ids(&self) -> KafkaTopics {
+        if self.unsynced {
+            KafkaTopics::default()
+        } else {
+            self.topics.clone()
+        }
+    }
+
+    /// A message read while unsynced: no text, status or latency.
+    fn scrub(&self, msg: &mut L7Message) {
+        if !self.unsynced {
+            return;
+        }
+        for f in [&mut msg.path, &mut msg.request_text, &mut msg.payload_text] {
+            if let Some(mut s) = f.take() {
+                zeroize::Zeroize::zeroize(&mut s);
+            }
+        }
+        msg.headers.retain_mut(|(k, v)| {
+            let keep = k == "api_version";
+            if !keep {
+                zeroize::Zeroize::zeroize(v);
+            }
+            keep
+        });
+        msg.status = None;
+        msg.latency_ns = None;
     }
 
     fn side(&mut self, direction: Direction) -> &mut Side {
@@ -872,7 +924,7 @@ impl KafkaParser {
         let mut r = Reader::new(&b[8..], false);
         let client_id = r.string().filter(|s| !s.is_empty());
         let mut info = BodyInfo {
-            ids: self.topics.clone(),
+            ids: self.ids(),
             ..BodyInfo::default()
         };
         if client_id.is_some() || r.pos > 0 {
@@ -898,8 +950,24 @@ impl KafkaParser {
         };
         // acks=0: the broker never answers.
         if api_key == 0 && pending.info.acks == Some(0) {
-            out.push(build_message(pending, None, timestamp_ns));
+            let mut msg = build_message(pending, None, timestamp_ns);
+            self.scrub(&mut msg);
+            out.push(msg);
             return;
+        }
+        // SaslHandshake v0: the SASL tokens that follow are bare frames,
+        // not Kafka requests (v1 wraps them in SaslAuthenticate).
+        if api_key == 17 && api_version == 0 {
+            self.unsynced = true;
+        }
+        // Responses are matched by correlation ID: one reused while still
+        // pending could answer either request.
+        if self
+            .pending_requests
+            .iter()
+            .any(|p| p.correlation_id == correlation_id)
+        {
+            self.unsynced = true;
         }
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
             self.pending_requests.pop_front();
@@ -925,7 +993,7 @@ impl KafkaParser {
         // ApiVersions responses always use header v0 (no tagged fields).
         let mut r = Reader::new(&b[4..], is_flexible(key, version) && key != 18);
         let mut info = BodyInfo {
-            ids: self.topics.clone(),
+            ids: self.ids(),
             ..BodyInfo::default()
         };
         let mut status = None;
@@ -944,6 +1012,7 @@ impl KafkaParser {
         let mut msg = build_message(pending, Some(info), timestamp_ns);
         msg.status = status;
         msg.response_size_bytes = frame.total_len as u64;
+        self.scrub(&mut msg);
         out.push(msg);
     }
 }
@@ -993,6 +1062,7 @@ fn build_message(req: PendingRequest, resp: Option<BodyInfo>, timestamp_ns: u64)
 
 impl ProtocolParser for KafkaParser {
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
+        self.skip_accounted = false;
         let side = self.side(direction);
         let data = side.strip(data);
         if side.buf.extend(data).is_err() {
@@ -1009,6 +1079,7 @@ impl ProtocolParser for KafkaParser {
         if side.discard > 0 {
             if n <= side.discard {
                 side.discard -= n;
+                self.skip_accounted = true;
                 return Some(ParseResult::NeedMoreData);
             }
             return None;
@@ -1041,6 +1112,7 @@ impl ProtocolParser for KafkaParser {
         side.buf.clear();
         side.discard = total_len - have - n;
         self.state = State::Idle;
+        self.skip_accounted = true;
         Some(if messages.is_empty() {
             ParseResult::NeedMoreData
         } else {
@@ -1057,6 +1129,18 @@ impl ProtocolParser for KafkaParser {
             State::Idle => "idle",
             State::Buffering => "buffering",
         }
+    }
+
+    /// The stream was not seen from its first byte (or bytes were lost
+    /// that `skip` could not place): the first "size" read may lie inside
+    /// a frame, so every frame found from there may be the inside of a
+    /// record (a forged request or response). Unsynced for good. Not right
+    /// after a `skip` that accounted for its gap (`skip_accounted`).
+    fn joined_late(&mut self) {
+        if std::mem::take(&mut self.skip_accounted) {
+            return;
+        }
+        self.unsynced = true;
     }
 }
 
@@ -1553,5 +1637,211 @@ pub(crate) mod tests {
         let parser = KafkaParser::new();
         assert_eq!(ProtocolParser::protocol(&parser), Protocol::Kafka);
         assert_eq!(parser.state_name(), "idle");
+    }
+
+    // ── Sync and pairing ─────────────────────────────────────────────────
+
+    fn msgs(r: ParseResult) -> Vec<L7Message> {
+        match r {
+            ParseResult::Messages(m) => m,
+            _ => vec![],
+        }
+    }
+
+    fn all_text(m: &L7Message) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?}",
+            m.path, m.request_text, m.payload_text, m.headers
+        )
+    }
+
+    /// A record value that holds a whole forged Produce frame (topic and
+    /// record naming a secret), and a fetched record holding a forged
+    /// response to it: what a parser joining inside them reads.
+    fn forged() -> (Vec<u8>, Vec<u8>) {
+        let mut client = b"tail of a record value".to_vec();
+        client.extend(request(
+            0,
+            7,
+            41,
+            Some("S3CRET-client"),
+            &produce_body(7, &[("S3CRET.topic", record_batch(&[("k", "S3CRET")]))], 1),
+        ));
+        let mut server = vec![0, 0];
+        server.extend(response(
+            0,
+            7,
+            41,
+            &produce_response_body(7, "S3CRET.topic", 0),
+        ));
+        (client, server)
+    }
+
+    #[test]
+    fn joined_late_inside_a_record_exports_no_forged_frame() {
+        let (client, server) = forged();
+        // Joined exactly at the forged frame (the worst case), and before it.
+        for at in [22, 0] {
+            let mut p = KafkaParser::new();
+            p.joined_late();
+            let mut out = Vec::new();
+            out.extend(msgs(p.feed(&client[at..], Direction::Egress, 1)));
+            out.extend(msgs(p.feed(&server[2..], Direction::Ingress, 2)));
+            for m in &out {
+                assert!(!all_text(m).contains("S3CRET"), "{}", all_text(m));
+                assert_eq!((m.status, m.latency_ns), (None, None));
+            }
+            if at == 22 {
+                assert_eq!(out.len(), 1, "the exchange is still counted");
+                assert_eq!(out[0].method.as_deref(), Some("Produce"));
+            }
+        }
+    }
+
+    fn manager_out(r: Option<crate::protocol::fsm::FsmResult>) -> Vec<L7Message> {
+        use crate::protocol::fsm::FsmResult;
+        match r {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    /// The same through the manager (`mark_joined_late`).
+    #[test]
+    fn manager_join_mid_stream_exports_no_forged_frame() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let (client, server) = forged();
+        let m = ConnectionFsmManager::new(16);
+        let (cl, sv) = ((1, 40000), (2, 9092));
+        m.get_or_create_with_server(7, Protocol::Kafka, Some(sv));
+        m.mark_joined_late(7);
+        let mut out =
+            manager_out(m.process_packet_from(7, cl, Direction::Egress, &client[22..], 1));
+        out.extend(manager_out(m.process_packet_from(
+            7,
+            sv,
+            Direction::Ingress,
+            &server[2..],
+            2,
+        )));
+        assert!(!out.is_empty());
+        for msg in &out {
+            assert!(!all_text(msg).contains("S3CRET"), "{}", all_text(msg));
+        }
+    }
+
+    /// A gap inside a frame of known length, through the manager (which
+    /// follows every skip with `joined_late`): accounted for, so the next
+    /// exchange keeps its text.
+    #[test]
+    fn manager_gap_inside_a_known_frame_keeps_text() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let m = ConnectionFsmManager::new(16);
+        let (cl, sv) = ((1, 40000), (2, 9092));
+        m.get_or_create_with_server(8, Protocol::Kafka, Some(sv));
+        let big = "x".repeat(20_000);
+        let resp = fetch_v16_response(5, [1; 16], &record_batch(&[("k", big.as_str())]));
+        m.process_packet_from(8, cl, Direction::Egress, &fetch_v16_request(5), 1);
+        m.process_packet_from(8, sv, Direction::Ingress, &resp[..4096], 2);
+        m.skip_from(8, sv, Direction::Ingress, resp.len() - 4096, 3);
+        let req = request(18, 3, 6, Some("c-after"), &[0, 0, 0]);
+        m.process_packet_from(8, cl, Direction::Egress, &req, 4);
+        let out = manager_out(m.process_packet_from(
+            8,
+            sv,
+            Direction::Ingress,
+            &response(18, 3, 6, &[0, 0, 0, 0, 0, 0, 0]),
+            5,
+        ));
+        assert_eq!(out[0].status, Some(0));
+        assert!(
+            out[0]
+                .headers
+                .contains(&("client_id".into(), "c-after".into()))
+        );
+    }
+
+    /// acks=0 Produce gets no response; requests around it still pair by
+    /// correlation ID, and a response arriving for none is ignored.
+    #[test]
+    fn acks_zero_produce_does_not_shift_pairing() {
+        let mut p = KafkaParser::new();
+        let mut reqs = request(18, 0, 1, Some("c"), &[]);
+        reqs.extend(request(
+            0,
+            9,
+            2,
+            Some("c"),
+            &produce_body(9, &[("fire.and.forget", record_batch(&[("k", "v")]))], 0),
+        ));
+        reqs.extend(request(12, 0, 3, Some("c"), &[]));
+        let out = msgs(p.feed(&reqs, Direction::Egress, 1));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path.as_deref(), Some("fire.and.forget"));
+        let mut resps = response(18, 0, 1, &[0, 0, 0, 0, 0, 0]);
+        resps.extend(response(12, 0, 3, &[0, 27]));
+        let out = msgs(p.feed(&resps, Direction::Ingress, 2));
+        let got: Vec<_> = out
+            .iter()
+            .map(|m| (m.method.as_deref(), m.status))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("ApiVersions"), Some(0)),
+                (Some("Heartbeat"), Some(27))
+            ]
+        );
+        assert!(!p.unsynced);
+    }
+
+    /// A correlation ID reused while still pending: a response could
+    /// answer either request, so the connection is unsynced.
+    #[test]
+    fn reused_correlation_id_unsyncs() {
+        let mut p = KafkaParser::new();
+        let mut reqs = request(18, 0, 5, Some("c"), &[]);
+        reqs.extend(request(12, 0, 5, Some("c"), &[]));
+        p.feed(&reqs, Direction::Egress, 1);
+        let out = msgs(p.feed(&response(12, 0, 5, &[0, 27]), Direction::Ingress, 2));
+        assert_eq!(out[0].status, None);
+        assert!(out[0].headers.iter().all(|(k, _)| k == "api_version"));
+    }
+
+    /// SaslHandshake v0: raw SASL tokens follow as bare frames (PLAIN:
+    /// `\0user\0password`). They are never read as requests with text.
+    #[test]
+    fn sasl_handshake_v0_unsyncs() {
+        let mut w = W::new(false);
+        w.str(Some("PLAIN"));
+        let mut p = KafkaParser::new();
+        p.feed(&request(17, 0, 1, Some("c"), &w.b), Direction::Egress, 1);
+        p.feed(
+            &response(17, 0, 1, &[0, 0, 0, 0, 0, 0]),
+            Direction::Ingress,
+            2,
+        );
+        let token = b"\0\0\0\x0b\0a\0S3CRETpwd";
+        let mut out = msgs(p.feed(&frame(&token[4..]), Direction::Egress, 3));
+        out.extend(msgs(p.feed(&frame(&[0, 0, 0, 0]), Direction::Ingress, 4)));
+        for m in &out {
+            assert!(!all_text(m).contains("S3CRET"), "{}", all_text(m));
+        }
+        assert!(p.unsynced);
+    }
+
+    /// A Metadata response read while unsynced names no topic ID for the
+    /// pipeline (it may be forged).
+    #[test]
+    fn unsynced_metadata_names_no_topic_id() {
+        let id = [9u8; 16];
+        let topics = KafkaTopics::default();
+        let mut p = KafkaParser::with_topics(topics.clone());
+        p.joined_late();
+        let [req, resp] = metadata_v12_exchange(1, "forged.name", id);
+        p.feed(&req, Direction::Egress, 1);
+        p.feed(&resp, Direction::Ingress, 2);
+        assert_eq!(topics.name_for(&id), "09".repeat(16));
     }
 }
