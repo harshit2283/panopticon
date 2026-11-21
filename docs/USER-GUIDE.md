@@ -243,9 +243,10 @@ validated on x86_64 only and refused elsewhere.
   `/<name>`, as in kind), directly (guaranteed QoS) or in its
   `burstable` / `besteffort` level, named as that driver names it
   (`pod<uid>`, `kubepods-burstable-pod<uid>.slice`). That directory and
-  every one above it up to the root must be owned by root, so a
-  directory another user creates (in a subtree delegated to them, such as
-  `user@<uid>.service`) is never taken for a pod's. If kubelet runs with
+  every one above it up to the root must be owned by root and not group-
+  or other-writable, so a directory another user creates (in a subtree
+  delegated to them, such as `user@<uid>.service`) is never taken for a
+  pod's; a directory removed while the agent looks is simply skipped. If kubelet runs with
   another `--cgroup-root` (`cgroupRoot`), so that its kubepods directory
   is elsewhere, name that directory in `pod_cgroup_root` (an absolute
   cgroup path under the cgroup2 mount, such as `"/custom/kubepods"` or
@@ -253,18 +254,29 @@ validated on x86_64 only and refused elsewhere.
   `.slice` is read with the systemd driver's names, anything else with
   cgroupfs's). It is searched the same way, besides the roots above; the
   agent refuses to start unless it is a directory reached without a
-  symlink or mount crossing and owned by root at every level, and if it
-  stops being one at runtime, no selected pod is captured until it is
-  again (logged as an error). Changing it needs a restart. Nothing else widens
-  the search. A selected pod with no such directory on this node is not
-  captured: an error names the pod and the roots searched (with a hint
-  to set `pod_cgroup_root`), and
+  symlink or mount crossing, owned by root and not group- or
+  other-writable at every level, and if it stops being one at runtime, no
+  selected pod is captured until it is again (logged as an error). It may
+  name a directory inside a recognised root (`"/kubepods/burstable"`): a
+  pod directory reached from both is the same directory and counts once.
+  Changing it needs a restart; set without any `[[pod_filter]]` it is
+  unused (a warning says so, and it is still checked at startup), so a
+  reload may remove every `[[pod_filter]]` while `cgroup_filter` stays.
+  Nothing else widens the search. Static pods (from kubelet's manifest
+  directory) are not supported: kubelet names their cgroup by the
+  manifest's hash, not the uid of their mirror pod in the API, so they
+  are never found. A selected pod with no such directory on this node is
+  not captured: an error names the pod and the roots searched (with a
+  hint to set `pod_cgroup_root`), and
   `panopticon_pod_filter_unresolved_total{reason="not_found"}` counts it;
   one whose uid matches more than one directory is not captured either,
   logged as a distinct error and counted as `reason="ambiguous"`, since
   only root can create those and neither can be told to be the real one
   (`reason="unusable"`: the one directory found could not be opened or
-  is not root's). Pods
+  is not root's, or is group- or other-writable). The selected pods are
+  resolved again on every pod change, so the error is logged once per pod
+  and reason (at debug level after that, until the pod resolves), while
+  the counter counts every resolution. Pods
   that start, stop or change labels are followed; a reload may change
   either list. Needs the host's unified cgroup2 hierarchy: on a cgroup v1
   host (RHEL 8's default) the agent mounts a private cgroup2 at
@@ -1134,7 +1146,7 @@ leave the node, use `metrics_only`.
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |
-| `panopticon_pod_filter_unresolved_total` | Resolutions of a pod `pod_filter` selected that left it uncaptured, by `reason`: `not_found` (no cgroup directory in the kubepods roots searched: a pod not started yet, or a kubelet cgroup root to name in `pod_cgroup_root`), `ambiguous` (several), `unusable`. Rising → check the agent's errors |
+| `panopticon_pod_filter_unresolved_total` | Resolutions of a pod `pod_filter` selected that left it uncaptured, by `reason`: `not_found` (no cgroup directory in the kubepods roots searched: a pod not started yet, a static pod, or a kubelet cgroup root to name in `pod_cgroup_root`), `ambiguous` (several), `unusable` (the one found cannot be opened, is not root's, or is group- or other-writable). Counts every resolution, not pods: the selected pods are resolved again on every pod change, so a pod that stays unresolved (Pending) adds one each time, while its error is logged once per pod and reason. Rising → check the agent's errors |
 | `panopticon_active_connections` | Connections being parsed |
 | `panopticon_raw_capture_dropped_total` | Events missing from the raw capture file (writer fell behind) |
 

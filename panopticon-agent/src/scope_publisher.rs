@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::{PodFilter, ScopeOptions};
 use crate::k8s::K8sMetadata;
@@ -163,8 +163,10 @@ impl<M: ScopeMaps> Publisher<M> {
             self.pod_root.as_deref(),
             self.pod_owner,
         )?;
+        // Each unresolved pod was logged as an error the first time
+        // (`resolve`); this runs on every pod change.
         if !r.unresolved.is_empty() {
-            warn!(
+            debug!(
                 pods = ?r.unresolved,
                 "pod_filter: no cgroup found for these pods on this node; not captured"
             );

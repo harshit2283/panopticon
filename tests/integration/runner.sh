@@ -193,14 +193,20 @@ echo "Waiting for agent to flush (5s)..."
 sleep 5
 
 # Stop agent gracefully (SIGINT) and wait for it to exit, so the export is final.
+# The agent is the container's PID 1 and exits 0 on SIGINT; anything else (a
+# panic or error at shutdown, or no exit at all) fails the run.
 docker compose kill -s SIGINT agent 2>/dev/null || true
-wait_for_service_exit agent 30 >/dev/null || echo "WARN: agent did not exit after SIGINT"
+agent_exit_code="$(wait_for_service_exit agent 30)" || agent_exit_code="none (no exit within 30s)"
 release_export
 
 # Validate results
 echo ""
 echo "=== Validating Results ==="
 EXIT_CODE=0
+if [[ "${agent_exit_code}" != "0" ]]; then
+    echo "FAIL: agent exit status after SIGINT: ${agent_exit_code}"
+    EXIT_CODE=1
+fi
 if [ -f output/events.jsonl ]; then
     python3 validation/validate.py output/events.jsonl || EXIT_CODE=$?
 else

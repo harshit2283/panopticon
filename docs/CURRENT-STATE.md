@@ -113,10 +113,14 @@ production-hardened compliance platform.
   Both settings change on reload. `pod_filter` takes a pod's cgroup only
   from where kubelet makes it (a top-level kubepods root and its
   `burstable` / `besteffort` level, either cgroup driver), with every
-  directory on the way owned by root, plus `pod_cgroup_root` when an
-  operator names a custom kubelet cgroup root; a pod with no such
-  directory, or with several, is not captured, logged as an error and
-  counted in `panopticon_pod_filter_unresolved_total{reason}`. Replay (`--replay-bench`) refuses every
+  directory on the way owned by root and not group- or other-writable,
+  plus `pod_cgroup_root` when an operator names a custom kubelet cgroup
+  root (inside a recognised root too: a pod reached twice counts once);
+  a pod with no such directory, or with several, is not captured, logged
+  as an error once per pod and reason and counted, on every
+  re-resolution, in `panopticon_pod_filter_unresolved_total{reason}`.
+  Static pods are not supported (kubelet names their cgroup by the
+  manifest's hash). Replay (`--replay-bench`) refuses every
   scope setting. The `client_pid` / `server_pid` export fields, filled
   from TC's connect / accept probes, are gone; packet events in the raw
   dump carry the kernel's `owner_tgid` / `acceptor_tgid`.

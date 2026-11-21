@@ -11,6 +11,9 @@
 #   tls_pid       T-10: pid_filter; unselected process, socket passed either
 #   tls_cgroup    way, PID reused after exit (tls_pid only); TLS addresses
 #                 only when the call's own socket is in scope
+#   tls_cgroup_nolo  tls_cgroup with capture_loopback at its default (off):
+#                 TLS plaintext still captured, without addresses; loopback
+#                 packets dropped (reason="loopback")
 #   tls_sample    T-10: connection_sample (0.99) / head_only: no TLS plaintext,
 #   tls_head      tls_mode counted
 #   netcls_start  T-6: a v1 net_cls/net_prio hierarchy is mounted: the
@@ -23,11 +26,14 @@
 #   ktls_scoped   splice) and WireGuard, in unscoped full, scoped full and
 #   ktls_head     head_only
 #   refuse_cgroup RHEL 8 (no host cgroup2): cgroup_filter is refused
-#   k8s           k3s_up, k8s_pods, k8s_tuples, k3s_down in one run (k3s is
-#                 never left running for other oracles):
+#   k8s           k3s_up, k8s_pods, k8s_pods_nolo, k8s_tuples, k3s_down in
+#                 one run (k3s is never left running for other oracles):
 #   k8s_pods      T-5 / T-10: pod_filter; a container restart in a selected
 #                 pod, a matching pod added (widening) and relabelled out
 #                 (narrowing) under traffic, unmatched pods, TLS in pods
+#   k8s_pods_nolo pod_filter with capture_loopback at its default (off): TLS
+#                 in a selected pod captured without addresses, its plain
+#                 HTTP over 127.0.0.1 and unmatched pods not captured
 #   k8s_tuples    T-18: ClusterIP, NodePort, hostNetwork, REDIRECT in a pod
 #   k3s_up, k3s_down  install-and-start / stop k3s on their own
 #
@@ -242,9 +248,10 @@ json.dump(n, open(d + "/narrowed.json", "w"))' "$d"
 # ── T-10 ──────────────────────────────────────────────────────────────────
 
 # Every T-10 run is over 127.0.0.1, so it captures loopback (off by
-# default). Without it a scoped run's loopback packets are dropped before
-# any socket gets a verdict, so OpenSSL calls carry no address (USER-GUIDE
-# "Capture scope") and HP's plain HTTP is not captured at all.
+# default), except tls_cgroup_nolo, which checks the default: a scoped
+# run's loopback packets are dropped before any socket gets a verdict, so
+# OpenSSL calls carry no address (USER-GUIDE "Capture scope") and plain
+# HTTP over loopback is not captured at all.
 T10_LO='capture_loopback = true'
 
 tls_server() { # tls_server PORT [env...]
@@ -275,9 +282,12 @@ run_tls_full() {
   score "$d" recall:OS:0.98 recall:GS:0.98 reads:OS:0.98 reads:GS:0.98 addr:OS:0.9
 }
 
-# run_tls_scoped DIR pid|cgroup
+# run_tls_scoped pid|cgroup [nolo]: nolo leaves capture_loopback at its
+# default (off), in DIR tls_HOW_nolo
 run_tls_scoped() {
-  local how=$1 d=$OUT/tls_$1; mkdir -p "$d"
+  local how=$1 nolo=${2:-} d=$OUT/tls_$1${2:+_$2}; mkdir -p "$d"
+  local lo=$T10_LO
+  [[ -n $nolo ]] && lo='# capture_loopback: default (false)'
   local sel=() uns=()
   [[ $how == cgroup ]] && sel=(CGROUP=b2/a) && uns=(CGROUP=b2/c)
   [[ $how == pid ]] && sel=(X=1) && uns=(X=1)
@@ -297,9 +307,9 @@ run_tls_scoped() {
   bg sleep 1000; local dummy=$!; L="$L $dummy"
   sleep 0.5
   if [[ $how == pid ]]; then
-    conf "$d" "$T10_LO"$'\n'"pid_filter = [$(echo $L | tr ' ' ',')]"
+    conf "$d" "$lo"$'\n'"pid_filter = [$(echo $L | tr ' ' ',')]"
   else
-    conf "$d" "$T10_LO"$'\ncgroup_filter = ["b2/a"]'
+    conf "$d" "$lo"$'\ncgroup_filter = ["b2/a"]'
   fi
   agent_start "$d" || { score "$d" log:NEVER; return; }
   touch "$d/go"
@@ -308,6 +318,10 @@ run_tls_scoped() {
   # every socket BIO). Go TLS never carries one (DESIGN §3.5).
   local checks=(recall:OSEL:0.98 recall:GSEL:0.98 reads:GSEL:0.98 truth:ON none:ON truth:PS none:PS
                 recall:PR:0.98 noaddr:PR addr:OSEL:0.95 noaddr:GSEL)
+  # Loopback off: the same plaintext, but no socket gets a verdict, so no
+  # OpenSSL call carries an address, and the loopback packets are counted.
+  [[ -n $nolo ]] && checks=(recall:OSEL:0.98 noaddr:OSEL recall:GSEL:0.98 noaddr:GSEL
+                            truth:ON none:ON truth:PS none:PS drop:loopback)
   if [[ $how == pid ]]; then
     sleep 1
     kill $dummy; wait $dummy 2>/dev/null
@@ -743,6 +757,35 @@ json.dump(w, open(sys.argv[1], "w"))' "$d/widened.json"
     recall:PT:0.95 truth:PU none:PU info:PT
 }
 
+# pod_filter with capture_loopback at its default (off). Each pod's client
+# reaches its own server over 127.0.0.1: the selected pod's TLS plaintext
+# (PT) is captured, without an address (no socket gets a verdict), its
+# plain HTTP (K1) is dropped as reason="loopback", and the unmatched pods
+# (K3, PU) are not captured at all.
+run_k8s_pods_nolo() {
+  local d=$OUT/k8s_pods_nolo; mkdir -p "$d"
+  cp "$OUT/cert.pem" "$OUT/key.pem" "$d/"
+  fresh_ns
+  local tls="TLS=1,TLS_CERT=/truth/cert.pem,TLS_KEY=/truth/key.pem"
+  local cli="EVERY=5,GAP=0.05"
+  pod sel-1 b2sel "$d" -- "srv||server 8080" "cli|$cli|client 8080 K1 0 /truth/K1.truth.jsonl"
+  pod uns-1 b2other "$d" -- "srv||server 8080" "cli|$cli|client 8080 K3 0 /truth/K3.truth.jsonl"
+  pod sel-tls b2sel "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PT 0 /truth/PT.truth.jsonl"
+  pod uns-tls b2other "$d" -- "srv|$tls|server 8443" "cli|$cli,TLS=1|client 8443 PU 0 /truth/PU.truth.jsonl"
+  pods_ready
+  k8s_env
+  conf "$d" $'[[pod_filter]]\nnamespace = "b2"\nlabels = { app = "b2sel" }'
+  agent_start "$d" || { score "$d" log:NEVER; return; }
+  touch "$d/go"; sleep 14
+  date +%s.%N >"$d/stop_t" # the pods' traffic runs on while the agent stops
+  "${K[@]}" -n b2 get pods -o wide >"$d/pods.txt"
+  "${K[@]}" delete ns b2 --wait=false >/dev/null
+  sleep 2
+  agent_stop "$d"
+  score "$d" recall:PT:0.95 noaddr:PT truth:K1 none:K1 truth:K3 none:K3 truth:PU none:PU \
+    drop:loopback
+}
+
 # T-18 on Kubernetes: ClusterIP, NodePort (from the node), hostNetwork, and
 # an Istio-style inbound REDIRECT (8081 -> 8080) in the server pod's netns.
 run_k8s_tuples() {
@@ -811,6 +854,7 @@ for s in "$@"; do
     tls_full) run_tls_full ;;
     tls_pid) run_tls_scoped pid ;;
     tls_cgroup) run_tls_scoped cgroup ;;
+    tls_cgroup_nolo) run_tls_scoped cgroup nolo ;;
     tls_sample) run_tls_mode sample ;;
     tls_head) run_tls_mode head ;;
     netcls_start) run_netcls_start ;;
@@ -819,10 +863,12 @@ for s in "$@"; do
     tuples) run_tuples ;;
     ktls_full | ktls_scoped | ktls_head) run_ktls "${s#ktls_}" ;;
     refuse_cgroup) run_refuse_cgroup ;;
-    k8s) run_k3s_up; run_k8s_pods; agent_kill; stop_pids; run_k8s_tuples; agent_kill; run_k3s_down ;;
+    k8s) run_k3s_up; run_k8s_pods; agent_kill; stop_pids; run_k8s_pods_nolo; agent_kill; stop_pids
+      run_k8s_tuples; agent_kill; run_k3s_down ;;
     k3s_up) run_k3s_up ;;
     k3s_down) run_k3s_down ;;
     k8s_pods) run_k8s_pods ;;
+    k8s_pods_nolo) run_k8s_pods_nolo ;;
     k8s_tuples) run_k8s_tuples ;;
     *) log "unknown scenario $s"; STATUS=1 ;;
   esac
