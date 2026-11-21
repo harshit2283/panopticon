@@ -300,6 +300,27 @@ production-hardened compliance platform.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
+  - Pairing and late joins (USER-GUIDE §5.3). MySQL error text is never
+    exported: an error adds only its code and SQLSTATE. MySQL replies
+    pair with commands only for commands whose replies are modelled
+    (multi-result queries, `CALL` and `LOAD DATA LOCAL INFILE` are one
+    exchange each); after any other command (`COM_CHANGE_USER`,
+    `COM_STMT_FETCH`, a cursor `EXECUTE`, replication, unknown), a reply
+    out of sequence or unsolicited, or on a connection joined mid-stream,
+    records keep only the statement keyword for the rest of the
+    connection; TLS and compressed MySQL connections are not parsed past
+    the switch. HTTP/1 pairs pipelined requests in order and frames
+    `1xx`, `HEAD`, `204`/`304`, `CONNECT`, `Upgrade` and close-delimited
+    responses per RFC 9112; on a connection joined mid-stream (over TLS,
+    any key not proven to start at its first record), after bytes it
+    cannot place, ambiguous framing or a response with no request
+    waiting, records keep only a known method and sizes. Kafka pairs by
+    correlation ID (`acks=0` Produce shifts nothing); a late join, a
+    reused pending correlation ID or `SaslHandshake` v0 leaves only the
+    API name, version and sizes. DNS pairs by ID and name; a late parser
+    reads only whole datagrams, and a DNS-over-TCP connection joined
+    mid-stream exports no name, record, status or answer. gRPC/HTTP/2
+    pair by stream ID.
 - PII detection:
   - Regex-first scanning is the stable baseline: 16 validated patterns
     (checksums, issuer prefixes, context keywords), including Indian
@@ -323,7 +344,7 @@ production-hardened compliance platform.
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on
-    (exported without bound values or MySQL error text). No other field has a
+    (exported without bound values). No other field has a
     bare name; anything outside the allowlist is withheld as before.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`). A letters-only segment before the word

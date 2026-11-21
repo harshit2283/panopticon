@@ -705,9 +705,9 @@ a body or an error message that reads `/oauth/token` or
   `WHERE profile = '\050alice\054…'` and `WHERE password = 'x'` are
   context. A value compared with a column that is not a credential word
   (`WHERE id = 1`) stays exported, as it would without the credential
-  column. Such a statement is exported without its bound values, and a
-  server error for it becomes `<statement withheld>` (it may echo a
-  bound value: `malformed record literal: "(alice,hunter2)"`).
+  column. Such a statement is exported without its bound values. (No
+  server error text is exported for any statement: it may echo a bound
+  value, `malformed record literal: "(alice,hunter2)"`.)
 
 Redis `CONFIG GET requirepass` is withheld whole: with renamed commands
 and `CLIENT REPLY`, a reply cannot be tied to its request, so nothing
@@ -725,11 +725,9 @@ Prose is never a bare position: `token abc123`, `your token expired` and
 What is exported then:
 
 - **SQL** (MySQL, PostgreSQL): the statement becomes its keyword and
-  `<statement withheld>` (`ALTER <statement withheld>`), its bound
-  parameter values are not exported, and a MySQL server error for it
-  (which may quote it) becomes `<statement withheld>`; so does any MySQL
-  error message that shows credential context itself. PostgreSQL never
-  exports error text (below). Only a known SQL statement keyword
+  `<statement withheld>` (`ALTER <statement withheld>`) and its bound
+  parameter values are not exported. Neither MySQL nor PostgreSQL ever
+  exports server error text (below). Only a known SQL statement keyword
   (`SELECT`, `INSERT`, `ALTER`, …) is ever exported as the method: a
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
@@ -763,7 +761,9 @@ What is exported then:
   response, keeps the captured prefix (it is scanned and trimmed like any
   body). A Kafka request or response is decoded only up to a gap inside
   it, and a gap anywhere else restarts the parser, so its record text
-  never joins bytes from both sides of a gap.
+  never joins bytes from both sides of a gap. A gap an HTTP/1, MySQL or
+  Kafka parser cannot place (outside a body, result set or frame of
+  known length) also withholds the connection's text for good (below).
 - **AMQP after lost frame sync**: when a gap (or a malformed frame) loses
   AMQP frame boundaries in one direction, the agent looks for the next
   plausible frame, which may lie inside a message body (the gapped body's
@@ -869,7 +869,7 @@ What is exported then:
   dropped before export and before the name can reach the service graph.
 - **Bare names** are exported as written: an HTTP request path
   `/oauth/token` and a SQL statement `SELECT password, email FROM users`
-  (without bound values or MySQL error text). The query or fragment after a
+  (without bound values). The query or fragment after a
   bare path is dropped: `/oauth/token?client_secret=x` exports
   `/oauth/token?<query withheld>`.
 
@@ -1059,6 +1059,81 @@ client sends a message the queue does not model, or past 4096 messages
 awaiting an answer: records go on, but no `Parse` is confirmed and no
 bound value is exported on it, until a new connection is observed from
 its start.
+
+**MySQL error text is never exported** either: an ERR packet adds only
+its error code (`status`, such as `1366`) and its SQLSTATE (`sqlstate`,
+five letters or digits after `#`, such as `HY000`) to the record. Its
+message is dropped, since it echoes statement text and values
+(`Incorrect integer value: 'hunter2' for column 'pin'`), and so are the
+`info` text of an OK packet and every row (`SHOW WARNINGS` included).
+MySQL answers commands in order, and the agent pairs a reply with the
+command in flight only for commands whose replies it models: a
+`COM_QUERY` or `COM_STMT_EXECUTE` is one record however many result
+sets it returns (a multi-statement query or a `CALL`, up to the result
+without "more results"), including a `LOAD DATA LOCAL INFILE` file
+transfer (the file's packets are never read as commands nor exported);
+a `COM_STMT_PREPARE` is reported only when it fails; `COM_PING`,
+`COM_INIT_DB`, `COM_STATISTICS` and the other single-reply commands are
+not reported; `COM_QUIT`, `COM_STMT_CLOSE` and
+`COM_STMT_SEND_LONG_DATA` get no reply. Any other command
+(`COM_CHANGE_USER`, `COM_FIELD_LIST`, `COM_STMT_FETCH`, an `EXECUTE`
+that opens a cursor, the replication commands, unknown ones), a reply
+packet out of sequence, server bytes with no command in flight, a reply
+the agent cannot read, lost server bytes on a connection whose client
+sends a command before the previous reply ends, or a connection the
+agent joined mid-stream or did not see from its first byte (a packet
+boundary found there may lie inside a statement or a row) makes the
+connection's replies untrusted for the rest of its life: records go on
+with the statement's keyword only (no statement text, bound value,
+status or latency). A connection that switches to TLS (`SSLRequest`)
+or to the compressed protocol is not parsed past that point.
+
+**HTTP/1** requests are queued in the order they are read, and each
+final response answers the oldest (pipelining included). `1xx`
+responses other than `101` are interim and answer nothing; a response to
+`HEAD`, a `1xx`, `204` or `304` has no body whatever its headers say;
+request bodies are read by `Content-Length` or chunked encoding. After
+`101 Switching Protocols` (WebSocket, h2c) or a `2xx` to `CONNECT`, and
+after a response with neither a length nor chunked encoding (its body
+runs to the close; it is exported without the body), nothing more of
+the connection is read. Which direction carries requests is learned
+once, from the first message start, never from each segment's bytes.
+A connection the agent joined mid-stream or did not see from its first
+byte (over TLS, a key not proven to start at its connection's first
+record), bytes lost outside a body of known length, a malformed
+message, a request whose framing the server may read differently
+(conflicting `Content-Length`, or `Transfer-Encoding` with
+`Content-Length`) or a response with no request waiting makes the
+connection unsynced for the rest of its life: a request line found
+there may lie inside a body. Records go on with a known method (`GET`,
+`POST`, …) and the sizes only: no path, header, content type, body,
+status or latency. Conflicting `Content-Length` values in a request, a
+request transfer coding that does not end in `chunked`, or broken chunk
+framing also stops the parsing of the connection.
+
+**Kafka** responses are paired by correlation ID, never by order, so an
+`acks=0` Produce (no response; exported on the request) moves no other
+pair. A connection the agent joined mid-stream or did not see from its
+first byte (a frame boundary found there may lie inside a record), a
+correlation ID reused while still awaiting its response, or a
+`SaslHandshake` v0 (bare SASL token frames follow, not Kafka requests)
+makes the connection unsynced for the rest of its life: records keep
+the API name, `api_version` and the sizes only, and its Metadata
+responses name no topic ID for the other connections.
+
+**DNS** responses are paired by transaction ID and query name, never by
+order. Over UDP every datagram is a whole message, so there is no
+boundary to lose; but a datagram carries no stream position, so a UDP
+flow and a TCP connection joined mid-stream look alike to the parser,
+and on both it reads only a datagram whose sections account for every
+byte. Over TCP (length-prefixed messages) a connection the agent joined
+mid-stream exports the method and sizes only for the rest of its life:
+a length prefix found there may lie inside a message (a TXT record can
+hold a whole forged response), so no name, record, status or DNS answer
+is exported from it.
+
+**gRPC and HTTP/2** responses are paired by stream ID, so a call answered
+out of order, reset, or never answered moves no other call.
 
 #### Your own credential formats: `[credentials]`
 

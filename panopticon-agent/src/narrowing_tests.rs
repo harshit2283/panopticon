@@ -579,7 +579,9 @@ fn exchange_to(server: u32, marker: &str, port: u16, gen_: u32) -> Vec<DataEvent
     )
 }
 
-/// One request and its response on a fresh TCP connection.
+/// One request and its response on a fresh TCP connection, seen from its
+/// handshake (the SYN and SYN+ACK place each side's first byte, so the
+/// parser is not taken to have joined mid-stream).
 fn tcp_exchange(
     cli: (u32, u16),
     srv: (u32, u16),
@@ -587,11 +589,16 @@ fn tcp_exchange(
     resp: &[u8],
     gen_: u32,
 ) -> Vec<DataEvent> {
+    let mut syn = packet(cli, srv, 6, b"", gen_);
+    (syn.tcp_seq, syn.tcp_flags) = (99, panopticon_common::TCP_FLAG_SYN);
+    let mut syn_ack = packet(srv, cli, 6, b"", gen_);
+    (syn_ack.tcp_seq, syn_ack.tcp_ack, syn_ack.tcp_flags) =
+        (899, 100, panopticon_common::TCP_FLAG_SYN | TCP_FLAG_ACK);
     let mut a = packet(cli, srv, 6, req, gen_);
     (a.tcp_seq, a.tcp_ack, a.tcp_flags) = (100, 900, TCP_FLAG_ACK);
     let mut b = packet(srv, cli, 6, resp, gen_);
     (b.tcp_seq, b.tcp_ack, b.tcp_flags) = (900, 100 + req.len() as u32, TCP_FLAG_ACK);
-    vec![a, b]
+    vec![syn, syn_ack, a, b]
 }
 
 /// Outputs that carry the request path (the audit log names the server).
@@ -943,7 +950,8 @@ fn a_blocked_export_and_a_full_queue_send_nothing_after_applied() {
             let deadline = tokio::time::Instant::now() + WAIT;
             for i in 0..2500u16 {
                 env.feed(&exchange("old-backlog", 20000 + i, 1));
-                let fed = 2 * (u64::from(i) + 1);
+                // Four events per exchange: SYN, SYN+ACK, request, response.
+                let fed = 4 * (u64::from(i) + 1);
                 while i % 25 == 24 && processed() < fed {
                     assert!(
                         tokio::time::Instant::now() < deadline,
