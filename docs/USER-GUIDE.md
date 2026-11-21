@@ -179,9 +179,8 @@ captured. A UDP datagram, and a TCP packet carrying RST, stay one record
 of at most 4096 bytes whatever the setting. A cut can cost a parser its message boundaries,
 and then some fields for the rest of the connection (§5.3). At one record
 (4096, the behaviour before this setting) a PostgreSQL 500-row result,
-sent in 8 KB packets, was cut, and the connection's bound values and
-error text are withheld from then on until an attributable
-`ReadyForQuery` (§5.3); the default covers it. A packet larger than the setting is still cut: on
+sent in 8 KB packets, was cut, and the connection's bound values are
+withheld from then on (§5.3); the default covers it. A packet larger than the setting is still cut: on
 RHEL 8.10 one RabbitMQ packet in about 300 to a consumer carries several
 deliveries in 23 KB, and after it the consumer's deliveries are exported
 without exchange, routing key or body (§5.3). AMQP consumers on RHEL 8
@@ -727,9 +726,10 @@ What is exported then:
 
 - **SQL** (MySQL, PostgreSQL): the statement becomes its keyword and
   `<statement withheld>` (`ALTER <statement withheld>`), its bound
-  parameter values are not exported, and a server error for it (which may
-  quote it) becomes `<statement withheld>`; so does any error message that
-  shows credential context itself. Only a known SQL statement keyword
+  parameter values are not exported, and a MySQL server error for it
+  (which may quote it) becomes `<statement withheld>`; so does any MySQL
+  error message that shows credential context itself. PostgreSQL never
+  exports error text (below). Only a known SQL statement keyword
   (`SELECT`, `INSERT`, `ALTER`, …) is ever exported as the method: a
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
@@ -869,7 +869,7 @@ What is exported then:
   dropped before export and before the name can reach the service graph.
 - **Bare names** are exported as written: an HTTP request path
   `/oauth/token` and a SQL statement `SELECT password, email FROM users`
-  (without bound values or error text). The query or fragment after a
+  (without bound values or MySQL error text). The query or fragment after a
   bare path is dropped: `/oauth/token?client_secret=x` exports
   `/oauth/token?<query withheld>`.
 
@@ -989,13 +989,21 @@ than the cycle's `Parse`, or of one the server rejected, exports no
 values. The agent keeps the client's messages that await an answer in
 order and pairs each answer with its own message: every `Execute` gets
 its own record, also when several statements share one `Sync` (JDBC
-batches, libpq pipelines), with its own values and status. An error is
-reported under the message that failed: a failed `Parse` under its own
-SQL, a failed `Bind` or `Execute` under the statement it ran. A failed
-`Describe` or `Close`, or an error answering the `Sync` (at commit), has
-no statement of its own and its text is withheld, as is the error text
-of a statement confirmed in an earlier exchange (it may have been
-redefined unseen, below). The statements the server then skips to the
+batches, libpq pipelines), with its own values and status. A
+FunctionCall (libpq `PQfn`, `lo_*`, the JDBC fastpath) is answered in
+the same queue and not reported; a client message the queue does not
+model makes the connection's answers untrusted (below). **PostgreSQL
+error and notice text is never exported**: an `ErrorResponse` adds only
+its SQLSTATE (`sqlstate`, five characters such as `22P02`) and severity
+(`severity`, such as `ERROR`) to the record, as headers, and status 1.
+Its message, detail, hint and context and the schema, table, column,
+type and constraint names are dropped: the server echoes bound values
+and rows in them (`invalid input syntax for type integer: "hunter2"`),
+and which statement an error answers is only as sure as the pairing. An
+error is reported under the message that failed: a failed `Parse` under
+its own SQL, a failed `Bind` or `Execute` under the statement it ran; a
+failed `Describe` or `Close`, or an error answering the `Sync` (at
+commit), with no statement. The statements the server then skips to the
 `Sync` are not reported, since they never ran.
 At most 4096 messages awaiting an answer are kept, holding at most 1 MiB
 of bound values (a `Bind` past that is exported without them); past
@@ -1025,28 +1033,32 @@ cannot become `ALTER ROLE ... PASSWORD`. The keyword test reads the text
 the agent sees, so dynamic SQL assembled at run time (`'DEALL' ||
 'OCATE s'`) is part of the same limit. A `Bind` of a
 statement whose SQL the agent does not know (prepared before capture, or
-forgotten) is still exported, as `EXECUTE` without SQL, bound values or
-error text (the error may quote a bound value). Several `Parse` messages may be sent before one `Sync`
+forgotten) is still exported, as `EXECUTE` without SQL or bound values. Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
 unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
-cancels an unanswered `Parse` of it. When server bytes are lost, or an
-answer matches no message awaiting one, the agent drops answers until a
-`ReadyForQuery` it can attribute: one read in the server's framing that
-arrives while exactly one group (up to a `Sync`, or a simple Query)
-awaits an answer. After lost bytes the next `ReadyForQuery` is found by
-its bytes, which may be row data: it re-establishes the framing and
-closes the oldest group, but never ends the doubt itself. Until then
-the groups are reported without bound values, error text or status, and
-the names their `Parse` messages defined are forgotten (they may or may
-not have been confirmed); statements confirmed before stay known. A
-`ReadyForQuery` that arrives while more groups wait cannot be
-attributed, so a client that sends its next query only after each answer
-keeps the connection in that state once a `ReadyForQuery` was lost. On a
-connection the agent joined mid-stream (or past 4096 messages awaiting
-an answer) answers to messages sent before capture may still come: no
-`Parse` is confirmed and no bound value or error text is exported on it,
-until a new connection is observed from its start.
+cancels an unanswered `Parse` of it. When an answer matches no message
+awaiting one (the server's framing intact), the agent drops answers
+until a `ReadyForQuery` it can attribute: one that arrives while exactly
+one group (up to a `Sync`, a simple Query or a FunctionCall) awaits an
+answer. With the framing intact every `ReadyForQuery` is real and
+answers one group the agent tracks, in order, so the groups it holds are
+never fewer than those really waiting. Until then the groups are
+reported without bound values or status, and the names their `Parse`
+messages defined are forgotten (they may or may not have been
+confirmed); statements confirmed before stay known. A `ReadyForQuery`
+that arrives while more groups wait cannot be attributed, so a client
+that sends its next query only after each answer can stay in that state.
+The connection's answers are untrusted for the rest of its life when
+server bytes are lost (the next `ReadyForQuery` is found by its bytes,
+which may be row data, and so may every message read after it), when
+the agent joined it mid-stream or did not see a side from its first
+byte (answers to messages sent before capture may still come; bytes
+that look like a startup message may be the inside of one), when the
+client sends a message the queue does not model, or past 4096 messages
+awaiting an answer: records go on, but no `Parse` is confirmed and no
+bound value is exported on it, until a new connection is observed from
+its start.
 
 #### Your own credential formats: `[credentials]`
 

@@ -204,10 +204,11 @@ pub fn export_statement(
     (verb, shown, bound, names_credential)
 }
 
-/// A server error message as a SQL parser exports it: withheld when its
+/// A MySQL server error message as exported: withheld when its
 /// statement names a credential (`error_withheld`, from
 /// [`export_statement`]), bare names included, or when it shows credential
-/// context itself.
+/// context itself. (PostgreSQL exports no error text at all, only the
+/// SQLSTATE and severity.)
 pub fn export_error_text(text: String, error_withheld: bool) -> String {
     if mask_credentials_enabled() && (error_withheld || has_credential_context(&text)) {
         let mut text = text;
