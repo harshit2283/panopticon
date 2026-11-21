@@ -100,87 +100,73 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   interface, whatever `capture_loopback` says.
 - **IPv6 is not captured.**
 - **HTTP/2 late join or loss withholds the stream.** On a connection the
-  agent did not see whole, or after a lost header block, headers are not
+  agent did not see whole (every HTTP/2 connection over TLS, below), or
+  after a lost header block, headers are not
   decoded and (with credential masking on) bodies of unknown type are not
   exported, for the connection's life.
 - **HTTP/2 content type over 256 bytes, or repeated.** With credential
   masking on, that stream's body is withheld.
-- **A TLS key starts latched unless proven to start at its connection's
-  first record.** A TLS record is keyed by the library's connection object
-  (OpenSSL `SSL*`, Go `*tls.Conn`) and carries no stream position, so a key
-  the agent first sees can be mid-connection (the agent started after it,
-  its entry was evicted, records were lost), and a Write there can begin
-  with bytes that look like a client preface. A new key's entry starts
-  clean only with proof from outside the bytes (protocol/fsm.rs
-  `TlsOrigin`); without it the entry is latched (HTTP/2: no headers decoded
-  for its life):
-  - OpenSSL: a `TlsNew` record (`SSL_new`'s return for that object),
-    emitted after the agent's last user-space drop, whose process loss
-    mark (`SSL_LOSS`, below) the key's first record still carries. A
-    reused `SSL*` the agent saw created starts clean.
-  - Go `crypto/tls` has no creation hook (`tls.Client` / `tls.Server` are
-    inlined). Each Go record carries its process's `PROC_EPOCH` stamp
-    (tls_probes.rs `emit_tls_event`, in `stream_off`), and a key starts
-    clean only if the agent saw that process image start
-    (`sched_process_exec` sets `GO_EPOCH_EXEC`) after the last completed
-    attach that put Go probes live (none during one; an attempt that
-    attached nothing leaves the floor as it was), no Go record of the process was
-    lost in the kernel (`GO_EPOCH_LOST`, below), nothing was dropped in
-    user space since the image started, the pipeline was installed before
-    it, and the key was never held by that instance before (a removed
-    key is remembered per instance: protocol/fsm.rs `GoTombs`). Then every
-    record of the instance reached the parser, so a key never held starts
-    at its connection's first record. **A reused Go key never starts clean
-    again**: Go reallocates a closed connection's `*tls.Conn` address, and
-    the new connection's records continue (or follow the removal of) the
-    old key's latched or live entry. Its HTTP/2 headers are withheld for
-    the rest of the process's life on that key; recall is lost, nothing
-    leaks (`run_tls.sh` `go-h2-reuse`). Any Go process image that started
-    before the agent or before its binary's probes attached, or found
-    `PROC_EPOCH` full at exec (8,192 entries), keeps every key latched.
-  - Loss marking: every Go probe path that skips or cannot emit a record
-    (capture off, process out of scope, ring full, scratch missing, a read
-    slot not saved or lost, a guard not recorded) sets `GO_EPOCH_LOST` on
-    the process (tls_probes.rs `go_lose`); every later record carries it
-    and all of the process's keys latch. A failed `GO_READ_CALLS` insert is
-    one such path. User space notes every drop before a parser
-    (event_loop.rs `EventStats::note_drop`) and latches the TLS entries
-    created before it, a malformed ring record included. OpenSSL
-    likewise: a process gets a loss mark at its first `TlsNew` (maps.rs
-    `SSL_LOSS`, a clock reading), and every OpenSSL read or write of it
-    that is not emitted (capture off, out of scope, ring full, scratch
-    missing, a call slot not saved or not its frame's, a length that
-    cannot be read) increments it (tls_probes.rs `ssl_lose`). Every
-    OpenSSL record and `TlsNew` carries the mark (`stream_off`); a key
-    starts clean only if its first record carries its `TlsNew`'s mark, and
-    latches at the first record carrying another (protocol/fsm.rs
-    `check_tls`). The mark only grows, and a re-created one (after the
-    leader thread's exit) starts at a later clock reading, so it never
-    returns to an earlier value. Without a mark (more than 65,536 marked
-    processes) a process's keys never start clean. The TCP reorder window
-    (reorder.rs) never holds a TLS record (it has no TCP sequence) and
-    drops nothing.
-  - `(*Conn).Write` is probed at its entry and every RET; the entry is
-    emitted once per call (Go's stack-growth prologue re-enters a
-    function: tls_probes.rs `go_tls_write_guarded`), all or nothing per
-    binary (otherwise the unguarded entry probe is used, whose records
-    carry no stamp and never start clean). Files are known by the `(dev,
-    ino)` the agent's own uprobes land on (proc_scanner.rs
-    `probe_file_id`), never a fresh stat of a workload path, and never
-    forgotten. A container's overlay root shows an image file under its
-    own device, while the uprobes sit on the real inode every container
-    of the image shares. That real inode is found by looking the path up
-    in the overlay's layers, as overlayfs would (overlay.rs
-    `lower_file_id`), and is used only when the file found is the one
-    examined: the same inode number on the layers' device, the same size
-    and mtime. It is used only when no whiteout, symlink, opaque or
-    redirected directory, or metacopy could make overlayfs resolve the
-    path otherwise. And it is used only for a mount namespace owned by
-    the initial user namespace. Any doubt keys the file by the `(dev,
-    ino)` examined, which can attach a shared inode twice but never
-    skips a file. This holds for OpenSSL libraries and Go binaries alike.
-    A binary without Write RETs or Go reads keeps every key latched; the
-    agent still starts and captures it.
+- **Every TLS key starts latched.** A TLS record is keyed by the library's
+  connection object (OpenSSL `SSL*`, Go `*tls.Conn`) and carries no stream
+  position, so nothing in it shows that it is its connection's first: a
+  key the agent first sees can be mid-connection (the agent started after
+  it, its entry was evicted, records were lost, the object's address was
+  reused), and a Write there can begin with bytes that look like a client
+  preface. Every new TLS entry therefore starts latched, OpenSSL and Go
+  alike, whatever came before it (protocol/fsm.rs `start_tls`). What the
+  latch withholds depends on the parser (its `joined_late`):
+  - HTTP/2 and gRPC: no header is decoded (no path, method, `:status`,
+    `grpc-status` or content type) and, with credential masking on, no
+    body of unknown type is exported, for the connection's life; records
+    keep timing, sizes and addresses.
+  - Redis: replies no longer pair with commands; each record keeps only
+    its error flag, timing and sizes (no command, key, arguments or reply
+    text).
+  - AMQP: both directions count as unsynced; methods, status, timing and
+    sizes stay, no text.
+  - HTTP/1.1, PostgreSQL, MySQL and Kafka: unchanged (their parsers
+    resynchronise on message boundaries and ignore the latch; PostgreSQL
+    marks a connection joined mid-stream untrusted by itself).
+
+  A `TlsNew` record (`SSL_new`'s return) still ends its key's connection,
+  so a new object at a reused address gets a new, latched entry. Proving
+  that a key starts at its connection's first record (and so decoding
+  HTTP/2 over TLS) is a separate design: each proof tried so far (a Go
+  handshake boundary, process stamps with loss marks, tombstones and
+  floors, an OpenSSL per-process loss mark) had a hole a reviewer could
+  show. Go records still carry their `PROC_EPOCH` stamp with
+  `GO_EPOCH_LOST` (tls_probes.rs `go_lose`); user space does not read it.
+- **Go `(*Conn).Write` probes.** `(*Conn).Write` is probed at its entry, at the first instruction of its
+  body (past the stack-check prologue: go_read.rs `body_start`, amd64
+  `JBE`, arm64 `B.LS`) and at every RET, all or nothing per binary
+  (otherwise the unguarded entry probe is used, which can emit a Write
+  twice). The entry is emitted once per call: Go's stack-growth prologue
+  (`morestack`) jumps back to the entry before the body runs, and an
+  entry is suppressed only when the goroutine's innermost recorded call
+  is on the same connection at the same frame depth and has not reached
+  its body (tls_probes.rs `guard_call`, `go_tls_write_body`). A recorded
+  call found past its body at the entry's depth ended without a RET (a
+  panic): the new Write is emitted and the instance marked lost. Files
+  are known by the `(dev, ino)` the agent's own uprobes land on
+  (proc_scanner.rs `probe_file_id`), never a fresh stat of a workload
+  path, and never forgotten. A container's overlay root shows an image
+  file under its own device, while the uprobes sit on the real inode
+  every container of the image shares. That real inode is found by
+  looking the path up in the overlay's layers, as overlayfs would
+  (overlay.rs `lower_file_id`), and is used only when the file found is
+  the one examined: the same inode number on the layers' device, the
+  same size and mtime. It is used only when no whiteout, symlink, opaque
+  or redirected directory, or metacopy could make overlayfs resolve the
+  path otherwise, and only for a mount namespace owned by the initial
+  user namespace. The probe is then attached through that layer file,
+  looked up again at attach time and checked to be the recorded inode
+  (proc_scanner.rs `open_probe_file`): a copy-up after the scan fails the
+  lookup and refuses the attach, and the next scan keys the file by the
+  `(dev, ino)` examined. Any doubt keys the file by the `(dev, ino)`
+  examined, which can attach a shared inode twice but never skips a
+  file. This holds for OpenSSL libraries and Go binaries alike. A Go
+  binary that attached no probe is retried after 2, 4, 8 and 16 scans,
+  then every 32 (proc_scanner.rs `GoRetry`).
   - Concurrent Writes on one connection are emitted at their entries,
     before `crypto/tls` takes the connection's write lock (`c.out`), so
     two that overlap may be emitted in an order other than the wire's.
