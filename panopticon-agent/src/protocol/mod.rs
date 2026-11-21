@@ -276,11 +276,20 @@ pub trait ProtocolParser: Send {
         None
     }
 
-    /// The parser did not see a direction of the stream from its first
-    /// byte (capture joined an open connection, TLS, or bytes were lost).
-    /// A parser that pairs replies with requests by order must stop
-    /// trusting that pairing.
+    /// Evidence that the parser did not see a direction of the stream from
+    /// its first byte: a TCP side whose first byte was never placed
+    /// (capture joined an open connection), or bytes lost that `skip`
+    /// could not place. A parser that pairs replies with requests by order
+    /// must stop trusting that pairing.
     fn joined_late(&mut self) {}
+
+    /// A TLS key was seen for the first time. A TLS record carries no
+    /// stream position, so nothing proves the key starts at its
+    /// connection's first record, but nothing shows it does not either
+    /// (unlike [`Self::joined_late`]). Parsers whose ruling is to latch
+    /// over TLS (HTTP/2, gRPC, Redis, AMQP, PostgreSQL) treat it as a late
+    /// join; the default does nothing (USER-GUIDE §5.3).
+    fn tls_unproven_start(&mut self) {}
 
     /// The parser holds a latch that withholds what it can no longer
     /// read with certainty (HTTP/2: header state lost). The connection

@@ -1173,6 +1173,12 @@ impl ProtocolParser for PostgresParser {
     fn joined_late(&mut self) {
         self.untrusted = true;
     }
+
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.joined_late();
+    }
     fn state_name(&self) -> &'static str {
         self.current_state()
     }

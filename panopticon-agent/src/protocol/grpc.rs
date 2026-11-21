@@ -88,6 +88,12 @@ impl ProtocolParser for GrpcParser {
         self.inner.joined_late();
     }
 
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.inner.tls_unproven_start();
+    }
+
     fn uncertain(&self) -> bool {
         self.inner.uncertain()
     }

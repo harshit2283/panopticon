@@ -448,6 +448,12 @@ impl ProtocolParser for RedisParser {
         self.lose_correspondence();
     }
 
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.joined_late();
+    }
+
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
         if self.silent {
             return ParseResult::NeedMoreData;

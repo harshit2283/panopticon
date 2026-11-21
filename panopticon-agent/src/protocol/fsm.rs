@@ -127,6 +127,9 @@ pub trait ProtocolFsm: Send {
     /// See [`ProtocolParser::joined_late`].
     fn joined_late(&mut self) {}
 
+    /// See [`ProtocolParser::tls_unproven_start`].
+    fn tls_unproven_start(&mut self) {}
+
     /// See [`ProtocolParser::uncertain`].
     fn uncertain(&self) -> bool {
         false
@@ -191,6 +194,10 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 
     fn joined_late(&mut self) {
         self.parser.joined_late();
+    }
+
+    fn tls_unproven_start(&mut self) {
+        self.parser.tls_unproven_start();
     }
 
     fn uncertain(&self) -> bool {
@@ -396,16 +403,21 @@ impl ConnectionFsmManager {
     }
 
     /// A TLS entry for `conn_id` was just created. Every TLS key starts
-    /// latched (`lost`, [`ProtocolFsm::joined_late`]), OpenSSL and Go
-    /// alike: a TLS record carries no stream position, so nothing in it
+    /// latched (`lost`, [`ProtocolFsm::tls_unproven_start`]), OpenSSL and
+    /// Go alike: a TLS record carries no stream position, so nothing in it
     /// shows that it is its connection's first, and a key first seen in
     /// the middle of a connection (the agent started after it, the entry
     /// was evicted, records were lost, a reused object address) can begin
     /// with bytes that look like a connection's start (an HTTP/2 client
     /// preface inside a DATA payload). Proving a clean start is a separate
     /// design (docs/adr/ADR-014-cgroup-skb-capture-scope.md).
+    /// What the latch withholds is each parser's ruling: it is not
+    /// evidence of a late join ([`ProtocolParser::tls_unproven_start`]).
     pub fn start_tls(&self, conn_id: u64) {
-        self.mark_joined_late(conn_id);
+        if let Some(mut entry) = self.connections.get_mut(&conn_id) {
+            entry.lost = true;
+            entry.fsm.tls_unproven_start();
+        }
     }
 
     pub fn get_or_create(&self, conn_id: u64, protocol: Protocol) -> CreateResult {

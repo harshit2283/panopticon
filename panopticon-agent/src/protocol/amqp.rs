@@ -877,6 +877,12 @@ impl ProtocolParser for AmqpParser {
         }
     }
 
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.joined_late();
+    }
+
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
         self.skip_accounted = false;
         let side = self.side(direction);

@@ -774,6 +774,12 @@ impl ProtocolParser for Http2Parser {
         self.server.headers_lost = true;
     }
 
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.joined_late();
+    }
+
     fn uncertain(&self) -> bool {
         self.client.headers_lost || self.server.headers_lost
     }
