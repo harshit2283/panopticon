@@ -28,6 +28,9 @@
 //! `unsynced` for the rest of its life: messages are still exported, with
 //! a known method and the sizes only (no path, header, content type, body,
 //! status or latency).
+//!
+//! **TLS.** A TLS key is not latched (its start is unproven, not shown
+//! missing), but its request paths hold no bare name ([`tls_path`]).
 
 use std::collections::VecDeque;
 
@@ -335,6 +338,10 @@ pub struct Http1Parser {
     /// gap itself. The connection manager follows every skip with
     /// [`ProtocolParser::joined_late`], which this flag lets through once.
     skip_accounted: bool,
+    /// A TLS key whose start is unproven
+    /// ([`ProtocolParser::tls_unproven_start`]): its request paths hold no
+    /// bare name ([`tls_path`]).
+    tls_unproven: bool,
 }
 
 impl Http1Parser {
@@ -350,6 +357,7 @@ impl Http1Parser {
             unsynced: false,
             opaque: false,
             skip_accounted: false,
+            tls_unproven: false,
         }
     }
 
@@ -739,7 +747,11 @@ impl Http1Parser {
                 msg.request_size_bytes = r.header_size + r.body.size;
                 msg.request_text = r.body.text();
                 msg.method = Some(r.method);
-                msg.path = Some(r.path);
+                msg.path = Some(if self.tls_unproven {
+                    tls_path(r.path)
+                } else {
+                    r.path
+                });
                 msg.headers = r.headers;
                 msg.headers.extend(resp.headers);
             }
@@ -929,6 +941,30 @@ impl ProtocolParser for Http1Parser {
         }
         self.lose_sync();
     }
+
+    /// The key may start inside a body, or a record may have been lost
+    /// (no trace on a TLS key), so a request line read on it can be body
+    /// bytes. Its path gets the strict credential rule ([`tls_path`]);
+    /// pairing is not latched (USER-GUIDE §5.3, integrity limit).
+    fn tls_unproven_start(&mut self) {
+        self.tls_unproven = true;
+    }
+}
+
+/// A request path read on a TLS key whose start is unproven: body bytes
+/// read as a request line would otherwise get the bare-name exemption a
+/// body never has (`/reset/x/token`). No bare name: a path part (before
+/// any `?` or `#`) with any credential word is withheld whole
+/// ([`FIELD_WITHHELD`](super::FIELD_WITHHELD)); otherwise the path goes to
+/// the usual rules (keyed query parameters masked).
+fn tls_path(mut path: String) -> String {
+    let part = &path[..path.find(['?', '#']).unwrap_or(path.len())];
+    if super::mask_credentials_enabled() && super::has_credential_context(part) {
+        super::count_builtin();
+        zeroize::Zeroize::zeroize(&mut path);
+        return super::FIELD_WITHHELD.to_string();
+    }
+    path
 }
 
 fn opposite(d: Direction) -> Direction {
@@ -1950,8 +1986,9 @@ mod tests {
 
 /// The TLS ruling (USER-GUIDE §5.3): what an HTTP/1 TLS key exports when
 /// its start is unproven ([`ProtocolParser::tls_unproven_start`]) and a
-/// record is lost (a ring drop leaves no trace on a TLS key). Each test
-/// asserts the safe outcome: it passes only if HTTP/1 latches over TLS.
+/// record is lost (a ring drop leaves no trace on a TLS key): a path with
+/// a credential word is withheld (no bare name), and a lost record
+/// misattributes a response, the documented integrity limit.
 #[cfg(test)]
 mod tls_ruling {
     use super::*;
@@ -1980,12 +2017,12 @@ mod tls_ruling {
 
     /// The key's first record starts inside a request body, at a forged
     /// request; the server's answer to the real (unseen) request then
-    /// arrives. Without a latch the forged path is exported as a path (a
-    /// letters-only segment before `token` is a bare-name position there,
-    /// not in a body), and the real response's body is exported under it.
+    /// arrives. The forged path would get the bare-name exemption a body
+    /// never has (`token` last): it is withheld whole. The real response
+    /// is exported under the forged request (integrity limit): its body is
+    /// masked as a body is in any case.
     #[test]
-    #[ignore = "TLS ruling pending: HTTP/1 does not latch over TLS"]
-    fn tls_key_starting_mid_body_exports_no_forged_request() {
+    fn tls_key_starting_mid_body_withholds_the_forged_path() {
         let m = ConnectionFsmManager::new(4);
         tls_key(&m, 1);
         let mut out = feed(
@@ -2001,15 +2038,55 @@ mod tls_ruling {
             b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nreal-response",
         ));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, None, "forged path exported: {:?}", out[0]);
-        assert_eq!(out[0].payload_text, None, "body under a forged request");
+        assert_eq!(
+            out[0].path.as_deref(),
+            Some(crate::protocol::FIELD_WITHHELD)
+        );
+        assert_eq!(out[0].payload_text.as_deref(), Some("real-response"));
+    }
+
+    /// Paths over such a key: any credential word withholds the path part
+    /// whole; a path with none, or with one only in a keyed query value,
+    /// goes to the usual rules.
+    #[test]
+    fn tls_path_holds_no_bare_name() {
+        let w = Some(crate::protocol::FIELD_WITHHELD);
+        for (path, want) in [
+            ("/oauth/token", w),
+            ("/api/password-reset/start", w),
+            ("/oauth/token?grant=x", w),
+            ("/users/42", Some("/users/42")),
+            ("/login?password=x", Some("/login?password=x")),
+        ] {
+            let m = ConnectionFsmManager::new(4);
+            tls_key(&m, 3);
+            let req = format!("GET {path} HTTP/1.1\r\nHost: a\r\n\r\n");
+            feed(&m, 3, true, req.as_bytes());
+            let out = feed(&m, 3, false, b"HTTP/1.1 204 No Content\r\n\r\n");
+            assert_eq!(out.len(), 1, "{path}");
+            assert_eq!(out[0].path.as_deref(), want, "{path}");
+        }
+        // A plaintext key keeps the bare name.
+        let mut p = Http1Parser::new();
+        p.feed(
+            b"GET /oauth/token HTTP/1.1\r\nHost: a\r\n\r\n",
+            Direction::Egress,
+            1,
+        );
+        match p.feed(b"HTTP/1.1 204 No Content\r\n\r\n", Direction::Ingress, 2) {
+            ParseResult::Messages(v) => assert_eq!(v[0].path.as_deref(), Some("/oauth/token")),
+            r => panic!("{r:?}"),
+        }
     }
 
     /// A lost record (here a whole response) on a key the parser read from
     /// its start: every later response answers the request before its own.
+    /// This pins the documented integrity limit: `/two`'s answer is
+    /// exported under `/one`, and moves no value under a weaker rule (a
+    /// path and a response body are protected by the same rules wherever
+    /// they are paired).
     #[test]
-    #[ignore = "TLS ruling pending: HTTP/1 does not latch over TLS"]
-    fn tls_lost_response_record_shifts_no_pair() {
+    fn tls_lost_response_record_misattributes_documented_limit() {
         let m = ConnectionFsmManager::new(4);
         tls_key(&m, 2);
         let mut out = feed(&m, 2, true, b"GET /one HTTP/1.1\r\nHost: a\r\n\r\n");
@@ -2021,11 +2098,10 @@ mod tls_ruling {
             false,
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\ntwo",
         ));
-        for msg in &out {
-            assert!(
-                !(msg.path.as_deref() == Some("/one") && msg.status == Some(404)),
-                "/two's answer exported under /one: {msg:?}"
-            );
-        }
+        let got: Vec<_> = out
+            .iter()
+            .map(|m| (m.path.as_deref(), m.status, m.payload_text.as_deref()))
+            .collect();
+        assert_eq!(got, vec![(Some("/one"), Some(404), Some("two"))]);
     }
 }

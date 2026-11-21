@@ -192,20 +192,36 @@ fn is_flexible(api_key: i16, api_version: i16) -> bool {
 
 // ── Topic IDs ────────────────────────────────────────────────────────────
 
+type TopicNames = Arc<Mutex<HashMap<[u8; 16], String>>>;
+
 /// Topic ID -> name, learned from Metadata responses. Topic IDs are
 /// cluster-wide UUIDs, so names learned on one connection resolve Fetch
 /// (v13+) traffic on any other. The map is captured-derived: one per
 /// capture pipeline, shared by that pipeline's parsers and dropped with it
 /// (DESIGN §3), never process-global.
 #[derive(Clone, Default)]
-pub struct KafkaTopics(Arc<Mutex<HashMap<[u8; 16], String>>>);
+pub struct KafkaTopics {
+    names: TopicNames,
+    /// A map read after `names` and never written: the pipeline's, behind
+    /// a connection-local map ([`Self::local_over`]).
+    shared: Option<TopicNames>,
+}
 
 impl KafkaTopics {
+    /// A connection-local map that resolves through this one too but never
+    /// writes to it.
+    fn local_over(&self) -> Self {
+        Self {
+            names: Default::default(),
+            shared: Some(self.names.clone()),
+        }
+    }
+
     fn remember(&self, id: [u8; 16], name: &str) {
         if id == [0; 16] || name.is_empty() {
             return;
         }
-        if let Ok(mut names) = self.0.lock() {
+        if let Ok(mut names) = self.names.lock() {
             if names.len() >= MAX_TOPIC_IDS && !names.contains_key(&id) {
                 names.clear();
             }
@@ -215,8 +231,10 @@ impl KafkaTopics {
 
     /// Name for a topic ID, or its hex form if no Metadata response named it.
     fn name_for(&self, id: &[u8; 16]) -> String {
-        if let Some(name) = self.0.lock().ok().and_then(|n| n.get(id).cloned()) {
-            return name;
+        for map in std::iter::once(&self.names).chain(&self.shared) {
+            if let Some(name) = map.lock().ok().and_then(|n| n.get(id).cloned()) {
+                return name;
+            }
         }
         id.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -772,6 +790,10 @@ pub struct KafkaParser {
     /// gap itself. The connection manager follows every skip with
     /// [`ProtocolParser::joined_late`], which this flag lets through once.
     skip_accounted: bool,
+    /// A TLS key whose start is unproven
+    /// ([`ProtocolParser::tls_unproven_start`]): Metadata responses read on
+    /// it name topic IDs in this connection-local map only.
+    tls_local: Option<KafkaTopics>,
 }
 
 /// Frame complete in the buffer, or a prefix of it.
@@ -797,15 +819,20 @@ impl KafkaParser {
             topics,
             unsynced: false,
             skip_accounted: false,
+            tls_local: None,
         }
     }
 
     /// The topic ID map a body decoded now may write to: the pipeline's,
-    /// or a throwaway once frames are unproven (a forged Metadata response
-    /// must not name topics on other connections).
+    /// a throwaway once frames are unproven, or on a TLS key whose start is
+    /// unproven a connection-local one read through to the pipeline's (a
+    /// forged Metadata response must not name topics on other
+    /// connections).
     fn ids(&self) -> KafkaTopics {
         if self.unsynced {
             KafkaTopics::default()
+        } else if let Some(local) = &self.tls_local {
+            local.clone()
         } else {
             self.topics.clone()
         }
@@ -1141,6 +1168,19 @@ impl ProtocolParser for KafkaParser {
             return;
         }
         self.unsynced = true;
+    }
+
+    /// The key may start inside a record, or a record may have been lost
+    /// (no trace on a TLS key), so a frame read on it can be a forged one.
+    /// Pairing is by correlation ID and record text is masked as record
+    /// bytes would be, so only the topic ID map is guarded: Metadata
+    /// responses on the key write a connection-local map
+    /// ([`KafkaTopics::local_over`]), never the pipeline's (USER-GUIDE
+    /// §5.3, integrity limit).
+    fn tls_unproven_start(&mut self) {
+        if self.tls_local.is_none() {
+            self.tls_local = Some(self.topics.local_over());
+        }
     }
 }
 
@@ -1849,8 +1889,9 @@ pub(crate) mod tests {
     //
     // What a Kafka TLS key exports when its start is unproven
     // (`tls_unproven_start`) and a record is lost (a ring drop leaves no
-    // trace on a TLS key). The ignored tests assert the safe outcome: they
-    // pass only if Kafka latches over TLS.
+    // trace on a TLS key): pairs hold (correlation IDs), topic IDs named
+    // on the key stay on it, and a forged response attaches to the request
+    // it names, the documented integrity limit.
 
     const TLS_CLIENT: (u32, u16) = (0, 1);
     const TLS_SERVER: (u32, u16) = (0, 2);
@@ -1898,34 +1939,50 @@ pub(crate) mod tests {
     }
 
     /// The key's server side starts inside a fetched record whose value is
-    /// a forged response to the Fetch in flight: its "records" are
-    /// exported under the real request.
+    /// a forged response to the Fetch in flight. This pins the documented
+    /// integrity limit: its "records" are exported under the real request,
+    /// as record text, which the same rules protect as the record bytes
+    /// they were (no value moves under a weaker rule).
     #[test]
-    #[ignore = "TLS ruling pending: Kafka does not latch over TLS"]
-    fn tls_forged_response_attaches_to_no_request() {
+    fn tls_forged_response_attaches_to_the_fetch_documented_limit() {
         let m = tls_manager(KafkaTopics::default());
         tls_feed(&m, true, &fetch_v16_request(7));
-        let forged = fetch_v16_response(7, [3; 16], &record_batch(&[("k", "S3CRET-forged")]));
+        let forged = fetch_v16_response(7, [3; 16], &record_batch(&[("k", "forged-value")]));
         let out = tls_feed(&m, false, &forged);
-        for msg in &out {
-            assert!(
-                !format!("{:?}", msg.payload_text).contains("S3CRET"),
-                "forged records under the real Fetch: {msg:?}"
-            );
-        }
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].method.as_deref(), Some("Fetch"));
+        assert!(
+            out[0]
+                .payload_text
+                .as_deref()
+                .is_some_and(|t| t.contains("forged-value")),
+            "{out:?}"
+        );
     }
 
-    /// A forged Metadata response on such a key names a topic ID for every
-    /// connection of the pipeline.
+    /// A forged Metadata response on such a key names no topic ID for the
+    /// pipeline: the name stays in the connection's own map, which still
+    /// reads the pipeline's names.
     #[test]
-    #[ignore = "TLS ruling pending: Kafka does not latch over TLS"]
     fn tls_forged_metadata_names_no_topic_id() {
-        let id = [5u8; 16];
+        let (id, known) = ([5u8; 16], [6u8; 16]);
         let topics = KafkaTopics::default();
+        topics.remember(known, "payments.settled");
         let m = tls_manager(topics.clone());
         let [req, resp] = metadata_v12_exchange(9, "forged.name", id);
         tls_feed(&m, true, &req);
         tls_feed(&m, false, &resp);
         assert_eq!(topics.name_for(&id), "05".repeat(16));
+        // Fetches on the key resolve both names.
+        for (cid, topic, name) in [(10, id, "forged.name"), (11, known, "payments.settled")] {
+            tls_feed(&m, true, &fetch_v16_request(cid));
+            let out = tls_feed(
+                &m,
+                false,
+                &fetch_v16_response(cid, topic, &record_batch(&[("k", "v")])),
+            );
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].path.as_deref(), Some(name));
+        }
     }
 }

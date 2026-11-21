@@ -8,7 +8,8 @@
 //! Covers the text protocol (COM_QUERY, including MySQL 8 query attributes)
 //! and prepared statements (COM_STMT_PREPARE / EXECUTE, the binary protocol
 //! Go, JDBC and most ORMs use): statements are remembered by id so each
-//! EXECUTE is reported with its SQL and its bound parameter values.
+//! EXECUTE is reported with its SQL and its bound parameter values (no
+//! bound value on a TLS key: [`ProtocolParser::tls_unproven_start`]).
 //!
 //! **Pairing.** MySQL answers commands in order, so a reply is paired
 //! with the command in flight. Commands are read only from an allowlist
@@ -194,6 +195,9 @@ pub struct MysqlParser {
     /// gap itself. The connection manager follows every skip with
     /// [`ProtocolParser::joined_late`], which this flag lets through once.
     skip_accounted: bool,
+    /// A TLS key whose start is unproven
+    /// ([`ProtocolParser::tls_unproven_start`]): no bound value is exported.
+    tls_unproven: bool,
 }
 
 impl MysqlParser {
@@ -219,6 +223,7 @@ impl MysqlParser {
             pipelined: false,
             untrusted: false,
             skip_accounted: false,
+            tls_unproven: false,
         }
     }
 
@@ -854,7 +859,12 @@ impl MysqlParser {
     fn build_msg(&mut self, ts: u64) -> L7Message {
         let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
-        let bound = self.param_text.take();
+        let mut bound = self.param_text.take();
+        if self.tls_unproven
+            && let Some(mut b) = bound.take()
+        {
+            zeroize::Zeroize::zeroize(&mut b);
+        }
         match self.query_text.take() {
             Some(q) => {
                 let (verb, shown, bound) = super::export_statement(q, bound);
@@ -1142,6 +1152,16 @@ impl ProtocolParser for MysqlParser {
             return;
         }
         self.untrusted = true;
+    }
+
+    /// The key may start inside a statement, or a record may have been
+    /// lost (no trace on a TLS key), so a COM_STMT_EXECUTE read on it can
+    /// be the bytes of another statement's value, bound under a statement
+    /// the key really prepared. No bound value is exported on it (as for
+    /// PostgreSQL over TLS); statement text and keyword stay, and pairing
+    /// is not latched (USER-GUIDE §5.3, integrity limit).
+    fn tls_unproven_start(&mut self) {
+        self.tls_unproven = true;
     }
 }
 
@@ -2367,8 +2387,9 @@ mod tests {
 
 /// The TLS ruling (USER-GUIDE §5.3): what a MySQL TLS key exports when its
 /// start is unproven ([`ProtocolParser::tls_unproven_start`]) and a record
-/// is lost (a ring drop leaves no trace on a TLS key). Each test asserts
-/// the safe outcome: it passes only if MySQL latches over TLS.
+/// is lost (a ring drop leaves no trace on a TLS key): no bound value is
+/// exported, and a lost record misattributes a reply, the documented
+/// integrity limit.
 #[cfg(test)]
 mod tls_ruling {
     use super::*;
@@ -2413,31 +2434,32 @@ mod tls_ruling {
     }
 
     /// A lost reply record: the next command's reply answers the command
-    /// before it, for the rest of the connection.
+    /// before it, for the rest of the connection. This pins the documented
+    /// integrity limit: the SELECT's error code is exported under the
+    /// UPDATE, and it carries no value (error text is never exported, and
+    /// no bound value is on a TLS key).
     #[test]
-    #[ignore = "TLS ruling pending: MySQL does not latch over TLS"]
-    fn tls_lost_reply_record_shifts_no_pair() {
+    fn tls_lost_reply_record_misattributes_documented_limit() {
         let m = ConnectionFsmManager::new(4);
         tls_key(&m, 1);
         let mut out = feed(&m, 1, true, &pkt(0, b"\x03UPDATE t SET a = 1"));
         // Its OK is lost.
         out.extend(feed(&m, 1, true, &pkt(0, b"\x03SELECT * FROM missing")));
         out.extend(feed(&m, 1, false, &pkt(1, b"\xff\x7a\x04#42S02x")));
-        for msg in &out {
-            assert!(
-                !(msg.method.as_deref() == Some("UPDATE") && msg.status == Some(1146)),
-                "SELECT's error exported under the UPDATE: {msg:?}"
-            );
-        }
+        let got: Vec<_> = out
+            .iter()
+            .map(|m| (m.method.as_deref(), m.status, m.request_text.as_deref()))
+            .collect();
+        assert_eq!(got, vec![(Some("UPDATE"), Some(1146), None)]);
     }
 
     /// A statement prepared on the key; then a record is lost and the next
     /// one starts inside an INSERT whose value holds a forged
     /// COM_STMT_EXECUTE of that statement id. The INSERT names a
     /// credential, so its text would be withheld; the forged EXECUTE's
-    /// "bound value" must not be exported under the prepared SQL.
+    /// "bound value" must not be exported under the prepared SQL: no
+    /// bound value is exported on the key. The statement text stays.
     #[test]
-    #[ignore = "TLS ruling pending: MySQL does not latch over TLS"]
     fn tls_forged_execute_exports_no_bound_value() {
         let m = ConnectionFsmManager::new(4);
         tls_key(&m, 2);
@@ -2474,11 +2496,61 @@ mod tls_ruling {
         let mut out = feed(&m, 2, true, &pkt(0, &exec));
         out.extend(feed(&m, 2, false, &pkt(1, OK)));
         assert_eq!(out.len(), 1, "{out:?}");
-        for msg in &out {
-            assert!(
-                !format!("{:?}", msg.request_text).contains("S3CRET"),
-                "body bytes exported as a bound value: {msg:?}"
-            );
-        }
+        assert!(!format!("{out:?}").contains("S3CRET"), "{out:?}");
+        assert_eq!(out[0].request_text, None);
+        assert_eq!(
+            out[0].payload_text.as_deref(),
+            Some("UPDATE notes SET body = ? WHERE id = 1")
+        );
+        assert_eq!(out[0].method.as_deref(), Some("UPDATE"));
+    }
+
+    /// A real EXECUTE on such a key: its SQL and keyword are exported, its
+    /// bound values never.
+    #[test]
+    fn tls_execute_keeps_statement_text_drops_bound_values() {
+        let m = ConnectionFsmManager::new(4);
+        tls_key(&m, 4);
+        let mut prep = vec![COM_STMT_PREPARE];
+        prep.extend_from_slice(b"SELECT name FROM notes WHERE id = ?");
+        feed(&m, 4, true, &pkt(0, &prep));
+        let mut ok = vec![0x00];
+        ok.extend(1u32.to_le_bytes());
+        ok.extend(0u16.to_le_bytes());
+        ok.extend(1u16.to_le_bytes());
+        ok.extend([0, 0, 0]);
+        feed(&m, 4, false, &pkt(1, &ok));
+        feed(&m, 4, false, &pkt(2, b"param-def"));
+        let exec = [
+            COM_STMT_EXECUTE,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0x00,
+            0x01,
+            0x0f,
+            0x00,
+            5,
+            b'n',
+            b'o',
+            b't',
+            b'e',
+            b'1',
+        ];
+        let mut out = feed(&m, 4, true, &pkt(0, &exec));
+        out.extend(feed(&m, 4, false, &pkt(1, OK)));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].method.as_deref(), Some("SELECT"));
+        assert_eq!(
+            out[0].payload_text.as_deref(),
+            Some("SELECT name FROM notes WHERE id = ?")
+        );
+        assert_eq!(out[0].request_text, None);
     }
 }

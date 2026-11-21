@@ -285,11 +285,16 @@ production-hardened compliance platform.
     starts latched, so HTTP/2 and gRPC over TLS export no headers. The
     same latch costs Redis over TLS its command and reply text, AMQP
     over TLS its text and PostgreSQL over TLS its bound values;
-    HTTP/1.1, MySQL and Kafka over TLS are not latched, with an integrity
-    limit: a TLS key first seen mid-connection or a lost TLS record can
-    misattribute HTTP/1.1 and MySQL replies and let bytes from inside a
-    message be read as one (USER-GUIDE §5.3). Proving a TLS connection's start is a separate
-    design. While credential masking is on, the bodies of such an HTTP/2
+    HTTP/1.1, MySQL and Kafka over TLS are not latched (HTTPS paths and
+    MySQL 8 stay readable) but follow TLS rules: an HTTP/1.1 path with
+    any credential word is withheld (no bare name), MySQL exports no
+    bound value, and Kafka Metadata names topic IDs on its own
+    connection only. Integrity limit: a TLS key first seen
+    mid-connection or a lost TLS record can misattribute HTTP/1.1 and
+    MySQL replies and let bytes from inside a message be read as one,
+    without moving a value under a weaker rule (USER-GUIDE §5.3).
+    Detecting a lost record per TLS key, like proving a TLS connection's
+    start, is a separate design. While credential masking is on, the bodies of such an HTTP/2
     connection are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
@@ -313,7 +318,11 @@ production-hardened compliance platform.
     reused pending correlation ID or `SaslHandshake` v0 leaves only the
     API name, version and sizes. DNS pairs by ID and name; a late parser
     reads only whole datagrams, and a DNS-over-TCP connection joined
-    mid-stream exports no name, record, status or answer. gRPC/HTTP/2
+    mid-stream exports no name, record, status or answer. After an
+    agent restart, connections open before it (keep-alive clients,
+    pools, producers) export method or keyword only (PostgreSQL:
+    `EXECUTE` without SQL) until they reconnect; verified on Linux for
+    HTTP/1.1, MySQL, PostgreSQL and Kafka. gRPC/HTTP/2
     pair by stream ID.
 - PII detection:
   - Regex-first scanning is the stable baseline: 16 validated patterns
@@ -339,7 +348,8 @@ production-hardened compliance platform.
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on
     (exported without bound values). No other field has a
-    bare name; anything outside the allowlist is withheld as before.
+    bare name, nor does an HTTP/1.1 path over TLS; anything outside the
+    allowlist is withheld as before.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`). A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.

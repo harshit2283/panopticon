@@ -285,9 +285,11 @@ pub trait ProtocolParser: Send {
     /// A TLS key was seen for the first time. A TLS record carries no
     /// stream position, so nothing proves the key starts at its
     /// connection's first record, but nothing shows it does not either
-    /// (unlike [`Self::joined_late`]). Parsers whose ruling is to latch
-    /// over TLS (HTTP/2, gRPC, Redis, AMQP, PostgreSQL) treat it as a late
-    /// join; the default does nothing (USER-GUIDE §5.3).
+    /// (unlike [`Self::joined_late`]). Each parser applies its TLS ruling
+    /// (USER-GUIDE §5.3): HTTP/2, gRPC, Redis, AMQP and PostgreSQL latch
+    /// as for a late join; HTTP/1 withholds any request path with a
+    /// credential word, MySQL exports no bound value and Kafka names topic
+    /// IDs in a connection-local map only. The default does nothing.
     fn tls_unproven_start(&mut self) {}
 
     /// The parser holds a latch that withholds what it can no longer

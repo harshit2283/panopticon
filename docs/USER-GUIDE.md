@@ -391,7 +391,8 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 | IPv6 | Not captured. |
 | HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
 | HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
-| Any TLS connection (OpenSSL or Go) | Starts latched: HTTP/2 and gRPC export no headers and, with credential masking on, no bodies of unknown type; Redis replies keep status, timing and sizes only; AMQP keeps methods, status, timing and sizes; PostgreSQL exports no bound values. HTTP/1.1, MySQL and Kafka are not latched, with an integrity limit over TLS (§5.3). |
+| Any TLS connection (OpenSSL or Go) | Starts latched: HTTP/2 and gRPC export no headers and, with credential masking on, no bodies of unknown type; Redis replies keep status, timing and sizes only; AMQP keeps methods, status, timing and sizes; PostgreSQL exports no bound values. HTTP/1.1, MySQL and Kafka are not latched but follow TLS rules: an HTTP/1.1 path with a credential word is withheld, MySQL exports no bound values, Kafka topic IDs stay on their connection; with an integrity limit (§5.3). |
+| Connections open before the agent started (an agent restart) | Export method or keyword only (PostgreSQL: `EXECUTE` without SQL) until the client reconnects (§5.3); with any scope setting they are not captured at all (`uninit`, above). |
 | PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
 | Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
@@ -656,7 +657,8 @@ check. Anything outside the allowlist is context (when in doubt, the
 field is withheld). No other field has a bare name: a Redis argument,
 a Kafka topic, an AMQP field, a DNS name, a gRPC path, a header,
 a body or an error message that reads `/oauth/token` or
-`SELECT password FROM users` is withheld.
+`SELECT password FROM users` is withheld. Nor does an HTTP/1.1 path read
+over TLS (below: its bytes may lie inside a body).
 
 - **the last segment of an HTTP request path** (HTTP/1, HTTP/2), read
   on the path part as captured (the text before the first `?` or `#`):
@@ -802,33 +804,46 @@ What is exported then:
   A latched TLS connection also costs Redis its commands (each reply is
   exported with its error flag, timing and sizes only) and AMQP its text
   (methods, status, timing and sizes stay), and PostgreSQL its bound
-  values. HTTP/1.1, MySQL and Kafka over TLS are not latched (the
-  integrity limit below). Decoding HTTP/2 over TLS needs a proof that a
-  connection starts at its first record, which is planned separately.
-- **Integrity limit: HTTP/1.1, MySQL and Kafka over TLS.** These parsers
-  read a TLS key as if it started at its connection's first record, and
-  a TLS record lost to a ring drop leaves no trace on its key. So a key
-  first seen in the middle of a connection, or one that lost a record,
-  can be read out of step, and nothing withholds its text:
+  values. HTTP/1.1, MySQL and Kafka over TLS are not latched, so HTTPS
+  paths and MySQL 8 (TLS by default) stay readable. Since bytes read on
+  a TLS key may lie inside a body, a statement or a record, each follows
+  a TLS rule that keeps such bytes from being exported under a weaker
+  rule than their own:
+  - HTTP/1.1: while credential masking is on, a request path holds no
+    bare name. A path whose path part (before any `?` or `#`) has any
+    credential word, `/oauth/token` included, is withheld whole
+    (`<field withheld>`); any other path goes to the usual rules (keyed
+    query values masked);
+  - MySQL: no bound value of a `COM_STMT_EXECUTE` is exported, as for
+    PostgreSQL over TLS; the statement text and keyword stay;
+  - Kafka: a Metadata response names topic IDs on its own connection
+    only, never for the pipeline's other connections (names learned on
+    other connections still resolve on it).
+  Decoding HTTP/2 over TLS needs a proof that a connection starts at its
+  first record, which is planned separately.
+- **Integrity limit: pairing of HTTP/1.1, MySQL and Kafka over TLS.**
+  These parsers read a TLS key as if it started at its connection's
+  first record, and a TLS record lost to a ring drop leaves no trace on
+  its key. So a key first seen in the middle of a connection, or one
+  that lost a record, can be read out of step, and a record can be
+  exported under the wrong request:
   - HTTP/1.1: a lost response pairs every later response with the
     request before its own (status, body and timing under the wrong
     path), and a key that starts inside a body at bytes that read as a
-    request exports them as a request, path included (a path has the
-    bare-name position, which a body does not) and with the next real
-    response attached;
+    request exports them as a request (its path under the TLS rule
+    above) with the next real response attached;
   - MySQL: a lost reply pairs every later reply with the command before
-    its own (status and SQLSTATE under the wrong statement), and bytes
-    read as a COM_STMT_EXECUTE of a statement prepared on the key export
-    their "values" as that statement's bound values, even when the
-    statement they came from would have been withheld;
+    its own (error code and SQLSTATE under the wrong statement);
   - Kafka: responses pair by correlation ID, so a lost record shifts
     nothing; but a response read from inside a record that matches a
-    request in flight exports its records under that request, and a
-    Metadata response read that way names topic IDs for every
-    connection of the pipeline.
-  A TCP connection is not affected: a connection whose start or bytes
-  the agent missed is detected and withheld as described for each
-  protocol below.
+    request in flight exports its records under that request.
+  A misattributed record moves no value under a weaker rule: a path, a
+  body and a record are protected by the same rules wherever they are
+  paired, error text is never exported, and no bound value is exported
+  over TLS. Detecting a lost record per TLS key is planned, with the
+  HTTP/2 over TLS work. A TCP connection is not affected: a connection
+  whose start or bytes the agent missed is detected and withheld as
+  described for each protocol below.
 
   Concurrent `Write`s on one Go connection are captured at their start,
   before `crypto/tls` serialises them, so two that overlap may be
@@ -861,7 +876,8 @@ What is exported then:
   `/oauth/token` and a SQL statement `SELECT password, email FROM users`
   (without bound values). The query or fragment after a
   bare path is dropped: `/oauth/token?client_secret=x` exports
-  `/oauth/token?<query withheld>`.
+  `/oauth/token?<query withheld>`. Over TLS an HTTP/1.1 path has no bare
+  name (the TLS rules below): `/oauth/token` is withheld.
 
 The price is more withheld text than a value-level mask would leave:
 a `SELECT` that compares a `password` column, names a credential word
@@ -1126,6 +1142,15 @@ is exported from it.
 
 **gRPC and HTTP/2** responses are paired by stream ID, so a call answered
 out of order, reset, or never answered moves no other call.
+
+**After an agent restart**, a TCP connection that was open before the
+agent started (a keep-alive client, a connection pool, a Kafka
+producer) is joined mid-stream: it exports method or keyword only
+(HTTP/1.1, MySQL and Kafka; PostgreSQL its `EXECUTE`s without SQL, and
+the other protocols as described above for a connection joined
+mid-stream) until the client reconnects. Connections opened after the
+agent started are decoded in full. (With any scope setting, such
+connections are not captured at all: `uninit`, §4.2.)
 
 #### Your own credential formats: `[credentials]`
 
@@ -1414,7 +1439,7 @@ real cluster.
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
 | `Failed to attach kprobe` | A TLS address hook is unavailable on this kernel/VM; TLS events carry no addresses. Packet capture is not affected. |
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, binaries with a symbol table; others are logged at debug level as `Go binary not probed`). Other statically linked TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) and Go binaries built with `-ldflags=-s` appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
-| HTTP/2 or gRPC over TLS shows no path, status or headers | Expected: every TLS connection starts latched, so HTTP/2 and gRPC over TLS export timing, sizes and addresses only (Redis and AMQP over TLS lose their text too, and PostgreSQL its bound values; [§5.3](#53-what-gets-redacted)). HTTP/1.1, MySQL and Kafka over TLS are decoded in full, with an integrity limit (§5.3). |
+| HTTP/2 or gRPC over TLS shows no path, status or headers | Expected: every TLS connection starts latched, so HTTP/2 and gRPC over TLS export timing, sizes and addresses only (Redis and AMQP over TLS lose their text too, and PostgreSQL its bound values; [§5.3](#53-what-gets-redacted)). HTTP/1.1, MySQL and Kafka over TLS are decoded, with TLS rules (an HTTP/1.1 path with a credential word withheld, no MySQL bound values) and an integrity limit (§5.3). |
 | Each exchange appears twice | Both ends of the connection run on this node: each end's socket is captured (two views). The two records are alike in the JSON export: without NAT between the ends they carry the same addresses, ports and direction, and differ only in timestamp and latency (by microseconds). Select one side with `pid_filter` or `cgroup_filter`. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
 | `Kubernetes API unavailable` warning, no `src_workload` | `hint` in the log line names the cause: 403 = the ClusterRole lacks `get/list/watch` on pods/services (`rbac.create=true`), 401 = token not mounted or rejected. Endpoints keep IP names meanwhile (§5.6). |

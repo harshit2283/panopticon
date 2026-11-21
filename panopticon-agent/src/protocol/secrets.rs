@@ -37,7 +37,9 @@
 //! passed in by the caller, never inferred from the text), and none
 //! applies on a view from which a NUL was dropped or to a word with a
 //! digit:
-//! - in an HTTP/1 or HTTP/2 request path: the last segment of the path
+//! - in an HTTP/1 or HTTP/2 request path (not an HTTP/1 path read on a
+//!   TLS key whose start is unproven, which the parser checks with no
+//!   bare name: `http1::tls_path`): the last segment of the path
 //!   part (the raw text before any `?` or `#`), when every segment is a
 //!   plain name (`A`-`Z`, `a`-`z`, `_`, `-`, `.`: no `%`, `+`, space or
 //!   other byte) and the word ends in a whole credential part
