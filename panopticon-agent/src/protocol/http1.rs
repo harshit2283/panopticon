@@ -1947,3 +1947,85 @@ mod tests {
         );
     }
 }
+
+/// The TLS ruling (USER-GUIDE §5.3): what an HTTP/1 TLS key exports when
+/// its start is unproven ([`ProtocolParser::tls_unproven_start`]) and a
+/// record is lost (a ring drop leaves no trace on a TLS key). Each test
+/// asserts the safe outcome: it passes only if HTTP/1 latches over TLS.
+#[cfg(test)]
+mod tls_ruling {
+    use super::*;
+    use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+
+    const CLIENT: (u32, u16) = (0, 1);
+    const SERVER: (u32, u16) = (0, 2);
+
+    fn tls_key(m: &ConnectionFsmManager, id: u64) {
+        m.get_or_create_with_server(id, Protocol::Http1, Some(SERVER));
+        m.start_tls(id);
+    }
+
+    fn feed(m: &ConnectionFsmManager, id: u64, from_client: bool, d: &[u8]) -> Vec<L7Message> {
+        let (src, dir) = if from_client {
+            (CLIENT, Direction::Egress)
+        } else {
+            (SERVER, Direction::Ingress)
+        };
+        match m.process_packet_from(id, src, dir, d, 1) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    /// The key's first record starts inside a request body, at a forged
+    /// request; the server's answer to the real (unseen) request then
+    /// arrives. Without a latch the forged path is exported as a path (a
+    /// letters-only segment before `token` is a bare-name position there,
+    /// not in a body), and the real response's body is exported under it.
+    #[test]
+    #[ignore = "TLS ruling pending: HTTP/1 does not latch over TLS"]
+    fn tls_key_starting_mid_body_exports_no_forged_request() {
+        let m = ConnectionFsmManager::new(4);
+        tls_key(&m, 1);
+        let mut out = feed(
+            &m,
+            1,
+            true,
+            b"GET /reset/qzkfwp/token HTTP/1.1\r\nHost: a\r\n\r\n",
+        );
+        out.extend(feed(
+            &m,
+            1,
+            false,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nreal-response",
+        ));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, None, "forged path exported: {:?}", out[0]);
+        assert_eq!(out[0].payload_text, None, "body under a forged request");
+    }
+
+    /// A lost record (here a whole response) on a key the parser read from
+    /// its start: every later response answers the request before its own.
+    #[test]
+    #[ignore = "TLS ruling pending: HTTP/1 does not latch over TLS"]
+    fn tls_lost_response_record_shifts_no_pair() {
+        let m = ConnectionFsmManager::new(4);
+        tls_key(&m, 2);
+        let mut out = feed(&m, 2, true, b"GET /one HTTP/1.1\r\nHost: a\r\n\r\n");
+        // The response to /one is lost (ring drop: no signal on TLS).
+        out.extend(feed(&m, 2, true, b"GET /two HTTP/1.1\r\nHost: a\r\n\r\n"));
+        out.extend(feed(
+            &m,
+            2,
+            false,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\ntwo",
+        ));
+        for msg in &out {
+            assert!(
+                !(msg.path.as_deref() == Some("/one") && msg.status == Some(404)),
+                "/two's answer exported under /one: {msg:?}"
+            );
+        }
+    }
+}

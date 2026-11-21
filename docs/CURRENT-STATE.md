@@ -283,9 +283,12 @@ production-hardened compliance platform.
     later client preface on it does not lift this. Over TLS no
     connection counts as seen whole: every TLS key (OpenSSL and Go)
     starts latched, so HTTP/2 and gRPC over TLS export no headers. The
-    same latch costs Redis over TLS its command and reply text and AMQP
-    over TLS its text; HTTP/1.1, PostgreSQL, MySQL and Kafka over TLS
-    are not affected. Proving a TLS connection's start is a separate
+    same latch costs Redis over TLS its command and reply text, AMQP
+    over TLS its text and PostgreSQL over TLS its bound values;
+    HTTP/1.1, MySQL and Kafka over TLS are not latched, with an integrity
+    limit: a TLS key first seen mid-connection or a lost TLS record can
+    misattribute HTTP/1.1 and MySQL replies and let bytes from inside a
+    message be read as one (USER-GUIDE §5.3). Proving a TLS connection's start is a separate
     design. While credential masking is on, the bodies of such an HTTP/2
     connection are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
@@ -299,11 +302,11 @@ production-hardened compliance platform.
     `COM_STMT_FETCH`, a cursor `EXECUTE`, replication, unknown), a reply
     out of sequence or unsolicited, or on a connection joined mid-stream,
     records keep only the statement keyword for the rest of the
-    connection; TLS and compressed MySQL connections are not parsed past
+    connection; a TCP connection that switches to TLS or compression is not parsed past
     the switch. HTTP/1 pairs pipelined requests in order and frames
     `1xx`, `HEAD`, `204`/`304`, `CONNECT`, `Upgrade` and close-delimited
-    responses per RFC 9112; on a connection joined mid-stream (over TLS,
-    any key not proven to start at its first record), after bytes it
+    responses per RFC 9112; on a connection joined mid-stream
+    (TCP only; TLS has the integrity limit above), after bytes it
     cannot place, ambiguous framing or a response with no request
     waiting, records keep only a known method and sizes. Kafka pairs by
     correlation ID (`acks=0` Produce shifts nothing); a late join, a

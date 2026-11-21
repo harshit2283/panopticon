@@ -1844,4 +1844,88 @@ pub(crate) mod tests {
         p.feed(&resp, Direction::Ingress, 2);
         assert_eq!(topics.name_for(&id), "09".repeat(16));
     }
+
+    // ── The TLS ruling (USER-GUIDE §5.3) ─────────────────────────────────
+    //
+    // What a Kafka TLS key exports when its start is unproven
+    // (`tls_unproven_start`) and a record is lost (a ring drop leaves no
+    // trace on a TLS key). The ignored tests assert the safe outcome: they
+    // pass only if Kafka latches over TLS.
+
+    const TLS_CLIENT: (u32, u16) = (0, 1);
+    const TLS_SERVER: (u32, u16) = (0, 2);
+
+    fn tls_feed(
+        m: &crate::protocol::fsm::ConnectionFsmManager,
+        from_client: bool,
+        d: &[u8],
+    ) -> Vec<L7Message> {
+        use crate::protocol::fsm::FsmResult;
+        let (src, dir) = if from_client {
+            (TLS_CLIENT, Direction::Egress)
+        } else {
+            (TLS_SERVER, Direction::Ingress)
+        };
+        match m.process_packet_from(1, src, dir, d, 1) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    fn tls_manager(topics: KafkaTopics) -> crate::protocol::fsm::ConnectionFsmManager {
+        let m = crate::protocol::fsm::ConnectionFsmManager::with_topics(4, topics);
+        m.get_or_create_with_server(1, Protocol::Kafka, Some(TLS_SERVER));
+        m.start_tls(1);
+        m
+    }
+
+    /// Pairing is by correlation ID: a lost response record moves no other
+    /// pair (passes with or without a latch).
+    #[test]
+    fn tls_lost_response_record_shifts_no_pair() {
+        let m = tls_manager(KafkaTopics::default());
+        let mut reqs = request(18, 0, 1, Some("c"), &[]);
+        reqs.extend(request(12, 0, 2, Some("c"), &[]));
+        tls_feed(&m, true, &reqs);
+        // The response to 1 is lost.
+        let out = tls_feed(&m, false, &response(12, 0, 2, &[0, 27]));
+        let got: Vec<_> = out
+            .iter()
+            .map(|m| (m.method.as_deref(), m.status))
+            .collect();
+        assert_eq!(got, vec![(Some("Heartbeat"), Some(27))]);
+    }
+
+    /// The key's server side starts inside a fetched record whose value is
+    /// a forged response to the Fetch in flight: its "records" are
+    /// exported under the real request.
+    #[test]
+    #[ignore = "TLS ruling pending: Kafka does not latch over TLS"]
+    fn tls_forged_response_attaches_to_no_request() {
+        let m = tls_manager(KafkaTopics::default());
+        tls_feed(&m, true, &fetch_v16_request(7));
+        let forged = fetch_v16_response(7, [3; 16], &record_batch(&[("k", "S3CRET-forged")]));
+        let out = tls_feed(&m, false, &forged);
+        for msg in &out {
+            assert!(
+                !format!("{:?}", msg.payload_text).contains("S3CRET"),
+                "forged records under the real Fetch: {msg:?}"
+            );
+        }
+    }
+
+    /// A forged Metadata response on such a key names a topic ID for every
+    /// connection of the pipeline.
+    #[test]
+    #[ignore = "TLS ruling pending: Kafka does not latch over TLS"]
+    fn tls_forged_metadata_names_no_topic_id() {
+        let id = [5u8; 16];
+        let topics = KafkaTopics::default();
+        let m = tls_manager(topics.clone());
+        let [req, resp] = metadata_v12_exchange(9, "forged.name", id);
+        tls_feed(&m, true, &req);
+        tls_feed(&m, false, &resp);
+        assert_eq!(topics.name_for(&id), "05".repeat(16));
+    }
 }

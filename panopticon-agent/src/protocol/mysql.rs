@@ -2364,3 +2364,121 @@ mod tests {
         }
     }
 }
+
+/// The TLS ruling (USER-GUIDE §5.3): what a MySQL TLS key exports when its
+/// start is unproven ([`ProtocolParser::tls_unproven_start`]) and a record
+/// is lost (a ring drop leaves no trace on a TLS key). Each test asserts
+/// the safe outcome: it passes only if MySQL latches over TLS.
+#[cfg(test)]
+mod tls_ruling {
+    use super::*;
+    use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+
+    const CLIENT: (u32, u16) = (0, 1);
+    const SERVER: (u32, u16) = (0, 2);
+    const OK: &[u8] = &[0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00];
+
+    fn pkt(seq: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = (body.len() as u32).to_le_bytes()[..3].to_vec();
+        v.push(seq);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A TLS key whose plaintext starts with the full handshake response
+    /// (as it does on a key seen from the start), then auth OK.
+    fn tls_key(m: &ConnectionFsmManager, id: u64) {
+        m.get_or_create_with_server(id, Protocol::Mysql, Some(SERVER));
+        m.start_tls(id);
+        let mut auth = (CLIENT_PROTOCOL_41 | CLIENT_SSL | CLIENT_DEPRECATE_EOF)
+            .to_le_bytes()
+            .to_vec();
+        auth.extend_from_slice(&[0; 28]);
+        auth.extend_from_slice(b"app\0");
+        feed(m, id, true, &pkt(2, &auth));
+        feed(m, id, false, &pkt(3, OK));
+    }
+
+    fn feed(m: &ConnectionFsmManager, id: u64, from_client: bool, d: &[u8]) -> Vec<L7Message> {
+        let (src, dir) = if from_client {
+            (CLIENT, Direction::Egress)
+        } else {
+            (SERVER, Direction::Ingress)
+        };
+        match m.process_packet_from(id, src, dir, d, 1) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    /// A lost reply record: the next command's reply answers the command
+    /// before it, for the rest of the connection.
+    #[test]
+    #[ignore = "TLS ruling pending: MySQL does not latch over TLS"]
+    fn tls_lost_reply_record_shifts_no_pair() {
+        let m = ConnectionFsmManager::new(4);
+        tls_key(&m, 1);
+        let mut out = feed(&m, 1, true, &pkt(0, b"\x03UPDATE t SET a = 1"));
+        // Its OK is lost.
+        out.extend(feed(&m, 1, true, &pkt(0, b"\x03SELECT * FROM missing")));
+        out.extend(feed(&m, 1, false, &pkt(1, b"\xff\x7a\x04#42S02x")));
+        for msg in &out {
+            assert!(
+                !(msg.method.as_deref() == Some("UPDATE") && msg.status == Some(1146)),
+                "SELECT's error exported under the UPDATE: {msg:?}"
+            );
+        }
+    }
+
+    /// A statement prepared on the key; then a record is lost and the next
+    /// one starts inside an INSERT whose value holds a forged
+    /// COM_STMT_EXECUTE of that statement id. The INSERT names a
+    /// credential, so its text would be withheld; the forged EXECUTE's
+    /// "bound value" must not be exported under the prepared SQL.
+    #[test]
+    #[ignore = "TLS ruling pending: MySQL does not latch over TLS"]
+    fn tls_forged_execute_exports_no_bound_value() {
+        let m = ConnectionFsmManager::new(4);
+        tls_key(&m, 2);
+        let mut prep = vec![COM_STMT_PREPARE];
+        prep.extend_from_slice(b"UPDATE notes SET body = ? WHERE id = 1");
+        feed(&m, 2, true, &pkt(0, &prep));
+        let mut ok = vec![0x00];
+        ok.extend(1u32.to_le_bytes());
+        ok.extend(0u16.to_le_bytes());
+        ok.extend(1u16.to_le_bytes());
+        ok.extend([0, 0, 0]);
+        feed(&m, 2, false, &pkt(1, &ok));
+        feed(&m, 2, false, &pkt(2, b"param-def"));
+        // Lost: the start of `INSERT INTO users (password) VALUES ('...`.
+        // Classic layout: 1 param, null bitmap, bound, VARCHAR, the value.
+        let mut exec = vec![
+            COM_STMT_EXECUTE,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0x00,
+            0x01,
+            0x0f,
+            0x00,
+        ];
+        exec.push(13);
+        exec.extend_from_slice(b"S3CRET-hunter");
+        let mut out = feed(&m, 2, true, &pkt(0, &exec));
+        out.extend(feed(&m, 2, false, &pkt(1, OK)));
+        assert_eq!(out.len(), 1, "{out:?}");
+        for msg in &out {
+            assert!(
+                !format!("{:?}", msg.request_text).contains("S3CRET"),
+                "body bytes exported as a bound value: {msg:?}"
+            );
+        }
+    }
+}

@@ -1555,8 +1555,9 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   first. Every TLS key starts latched (USER-GUIDE §5.3): over TLS, HTTP/2
   and gRPC export no path, status or headers and (with credential masking
   on) no body of unknown type; Redis replies keep status, timing and sizes
-  only, AMQP methods, status, timing and sizes. HTTP/1.1, PostgreSQL,
-  MySQL and Kafka over TLS are not affected. Both `go-h2` stacks are
+  only, AMQP methods, status, timing and sizes, and PostgreSQL exports no
+  bound values. HTTP/1.1, MySQL and Kafka over TLS are not latched (an
+  integrity limit, USER-GUIDE §5.3). Both `go-h2` stacks are
   gated on no such field on any unattributed record and no raw PII in the
   export; their recall is reported only. Every proof of a TLS
   connection's start tried so far (a Go handshake-entry record, process
