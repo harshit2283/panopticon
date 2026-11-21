@@ -1,69 +1,43 @@
-//! HTTP/1.1 protocol parser.
+//! HTTP/1.x protocol parser.
 //!
-//! Uses the `httparse` crate for zero-copy header parsing. Handles:
-//! - Content-Length body accumulation
-//! - Chunked transfer-encoding
-//! - Keep-Alive: emit L7Message on complete response, reset for next transaction
-//! - Latency calculation from request→response timestamps
+//! Uses the `httparse` crate for header parsing. Requests are queued in
+//! the order they are read and each response answers the oldest one
+//! (pipelining included). Message framing follows RFC 9112 §6.3:
+//! - a request body is `Transfer-Encoding: chunked` or `Content-Length`,
+//!   otherwise empty;
+//! - a response to `HEAD`, a `1xx`, `204` or `304` has no body; a `1xx`
+//!   other than `101` is interim and does not answer its request;
+//! - `101 Switching Protocols` and a `2xx` answer to `CONNECT` turn the
+//!   connection into something else (a tunnel, WebSocket, h2c): it is
+//!   exported once and nothing more is read from it;
+//! - otherwise chunked, then `Content-Length`, and a response with
+//!   neither is delimited by the connection's close: it is exported
+//!   without its body and nothing more is read from the connection.
+//!
+//! Which capture direction carries requests is learned once, from the
+//! first message start seen, never per segment: a body segment that starts
+//! with `HTTP/1.` or `GET ` stays in its own direction.
+//!
+//! **Sync.** The parser reads message boundaries only from a stream it saw
+//! from its first byte, with every byte accounted for. A connection joined
+//! mid-stream ([`ProtocolParser::joined_late`]), bytes it cannot place, a
+//! malformed message, ambiguous framing (conflicting `Content-Length`,
+//! `Transfer-Encoding` with `Content-Length` in a request), or a response
+//! with no request waiting all mean that a "message" found from there may
+//! lie inside a body, or answer another request. The connection is then
+//! `unsynced` for the rest of its life: messages are still exported, with
+//! a known method and the sizes only (no path, header, content type, body,
+//! status or latency).
+
+use std::collections::VecDeque;
 
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
 
-// ── Parser State ─────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
-enum State {
-    /// Waiting for an HTTP request from the client.
-    WaitingForRequest,
-    /// Accumulating request body bytes.
-    ReadingRequestBody { remaining: usize },
-    /// Request complete, waiting for response from server.
-    WaitingForResponse,
-    /// Accumulating response body bytes.
-    ReadingResponseBody { remaining: usize },
-    /// Reading chunked response body.
-    ReadingChunkedResponse,
-}
-
-/// Parsed request metadata, stored while we wait for the response.
-#[derive(Debug, Clone)]
-struct PendingRequest {
-    method: String,
-    path: String,
-    timestamp_ns: u64,
-    request_size: u64,
-    headers: Vec<(String, String)>,
-    /// Request body (POST/PUT/PATCH payload), capped at MAX_CAPTURED_BODY.
-    body: Vec<u8>,
-}
-
-/// HTTP/1.1 parser with Keep-Alive support.
-pub struct Http1Parser {
-    state: State,
-    client_buf: StreamBuffer,
-    server_buf: StreamBuffer,
-    pending_request: Option<PendingRequest>,
-    /// Accumulated response body (for payload_text), capped at
-    /// `MAX_CAPTURED_BODY` so a large download is never held in memory.
-    response_body: Vec<u8>,
-    /// Full response body size, including bytes beyond the capture cap.
-    response_size: u64,
-    response_headers: Vec<(String, String)>,
-    response_status: Option<u32>,
-    response_content_type: Option<String>,
-    /// Body bytes were kept after bytes of the same body were lost: they
-    /// may hold a credential's value without its name, so the body is not
-    /// exported (sizes are). A gap that only cuts a body's end (the capture
-    /// cap on a large segment) keeps the captured prefix.
-    request_gap: bool,
-    response_gap: bool,
-    /// A gap inside the body; it becomes `*_gap` if more body bytes follow.
-    request_gap_pending: bool,
-    response_gap_pending: bool,
-}
-
-/// Request-line prefixes; anything else at the start of the client buffer is
-/// junk (e.g. body bytes we lost track of after a capture gap).
+/// Request-line prefixes used to find a message start once sync is lost;
+/// also the only methods ever exported from an unsynced connection.
 const REQUEST_STARTS: [&[u8]; 8] = [
     b"GET ",
     b"POST ",
@@ -74,38 +48,63 @@ const REQUEST_STARTS: [&[u8]; 8] = [
     b"PATCH ",
     b"CONNECT ",
 ];
+const KNOWN_METHODS: [&str; 9] = [
+    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE",
+];
 const RESPONSE_START: &[u8] = b"HTTP/1.";
 
-/// Offset of the earliest occurrence of any of `starts` in `data`.
-fn find_start(data: &[u8], starts: &[&[u8]]) -> Option<usize> {
-    (0..data.len()).find(|&i| starts.iter().any(|s| data[i..].starts_with(s)))
-}
-
-/// Drop leading junk so `buf` begins at the next plausible message start.
-/// Keeps a short tail if no start is found, in case a start token is split
-/// across packets. Returns true if anything was dropped.
-fn resync(buf: &mut StreamBuffer, starts: &[&[u8]]) -> bool {
-    let data = buf.data();
-    if data.is_empty()
-        || starts
-            .iter()
-            .any(|s| data.starts_with(s) || s.starts_with(data))
-    {
-        return false;
-    }
-    let drop = match find_start(data, starts) {
-        Some(off) => off,
-        None => data.len().saturating_sub(8),
-    };
-    if drop == 0 {
-        return false;
-    }
-    buf.consume(drop);
-    true
-}
-
-/// Max response body bytes retained for payload_text / PII scanning.
+/// Max body bytes retained for payload_text / request_text.
 const MAX_CAPTURED_BODY: usize = 64 * 1024;
+
+/// Requests waiting for a response. More means the parser lost track
+/// (a pipelining client never waits this long).
+const MAX_PENDING: usize = 64;
+
+/// Longest chunk-size or trailer line accepted.
+const MAX_CHUNK_LINE: usize = 4096;
+
+// ── Bodies ───────────────────────────────────────────────────────────────
+
+/// A message body as captured: its first `MAX_CAPTURED_BODY` bytes, its
+/// full size, and whether bytes were kept after a gap inside it.
+#[derive(Debug, Default, Clone)]
+struct Body {
+    bytes: Vec<u8>,
+    size: u64,
+    /// A gap inside the body; it becomes `gap` if more body bytes follow.
+    gap_pending: bool,
+    /// Body bytes were kept after bytes of the same body were lost: they
+    /// may hold a credential's value without its name, so the body is not
+    /// exported (its size is). A gap that only cuts a body's end (the
+    /// capture cap on a large segment) keeps the captured prefix.
+    gap: bool,
+}
+
+impl Body {
+    fn append(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.gap |= self.gap_pending;
+        self.size += bytes.len() as u64;
+        let room = MAX_CAPTURED_BODY.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// `n` body bytes were never captured.
+    fn lost(&mut self, n: usize) {
+        self.size += n as u64;
+        self.gap_pending = true;
+    }
+
+    fn text(&self) -> Option<String> {
+        if self.gap {
+            return None;
+        }
+        body_text(&self.bytes)
+    }
+}
 
 /// Body as text for PII scanning: `None` if empty or not UTF-8. The capture
 /// cap can split a multi-byte character at the end; keep the valid prefix then.
@@ -118,114 +117,271 @@ fn body_text(body: &[u8]) -> Option<String> {
     text.filter(|t| !t.is_empty()).map(str::to_string)
 }
 
-/// Append to the captured body without exceeding `MAX_CAPTURED_BODY`.
-fn append_capped(body: &mut Vec<u8>, bytes: &[u8]) {
-    let room = MAX_CAPTURED_BODY.saturating_sub(body.len());
-    body.extend_from_slice(&bytes[..bytes.len().min(room)]);
+// ── Chunked transfer coding ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Chunk {
+    /// Expecting a chunk-size line (`hex[;ext]\r\n`).
+    Size,
+    /// Inside chunk data.
+    Data(usize),
+    /// Expecting the CRLF after chunk data.
+    DataEnd,
+    /// After the last chunk: trailer lines until an empty one.
+    Trailer,
+}
+
+enum Step {
+    Need,
+    Done,
+    /// Not chunked framing: the stream's boundaries are unknown.
+    Bad,
+}
+
+/// Decode as much chunked framing from `buf` as is there, into `body`.
+fn read_chunked(buf: &mut StreamBuffer, st: &mut Chunk, body: &mut Option<&mut Body>) -> Step {
+    loop {
+        let data = buf.data();
+        match *st {
+            Chunk::Size | Chunk::Trailer => {
+                let Some(eol) = data.windows(2).position(|w| w == b"\r\n") else {
+                    return if data.len() > MAX_CHUNK_LINE {
+                        Step::Bad
+                    } else {
+                        Step::Need
+                    };
+                };
+                if eol > MAX_CHUNK_LINE {
+                    return Step::Bad;
+                }
+                if *st == Chunk::Trailer {
+                    buf.consume(eol + 2);
+                    if eol == 0 {
+                        return Step::Done;
+                    }
+                    continue;
+                }
+                let line = &data[..eol];
+                let digits = line
+                    .iter()
+                    .position(|&b| b == b';' || b == b' ' || b == b'\t')
+                    .map_or(line, |i| &line[..i]);
+                let Some(size) = std::str::from_utf8(digits)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| usize::from_str_radix(s, 16).ok())
+                else {
+                    return Step::Bad;
+                };
+                buf.consume(eol + 2);
+                *st = if size == 0 {
+                    Chunk::Trailer
+                } else {
+                    Chunk::Data(size)
+                };
+            }
+            Chunk::Data(remaining) => {
+                if data.is_empty() {
+                    return Step::Need;
+                }
+                let take = data.len().min(remaining);
+                if let Some(b) = body.as_deref_mut() {
+                    b.append(&data[..take]);
+                }
+                buf.consume(take);
+                if take < remaining {
+                    *st = Chunk::Data(remaining - take);
+                    return Step::Need;
+                }
+                *st = Chunk::DataEnd;
+            }
+            Chunk::DataEnd => {
+                if data.len() < 2 {
+                    return Step::Need;
+                }
+                if &data[..2] != b"\r\n" {
+                    return Step::Bad;
+                }
+                buf.consume(2);
+                *st = Chunk::Size;
+            }
+        }
+    }
+}
+
+// ── Framing ──────────────────────────────────────────────────────────────
+
+/// How a message's body is delimited.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Framing {
+    None,
+    Length(usize),
+    Chunked,
+    /// Until the connection closes (responses only).
+    Close,
+}
+
+/// What the framing headers of a message say. `None`: they contradict
+/// each other or cannot be read (the peers may disagree on the boundary).
+fn framing(headers: &[(String, String)], request: bool) -> Option<(Framing, bool)> {
+    let mut length: Option<usize> = None;
+    let mut te: Option<String> = None;
+    for (name, value) in headers {
+        match name.as_str() {
+            "content-length" => {
+                // `Content-Length: 5, 5` is allowed; different values not.
+                for part in value.split(',') {
+                    let n: usize = part.trim().parse().ok()?;
+                    if length.is_some_and(|l| l != n) {
+                        return None;
+                    }
+                    length = Some(n);
+                }
+            }
+            "transfer-encoding" => {
+                let v = te.get_or_insert_with(String::new);
+                if !v.is_empty() {
+                    v.push(',');
+                }
+                v.push_str(&value.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    if let Some(te) = te {
+        let chunked_last = te.rsplit(',').next().map(str::trim) == Some("chunked");
+        // A request whose transfer coding does not end in chunked cannot
+        // be framed (RFC 9112 §6.3); a response then runs to the close.
+        // A request with both headers is a smuggling shape: the server
+        // may frame it either way.
+        return match (chunked_last, request) {
+            (true, true) => Some((Framing::Chunked, length.is_some())),
+            (true, false) => Some((Framing::Chunked, false)),
+            (false, true) => None,
+            (false, false) => Some((Framing::Close, false)),
+        };
+    }
+    Some(match length {
+        Some(0) => (Framing::None, false),
+        Some(n) => (Framing::Length(n), false),
+        None if request => (Framing::None, false),
+        None => (Framing::Close, false),
+    })
+}
+
+// ── Parser state ─────────────────────────────────────────────────────────
+
+/// A request read from the client, waiting for its response.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    method: String,
+    path: String,
+    timestamp_ns: u64,
+    header_size: u64,
+    headers: Vec<(String, String)>,
+    body: Body,
+}
+
+/// What the client side is reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReqState {
+    Line,
+    /// Body of the newest pending request (`attached`: it is still
+    /// queued; a response may answer a request before its body ends).
+    Body {
+        remaining: usize,
+        attached: bool,
+    },
+    Chunked {
+        st: Chunk,
+        attached: bool,
+    },
+}
+
+/// The response being read.
+#[derive(Debug, Clone, Default)]
+struct Response {
+    status: Option<u32>,
+    headers: Vec<(String, String)>,
+    content_type: Option<String>,
+    body: Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RespState {
+    Line,
+    Body { remaining: usize },
+    Chunked(Chunk),
+}
+
+/// HTTP/1.x parser with Keep-Alive and pipelining support.
+pub struct Http1Parser {
+    /// The capture direction that carries requests, learned once.
+    client_dir: Option<Direction>,
+    client_buf: StreamBuffer,
+    server_buf: StreamBuffer,
+    req_state: ReqState,
+    pending: VecDeque<PendingRequest>,
+    resp_state: RespState,
+    response: Response,
+    /// Message boundaries (and which request a response answers) are no
+    /// longer known for certain; see the module docs. For good.
+    unsynced: bool,
+    /// The connection stopped being HTTP/1 framed (a tunnel, an upgrade,
+    /// a close-delimited body, or framing that cannot be followed): no
+    /// more bytes are read from it.
+    opaque: bool,
+    /// The last call was [`ProtocolParser::skip`], which accounted for the
+    /// gap itself. The connection manager follows every skip with
+    /// [`ProtocolParser::joined_late`], which this flag lets through once.
+    skip_accounted: bool,
 }
 
 impl Http1Parser {
     pub fn new() -> Self {
         Self {
-            state: State::WaitingForRequest,
+            client_dir: None,
             client_buf: StreamBuffer::new(),
             server_buf: StreamBuffer::new(),
-            pending_request: None,
-            response_body: Vec::new(),
-            response_size: 0,
-            response_headers: Vec::new(),
-            response_status: None,
-            response_content_type: None,
-            request_gap: false,
-            response_gap: false,
-            request_gap_pending: false,
-            response_gap_pending: false,
+            req_state: ReqState::Line,
+            pending: VecDeque::new(),
+            resp_state: RespState::Line,
+            response: Response::default(),
+            unsynced: false,
+            opaque: false,
+            skip_accounted: false,
         }
+    }
+
+    /// Sync is lost for the rest of the connection.
+    fn lose_sync(&mut self) {
+        self.unsynced = true;
+    }
+
+    /// Stop reading the connection: nothing after this point is HTTP/1
+    /// framed (or its framing cannot be followed).
+    fn go_opaque(&mut self) {
+        self.opaque = true;
+        self.client_buf.clear();
+        self.server_buf.clear();
+        self.pending.clear();
+        self.response = Response::default();
     }
 
     fn process(&mut self, timestamp_ns: u64) -> ParseResult {
         let mut messages = Vec::new();
-
         loop {
-            match self.state.clone() {
-                State::WaitingForRequest => {
-                    if self.try_parse_request(timestamp_ns) {
-                        continue;
-                    }
-                    if self.try_parse_response(timestamp_ns) {
-                        if self.state == State::WaitingForRequest {
-                            if let Some(msg) = self.emit_message(timestamp_ns) {
-                                messages.push(msg);
-                            }
-                            self.reset_for_next_transaction();
-                        }
-                        continue;
-                    }
-                    break;
-                }
-                State::ReadingRequestBody { remaining } => {
-                    let avail = self.client_buf.data().len();
-                    let take = avail.min(remaining);
-                    if let Some(req) = self.pending_request.as_mut() {
-                        append_capped(&mut req.body, &self.client_buf.data()[..take]);
-                    }
-                    if avail >= remaining {
-                        self.client_buf.consume(remaining);
-                        self.state = State::WaitingForResponse;
-                    } else {
-                        self.client_buf.consume(avail);
-                        self.state = State::ReadingRequestBody {
-                            remaining: remaining - avail,
-                        };
-                        break;
-                    }
-                }
-                State::WaitingForResponse => {
-                    if !self.try_parse_response(timestamp_ns) {
-                        break;
-                    }
-                    // Bodyless responses (204, 304, Content-Length: 0) skip directly to
-                    // WaitingForRequest without accumulating a body — emit the L7Message now.
-                    if self.state == State::WaitingForRequest {
-                        if let Some(msg) = self.emit_message(timestamp_ns) {
-                            messages.push(msg);
-                        }
-                        self.reset_for_next_transaction();
-                    }
-                }
-                State::ReadingResponseBody { remaining } => {
-                    let data = self.server_buf.data();
-                    let to_read = data.len().min(remaining);
-                    append_capped(&mut self.response_body, &data[..to_read]);
-                    self.response_size += to_read as u64;
-                    self.server_buf.consume(to_read);
-
-                    if to_read >= remaining {
-                        // Response body complete — emit message
-                        if let Some(msg) = self.emit_message(timestamp_ns) {
-                            messages.push(msg);
-                        }
-                        self.reset_for_next_transaction();
-                    } else {
-                        self.state = State::ReadingResponseBody {
-                            remaining: remaining - to_read,
-                        };
-                        break;
-                    }
-                }
-                State::ReadingChunkedResponse => match self.read_chunked_body() {
-                    ChunkResult::Complete => {
-                        if let Some(msg) = self.emit_message(timestamp_ns) {
-                            messages.push(msg);
-                        }
-                        self.reset_for_next_transaction();
-                    }
-                    ChunkResult::NeedMoreData => break,
-                    ChunkResult::Error(e) => return ParseResult::Error(e),
-                },
+            if self.opaque {
+                self.client_buf.clear();
+                self.server_buf.clear();
+                break;
+            }
+            let client = self.step_client(timestamp_ns);
+            let server = !self.opaque && self.step_server(timestamp_ns, &mut messages);
+            if !client && !server {
+                break;
             }
         }
-
         if messages.is_empty() {
             ParseResult::NeedMoreData
         } else {
@@ -233,356 +389,520 @@ impl Http1Parser {
         }
     }
 
-    /// Try to parse an HTTP request from the client buffer.
-    /// Returns true if a request was successfully parsed (state advanced).
-    fn try_parse_request(&mut self, timestamp_ns: u64) -> bool {
-        // httparse accepts any token as a method, so leftover body bytes glued
-        // to the next request line ("pppGET /x") would parse as a bogus
-        // request. Only parse from a real request-line start.
-        resync(&mut self.client_buf, &REQUEST_STARTS);
-        let data = self.client_buf.data();
-        if data.is_empty() || !REQUEST_STARTS.iter().any(|s| data.starts_with(s)) {
+    /// Advance the client side by one unit. False: needs more data.
+    fn step_client(&mut self, timestamp_ns: u64) -> bool {
+        match self.req_state {
+            ReqState::Line => self.parse_request(timestamp_ns),
+            ReqState::Body {
+                remaining,
+                attached,
+            } => {
+                let data = self.client_buf.data();
+                if data.is_empty() {
+                    return false;
+                }
+                let take = data.len().min(remaining);
+                if attached && let Some(req) = self.pending.back_mut() {
+                    req.body.append(&data[..take]);
+                }
+                self.client_buf.consume(take);
+                self.req_state = if take == remaining {
+                    ReqState::Line
+                } else {
+                    ReqState::Body {
+                        remaining: remaining - take,
+                        attached,
+                    }
+                };
+                true
+            }
+            ReqState::Chunked { mut st, attached } => {
+                let before = self.client_buf.len();
+                let mut body = if attached {
+                    self.pending.back_mut().map(|r| &mut r.body)
+                } else {
+                    None
+                };
+                let step = read_chunked(&mut self.client_buf, &mut st, &mut body);
+                let progressed = self.client_buf.len() != before;
+                match step {
+                    Step::Done => {
+                        self.req_state = ReqState::Line;
+                        true
+                    }
+                    Step::Need => {
+                        self.req_state = ReqState::Chunked { st, attached };
+                        progressed
+                    }
+                    Step::Bad => {
+                        self.lose_sync();
+                        self.go_opaque();
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find where the next message starts in `buf`. On a synced connection
+    /// it must be right there (empty lines before a request line are
+    /// allowed); anything else loses sync, and from then on the next
+    /// plausible start is searched for.
+    fn locate(&mut self, request: bool) -> bool {
+        let starts: &[&[u8]] = if request {
+            &REQUEST_STARTS
+        } else {
+            &[RESPONSE_START]
+        };
+        let unsynced = self.unsynced;
+        let buf = if request {
+            &mut self.client_buf
+        } else {
+            &mut self.server_buf
+        };
+        if request && !unsynced {
+            while buf.data().starts_with(b"\r\n") {
+                buf.consume(2);
+            }
+            if buf.data() == b"\r" {
+                return false;
+            }
+        }
+        let data = buf.data();
+        if data.is_empty() {
             return false;
         }
+        if !unsynced {
+            if request {
+                // Any token method is a request line here (httparse checks).
+                return true;
+            }
+            if data.starts_with(RESPONSE_START) || RESPONSE_START.starts_with(data) {
+                return true;
+            }
+            self.lose_sync();
+            return self.locate(request);
+        }
+        if starts
+            .iter()
+            .any(|s| data.starts_with(s) || s.starts_with(data))
+        {
+            return starts.iter().any(|s| data.starts_with(s));
+        }
+        let drop = (0..data.len())
+            .find(|&i| starts.iter().any(|s| data[i..].starts_with(s)))
+            .unwrap_or(data.len().saturating_sub(8));
+        buf.consume(drop);
+        let data = buf.data();
+        starts.iter().any(|s| data.starts_with(s))
+    }
 
+    fn parse_request(&mut self, timestamp_ns: u64) -> bool {
+        if !self.locate(true) {
+            return false;
+        }
         let mut headers_buf = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers_buf);
-
-        match req.parse(data) {
-            Ok(httparse::Status::Complete(header_len)) => {
-                let method = req.method.unwrap_or("").to_string();
-                let path = req.path.unwrap_or("").to_string();
-
-                let mut headers = Vec::new();
-                let mut content_length: Option<usize> = None;
-
-                for h in req.headers.iter() {
-                    let name = h.name.to_lowercase();
-                    let value = String::from_utf8_lossy(h.value).into_owned();
-                    if name == "content-length" {
-                        content_length = value.parse().ok();
-                    }
-                    headers.push((name, value));
+        let header_len = match req.parse(self.client_buf.data()) {
+            Ok(httparse::Status::Complete(n)) => n,
+            Ok(httparse::Status::Partial) => return false,
+            Err(_) => {
+                // Not a request line where one must be: drop a byte and
+                // look for the next plausible start, unsynced.
+                self.lose_sync();
+                self.client_buf.consume(1);
+                return true;
+            }
+        };
+        let method = req.method.unwrap_or("").to_string();
+        let path = req.path.unwrap_or("").to_string();
+        let headers: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .map(|h| {
+                (
+                    h.name.to_ascii_lowercase(),
+                    String::from_utf8_lossy(h.value).into_owned(),
+                )
+            })
+            .collect();
+        self.client_buf.consume(header_len);
+        let framing = match framing(&headers, true) {
+            Some((f, ambiguous)) => {
+                if ambiguous {
+                    self.lose_sync();
                 }
+                f
+            }
+            None => {
+                // The server and the parser may disagree on where this
+                // request ends: nothing after it can be framed.
+                self.lose_sync();
+                self.go_opaque();
+                return false;
+            }
+        };
+        if self.pending.len() >= MAX_PENDING {
+            self.lose_sync();
+            self.pending.pop_front();
+        }
+        self.pending.push_back(PendingRequest {
+            method,
+            path,
+            timestamp_ns,
+            header_size: header_len as u64,
+            headers,
+            body: Body::default(),
+        });
+        self.req_state = match framing {
+            Framing::Length(n) => ReqState::Body {
+                remaining: n,
+                attached: true,
+            },
+            Framing::Chunked => ReqState::Chunked {
+                st: Chunk::Size,
+                attached: true,
+            },
+            Framing::None | Framing::Close => ReqState::Line,
+        };
+        true
+    }
 
-                self.pending_request = Some(PendingRequest {
-                    method,
-                    path,
-                    timestamp_ns,
-                    request_size: header_len as u64,
-                    headers,
-                    body: Vec::new(),
-                });
-
-                self.client_buf.consume(header_len);
-
-                if let Some(body_len) = content_length {
-                    if body_len > 0 {
-                        self.state = State::ReadingRequestBody {
-                            remaining: body_len,
-                        };
-                        if let Some(req) = &mut self.pending_request {
-                            req.request_size += body_len as u64;
-                        }
-                    } else {
-                        self.state = State::WaitingForResponse;
-                    }
+    /// Advance the server side by one unit. False: needs more data.
+    fn step_server(&mut self, timestamp_ns: u64, out: &mut Vec<L7Message>) -> bool {
+        match self.resp_state {
+            RespState::Line => self.parse_response(timestamp_ns, out),
+            RespState::Body { remaining } => {
+                let data = self.server_buf.data();
+                if data.is_empty() {
+                    return false;
+                }
+                let take = data.len().min(remaining);
+                self.response.body.append(&data[..take]);
+                self.server_buf.consume(take);
+                if take == remaining {
+                    self.finish(timestamp_ns, out);
                 } else {
-                    self.state = State::WaitingForResponse;
+                    self.resp_state = RespState::Body {
+                        remaining: remaining - take,
+                    };
                 }
                 true
             }
-            Ok(httparse::Status::Partial) => false,
-            Err(_) => {
-                // Malformed request line: drop its first byte so resync moves
-                // on to the next candidate instead of blocking forever.
-                self.client_buf.consume(1);
-                false
+            RespState::Chunked(mut st) => {
+                let before = self.server_buf.len();
+                let step = read_chunked(
+                    &mut self.server_buf,
+                    &mut st,
+                    &mut Some(&mut self.response.body),
+                );
+                let progressed = self.server_buf.len() != before;
+                match step {
+                    Step::Done => {
+                        self.finish(timestamp_ns, out);
+                        true
+                    }
+                    Step::Need => {
+                        self.resp_state = RespState::Chunked(st);
+                        progressed
+                    }
+                    Step::Bad => {
+                        self.lose_sync();
+                        self.go_opaque();
+                        false
+                    }
+                }
             }
         }
     }
 
-    /// Try to parse an HTTP response from the server buffer.
-    /// Returns true if response headers were successfully parsed (state advanced).
-    fn try_parse_response(&mut self, _timestamp_ns: u64) -> bool {
-        resync(&mut self.server_buf, &[RESPONSE_START]);
-        let data = self.server_buf.data();
-        if data.is_empty() || !data.starts_with(RESPONSE_START) {
+    fn parse_response(&mut self, timestamp_ns: u64, out: &mut Vec<L7Message>) -> bool {
+        if !self.locate(false) {
             return false;
         }
-
         let mut headers_buf = [httparse::EMPTY_HEADER; 64];
         let mut resp = httparse::Response::new(&mut headers_buf);
-
-        match resp.parse(data) {
-            Ok(httparse::Status::Complete(header_len)) => {
-                self.response_status = resp.code.map(|c| c as u32);
-
-                let mut content_length: Option<usize> = None;
-                let mut is_chunked = false;
-
-                self.response_headers.clear();
-                for h in resp.headers.iter() {
-                    let name = h.name.to_lowercase();
-                    let value = String::from_utf8_lossy(h.value).into_owned();
-                    if name == "content-length" {
-                        content_length = value.parse().ok();
-                    }
-                    if name == "transfer-encoding" && value.to_lowercase().contains("chunked") {
-                        is_chunked = true;
-                    }
-                    if name == "content-type" {
-                        self.response_content_type = Some(value.clone());
-                    }
-                    self.response_headers.push((name, value));
-                }
-
-                self.server_buf.consume(header_len);
-                self.response_body.clear();
-                self.response_size = 0;
-
-                if is_chunked {
-                    self.state = State::ReadingChunkedResponse;
-                } else if let Some(body_len) = content_length {
-                    if body_len > 0 {
-                        self.state = State::ReadingResponseBody {
-                            remaining: body_len,
-                        };
-                    } else {
-                        // No body — emit immediately
-                        self.state = State::WaitingForRequest;
-                        return true;
-                    }
-                } else {
-                    // No content-length and not chunked — assume no body
-                    // (for 204, 304, HEAD responses, etc.)
-                    self.state = State::WaitingForRequest;
-                    return true;
-                }
-                true
-            }
-            Ok(httparse::Status::Partial) => false,
+        let header_len = match resp.parse(self.server_buf.data()) {
+            Ok(httparse::Status::Complete(n)) => n,
+            Ok(httparse::Status::Partial) => return false,
             Err(_) => {
+                self.lose_sync();
                 self.server_buf.consume(1);
-                false
+                return true;
             }
+        };
+        let status = resp.code.unwrap_or(0) as u32;
+        let headers: Vec<(String, String)> = resp
+            .headers
+            .iter()
+            .map(|h| {
+                (
+                    h.name.to_ascii_lowercase(),
+                    String::from_utf8_lossy(h.value).into_owned(),
+                )
+            })
+            .collect();
+        self.server_buf.consume(header_len);
+
+        // Interim response: the request is still waiting for its final one.
+        if (100..200).contains(&status) && status != 101 {
+            return true;
         }
-    }
-
-    /// Read chunked transfer-encoding body.
-    fn read_chunked_body(&mut self) -> ChunkResult {
-        loop {
-            let data = self.server_buf.data();
-            if data.is_empty() {
-                return ChunkResult::NeedMoreData;
-            }
-
-            // Find chunk size line (hex number followed by \r\n)
-            let crlf_pos = match data.windows(2).position(|w| w == b"\r\n") {
-                Some(pos) => pos,
-                None => return ChunkResult::NeedMoreData,
-            };
-
-            let size_str = match std::str::from_utf8(&data[..crlf_pos]) {
-                Ok(s) => s.trim(),
-                Err(_) => return ChunkResult::Error("invalid chunk size encoding".into()),
-            };
-
-            let chunk_size = match usize::from_str_radix(size_str, 16) {
-                Ok(n) => n,
-                Err(_) => return ChunkResult::Error("invalid chunk size".into()),
-            };
-
-            // Last chunk (size=0)
-            if chunk_size == 0 {
-                // Consume "0\r\n\r\n"
-                let end = crlf_pos + 2 + 2; // chunk line + trailing CRLF
-                if data.len() >= end {
-                    self.server_buf.consume(end);
-                    return ChunkResult::Complete;
-                }
-                return ChunkResult::NeedMoreData;
-            }
-
-            // Need: chunk_size_line + chunk_data + trailing \r\n.
-            // chunk_size is peer-controlled: a size like FFFFFFFFFFFFFFFF must
-            // not overflow (debug panic / release wrap + slice panic).
-            let Some(total) = chunk_size.checked_add(crlf_pos + 4) else {
-                return ChunkResult::Error("chunk size overflow".into());
-            };
-            if data.len() < total {
-                return ChunkResult::NeedMoreData;
-            }
-
-            let chunk_start = crlf_pos + 2;
-            append_capped(
-                &mut self.response_body,
-                &data[chunk_start..chunk_start + chunk_size],
-            );
-            self.response_size += chunk_size as u64;
-            self.server_buf.consume(total);
+        // An answer with no request waiting: it answers a request the
+        // parser did not see, so the queue no longer lines up.
+        if self.pending.is_empty() {
+            self.lose_sync();
         }
-    }
-
-    /// Build an L7Message from the pending request + accumulated response.
-    fn emit_message(&self, timestamp_ns: u64) -> Option<L7Message> {
-        let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, timestamp_ns);
-
-        msg.status = self.response_status;
-        msg.content_type = self.response_content_type.clone();
-        msg.response_size_bytes = self.response_size;
-
-        if let Some(req) = self.pending_request.as_ref() {
-            msg.method = Some(req.method.clone());
-            msg.path = Some(req.path.clone());
-            msg.latency_ns = Some(timestamp_ns.saturating_sub(req.timestamp_ns));
-            msg.request_size_bytes = req.request_size;
-            msg.headers = req
-                .headers
-                .iter()
-                .chain(self.response_headers.iter())
-                .cloned()
-                .collect();
+        let method = self.pending.front().map(|r| r.method.as_str());
+        let tunnel = status == 101 || (method == Some("CONNECT") && (200..300).contains(&status));
+        let bodyless = method == Some("HEAD") || matches!(status, 204 | 304);
+        let framing = if tunnel || bodyless {
+            Framing::None
         } else {
-            msg.headers = self.response_headers.clone();
+            match framing(&headers, false) {
+                Some((f, _)) => f,
+                None => {
+                    self.lose_sync();
+                    Framing::Close
+                }
+            }
+        };
+        self.response = Response {
+            status: Some(status),
+            content_type: headers
+                .iter()
+                .find(|(n, _)| n == "content-type")
+                .map(|(_, v)| v.clone()),
+            headers,
+            body: Body::default(),
+        };
+        match framing {
+            Framing::None => {
+                self.finish(timestamp_ns, out);
+                if tunnel {
+                    self.go_opaque();
+                }
+            }
+            Framing::Length(n) => self.resp_state = RespState::Body { remaining: n },
+            Framing::Chunked => self.resp_state = RespState::Chunked(Chunk::Size),
+            Framing::Close => {
+                // The body runs to the close, which the parser is not
+                // told about: export the exchange now, without the body,
+                // and read nothing more.
+                self.finish(timestamp_ns, out);
+                self.go_opaque();
+            }
         }
+        true
+    }
 
-        msg.payload_text = body_text(&self.response_body).filter(|_| !self.response_gap);
-        msg.request_text = self
-            .pending_request
-            .as_ref()
-            .and_then(|req| body_text(&req.body))
-            .filter(|_| !self.request_gap);
+    /// The response is complete: export it with the request it answers.
+    fn finish(&mut self, timestamp_ns: u64, out: &mut Vec<L7Message>) {
+        let req = self.pending.pop_front();
+        if self.pending.is_empty() {
+            // The request whose body is being read was just answered.
+            match &mut self.req_state {
+                ReqState::Body { attached, .. } | ReqState::Chunked { attached, .. } => {
+                    *attached = false
+                }
+                ReqState::Line => {}
+            }
+        }
+        let resp = std::mem::take(&mut self.response);
+        self.resp_state = RespState::Line;
+        out.push(self.message(req, resp, timestamp_ns));
+    }
 
-        Some(msg)
+    fn message(&self, req: Option<PendingRequest>, resp: Response, timestamp_ns: u64) -> L7Message {
+        let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, timestamp_ns);
+        msg.response_size_bytes = resp.body.size;
+        if self.unsynced {
+            msg.method = req.as_ref().and_then(|r| {
+                KNOWN_METHODS
+                    .iter()
+                    .find(|m| **m == r.method)
+                    .map(|m| m.to_string())
+            });
+            msg.request_size_bytes = req.as_ref().map_or(0, |r| r.header_size + r.body.size);
+            if let Some(mut r) = req {
+                wipe_request(&mut r);
+            }
+            wipe_response(resp);
+            return msg;
+        }
+        msg.status = resp.status;
+        msg.content_type = resp.content_type;
+        msg.payload_text = resp.body.text();
+        match req {
+            Some(r) => {
+                msg.latency_ns = Some(timestamp_ns.saturating_sub(r.timestamp_ns));
+                msg.request_size_bytes = r.header_size + r.body.size;
+                msg.request_text = r.body.text();
+                msg.method = Some(r.method);
+                msg.path = Some(r.path);
+                msg.headers = r.headers;
+                msg.headers.extend(resp.headers);
+            }
+            None => msg.headers = resp.headers,
+        }
+        msg
     }
 
     pub fn current_state(&self) -> &'static str {
-        match self.state {
-            State::WaitingForRequest => "waiting_for_request",
-            State::ReadingRequestBody { .. } => "reading_request_body",
-            State::WaitingForResponse => "waiting_for_response",
-            State::ReadingResponseBody { .. } => "reading_response_body",
-            State::ReadingChunkedResponse => "reading_chunked_response",
+        if self.opaque {
+            return "opaque";
+        }
+        match (self.req_state, self.resp_state) {
+            (ReqState::Body { .. } | ReqState::Chunked { .. }, _) => "reading_request_body",
+            (_, RespState::Body { .. }) => "reading_response_body",
+            (_, RespState::Chunked(_)) => "reading_chunked_response",
+            _ if !self.pending.is_empty() => "waiting_for_response",
+            _ => "waiting_for_request",
         }
     }
 
-    /// Reset state for the next Keep-Alive transaction.
-    fn reset_for_next_transaction(&mut self) {
-        self.state = State::WaitingForRequest;
-        self.pending_request = None;
-        self.response_body.clear();
-        self.response_size = 0;
-        self.response_headers.clear();
-        self.response_status = None;
-        self.response_content_type = None;
-        self.request_gap = false;
-        self.response_gap = false;
-        self.request_gap_pending = false;
-        self.response_gap_pending = false;
+    /// Forget every exchange in flight (the connection's sync state and
+    /// orientation stay).
+    pub fn reset_for_next_transaction(&mut self) {
+        self.client_buf.clear();
+        self.server_buf.clear();
+        self.pending.clear();
+        self.req_state = ReqState::Line;
+        self.resp_state = RespState::Line;
+        self.response = Response::default();
     }
 }
 
-enum ChunkResult {
-    Complete,
-    NeedMoreData,
-    Error(String),
+fn wipe_request(r: &mut PendingRequest) {
+    zeroize::Zeroize::zeroize(&mut r.path);
+    zeroize::Zeroize::zeroize(&mut r.body.bytes);
+    for (k, v) in r.headers.iter_mut() {
+        zeroize::Zeroize::zeroize(k);
+        zeroize::Zeroize::zeroize(v);
+    }
+}
+
+fn wipe_response(mut r: Response) {
+    zeroize::Zeroize::zeroize(&mut r.body.bytes);
+    if let Some(ct) = r.content_type.as_mut() {
+        zeroize::Zeroize::zeroize(ct);
+    }
+    for (k, v) in r.headers.iter_mut() {
+        zeroize::Zeroize::zeroize(k);
+        zeroize::Zeroize::zeroize(v);
+    }
 }
 
 impl ProtocolParser for Http1Parser {
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
-        enum BufferTarget {
-            Client,
-            Server,
+        self.skip_accounted = false;
+        if self.opaque {
+            return ParseResult::NeedMoreData;
         }
-
-        let target = if is_http1_response(data) {
-            BufferTarget::Server
-        } else if is_http1_request(data) {
-            BufferTarget::Client
+        // Orientation, once: the manager normalises directions when it
+        // knows the server; a parser used without one learns it from the
+        // first message start.
+        let client_dir = *self.client_dir.get_or_insert_with(|| {
+            if data.starts_with(RESPONSE_START) {
+                opposite(direction)
+            } else if REQUEST_STARTS.iter().any(|s| data.starts_with(s)) {
+                direction
+            } else {
+                Direction::Egress
+            }
+        });
+        let buf = if direction == client_dir {
+            &mut self.client_buf
         } else {
-            match direction {
-                Direction::Egress => BufferTarget::Client,
-                Direction::Ingress => BufferTarget::Server,
-            }
+            &mut self.server_buf
         };
-
-        // Body bytes after a gap inside that body.
-        match target {
-            BufferTarget::Client
-                if self.request_gap_pending
-                    && matches!(self.state, State::ReadingRequestBody { .. }) =>
-            {
-                self.request_gap = true
-            }
-            BufferTarget::Server
-                if self.response_gap_pending
-                    && matches!(self.state, State::ReadingResponseBody { .. }) =>
-            {
-                self.response_gap = true
-            }
-            _ => {}
-        }
-        match target {
-            BufferTarget::Client => {
-                if self.client_buf.extend(data).is_err() {
-                    return ParseResult::Error("HTTP/1.1 client buffer overflow".into());
-                }
-            }
-            BufferTarget::Server => {
-                if self.server_buf.extend(data).is_err() {
-                    return ParseResult::Error("HTTP/1.1 server buffer overflow".into());
-                }
-            }
+        if buf.extend(data).is_err() {
+            return ParseResult::Error("HTTP/1.1 buffer overflow".into());
         }
         self.process(timestamp_ns)
     }
 
+    /// `n` bytes were not captured. Inside a body of known length (or a
+    /// chunk's data) they are counted and the body is marked; anywhere
+    /// else the boundaries are lost and the parser is replaced.
     fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
-        match (direction, self.state.clone()) {
-            // Gap inside a request body of known length: just count it.
-            (Direction::Egress, State::ReadingRequestBody { remaining })
-                if n <= remaining && self.client_buf.is_empty() =>
-            {
-                self.request_gap_pending |= n < remaining;
-                self.state = if n == remaining {
-                    State::WaitingForResponse
-                } else {
-                    State::ReadingRequestBody {
-                        remaining: remaining - n,
-                    }
-                };
-                Some(ParseResult::NeedMoreData)
-            }
-            // Gap inside a response body of known length: count it, and emit
-            // the message if the gap finished the body.
-            (Direction::Ingress, State::ReadingResponseBody { remaining })
-                if n <= remaining && self.server_buf.is_empty() =>
-            {
-                self.response_gap_pending |= n < remaining;
-                self.response_size += n as u64;
-                if n == remaining {
-                    let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
-                    self.reset_for_next_transaction();
-                    Some(ParseResult::Messages(msgs))
-                } else {
-                    self.state = State::ReadingResponseBody {
-                        remaining: remaining - n,
-                    };
-                    Some(ParseResult::NeedMoreData)
-                }
-            }
-            // Chunk framing is lost: emit what we have (status, headers,
-            // partial body), then resync on the next response line.
-            (Direction::Ingress, State::ReadingChunkedResponse) => {
-                self.response_size += n as u64;
-                let msgs: Vec<_> = self.emit_message(timestamp_ns).into_iter().collect();
-                self.reset_for_next_transaction();
-                self.server_buf.clear();
-                Some(ParseResult::Messages(msgs))
-            }
-            _ => None,
+        if self.opaque {
+            self.skip_accounted = true;
+            return Some(ParseResult::NeedMoreData);
         }
+        let from_client = Some(direction) == self.client_dir
+            || (self.client_dir.is_none() && direction == Direction::Egress);
+        let result = if from_client {
+            if !self.client_buf.is_empty() {
+                return None;
+            }
+            match self.req_state {
+                ReqState::Body {
+                    remaining,
+                    attached,
+                } if n <= remaining => {
+                    if attached && let Some(r) = self.pending.back_mut() {
+                        r.body.lost(n);
+                    }
+                    self.req_state = if n == remaining {
+                        ReqState::Line
+                    } else {
+                        ReqState::Body {
+                            remaining: remaining - n,
+                            attached,
+                        }
+                    };
+                    ParseResult::NeedMoreData
+                }
+                ReqState::Chunked {
+                    st: Chunk::Data(remaining),
+                    attached,
+                } if n <= remaining => {
+                    if attached && let Some(r) = self.pending.back_mut() {
+                        r.body.lost(n);
+                    }
+                    let st = if n == remaining {
+                        Chunk::DataEnd
+                    } else {
+                        Chunk::Data(remaining - n)
+                    };
+                    self.req_state = ReqState::Chunked { st, attached };
+                    ParseResult::NeedMoreData
+                }
+                _ => return None,
+            }
+        } else {
+            if !self.server_buf.is_empty() {
+                return None;
+            }
+            match self.resp_state {
+                RespState::Body { remaining } if n <= remaining => {
+                    self.response.body.lost(n);
+                    if n == remaining {
+                        let mut out = Vec::new();
+                        self.finish(timestamp_ns, &mut out);
+                        ParseResult::Messages(out)
+                    } else {
+                        self.resp_state = RespState::Body {
+                            remaining: remaining - n,
+                        };
+                        ParseResult::NeedMoreData
+                    }
+                }
+                RespState::Chunked(Chunk::Data(remaining)) if n <= remaining => {
+                    self.response.body.lost(n);
+                    self.resp_state = RespState::Chunked(if n == remaining {
+                        Chunk::DataEnd
+                    } else {
+                        Chunk::Data(remaining - n)
+                    });
+                    ParseResult::NeedMoreData
+                }
+                _ => return None,
+            }
+        };
+        self.skip_accounted = true;
+        Some(result)
     }
 
     fn protocol(&self) -> Protocol {
@@ -596,21 +916,26 @@ impl ProtocolParser for Http1Parser {
     fn protocol_version(&self) -> Option<&str> {
         Some("1.1")
     }
+
+    /// The stream was not seen from its first byte (or bytes were lost
+    /// that `skip` could not place): a request or status line found from
+    /// here may lie inside a body, and a response may answer a request
+    /// sent before capture. The connection is unsynced for good (see the
+    /// module docs). Not right after a `skip` that accounted for its gap
+    /// (`skip_accounted`).
+    fn joined_late(&mut self) {
+        if std::mem::take(&mut self.skip_accounted) {
+            return;
+        }
+        self.lose_sync();
+    }
 }
 
-fn is_http1_request(payload: &[u8]) -> bool {
-    payload.starts_with(b"GET ")
-        || payload.starts_with(b"POST ")
-        || payload.starts_with(b"PUT ")
-        || payload.starts_with(b"DELETE ")
-        || payload.starts_with(b"HEAD ")
-        || payload.starts_with(b"OPTIONS ")
-        || payload.starts_with(b"PATCH ")
-        || payload.starts_with(b"CONNECT ")
-}
-
-fn is_http1_response(payload: &[u8]) -> bool {
-    payload.starts_with(b"HTTP/1.")
+fn opposite(d: Direction) -> Direction {
+    match d {
+        Direction::Egress => Direction::Ingress,
+        Direction::Ingress => Direction::Egress,
+    }
 }
 
 #[cfg(test)]
@@ -782,9 +1107,11 @@ mod tests {
         let mut parser = Http1Parser::new();
         parser.feed(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", Direction::Egress, 1);
         let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nssn=123-45-6789\r\nx\r\n";
+        // Not chunked framing: nothing more is read from the connection.
         match parser.feed(resp, Direction::Ingress, 2) {
             ParseResult::Error(e) => assert!(!e.contains("123-45"), "{e}"),
-            other => panic!("expected an error, got {other:?}"),
+            ParseResult::NeedMoreData => assert_eq!(parser.state_name(), "opaque"),
+            other => panic!("expected nothing, got {other:?}"),
         }
     }
 
@@ -989,10 +1316,13 @@ mod tests {
         match result {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
+                // No request was seen: it answers one sent before
+                // capture, so nothing of it is exported but its size.
                 assert_eq!(msgs[0].method, None);
                 assert_eq!(msgs[0].path, None);
-                assert_eq!(msgs[0].status, Some(200));
-                assert_eq!(msgs[0].payload_text.as_deref(), Some("OK"));
+                assert_eq!(msgs[0].status, None);
+                assert_eq!(msgs[0].payload_text, None);
+                assert_eq!(msgs[0].response_size_bytes, 2);
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -1018,5 +1348,602 @@ mod tests {
 
         parser.reset_for_next_transaction();
         assert_eq!(parser.current_state(), "waiting_for_request");
+    }
+
+    // ── Sync and pairing ─────────────────────────────────────────────────
+
+    fn msgs(r: ParseResult) -> Vec<L7Message> {
+        match r {
+            ParseResult::Messages(m) => m,
+            ParseResult::NeedMoreData => vec![],
+            ParseResult::Error(e) => panic!("error: {e}"),
+        }
+    }
+
+    fn all_text(m: &L7Message) -> String {
+        let mut s = format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            m.method, m.path, m.content_type, m.payload_text, m.request_text
+        );
+        for (k, v) in &m.headers {
+            s.push_str(&format!(" {k}={v}"));
+        }
+        s
+    }
+
+    /// Feed a whole exchange list, collecting (method, path, status).
+    fn run(p: &mut Http1Parser, steps: &[(&[u8], Direction)]) -> Vec<L7Message> {
+        let mut out = Vec::new();
+        for (i, (d, dir)) in steps.iter().enumerate() {
+            out.extend(msgs(p.feed(d, *dir, 10 * (i as u64 + 1))));
+        }
+        out
+    }
+
+    fn summary(m: &[L7Message]) -> Vec<(Option<&str>, Option<&str>, Option<u32>)> {
+        m.iter()
+            .map(|m| (m.method.as_deref(), m.path.as_deref(), m.status))
+            .collect()
+    }
+
+    /// The tail of a request body that holds a whole forged exchange: a
+    /// parser that joins here must not export the forged request or
+    /// response with text.
+    const FORGED_TAIL: &[u8] = b"lue\"}\r\n\r\nPOST /reset?token=S3CRET HTTP/1.1\r\nHost: a\r\n\
+          Content-Length: 13\r\n\r\npassword=S3CRET";
+    const FORGED_RESP: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nS3CRET";
+
+    #[test]
+    fn joined_late_inside_a_body_exports_no_forged_message() {
+        let mut p = Http1Parser::new();
+        p.joined_late();
+        let out = run(
+            &mut p,
+            &[
+                (FORGED_TAIL, Direction::Egress),
+                (FORGED_RESP, Direction::Ingress),
+            ],
+        );
+        assert!(!out.is_empty(), "the exchange is still counted");
+        for m in &out {
+            assert!(!all_text(m).contains("S3CRET"), "{}", all_text(m));
+            assert_eq!((m.path.as_deref(), m.status), (None, None));
+        }
+        // For the rest of the connection.
+        let out = run(
+            &mut p,
+            &[
+                (b"GET /next HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(summary(&out), vec![(Some("GET"), None, None)]);
+        assert_eq!(out[0].payload_text, None);
+    }
+
+    fn manager_out(r: Option<crate::protocol::fsm::FsmResult>) -> Vec<L7Message> {
+        use crate::protocol::fsm::FsmResult;
+        match r {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    /// The same through the connection manager (`mark_joined_late`, as the
+    /// event loop does for a connection it did not see open).
+    #[test]
+    fn manager_join_mid_stream_exports_no_forged_message() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let m = ConnectionFsmManager::new(16);
+        let (client, server) = ((1, 40000), (2, 80));
+        m.get_or_create_with_server(7, Protocol::Http1, Some(server));
+        m.mark_joined_late(7);
+        let mut out =
+            manager_out(m.process_packet_from(7, client, Direction::Egress, FORGED_TAIL, 1));
+        out.extend(manager_out(m.process_packet_from(
+            7,
+            server,
+            Direction::Ingress,
+            FORGED_RESP,
+            2,
+        )));
+        assert!(!out.is_empty());
+        for msg in &out {
+            assert!(!all_text(msg).contains("S3CRET"), "{}", all_text(msg));
+        }
+    }
+
+    /// A gap inside a body of known length, through the manager (which
+    /// follows every skip with `joined_late`): the parser accounted for
+    /// it, so the connection stays synced and the next exchange keeps text.
+    #[test]
+    fn manager_gap_inside_a_known_body_keeps_text() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let m = ConnectionFsmManager::new(16);
+        let (client, server) = ((1, 40000), (2, 80));
+        m.get_or_create_with_server(8, Protocol::Http1, Some(server));
+        m.process_packet_from(
+            8,
+            client,
+            Direction::Egress,
+            b"GET /big HTTP/1.1\r\n\r\n",
+            1,
+        );
+        m.process_packet_from(
+            8,
+            server,
+            Direction::Ingress,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nfirst",
+            2,
+        );
+        let out = manager_out(m.skip_from(8, server, Direction::Ingress, 95, 3));
+        assert_eq!(out[0].payload_text.as_deref(), Some("first"));
+        m.process_packet_from(
+            8,
+            client,
+            Direction::Egress,
+            b"GET /next HTTP/1.1\r\n\r\n",
+            4,
+        );
+        let out = manager_out(m.process_packet_from(
+            8,
+            server,
+            Direction::Ingress,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            5,
+        ));
+        assert_eq!(summary(&out), vec![(Some("GET"), Some("/next"), Some(200))]);
+        assert_eq!(out[0].payload_text.as_deref(), Some("ok"));
+    }
+
+    /// A request body segment that starts like a status line stays a
+    /// request body (orientation is learned once, not per segment).
+    #[test]
+    fn body_segment_starting_like_a_response_is_not_routed_as_one() {
+        let mut p = Http1Parser::new();
+        let body = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nS3CRET";
+        let head = format!(
+            "POST /echo HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let out = run(
+            &mut p,
+            &[
+                (head.as_bytes(), Direction::Egress),
+                (body, Direction::Egress),
+                (b"HTTP/1.1 204 No Content\r\n\r\n", Direction::Ingress),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![(Some("POST"), Some("/echo"), Some(204))]
+        );
+        assert_eq!(
+            out[0].request_text.as_deref(),
+            Some(std::str::from_utf8(body).unwrap())
+        );
+        assert_eq!(out[0].payload_text, None);
+    }
+
+    /// `100 Continue` is interim: the request is answered by the final
+    /// response, and the next request by its own.
+    #[test]
+    fn interim_100_continue_does_not_answer_the_request() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"PUT /up HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (b"HTTP/1.1 100 Continue\r\n\r\n", Direction::Ingress),
+                (b"data", Direction::Egress),
+                (
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n",
+                    Direction::Ingress,
+                ),
+                (b"GET /b HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("PUT"), Some("/up"), Some(201)),
+                (Some("GET"), Some("/b"), Some(404))
+            ]
+        );
+        assert_eq!(out[0].request_text.as_deref(), Some("data"));
+    }
+
+    /// `103 Early Hints` (with headers) before the final response.
+    #[test]
+    fn early_hints_are_interim() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n\
+                      HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na\
+                      HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("GET"), Some("/a"), Some(200)),
+                (Some("GET"), Some("/b"), Some(200))
+            ]
+        );
+        assert_eq!(out[1].payload_text.as_deref(), Some("b"));
+    }
+
+    /// A response to HEAD has no body, whatever its Content-Length says:
+    /// the next response is not read as its body.
+    #[test]
+    fn head_response_has_no_body() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"HEAD /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n\
+                      HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nbb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("HEAD"), Some("/a"), Some(200)),
+                (Some("GET"), Some("/b"), Some(200))
+            ]
+        );
+        assert_eq!(out[1].payload_text.as_deref(), Some("bb"));
+    }
+
+    /// Pipelined requests (any method token) are answered in order.
+    #[test]
+    fn pipelined_requests_pair_in_order() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"PROPFIND /dav HTTP/1.1\r\nContent-Length: 0\r\n\r\n\
+                      POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc\
+                      GET /g HTTP/1.1\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 1\r\n\r\n1",
+                    Direction::Ingress,
+                ),
+                (
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\n2",
+                    Direction::Ingress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n3",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("PROPFIND"), Some("/dav"), Some(207)),
+                (Some("POST"), Some("/p"), Some(201)),
+                (Some("GET"), Some("/g"), Some(200))
+            ]
+        );
+        assert_eq!(out[1].request_text.as_deref(), Some("abc"));
+        assert_eq!(out[2].payload_text.as_deref(), Some("3"));
+    }
+
+    /// HTTP/1.0 keep-alive with Content-Length pairs like 1.1.
+    #[test]
+    fn http10_keep_alive_pairs() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"GET /a HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+                (
+                    b"GET /b HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("GET"), Some("/a"), Some(200)),
+                (Some("GET"), Some("/b"), Some(200))
+            ]
+        );
+    }
+
+    /// A response with neither length nor chunking runs to the close: it
+    /// is exported without its body, and its body (which here holds a
+    /// forged response) is never parsed.
+    #[test]
+    fn close_delimited_body_is_never_parsed() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (b"GET /a HTTP/1.0\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n",
+                    Direction::Ingress,
+                ),
+                (b"GET /x HTTP/1.1\r\n\r\n", Direction::Egress),
+                (FORGED_RESP, Direction::Ingress),
+            ],
+        );
+        assert_eq!(summary(&out), vec![(Some("GET"), Some("/a"), Some(200))]);
+        assert_eq!(out[0].payload_text, None);
+        assert_eq!(p.state_name(), "opaque");
+    }
+
+    /// CONNECT 2xx and 101 make the connection a tunnel: what follows is
+    /// not HTTP/1 and is never parsed.
+    #[test]
+    fn tunnels_are_not_parsed() {
+        for (req, resp) in [
+            (
+                &b"CONNECT db:5432 HTTP/1.1\r\nHost: db:5432\r\n\r\n"[..],
+                &b"HTTP/1.1 200 Connection Established\r\n\r\n"[..],
+            ),
+            (
+                b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+            ),
+        ] {
+            let mut p = Http1Parser::new();
+            let out = run(
+                &mut p,
+                &[
+                    (req, Direction::Egress),
+                    (resp, Direction::Ingress),
+                    (
+                        b"POST /reset?token=S3CRET HTTP/1.1\r\n\r\n",
+                        Direction::Egress,
+                    ),
+                    (FORGED_RESP, Direction::Ingress),
+                ],
+            );
+            assert_eq!(out.len(), 1, "{:?}", summary(&out));
+            assert!(matches!(out[0].status, Some(200 | 101)));
+            assert_eq!(p.state_name(), "opaque");
+        }
+    }
+
+    /// An Upgrade the server declines (a 200) keeps HTTP/1 going.
+    #[test]
+    fn declined_upgrade_keeps_parsing() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"GET /a HTTP/1.1\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+                (b"GET /b HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].path.as_deref(), Some("/b"));
+    }
+
+    /// A chunked request body (here holding a forged request) is decoded
+    /// as the body, never scanned for request lines.
+    #[test]
+    fn chunked_request_body_is_decoded() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      1d;ext=1\r\nGET /forged?token=S3CRET HTTP\r\n\
+                      0\r\nX-Trailer: t\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+                (b"GET /next HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("POST"), Some("/c"), Some(200)),
+                (Some("GET"), Some("/next"), Some(200))
+            ]
+        );
+        assert_eq!(
+            out[0].request_text.as_deref(),
+            Some("GET /forged?token=S3CRET HTTP")
+        );
+    }
+
+    /// Chunk extensions and trailer fields in a response.
+    #[test]
+    fn chunked_response_with_extensions_and_trailers() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      3;name=v\r\nabc\r\n0\r\nGrpc-Status: 0\r\n\r\n\
+                      HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].payload_text.as_deref(), Some("abc"));
+        assert_eq!(out[1].path.as_deref(), Some("/b"));
+    }
+
+    /// Framing the server may read differently (conflicting lengths)
+    /// stops parsing; TE with CL in a request unsyncs the connection.
+    #[test]
+    fn ambiguous_request_framing_withholds() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"POST /a HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 30\r\n\r\nabc",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert!(out.is_empty());
+        assert_eq!(p.state_name(), "opaque");
+
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"POST /a HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      3\r\nabc\r\n0\r\n\r\n",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(summary(&out), vec![(Some("POST"), None, None)]);
+    }
+
+    /// A response with no request waiting answers one the parser did not
+    /// see: every later exchange of the connection is withheld too (the
+    /// queue may be one off).
+    #[test]
+    fn unrequested_response_unsyncs_the_connection() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (b"GET /a HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+                    Direction::Ingress,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nS3CRET",
+                    Direction::Ingress,
+                ),
+                (b"GET /b HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("GET"), Some("/a"), Some(200)),
+                (None, None, None),
+                (Some("GET"), None, None)
+            ]
+        );
+        assert!(out.iter().all(|m| !all_text(m).contains("S3CRET")));
+    }
+
+    /// A response sent before the request body ended (a 413) answers that
+    /// request; the rest of its body is not taken for the next request.
+    #[test]
+    fn early_response_before_request_body_ends() {
+        let mut p = Http1Parser::new();
+        let out = run(
+            &mut p,
+            &[
+                (
+                    b"POST /up HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc",
+                    Direction::Egress,
+                ),
+                (
+                    b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n",
+                    Direction::Ingress,
+                ),
+                (b"defghijGET /n HTTP/1.1\r\n\r\n", Direction::Egress),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nn",
+                    Direction::Ingress,
+                ),
+            ],
+        );
+        assert_eq!(
+            summary(&out),
+            vec![
+                (Some("POST"), Some("/up"), Some(413)),
+                (Some("GET"), Some("/n"), Some(200))
+            ]
+        );
     }
 }
