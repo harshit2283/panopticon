@@ -6,8 +6,10 @@
 //! emits TlsData events tagged with the connection object pointer (`SSL*`,
 //! `*tls.Conn`) so user space can tell connections apart. `SSL_new`'s
 //! return sends a TlsNew record, so a connection that gets a destroyed
-//! object's address is not read as the old one. Go has no such boundary: a
-//! reused `*tls.Conn` address stays latched in user space.
+//! object's address is not read as the old one. User space starts every
+//! TLS key latched, OpenSSL and Go alike (protocol/fsm.rs `start_tls`); Go
+//! records still carry their process stamp (`PROC_EPOCH`), which nothing in
+//! user space reads yet (a clean-start proof is a separate design).
 //!
 //! Go received plaintext is not taken from the caller's `Read` buffer, whose
 //! lifetime a probe cannot establish, but from each record as
@@ -29,11 +31,10 @@ use panopticon_common::{
 };
 
 use crate::maps::{
-    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_GUARD_CALLS, GO_READ_CALLS, PROC_EPOCH, SSL_LOSS,
-    SizedEvent, SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED,
-    TLS_CALL_POISONED, TLS_CONN_ADDR, TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs,
-    pid_allowed, shard_for, shard_reserve, shard_reserve_as, shard_submit_flags,
-    shard_submit_flags_for,
+    CONFIG, DATA_EVENTS_PERF, EVENT_SCRATCH, GO_GUARD_CALLS, GO_READ_CALLS, PROC_EPOCH, SizedEvent,
+    SockTuple, TLS_ACTIVE, TLS_CALL, TLS_CALL_EMPTY, TLS_CALL_FILLED, TLS_CALL_POISONED,
+    TLS_CONN_ADDR, TLS_NEW_CALL, TLS_SCRATCH, TlsCall, TlsConnKey, TlsReadArgs, pid_allowed,
+    shard_for, shard_reserve, shard_reserve_as, shard_submit_flags, shard_submit_flags_for,
 };
 use crate::sock_capture::read_sock_tuple;
 use panopticon_common::scope::STREAM_OFF_UNKNOWN;
@@ -342,7 +343,6 @@ fn begin_call(ctx: &ProbeContext, conn: u64, buf: u64, len: u64, aux: u64) {
     };
     if TLS_CALL.insert(&pid_tgid, &call, 0).is_err() {
         let _ = TLS_CALL.remove(&pid_tgid);
-        ssl_lose();
     }
 }
 
@@ -440,7 +440,6 @@ pub fn ssl_write_entry(ctx: ProbeContext) {
 #[inline(always)]
 fn try_ssl_write_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
-        ssl_lose();
         return Ok(());
     }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
@@ -483,7 +482,6 @@ pub fn ssl_write_ex_entry(ctx: ProbeContext) {
 #[inline(always)]
 fn try_ssl_write_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
-        ssl_lose();
         return Ok(());
     }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
@@ -531,38 +529,23 @@ fn try_ssl_write_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     if !crate::sock_capture::tls_capture_on() {
         forget_call(pid_tgid);
-        ssl_lose();
         return Ok(());
     }
     let call = end_call(ctx, pid_tgid);
-    let ret = ctx.ret::<i32>();
     if call.found == 0 {
-        // No call opened by this frame's entry probe: written bytes are
-        // lost.
-        if ret > 0 {
-            ssl_lose();
-        }
-        return Ok(());
+        return Ok(()); // no call opened by this frame's entry probe
     }
     let _ = take_active(pid_tgid);
+    let ret = ctx.ret::<i32>();
     if ret <= 0 {
         return Ok(());
     }
     let len = if call.aux == 0 {
         ret as u64
     } else {
-        match unsafe { bpf_probe_read_user(call.aux as *const u64) } {
-            Ok(n) => n,
-            Err(_) => {
-                ssl_lose();
-                return Ok(());
-            }
-        }
+        unsafe { bpf_probe_read_user(call.aux as *const u64) }.map_err(|_| ())?
     };
     if len == 0 || len > call.len {
-        if len != 0 {
-            ssl_lose();
-        }
         return Ok(());
     }
     emit_tls_event(
@@ -590,7 +573,6 @@ pub fn ssl_read_entry(ctx: ProbeContext) {
 #[inline(always)]
 fn try_ssl_read_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
-        ssl_lose();
         return Ok(());
     }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
@@ -610,7 +592,6 @@ pub fn ssl_read_ex_entry(ctx: ProbeContext) {
 #[inline(always)]
 fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
     if !crate::sock_capture::tls_capture_on() {
-        ssl_lose();
         return Ok(());
     }
     let ssl: u64 = ctx.arg(0).ok_or(())?;
@@ -622,7 +603,6 @@ fn try_ssl_read_ex_entry(ctx: &ProbeContext) -> Result<(), ()> {
         let pid_tgid = bpf_get_current_pid_tgid();
         let _ = TLS_SCRATCH.remove(&pid_tgid);
         let _ = TLS_CALL.remove(&pid_tgid);
-        ssl_lose();
         return Ok(());
     }
     begin_read(ctx, ssl, buf, readbytes);
@@ -649,7 +629,6 @@ fn begin_read(ctx: &ProbeContext, ssl: u64, buf: u64, readbytes: u64) {
     };
     if TLS_SCRATCH.insert(&pid_tgid, &args, 0).is_err() {
         let _ = TLS_SCRATCH.remove(&pid_tgid);
-        ssl_lose();
     }
 }
 
@@ -666,7 +645,6 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     let pid_tgid = bpf_get_current_pid_tgid();
     if !crate::sock_capture::tls_capture_on() {
         forget_call(pid_tgid);
-        ssl_lose();
         return Ok(());
     }
 
@@ -677,25 +655,15 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
     // call slot in restricted modes, TLS_SCRATCH otherwise. Anything not
     // opened by this frame's entry (a nested call, a missed return) is
     // dropped and nothing is emitted from it.
-    // A call that returned data but is not emitted marks the process
-    // (`ssl_lose`); one that returned none lost nothing.
-    let ret = ctx.ret::<i32>();
     let (ssl, buf, readbytes, addr) = if restricted() {
         let call = end_call(ctx, pid_tgid);
         if call.found == 0 {
-            if ret > 0 {
-                ssl_lose();
-            }
             return Ok(());
         }
         (call.conn, call.buf, call.aux, call.addr)
     } else {
         let Some(a) = TLS_SCRATCH.get_ptr(&pid_tgid) else {
-            // Missed the entry probe.
-            if ret > 0 {
-                ssl_lose();
-            }
-            return Ok(());
+            return Ok(()); // missed the entry probe
         };
         // SAFETY: this thread's own entry (maps.rs TLS_SCRATCH), read field
         // by field before the delete.
@@ -703,32 +671,21 @@ fn try_ssl_read_ret(ctx: &RetProbeContext) -> Result<(), ()> {
             unsafe { ((*a).ssl, (*a).buf, (*a).readbytes, (*a).ident) };
         let _ = TLS_SCRATCH.remove(&pid_tgid);
         if !same_frame(ident, user_sp(ctx.regs)) {
-            if ret > 0 {
-                ssl_lose();
-            }
             return Ok(());
         }
         (ssl, buf, readbytes, NO_ADDR)
     };
 
+    let ret = ctx.ret::<i32>();
     if ret <= 0 {
         return Ok(()); // error / would-block / closed
     }
     let len = if readbytes == 0 {
         ret as u64
     } else {
-        match unsafe { bpf_probe_read_user(readbytes as *const u64) } {
-            Ok(n) => n,
-            Err(_) => {
-                ssl_lose();
-                return Ok(());
-            }
-        }
+        unsafe { bpf_probe_read_user(readbytes as *const u64) }.map_err(|_| ())?
     };
     if len == 0 || len > u32::MAX as u64 {
-        if len != 0 {
-            ssl_lose();
-        }
         return Ok(());
     }
 
@@ -813,20 +770,12 @@ fn send_tls_new(conn: u64, pid_tgid: u64, library: TlsLibrary) -> Result<(), ()>
     let Some(scope_gen) = tls_new_scope(pid_tgid) else {
         return Ok(());
     };
-    // The process's loss mark, created at its first TlsNew (maps.rs
-    // SSL_LOSS); none (a full map): the record proves nothing.
-    let pid = (pid_tgid >> 32) as u32;
-    let start = unsafe { bpf_ktime_get_ns() };
-    const BPF_NOEXIST: u64 = 1;
-    let _ = SSL_LOSS.insert(&pid, &start, BPF_NOEXIST);
-    let stamp = ssl_stamp(pid);
     let shard = shard_for(conn);
     let Some(mut entry) = shard_reserve_as::<SizedEvent<0>>(shard) else {
         crate::maps::count_kernel_drop();
-        ssl_lose();
         return Ok(());
     };
-    fill_tls_new(&mut entry, conn, pid_tgid, library, scope_gen, stamp);
+    fill_tls_new(&mut entry, conn, pid_tgid, library, scope_gen);
     entry.submit(shard_submit_flags_for::<SizedEvent<0>>(shard));
     Ok(())
 }
@@ -853,7 +802,6 @@ fn fill_tls_new(
     pid_tgid: u64,
     library: TlsLibrary,
     scope_gen: u32,
-    stamp: u64,
 ) {
     let pid = (pid_tgid >> 32) as u32;
     // The new object has its own sockets: no address of an earlier one.
@@ -879,30 +827,7 @@ fn fill_tls_new(
         (*event).tcp_ack = 0;
         crate::maps::clear_scope_fields(event);
         (*event).scope_gen = scope_gen;
-        (*event).stream_off = stamp;
     }
-}
-
-/// An OpenSSL read or write of this process was not emitted: its loss mark
-/// moves (maps.rs `SSL_LOSS`), so every key of the process whose next
-/// record carries the new value latches. No mark (no `TlsNew` of the
-/// process yet, or a full map): no key of it was proven, nothing to mark.
-#[inline(always)]
-fn ssl_lose() {
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if let Some(p) = SSL_LOSS.get_ptr_mut(&pid) {
-        // SAFETY: a map value pointer; the add is one atomic instruction.
-        unsafe { crate::maps::atomic_add_u64(p, 1) };
-    }
-}
-
-/// The process's OpenSSL loss mark, as records carry it.
-#[inline(always)]
-fn ssl_stamp(pid: u32) -> u64 {
-    // SAFETY: a u64 copied out at once.
-    unsafe { SSL_LOSS.get(&pid) }
-        .copied()
-        .unwrap_or(STREAM_OFF_UNKNOWN)
 }
 
 // ── Go TLS: crypto/tls.(*Conn).Write ──────────────────────────────────────
@@ -929,8 +854,7 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     }
     mark_active(conn);
 
-    // No stamp: without its RETs the probe can emit one call twice, so its
-    // keys are never proven (event_loop.rs `go_stamp`).
+    // No stamp: without its RETs the probe can emit one call twice.
     emit_tls_event(
         ctx,
         conn,
@@ -1078,7 +1002,7 @@ pub fn go_tls_write_guarded(ctx: ProbeContext) {
 fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
     let (conn, buf, len) = read_go_write_args(ctx)?;
     // A call that cannot be recorded may be emitted twice: the instance's
-    // records are no longer proven whole.
+    // records are no longer whole.
     let again = guard_call(ctx, conn).unwrap_or_else(|()| {
         go_lose();
         false
@@ -1101,7 +1025,7 @@ fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
 
 /// A Go TLS record of this process instance was not emitted: set
 /// `GO_EPOCH_LOST` in its `PROC_EPOCH` value, for good (no instance entry:
-/// nothing to mark, its keys are not proven anyway). A plain read-modify-
+/// nothing to mark). A plain read-modify-
 /// write: every writer of an existing entry stores the value with the bit
 /// set (exec replaces it with a new instance), so racing writers agree.
 #[inline(always)]
@@ -1477,8 +1401,6 @@ fn emit_tls_event<C: EbpfContext>(
     let lose = || {
         if go_stamped {
             go_lose();
-        } else if tls_lib == TlsLibrary::OpenSsl {
-            ssl_lose();
         }
     };
     // Decided here, before any reserve or copy, for every TLS writer.
@@ -1514,15 +1436,12 @@ fn emit_tls_event<C: EbpfContext>(
     }
     // Read after every check above: a record emitted with the stamp left
     // nothing of the instance unmarked before it.
-    let stamp = if go_stamped {
+    let stamp = match go_stamped {
         // SAFETY: a u64 copied out at once.
-        unsafe { PROC_EPOCH.get(&tgid) }
+        true => unsafe { PROC_EPOCH.get(&tgid) }
             .copied()
-            .unwrap_or(STREAM_OFF_UNKNOWN)
-    } else if tls_lib == TlsLibrary::OpenSsl {
-        ssl_stamp(tgid)
-    } else {
-        STREAM_OFF_UNKNOWN
+            .unwrap_or(STREAM_OFF_UNKNOWN),
+        false => STREAM_OFF_UNKNOWN,
     };
     let h = tls_header(
         conn, direction, tls_lib, restricted, scope_gen, call_addr, stamp,
