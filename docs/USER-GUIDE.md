@@ -391,7 +391,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 | IPv6 | Not captured. |
 | HTTP/2 joined late or with bytes lost | That connection's headers and (with credential masking on) bodies of unknown type are withheld for its life (§5.3). |
 | HTTP/2 content type over 256 bytes, or repeated | With credential masking on, that stream's body is withheld (§5.3). |
-| TLS connection object reused, or first seen mid-connection | A TLS key starts clean only when proven to start at its connection's first record: OpenSSL's `SSL_new` return for it, or for Go a key never used before by a process the agent saw start after its probes attached, with nothing lost. A Go connection on a reused `*tls.Conn` address never decodes headers (§5.3). |
+| Any TLS connection (OpenSSL or Go) | Starts latched: HTTP/2 and gRPC export no headers and, with credential masking on, no bodies of unknown type; Redis replies keep status, timing and sizes only; AMQP keeps methods, status, timing and sizes. HTTP/1.1, PostgreSQL, MySQL and Kafka are not affected (§5.3). |
 | PostgreSQL statement with credential context | Exported without its bound values (§5.3). |
 | Credential masking | Narrowed to fields where a credential value could be present; bare names are exported ([§5.3](#53-what-gets-redacted)). |
 
@@ -790,66 +790,21 @@ What is exported then:
   content type are ever examined). This lasts for the connection: a
   client preface seen later on it does not lift it (it may be the payload
   of a DATA frame). Only a new connection observed from its start
-  exports bodies again. Over TLS that start must be proven: a TLS record
-  carries no stream position, and a connection is keyed by the library's
-  connection object address (OpenSSL `SSL*`, Go `*tls.Conn`), which a new
-  connection can reuse after a closed one. A key the agent sees for the
-  first time starts clean, in every mode, only when:
-  - **OpenSSL**: the agent saw `SSL_new` return the object at that
-    address, after its last dropped event, and no OpenSSL read or write
-    of the process went uncaptured since (the kernel marks the process on
-    every one it skips or cannot send; a later mark latches the key, and
-    every other key of the process, at its next record). A reused `SSL*`
-    the agent saw created starts clean; nothing else resets a key (no client preface,
-    wherever it falls, nor `SSL_free`, which may drop one reference of
-    several).
-  - **Go `crypto/tls`**: the agent saw the process start (exec) after it
-    attached the probes of every Go binary it has, no Go record of the
-    process was lost (the kernel marks the process on every one it skips
-    or cannot send), nothing was dropped since the process started, and
-    the process has never used that key before. Go's constructors are
-    inlined, so there is no creation event: **a Go connection on a reused
-    `*tls.Conn` address never starts clean**. Go reuses addresses of
-    closed connections, so a process that opens and closes HTTP/2
-    connections one after another keeps headers withheld on most of them
-    (the `go-h2-reuse` oracle in docs/BENCHMARKS.md §7: 31–72% of the
-    exchanges exported, none with headers or raw PII among the rest).
-    Connections held open at once (a pool, a server's concurrent clients)
-    have distinct addresses and decode in full.
-
-  Otherwise a connection on the key gets neither its headers decoded nor
-  its bodies exported, for as long as the agent tracks that key: a libssl
-  whose `SSL_new` the agent cannot find (static or renamed), an object
-  reused through `SSL_clear`, an object created before the agent attached,
-  an object read or written inside `SSL_new` (a creation callback, so
-  before the agent saw it created), any event the agent dropped (channel
-  full, rate limit), any record lost in the kernel (ring full, capture
-  switched off, the process out of scope), and an OpenSSL process past
-  65,536 marked ones. For Go also:
-  - **Processes already running when the probes attached.** A process
-    running when the agent started, or when the agent attached a Go
-    binary, keeps every key latched for its whole life. The agent finds Go
-    binaries by scanning running processes, so this includes the first
-    process of every binary, every Go process running when the agent
-    (re)starts, and a new binary's processes started before the scan that
-    finds it (every 60 s by default, `tls_scan_interval_secs`). Each Go
-    binary attached later also latches new connections of every Go
-    process started before that attach; an attempt that attached no
-    probe does not. A Go binary that attached no probe is tried again
-    after 2, 4, 8, 16 and 32 scans, then not until the agent restarts. New replicas and restarts of a
-    binary already attached decode, in containers too:
-    each container's overlay root shows the image file under a device of
-    its own, and the agent finds the real inode all of them share in the
-    overlay's layers and does not attach it again. When it cannot prove
-    which layer file it is, it attaches that container's file again, and
-    processes running at that moment stay latched.
-  - A binary whose `(*Conn).Write` return instructions cannot be found
-    (stripped, renamed, inlined by a profile-guided build) or did not all
-    attach (the agent then uses an entry-only `Write` probe whose records
-    prove nothing; the agent still starts and captures it); a binary
-    without Go reads (the `sched_process_exec`/`exit` tracepoints are
-    missing); a process that found `PROC_EPOCH` full (8,192 entries)
-    when it started.
+  exports bodies again. Over TLS no connection is observed from its
+  start: a TLS record carries no stream position, and a connection is
+  keyed by the library's connection object address (OpenSSL `SSL*`, Go
+  `*tls.Conn`), which a new connection can reuse after a closed one, so
+  nothing shows that a record is its connection's first. **Every TLS
+  connection starts latched**, in every mode, OpenSSL and Go alike: over
+  TLS, HTTP/2 and gRPC export no header (no path, method, status,
+  `grpc-status` or content type) and, while credential masking is on, no
+  body of unknown type; their records keep timing, sizes and addresses.
+  A latched TLS connection also costs Redis its commands (each reply is
+  exported with its error flag, timing and sizes only) and AMQP its text
+  (methods, status, timing and sizes stay). HTTP/1.1, PostgreSQL, MySQL
+  and Kafka over TLS are not affected. Decoding HTTP/2 over TLS needs a
+  proof that a connection starts at its first record, which is planned
+  separately.
 
   Concurrent `Write`s on one Go connection are captured at their start,
   before `crypto/tls` serialises them, so two that overlap may be
@@ -857,12 +812,23 @@ What is exported then:
   each frame under one lock, so only writes whose order HTTP/2 leaves
   open can swap; redaction does not depend on order, and a swap that
   breaks parsing latches the connection.
+
+  The agent finds Go binaries by scanning running processes (every 60 s
+  by default, `tls_scan_interval_secs`), so a new binary's TLS traffic
+  before the scan that finds it is not captured. A Go binary that
+  attached no probe is tried again after 2, 4, 8 and 16 scans, then every
+  32. New replicas and restarts of a binary already attached share its
+  probes, in containers too: each container's overlay root shows the
+  image file under a device of its own, and the agent finds the real
+  inode all of them share in the overlay's layers and attaches through
+  that layer file. When it cannot prove which layer file it is, it
+  attaches that container's file again.
 - **HTTP/2 headers**: after a header block of one direction fails to
   decode or is skipped, that direction's header table may differ from the
   peer's, so no header of it is exported again on that connection; on a
-  connection the agent did not see whole (as above), no header is decoded
-  at all. Both last for the connection, and a new TLS key starts clean
-  only when proven to start at its connection's first record, as above.
+  connection the agent did not see whole (as above, every connection over
+  TLS included), no header is decoded at all. Both last for the
+  connection.
 - **DNS answers** whose name has credential context (any credential
   word: a DNS name holds no bare name, so `db.password.internal`
   included), or matches one of your `[credentials]` patterns, are
@@ -1422,6 +1388,7 @@ real cluster.
 | `Failed to attach tracepoint ... tracefs not found` | Mount tracefs: `mount -t tracefs nodev /sys/kernel/tracing`. Capture still works; process events don't. |
 | `Failed to attach kprobe` | A TLS address hook is unavailable on this kernel/VM; TLS events carry no addresses. Packet capture is not affected. |
 | HTTPS traffic not decoded | TLS is decoded only for processes using a shared OpenSSL `libssl` (`SSL_read`/`SSL_write` and their `_ex` variants) or Go's `crypto/tls` (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, binaries with a symbol table; others are logged at debug level as `Go binary not probed`). Other statically linked TLS stacks (BoringSSL in Envoy/Chrome, rustls, Java) and Go binaries built with `-ldflags=-s` appear as unknown traffic. Uprobes are per library file, so they cover every process using that `libssl`. Libraries are found at startup, when a process execs, and every `tls_scan_interval_secs` (60 s), so one loaded later, e.g. from a new container image, can take up to a minute to appear; look for `TLS uprobes attached` in the log. |
+| HTTP/2 or gRPC over TLS shows no path, status or headers | Expected: every TLS connection starts latched, so HTTP/2 and gRPC over TLS export timing, sizes and addresses only (Redis and AMQP over TLS lose their text too; [§5.3](#53-what-gets-redacted)). HTTP/1.1 over TLS is decoded in full. |
 | Each exchange appears twice | Both ends of the connection run on this node: each end's socket is captured (two views). The two records are alike in the JSON export: without NAT between the ends they carry the same addresses, ports and direction, and differ only in timestamp and latency (by microseconds). Select one side with `pid_filter` or `cgroup_filter`. |
 | Event log empty after restart | `--json-export` truncates the file at startup; copy it before restarting. |
 | `Kubernetes API unavailable` warning, no `src_workload` | `hint` in the log line names the cause: 403 = the ClusterRole lacks `get/list/watch` on pods/services (`rbac.create=true`), 401 = token not mounted or rejected. Endpoints keep IP names meanwhile (§5.6). |

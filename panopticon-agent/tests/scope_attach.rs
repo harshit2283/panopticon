@@ -2581,7 +2581,12 @@ fn go_tls_reads() {
     );
     let write =
         go_read::go_write_probes_from(&elf[..]).expect("discovery finds Write and its RETs");
-    println!("GOWRITE Write rets={}", write.write_rets.len());
+    println!(
+        "GOWRITE Write rets={} body={:#x} (entry {:#x})",
+        write.write_rets.len(),
+        write.write_body,
+        write.write_entry
+    );
 
     let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/panopticon-ebpf"));
     let mut ebpf = EbpfLoader::new().load(bytes).expect("object and maps load");

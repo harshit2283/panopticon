@@ -22,11 +22,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     ("main.rs", "GLOBAL", "the global allocator"),
     (
-        "protocol/fsm.rs",
-        "GO_PROBES_SINCE",
-        "when the agent last attached a Go binary's probes, its own clock",
-    ),
-    (
         "narrowing_tests.rs",
         "GLOBAL_LOG",
         "tests only: the test binary's process-wide log, the oracle itself",

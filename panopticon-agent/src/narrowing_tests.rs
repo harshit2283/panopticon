@@ -1776,19 +1776,18 @@ fn ssl_rec(kind: EventType, dir: Direction, payload: &[u8]) -> DataEvent {
     e
 }
 
-/// Through the real worker loop: only a TlsNew record (`SSL_new`
-/// returned the object; Go TLS has none, see
-/// `go_tls_reused_key_stays_latched`) starts a new connection on a TLS
-/// key. Codex R10's up-ref
-/// schedule (`SSL_up_ref`, a non-final `SSL_free`, the object still in
-/// use, no new object) sends no TlsNew: a latched connection followed by
-/// a preface stays withheld. After a TlsNew the next connection exports,
-/// and an embedded preface inside its DATA does not restart it. Every
-/// record is on one key, so one worker handles them in order.
+/// Through the real worker loop: a TlsNew record (`SSL_new` returned the
+/// object) ends the key's connection, and the next one starts latched
+/// like every TLS key (fsm.rs `start_tls`). Codex R10's up-ref schedule
+/// (`SSL_up_ref`, a non-final `SSL_free`, no new object) sends no TlsNew:
+/// a latched connection followed by a preface stays withheld; after each
+/// TlsNew the next connection exports no header either, and an embedded
+/// preface inside its DATA restarts nothing. Every record is on one key,
+/// so one worker handles them in order.
 #[test]
-fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
+fn ssl_new_starts_a_latched_connection_on_a_tls_key() {
     t2(
-        "only_ssl_new_starts_a_new_connection_on_a_tls_key",
+        "ssl_new_starts_a_latched_connection_on_a_tls_key",
         4,
         async {
             let env = Env::new("tlsnew").await;
@@ -1825,8 +1824,6 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
                 data(Direction::Egress, &h2_start(&h2_request(1, b"tlsnew-four"))),
                 data(Direction::Ingress, &reply(1)),
             ]);
-            env.wait_for("tlsnew-two", &["json"]).await;
-            env.wait_for("tlsnew-four", &["json"]).await;
             // Every sink drained before it is inspected.
             env.scope.shutdown().await;
             for sink in ["json", "otlp"] {
@@ -1836,7 +1833,12 @@ fn only_ssl_new_starts_a_new_connection_on_a_tls_key() {
                     .find(|(n, _)| *n == sink)
                     .unwrap()
                     .1;
-                for canary in ["tlsnew-canary-one", "tlsnew-canary-three"] {
+                for canary in [
+                    "tlsnew-canary-one",
+                    "tlsnew-two",
+                    "tlsnew-canary-three",
+                    "tlsnew-four",
+                ] {
                     assert!(!contains(&out, canary), "{canary} reached {sink}");
                 }
             }
@@ -1888,16 +1890,15 @@ async fn h2_records(env: &Env) -> Vec<serde_json::Value> {
 
 /// The `go-h2-reuse` TLS oracle stack (tests/oracle/run_tls.sh) as the
 /// worker sees it. Go's allocator hands a closed connection's `*tls.Conn`
-/// address to the next one, so connections share a key, and Go has no
-/// connection boundary: the second connection on the key restarts its
-/// parser latched and exports an HTTP/2 record with no path, status or
-/// headers, and none of its values.
+/// address to the next one, so connections share a key. Every TLS key
+/// starts latched (fsm.rs `start_tls`), the first connection's included:
+/// each exports an HTTP/2 record with no path, status or headers, and none
+/// of its values.
 #[test]
-fn go_tls_reused_key_stays_latched() {
-    t2("go_tls_reused_key_stays_latched", 4, async {
+fn go_tls_key_stays_latched() {
+    t2("go_tls_key_stays_latched", 4, async {
         let env = Env::new("goreuse").await;
-        // An instance the agent saw start after the pipeline was installed.
-        let stamp = panopticon_common::GO_EPOCH_EXEC | crate::protocol::fsm::mono_ns();
+        let stamp = panopticon_common::GO_EPOCH_EXEC | 1_000;
         let rec = |dir, p: &[u8]| go_rec(dir, 18444, p, stamp);
         let reply = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]); // :status 200
         let mut events = vec![];
@@ -1907,13 +1908,16 @@ fn go_tls_reused_key_stays_latched() {
             events.push(rec(Direction::Ingress, &reply));
         }
         env.feed(&events);
-        env.wait_for("goreuse-q1", &["json"]).await;
         let h2 = h2_records(&env).await;
         let paths: Vec<_> = h2.iter().map(|e| e["path"].as_str()).collect();
-        assert_eq!(paths, [Some("/len/10?id=goreuse-q1"), None, None], "{h2:?}");
-        assert!(h2[1..].iter().all(|e| e["status"].is_null()), "{h2:?}");
+        assert_eq!(paths, [None, None, None], "{h2:?}");
+        assert!(h2.iter().all(|e| e["status"].is_null()), "{h2:?}");
         let json = env.file("events.jsonl");
-        assert!(!contains(&json, "goreuse-q2") && !contains(&json, "goreuse-q3"));
+        assert!(
+            ["goreuse-q1", "goreuse-q2", "goreuse-q3"]
+                .iter()
+                .all(|q| !contains(&json, q))
+        );
     });
 }
 

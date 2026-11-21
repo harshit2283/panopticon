@@ -8,8 +8,8 @@ Also counts agent records whose id is not in the truth (phantoms).
 
 Usage: score.py TRUTH AGENT_JSONL [MIN_RECALL] [--withheld]
 With MIN_RECALL, exits non-zero below it or if any raw PII value reached
-the export. --withheld (connections whose TLS keys were reused, which the
-agent never decodes again) also exits non-zero if any phantom carries a
+the export. --withheld (HTTP/2 over TLS, where every key starts latched
+and nothing is decoded) also exits non-zero if any phantom carries a
 path, status, content type or header: a record the agent could not
 attribute must be withheld, not guessed.
 """

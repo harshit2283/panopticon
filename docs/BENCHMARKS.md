@@ -78,17 +78,18 @@ taken per TLS record where `(*halfConn).decrypt` returns it (uprobes on its
 in the connection's own input buffer, with the connection named by the entry
 of `(*Conn).readRecordOrCCS`. Go reads were removed for a while (writes only)
 and are back with that design; the rows marked 2026-11-12 are its
-measurements (kernel 7.0, 32 vCPU VM, unscoped `full`). Over HTTP/2 the
-`go-h2` stack holds every connection open until the client exits, so no
-`*tls.Conn` address (the agent's key) is reused, and is gated at 99% recall
-per view with as many distinct keys as connections (`tls_conns.py`). The
-`go-h2-reuse` stack closes each connection before opening the next, so Go
-reuses addresses; a reused key never decodes headers (§7), so its recall is
-reported, not gated, and it is gated on no raw PII and on every record it
-cannot attribute carrying no path, status, content type or header, and on no
-client exchange decoded on a connection whose `*tls.Conn` address an earlier
-connection used (`tls_conns.py --reused-latched`, from the addresses the
-oracle records, not the agent's keys).
+measurements (kernel 7.0, 32 vCPU VM, unscoped `full`). Since 2026-11-21
+every TLS key starts latched (§7), so HTTP/2 over TLS decodes no header and
+both HTTP/2 stacks report recall without gating it. The `go-h2` stack holds
+every connection open until the client exits, so no `*tls.Conn` address (the
+agent's key) is reused (`tls_conns.py --distinct`); the `go-h2-reuse` stack
+closes each connection before opening the next, so Go reuses addresses, and
+no client exchange may decode on a connection whose `*tls.Conn` address an
+earlier connection used (`tls_conns.py --reused-latched`, from the addresses
+the oracle records, not the agent's keys). Both are gated on no raw PII and
+on every record score.py cannot attribute carrying no path, status, content
+type or header. The `openssl` and `go` (HTTP/1.1) stacks stay gated at 99%
+recall per view.
 
 | Run | Exchanges | Recall (client / server view) | Status / method / size | With socket addresses | Leaks |
 |---|---|---|---|---|---|
@@ -105,9 +106,12 @@ oracle records, not the agent's keys).
 | HTTP/2 (`go-h2` stack, connections reused), 2026-11-20, fail-closed boundary (since removed: handshake wrappers, guards checked after the record's reservation, processes started after the attach only), seeds 42–51, Go 1.22.2 and Go 1.25.4 (20 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
 | HTTP/1.1 (`go` stack), 2026-11-20, same build, seeds 42–51, Go 1.22.2 (10 runs) | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
 | HTTP/2 (`go-h2` stack, connections reused), same build (since removed), server started before the agent (seed 42) | 500 | 100% client / 51.2% server (the server's reused keys latched: 244 header-less records, scored as phantoms) | — | 100% / 100% | 0 |
-| HTTP/2 (`go-h2` stack: connections held open, no `*tls.Conn` reused), 2026-11-21, new keys latched unless proven first, no Go boundary, seeds 7, 14, 42, 43, 44, Go 1.22.2, kernel 7.0 | 500 | **100% / 100%** in every run; distinct keys = connections (119–136) in both processes | 100% / 100% / 100% | 100% / 100% | 0 |
-| HTTP/2 (`go-h2-reuse` stack: each connection closed before the next), same build and seeds | 500 | 30.8–59.8% client / 43.4–72.0% server, not gated (reused keys latched; every unattributed record without path, status, content type or headers) | 100% / 100% / 100% (matched) | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack: connections held open, no `*tls.Conn` reused), 2026-11-21, new keys latched unless proven first (since removed: every TLS key now starts latched), no Go boundary, seeds 7, 14, 42, 43, 44, Go 1.22.2, kernel 7.0 | 500 | **100% / 100%** in every run; distinct keys = connections (119–136) in both processes | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2-reuse` stack: each connection closed before the next), same build (since removed) and seeds | 500 | 30.8–59.8% client / 43.4–72.0% server, not gated (reused keys latched; every unattributed record without path, status, content type or headers) | 100% / 100% / 100% (matched) | 100% / 100% | 0 |
 | HTTP/1.1 (`go` stack), same build, seed 42 | 500 | **100% / 100%** | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/1.1 (`openssl` and `go` stacks), 2026-11-21, every TLS key starts latched, seeds 42, 7, Go 1.22.2, kernel 7.0 | 500 | **100% / 100%** in every run | 100% / 100% / 100% | 100% / 100% | 0 |
+| HTTP/2 (`go-h2` stack: connections held open, no `*tls.Conn` reused), same build and seeds | 500 | 0% / 0%, not gated (every exchange exported without path, status, content type or headers: 500 unattributed records per view, none carrying those fields); distinct keys = connections (119, 124) | — | 100% / 100% | 0 |
+| HTTP/2 (`go-h2-reuse` stack: each connection closed before the next), same build and seeds | 500 | 0% / 0%, not gated (the same; 119 and 124 connections on 48–68 keys per process, no client exchange decoded on a reused key) | — | 100% / 100% | 0 |
 
 Repeated runs of the HTTP/1.1 stack (seeds 42–51, ten runs per build, on
 64 vCPUs) are not always clean. In 2 runs of 10, the client view scores
@@ -146,13 +150,13 @@ HTTP/2 over TLS had two problems of its own:
   connection's first handshake (`clientHandshake-fm` /
   `serverHandshake-fm`) served as Go's creation record for a while (the
   2026-11-20 boundary rows), but it could not be shown never to fire
-  mid-connection, and it was removed: a reused Go key stays latched
-  (§7). Since 2026-11-21 any new TLS key starts latched unless proven to
-  start at its connection's first record (USER-GUIDE §5.3), and the
-  oracle is split: `go-h2` without address reuse, gated, and
-  `go-h2-reuse`, which shows the latch. `run_tls.sh` starts the measured
-  server after the agent (a copy of it runs before, for the initial
-  scan), since a server already running keeps every key latched.
+  mid-connection, and it was removed. Proofs from process stamps, loss
+  marks, tombstones and floors (the 2026-11-21 "unless proven first"
+  rows) each had a hole a reviewer could show, and were removed too:
+  every TLS key now starts latched, OpenSSL and Go alike (§7, USER-GUIDE
+  §5.3), so HTTP/2 over TLS exports no headers. The oracle keeps two
+  HTTP/2 stacks, `go-h2` without address reuse and `go-h2-reuse`, both
+  gated on withholding, not recall.
 - **Large reads and writes were cut.** One TLS read or write often holds a
   whole 16 KB record, which is several frames, while each event carries at
   most 4 KB. The probes now emit a call as up to four consecutive 4 KB events,
@@ -1541,25 +1545,23 @@ The fuzzing harness is in `fuzz/` (libFuzzer via `cargo fuzz`, nightly). It has 
   opened, a side's start not captured, or the parser restarted after bytes
   lost outside a DATA frame): HPACK state is unknown, so no header,
   including the path, is decoded for the rest of that connection (a later
-  client preface on it does not lift this; over TLS a key starts clean
-  only when proven to start at its connection's first record: `SSL_new`
-  returned it, or for Go the key is new to a process the agent saw start
-  after its probes attached, with nothing lost, USER-GUIDE §5.3), and
-  while credential masking
+  client preface on it does not lift this; over TLS no connection
+  counts as seen whole, below), and while credential masking
   is on its bodies are not exported (nor are bodies after any lost header
   block, or with a content type repeated or over 256 bytes).
-- **Reused Go TLS keys never decode HTTP/2 headers.** Go has no
-  connection creation event the agent can probe (`tls.Client` /
-  `tls.Server` are inlined), and Go reuses a closed connection's
-  `*tls.Conn` address, so a connection on a reused address stays latched:
-  no path, status or headers, and (with credential masking on) no body of
-  unknown type. `go-h2-reuse`, which closes each connection before opening
-  the next (119–136 connections on 37–95 addresses per process, seeds 7,
-  14, 42–44), exports 31–72% of the exchanges per view; every other record
-  carries none of those fields, and no raw PII reached the export. Connections held open at once (`go-h2`) decode in
-  full. A connection-boundary record for Go (the first handshake's entry,
-  2026-11-20 rows in §2) was removed: it could not be shown never to fire
-  mid-connection.
+- **HTTP/2 over TLS decodes no headers.** A TLS record carries no stream
+  position, and Go and OpenSSL reuse a closed connection object's address
+  (the agent's key), so nothing shows that a record is its connection's
+  first. Every TLS key starts latched (USER-GUIDE §5.3): over TLS, HTTP/2
+  and gRPC export no path, status or headers and (with credential masking
+  on) no body of unknown type; Redis replies keep status, timing and sizes
+  only, AMQP methods, status, timing and sizes. HTTP/1.1, PostgreSQL,
+  MySQL and Kafka over TLS are not affected. Both `go-h2` stacks are
+  gated on no such field on any unattributed record and no raw PII in the
+  export; their recall is reported only. Every proof of a TLS
+  connection's start tried so far (a Go handshake-entry record, process
+  stamps, loss marks, tombstones, floors) was removed; one is a separate
+  design.
 - **Large capture gaps in HTTP/2** (several frames lost) reset that
   connection's parser. Gaps inside a single DATA frame are handled. Over TLS a
   gap only occurs past 16 KB per read/write call.

@@ -67,15 +67,18 @@ pub fn go_read_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoReadPr
 /// Writes plaintext (tls_probes.rs `go_tls_write_guarded`).
 pub const WRITE: &str = "crypto/tls.(*Conn).Write";
 
-/// Probe offsets of `(*Conn).Write` with its RET instructions: the entry
-/// probe records each call until a RET, so an entry that fires again for
-/// one call (the stack-growth prologue re-entering it) emits nothing
+/// Probe offsets of `(*Conn).Write` with its RET instructions and the
+/// first instruction of its body (past the stack-check prologue): the
+/// entry probe records each call until a RET, and the body probe marks it
+/// running, so an entry that fires again for one call before its body
+/// began (the stack-growth prologue re-entering it) emits nothing
 /// (tls_probes.rs `guard_call`). A binary without them (stripped, renamed,
-/// RETs not found) gets the unguarded entry probe, which can emit a Write
-/// twice; its records carry no process stamp, so its keys stay latched.
+/// RETs or prologue not found) gets the unguarded entry probe, which can
+/// emit a Write twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoWriteProbes {
     pub write_entry: u64,
+    pub write_body: u64,
     pub write_rets: Vec<u64>,
 }
 
@@ -91,10 +94,72 @@ pub fn go_write_probes_from<'data, R: ReadRef<'data>>(data: R) -> Option<GoWrite
     }
     let write = write?;
     let write_rets = function_returns(&elf, data, write)?;
+    let code = function_code(&elf, data, write)?;
+    let body = body_start(elf.architecture(), write.0, code)?;
     Some(GoWriteProbes {
         write_entry: symbol_file_offset(&elf, write.0),
+        write_body: symbol_file_offset(&elf, body),
         write_rets,
     })
+}
+
+/// The address of the first instruction after a Go function's stack-check
+/// prologue: the conditional branch to `morestack` among the first few
+/// instructions (amd64 `CMPQ SP, 16(R14); JBE`, or with `LEAQ` for a large
+/// frame; arm64 `CMP ..., RSP; BLS`), forward inside the function. None if
+/// the prologue is not found: then no guarded probe is used.
+fn body_start(arch: object::Architecture, addr: u64, code: &[u8]) -> Option<u64> {
+    const PROLOGUE_INSNS: usize = 4;
+    match arch {
+        object::Architecture::X86_64 => {
+            use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+            let end = addr + code.len() as u64;
+            let mut decoder = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
+            for insn in decoder.iter().take(PROLOGUE_INSNS) {
+                if insn.is_invalid() {
+                    return None;
+                }
+                if insn.mnemonic() == Mnemonic::Jbe {
+                    let target = insn.near_branch_target();
+                    return (target > insn.ip() && target < end).then(|| insn.next_ip());
+                }
+            }
+            None
+        }
+        object::Architecture::Aarch64 => {
+            // B.LS <label>: 0101_0100 imm19 0 1001.
+            code.chunks_exact(4)
+                .take(PROLOGUE_INSNS)
+                .position(|w| {
+                    u32::from_le_bytes([w[0], w[1], w[2], w[3]]) & 0xff00_001f == 0x5400_0009
+                })
+                .map(|i| addr + 4 * (i as u64 + 1))
+        }
+        _ => None,
+    }
+}
+
+/// The bytes of the function at `addr` (`size` bytes), or None.
+fn function_code<'data, R: ReadRef<'data>>(
+    elf: &ElfFile<'data, object::elf::FileHeader64<object::Endianness>, R>,
+    data: R,
+    (addr, size): (u64, u64),
+) -> Option<&'data [u8]> {
+    if size > MAX_GO_FN_BYTES {
+        return None;
+    }
+    let section = elf.sections().find(|s| {
+        s.address() <= addr
+            && addr
+                .checked_add(size)
+                .is_some_and(|e| e <= s.address() + s.size())
+    })?;
+    let (sec_off, sec_len) = section.file_range()?;
+    let rel = addr - section.address();
+    if rel.checked_add(size)? > sec_len {
+        return None;
+    }
+    data.read_bytes_at(sec_off.checked_add(rel)?, size).ok()
 }
 
 /// File offsets of the return instructions of the function at `addr`
@@ -676,6 +741,53 @@ pub(crate) mod tests {
         assert_eq!(go_read_probes_from(&elf(&big)[..]), None);
         big.truncate(MAX_GO_FN_BYTES as usize);
         assert!(go_read_probes_from(&elf(&big)[..]).is_some());
+    }
+
+    /// The body starts after the prologue's branch to `morestack` (amd64
+    /// `CMPQ SP, 16(R14); JBE`, or `LEAQ` first for a large frame; arm64
+    /// `B.LS`), forward inside the function; without one, nothing.
+    #[test]
+    fn test_body_start_after_the_stack_check() {
+        use object::Architecture::{Aarch64, X86_64};
+        // cmp rsp,[r14+0x10]; jbe +4; push rbp; ret; call; jmp
+        let small: &[u8] = &[0x49, 0x3b, 0x66, 0x10, 0x76, 0x02, 0x55, 0xc3, 0xeb, 0xf6];
+        assert_eq!(body_start(X86_64, 0x1000, small), Some(0x1006));
+        // lea r12,[rsp-0x48]; cmp r12,[r14+0x10]; jbe +2; push rbp; ret; jmp
+        let large: &[u8] = &[
+            0x4c, 0x8d, 0x64, 0x24, 0xb8, 0x4d, 0x3b, 0x66, 0x10, 0x76, 0x02, 0x55, 0xc3, 0xeb,
+            0xf1,
+        ];
+        assert_eq!(body_start(X86_64, 0x1000, large), Some(0x100b));
+        // No stack check (push rbp; ret), and a backward JBE: refused.
+        assert_eq!(body_start(X86_64, 0x1000, &[0x55, 0xc3]), None);
+        assert_eq!(body_start(X86_64, 0x1000, &[0x90, 0x76, 0xfd, 0xc3]), None);
+        // ldr x16,[x28,#16]; cmp sp,x16; b.ls +0x10; ...
+        let arm: Vec<u8> = [0xf9400b90u32, 0xeb3063ff, 0x54000089, 0xd65f03c0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(body_start(Aarch64, 0x4000, &arm), Some(0x400c));
+        assert_eq!(
+            body_start(Aarch64, 0x4000, &0xd65f03c0u32.to_le_bytes()),
+            None
+        );
+    }
+
+    /// Write discovery end to end: entry, body and RETs, or nothing.
+    #[test]
+    fn test_go_write_probes_from_elf() {
+        let write: &[u8] = &[0x49, 0x3b, 0x66, 0x10, 0x76, 0x02, 0x55, 0xc3, 0xeb, 0xf6];
+        let elf = elf_with_functions(&[("other", &[0xc3]), (WRITE, write)]);
+        assert_eq!(
+            go_write_probes_from(&elf[..]),
+            Some(GoWriteProbes {
+                write_entry: 0x1001,
+                write_body: 0x1007,
+                write_rets: vec![0x1008],
+            })
+        );
+        let no_check = elf_with_functions(&[(WRITE, &[0x55, 0xc3])]);
+        assert_eq!(go_write_probes_from(&no_check[..]), None);
     }
 
     /// A reader whose string lookups all fail, counting them.

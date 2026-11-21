@@ -212,17 +212,15 @@ production-hardened compliance platform.
     scope oracle
     (`tests/oracle/run_scope.sh`: 100% of reads from both processes in
     unscoped `full`, `pid_filter` and `cgroup_filter`, the last not on
-    RHEL 8, where `cgroup_filter` is refused); `run_tls.sh` scores 100%
-    recall in both views for the `go` stack and for `go-h2`, whose
-    connections are held open at once so no `*tls.Conn` address is
-    reused (docs/BENCHMARKS.md §7). A `Write` whose entry probe fires
-    again (Go's stack-growth prologue) is emitted once. A Go connection
-    on a reused `*tls.Conn` address never decodes HTTP/2 headers (no
-    creation event proves its start): `go-h2-reuse`, which closes each
-    connection before opening the next, exports 31–72% of the
-    exchanges per view, with no headers or raw PII among the rest.
-    The measured server starts after the agent attached its binary: a
-    server already running keeps every key latched (USER-GUIDE §5.3).
+    RHEL 8, where `cgroup_filter` is refused); `run_tls.sh` gates
+    recall in both views for the `openssl` and `go` (HTTP/1.1) stacks
+    (docs/BENCHMARKS.md §7). A `Write` whose entry probe fires again
+    (Go's stack-growth prologue) is emitted once. Every TLS connection
+    starts latched (nothing proves a TLS record is its connection's
+    first), so HTTP/2 over TLS decodes no headers: both `go-h2` stacks
+    are gated on no raw PII in the export and no path, status, content
+    type or header on any record that cannot be attributed, and their
+    recall is reported only.
     Record reads in flight at once are
     capped at 65,536 node-wide (a goroutine parked waiting for a record on
     an idle keep-alive connection holds one); past that, further reads are
@@ -282,21 +280,14 @@ production-hardened compliance platform.
   - HTTP/2 headers are not decoded on a connection the agent did not see
     whole: one already open when the agent started, a side whose start
     was not captured, or one whose parser restarted after lost bytes; a
-    later client preface on it does not lift this. Over TLS a key the
-    agent sees for the first time starts clean only when proven to start
-    at its connection's first record: OpenSSL's `SSL_new` returned that
-    object after the agent's last dropped event and no OpenSSL call of
-    the process went uncaptured since (a kernel loss mark per process,
-    moved on every call it skips or cannot send), or for Go the process
-    was seen starting after its probes attached, lost no record and
-    never used the key before. A Go connection on a reused `*tls.Conn`
-    address therefore never decodes headers. With a static or renamed
-    libssl, `SSL_clear` reuse, I/O inside `SSL_new` (a creation
-    callback), a Go binary whose `Write` returns cannot be probed
-    (stripped, renamed), a Go process that was running when the agent
-    started or attached a Go binary (the first process of every Go
-    binary included), or a lost record, it is not decoded either. While
-    credential masking is on its bodies are not exported either.
+    later client preface on it does not lift this. Over TLS no
+    connection counts as seen whole: every TLS key (OpenSSL and Go)
+    starts latched, so HTTP/2 and gRPC over TLS export no headers. The
+    same latch costs Redis over TLS its command and reply text and AMQP
+    over TLS its text; HTTP/1.1, PostgreSQL, MySQL and Kafka over TLS
+    are not affected. Proving a TLS connection's start is a separate
+    design. While credential masking is on, the bodies of such an HTTP/2
+    connection are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -374,7 +365,7 @@ production-hardened compliance platform.
     agent did not see from its first byte, HTTP/2 headers after a lost HPACK block or on a connection
     the agent did not see whole (and, while masking is on, HTTP/2 bodies
     on such a connection until a new connection is observed from its
-    start, over TLS only for a key proven to start there as above,
+    start, never over TLS,
     and bodies whose content type is repeated or over 256 bytes),
     over-long header names and gRPC/protobuf body text are not exported;
     PostgreSQL bound values are exported only under the SQL their
