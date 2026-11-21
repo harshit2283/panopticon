@@ -40,16 +40,22 @@ enum State {
 /// no channel, `CLIENT REPLY OFF|SKIP` (no acknowledgement shows whether
 /// the server took them), a malformed `CLIENT REPLY`, `MULTI`, `EXEC`,
 /// `DISCARD` or `RESET`, an oversized transaction — ends matching for the
-/// connection: every later reply is exported without its text, so a
-/// credential reply is never exported under another command.
+/// connection: every later reply is exported with no command. A reply's
+/// own text is never exported, only its type and size ([`reply_shape`]).
+/// `MONITOR`, `SYNC`, `PSYNC` and `REPLCONF` turn the connection into a
+/// stream of commands or replication data that answers nothing, and a
+/// request that is not an array cannot be paired with what the server
+/// answers it with (inline lines): after any of these the connection
+/// exports nothing more ([`RedisParser::go_silent`]).
 pub struct RedisParser {
     state: State,
     client_buf: StreamBuffer,
     server_buf: StreamBuffer,
     /// Commands awaiting a reply, oldest first (pipelining).
     pending_queue: VecDeque<Pending>,
-    /// Commands queued since `MULTI` (their replies arrive under `EXEC`).
-    transaction: Option<Vec<Vec<String>>>,
+    /// Number of commands queued since `MULTI` (their replies arrive under
+    /// `EXEC`).
+    transaction: Option<usize>,
     /// Bytes of the commands in `transaction`.
     transaction_bytes: usize,
     /// RESP3 in use, as the server answered `HELLO` (or sent a push):
@@ -58,8 +64,11 @@ pub struct RedisParser {
     /// The server acknowledged a subscription and its last count was not
     /// zero: in RESP2, `message` arrays answer no command.
     subscribed: bool,
-    /// Correspondence lost for good: every later reply text is withheld.
+    /// Correspondence lost for good: later replies carry no command.
     desync: bool,
+    /// Nothing more is exported for this connection (monitor or
+    /// replication stream, or a request that cannot be paired).
+    silent: bool,
 }
 
 /// A command awaiting its reply.
@@ -75,10 +84,6 @@ enum Expect {
     Reply,
     /// One acknowledgement per channel still to come.
     Subscription(usize),
-    /// An array of the results of these queued commands.
-    Exec(Vec<Vec<String>>),
-    /// `+OK`, then a stream of monitored commands answering nothing.
-    Monitor,
     /// `HELLO [protover]`: a successful reply switches to that protocol.
     Hello(Option<u8>),
     /// `RESET`: `+RESET` returns the connection to its initial state.
@@ -115,6 +120,7 @@ impl RedisParser {
             resp3: false,
             subscribed: false,
             desync: false,
+            silent: false,
         }
     }
 
@@ -129,6 +135,13 @@ impl RedisParser {
             match parse_resp_value(data) {
                 RespParse::Complete(value, consumed) => {
                     self.client_buf.consume(consumed);
+                    if !matches!(value, RespValue::Array(Some(_))) {
+                        // `$4\r\nPING\r\n`, `$-1`, `_`, `%1`...: the server
+                        // reads such bytes as inline commands, one per
+                        // line, and its replies cannot be paired.
+                        self.go_silent();
+                        break;
+                    }
                     let mut parts = flatten_to_strings(&value);
                     if super::mask_credentials_enabled() {
                         mask_credentials(&mut parts);
@@ -168,23 +181,28 @@ impl RedisParser {
             self.lose_correspondence();
             return;
         }
+        // A monitor or replication stream follows (also when queued: EXEC
+        // would start it): nothing of it answers a command.
+        if matches!(cmd.as_str(), "MONITOR" | "SYNC" | "PSYNC" | "REPLCONF") {
+            self.go_silent();
+            return;
+        }
         match cmd.as_str() {
             // Inside MULTI a command is only queued (`+QUEUED`); its result
             // comes back in EXEC's array.
             // Run at EXEC, these change how later replies line up (or the
             // protocol) without a reply we can check: stop matching.
             c if queued_in_transaction
-                && (matches!(c, "CLIENT" | "HELLO" | "MONITOR")
-                    || SUBSCRIBE_COMMANDS.contains(&c)) =>
+                && (matches!(c, "CLIENT" | "HELLO") || SUBSCRIBE_COMMANDS.contains(&c)) =>
             {
                 self.lose_correspondence();
                 return;
             }
             _ if queued_in_transaction => {
                 self.transaction_bytes += parts.iter().map(String::len).sum::<usize>();
-                let queued = self.transaction.get_or_insert_with(Vec::new);
-                queued.push(parts.clone());
-                if queued.len() > MAX_TRANSACTION_COMMANDS
+                let queued = self.transaction.get_or_insert(0);
+                *queued += 1;
+                if *queued > MAX_TRANSACTION_COMMANDS
                     || self.transaction_bytes > MAX_TRANSACTION_BYTES
                 {
                     self.lose_correspondence();
@@ -212,14 +230,12 @@ impl RedisParser {
                 expect = Expect::Reset;
             }
             "MULTI" => {
-                self.transaction = Some(Vec::new());
+                self.transaction = Some(0);
                 self.transaction_bytes = 0;
             }
             "DISCARD" => self.transaction = None,
-            // With no MULTI seen (capture started inside the transaction)
-            // nothing lines up, and all of a result array is masked.
-            "EXEC" => expect = Expect::Exec(self.transaction.take().unwrap_or_default()),
-            "MONITOR" => expect = Expect::Monitor,
+            // One array answers the queued commands.
+            "EXEC" => self.transaction = None,
             c if SUBSCRIBE_COMMANDS.contains(&c) => {
                 // (P|S)UNSUBSCRIBE with no channel: one ack per current
                 // subscription, a number we do not track.
@@ -243,6 +259,14 @@ impl RedisParser {
             timestamp_ns,
             expect,
         });
+    }
+
+    /// Export nothing more for this connection.
+    fn go_silent(&mut self) {
+        self.silent = true;
+        self.lose_correspondence();
+        self.client_buf.clear();
+        self.server_buf.clear();
     }
 
     fn lose_correspondence(&mut self) {
@@ -286,7 +310,10 @@ impl RedisParser {
     }
 
     /// The message for one server value, if it answers a command.
-    fn answer(&mut self, mut value: RespValue, timestamp_ns: u64) -> Option<L7Message> {
+    fn answer(&mut self, value: RespValue, timestamp_ns: u64) -> Option<L7Message> {
+        if self.silent {
+            return None;
+        }
         let kind = subscription_kind(&value);
         if let RespValue::Push(_) = value {
             self.resp3 = true;
@@ -354,7 +381,7 @@ impl RedisParser {
             expect,
         }) = pending
         else {
-            // No command known to answer: withhold the text.
+            // No command known to answer: no text, not even its shape.
             return Some(msg);
         };
         msg.method = Some(parts[0].to_uppercase());
@@ -369,7 +396,7 @@ impl RedisParser {
         // The command is one unit for credential protection (security scan
         // F4): field by field, `SET otp:<id> <code>` would withhold the key
         // and export the code beside it. With credential context anywhere in
-        // the key or arguments, neither is exported, nor the reply text.
+        // the key or arguments, neither is exported, nor the reply's shape.
         let withheld = super::mask_credentials_enabled() && command_has_credential_context(&parts);
         if withheld {
             super::count_builtin();
@@ -385,7 +412,6 @@ impl RedisParser {
                 self.lose_correspondence();
                 return Some(msg);
             }
-            Expect::Monitor => self.lose_correspondence(),
             Expect::Hello(Some(v)) if !matches!(value, RespValue::Error(_)) => {
                 self.resp3 = *v == 3;
             }
@@ -395,21 +421,11 @@ impl RedisParser {
             }
             _ => {}
         }
-        if super::mask_credentials_enabled() {
-            match &expect {
-                Expect::Exec(queued) => mask_exec_reply(queued, &mut value),
-                _ => mask_reply_credentials(&parts, &mut value),
-            }
-            mask_reply_shapes(&mut value);
-        }
-        msg.payload_text = match &value {
-            RespValue::Error(e) => Some(e.clone()),
-            v => resp_value_to_text(v),
-        };
-        if withheld && let Some(text) = msg.payload_text.as_mut() {
-            zeroize::Zeroize::zeroize(text);
-            *text = super::FIELD_WITHHELD.to_string();
-        }
+        msg.payload_text = Some(if withheld {
+            super::FIELD_WITHHELD.to_string()
+        } else {
+            reply_shape(&value)
+        });
         Some(msg)
     }
 
@@ -433,6 +449,9 @@ impl ProtocolParser for RedisParser {
     }
 
     fn feed(&mut self, data: &[u8], direction: Direction, timestamp_ns: u64) -> ParseResult {
+        if self.silent {
+            return ParseResult::NeedMoreData;
+        }
         match direction {
             Direction::Egress => {
                 if self.client_buf.extend(data).is_err() {
@@ -517,25 +536,6 @@ fn mask_credentials(parts: &mut [String]) {
     }
 }
 
-/// Mask the secrets a reply carries, given the command it answers:
-/// `CONFIG GET` values of credential-named parameters (name/value pairs,
-/// RESP2 array or RESP3 map; see [`super::is_credential_name`]), and the
-/// whole reply of `ACL LIST` (password hashes), `ACL GETUSER` (password
-/// hashes) and `ACL GENPASS` (a fresh password).
-fn mask_reply_credentials(cmd: &[String], value: &mut RespValue) {
-    let is = |i: usize, name: &str| cmd.get(i).is_some_and(|a| a.eq_ignore_ascii_case(name));
-    if is(0, "ACL") && (is(1, "LIST") || is(1, "GETUSER") || is(1, "GENPASS")) {
-        if !matches!(value, RespValue::Error(_)) {
-            *value = redacted();
-        }
-    } else if is(0, "CONFIG")
-        && is(1, "GET")
-        && let RespValue::Array(Some(items)) = value
-    {
-        mask_pairs(items);
-    }
-}
-
 /// Whether any argument of a command (`parts[1..]`: key, names and values
 /// alike, whatever the command, known or not) has credential context
 /// ([`super::has_credential_context`], the arguments read together or one
@@ -562,66 +562,30 @@ fn command_has_credential_context(parts: &[String]) -> bool {
     found
 }
 
-/// `EXEC`'s array answers the queued commands in order; when it does not
-/// line up with them, all of it is masked. The result of a queued command
-/// with credential context ([`command_has_credential_context`]) is masked
-/// whole.
-fn mask_exec_reply(queued: &[Vec<String>], value: &mut RespValue) {
+/// Status replies that are fixed protocol words, exported as such; any
+/// other status text is exported as its type only.
+const STATUS_WORDS: &[&str] = &[
+    "OK", "PONG", "QUEUED", "RESET", "none", "string", "list", "set", "zset", "hash", "stream",
+];
+
+/// What is exported of a reply: its type and size or element count, never
+/// its text (a value read, an error quoting arguments, another command's
+/// arguments in `SLOWLOG GET` output). Statuses that are fixed protocol
+/// words ([`STATUS_WORDS`]) are kept.
+fn reply_shape(value: &RespValue) -> String {
     match value {
-        RespValue::Array(Some(items)) if items.len() == queued.len() => {
-            for (cmd, item) in queued.iter().zip(items.iter_mut()) {
-                if command_has_credential_context(cmd) {
-                    // An error too: some quote the command's arguments.
-                    *item = redacted();
-                    continue;
-                }
-                mask_reply_credentials(cmd, item);
-            }
-        }
-        RespValue::Array(Some(items)) if !items.is_empty() => *value = redacted(),
-        _ => {}
+        RespValue::SimpleString(s) if STATUS_WORDS.contains(&s.as_str()) => s.clone(),
+        RespValue::SimpleString(_) => "(status)".into(),
+        RespValue::Error(_) => "(error)".into(),
+        RespValue::Integer(_) => "(integer)".into(),
+        RespValue::Scalar(kind) => format!("({kind})"),
+        RespValue::BulkString(None) | RespValue::Array(None) => "(nil)".into(),
+        RespValue::BulkString(Some(b)) => format!("(bulk, {} bytes)", b.len()),
+        RespValue::Array(Some(v)) => format!("(array, {})", v.len()),
+        RespValue::Set(v) => format!("(set, {})", v.len()),
+        RespValue::Map(v) => format!("(map, {})", v.len() / 2),
+        RespValue::Push(v) => format!("(push, {})", v.len()),
     }
-}
-
-/// Mask credentials by the shape of a reply, whatever the command (a
-/// script or a command we did not see may return them): the value after a
-/// credential-named element at an even position of any array or map
-/// (`CONFIG GET` output, a hash with a `password` field, `ACL GETUSER`'s
-/// `passwords`), and `ACL LIST` lines carrying a password rule.
-fn mask_reply_shapes(value: &mut RespValue) {
-    match value {
-        RespValue::Array(Some(items)) | RespValue::Push(items) => {
-            mask_pairs(items);
-            items.iter_mut().for_each(mask_reply_shapes);
-        }
-        RespValue::SimpleString(s) if is_acl_rule_line(s) => *value = redacted(),
-        RespValue::BulkString(Some(b)) if is_acl_rule_line(&String::from_utf8_lossy(b)) => {
-            *value = redacted()
-        }
-        _ => {}
-    }
-}
-
-fn mask_pairs(items: &mut [RespValue]) {
-    for pair in items.chunks_mut(2) {
-        if let [name, v] = pair
-            && resp_element_to_string(name).is_some_and(|n| super::is_credential_name(&n))
-        {
-            *v = redacted();
-        }
-    }
-}
-
-/// An `ACL LIST` line: `user <name> ... #<hash>` or `>password`.
-fn is_acl_rule_line(s: &str) -> bool {
-    s.starts_with("user ")
-        && s.split(' ')
-            .skip(2)
-            .any(|r| r.starts_with(['#', '>', '<', '!']))
-}
-
-fn redacted() -> RespValue {
-    RespValue::SimpleString(super::REDACTED_CREDENTIAL.to_string())
 }
 
 /// The channel count closing a subscription acknowledgement.
@@ -655,6 +619,12 @@ enum RespValue {
     Integer(i64),
     BulkString(Option<Vec<u8>>),   // None = null bulk string
     Array(Option<Vec<RespValue>>), // None = null array
+    /// RESP3 map: keys and values alternating.
+    Map(Vec<RespValue>),
+    /// RESP3 set.
+    Set(Vec<RespValue>),
+    /// RESP3 boolean, double or big number: its kind (the value is not kept).
+    Scalar(&'static str),
     /// RESP3 out-of-band push (pub/sub, client-side caching invalidation):
     /// not a reply to any pending command.
     Push(Vec<RespValue>),
@@ -698,9 +668,12 @@ fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
             None => RespParse::Incomplete,
         },
         b'#' | b',' | b'(' => match find_crlf(data) {
-            // boolean / double / big number: keep the literal text
             Some(pos) => RespParse::Complete(
-                RespValue::SimpleString(String::from_utf8_lossy(&data[1..pos]).into_owned()),
+                RespValue::Scalar(match data[0] {
+                    b'#' => "boolean",
+                    b',' => "double",
+                    _ => "big number",
+                }),
                 pos + 2,
             ),
             None => RespParse::Incomplete,
@@ -720,8 +693,8 @@ fn parse_resp_value_at(data: &[u8], depth: usize) -> RespParse {
             ),
             other => other,
         },
-        b'%' => parse_aggregate(data, depth, 2, |v| RespValue::Array(Some(v))),
-        b'~' => parse_aggregate(data, depth, 1, |v| RespValue::Array(Some(v))),
+        b'%' => parse_aggregate(data, depth, 2, RespValue::Map),
+        b'~' => parse_aggregate(data, depth, 1, RespValue::Set),
         b'>' => parse_aggregate(data, depth, 1, RespValue::Push),
         b'|' => {
             // Attribute: metadata map that precedes the actual reply.
@@ -909,21 +882,6 @@ fn resp_element_to_string(value: &RespValue) -> Option<String> {
     }
 }
 
-fn resp_value_to_text(value: &RespValue) -> Option<String> {
-    match value {
-        RespValue::SimpleString(s) => Some(s.clone()),
-        RespValue::BulkString(Some(bytes)) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        RespValue::BulkString(None) => Some("(nil)".into()),
-        RespValue::Integer(n) => Some(format!("(integer) {n}")),
-        RespValue::Error(e) => Some(format!("(error) {e}")),
-        RespValue::Array(None) => Some("(nil)".into()),
-        RespValue::Array(Some(elements)) | RespValue::Push(elements) => {
-            let parts: Vec<String> = elements.iter().filter_map(resp_value_to_text).collect();
-            Some(parts.join(", "))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,10 +960,13 @@ mod tests {
                     .collect();
                 assert_eq!(got.len(), 6, "{got:?}"); // the push answers nothing
                 assert_eq!(got[1], ("GET".into(), 0, Some("(nil)".into())));
-                assert_eq!(got[2].2.as_deref(), Some("t"));
-                assert_eq!(got[3].2.as_deref(), Some("3.14"));
-                assert_eq!(got[4].2.as_deref(), Some("hello"));
+                // Reply text is never exported: type and size only.
+                assert_eq!(got[0].2.as_deref(), Some("(map, 2)"));
+                assert_eq!(got[2].2.as_deref(), Some("(boolean)"));
+                assert_eq!(got[3].2.as_deref(), Some("(double)"));
+                assert_eq!(got[4].2.as_deref(), Some("(bulk, 5 bytes)"));
                 assert_eq!(got[5].1, 1);
+                assert_eq!(got[5].2.as_deref(), Some("(error)"));
             }
             other => panic!("expected RESP3 replies, got {other:?}"),
         }
@@ -1199,6 +1160,14 @@ mod tests {
             // A value that only mentions a credential word withholds too.
             &["MSET", "a", "otp-free", "b", "2"],
             &["SET", "note", "my api key"],
+            // Review: plurals, an acronym before a word, digit boundaries.
+            &["SET", "cache:keys", "3"],
+            &["SET", ":1:django.contrib.sessions.cachexk3v9", "x"],
+            &["HSET", "u:1", "pins", "1234"],
+            &["SET", "u:1:otps", "1"],
+            &["HSET", "u:1", "OTPCode", "1"],
+            &["HSET", "u:1", "PINCode", "1"],
+            &["SET", "otp2", "1"],
         ] {
             assert!(command_has_credential_context(&cmd(c)), "{c:?}");
         }
@@ -1211,7 +1180,6 @@ mod tests {
             &["SET", "ui:spinner", "on"],
             &["HSET", "book:1", "author", "Le Guin"],
             &["SET", "user_1_otpcode", "1"],
-            &["SET", "cache:keys", "3"],
             &["SET", "user:1:name", "bob"],
             &["HSET", "u:1", "name", "pinto"],
             &["HSET", "u:1", "Otpcode", "1"],
@@ -1225,7 +1193,7 @@ mod tests {
 
     /// Security scan F4: a Redis command is one unit for credential
     /// protection. A credential-named key withholds the key, every
-    /// argument and the reply text, so an opaque value stored or read
+    /// argument and the reply's shape, so an opaque value stored or read
     /// under it (an OTP, a reset token) is never exported beside it.
     #[test]
     fn test_command_with_credential_context_is_withheld_whole() {
@@ -1260,7 +1228,7 @@ mod tests {
                 assert_eq!(m.status, Some(0));
             }
         }
-        // Reads of such a key: the reply text too, whatever it holds.
+        // Reads of such a key: the reply's shape too.
         for (args, reply) in [
             (&["GET", "otp:+15551234567"][..], &b"$6\r\n482913\r\n"[..]),
             (
@@ -1279,7 +1247,7 @@ mod tests {
                 assert_eq!(m.payload_text.as_deref(), withheld, "{args:?}");
             }
         }
-        // Inside a transaction: the result under EXEC is masked.
+        // Inside a transaction: EXEC's reply is its shape only.
         let out = exchange_all(&[
             (&["MULTI"], b"+OK\r\n"),
             (&["GET", "otp:alice"], b"+QUEUED\r\n"),
@@ -1288,8 +1256,7 @@ mod tests {
         ]);
         assert_eq!(out[1].path.as_deref(), withheld);
         let exec = out[3].payload_text.as_deref().unwrap();
-        assert!(!exec.contains("482913"), "{exec}");
-        assert!(exec.ends_with("value"), "{exec}");
+        assert_eq!(exec, "(array, 2)");
         // No credential context: exported as before.
         let (raw, _) = exchange(&["SET", "user:1", "hello"], b"+OK\r\n");
         assert_eq!(raw.path.as_deref(), Some("user:1"));
@@ -1333,19 +1300,113 @@ mod tests {
                 assert_eq!(m.payload_text.as_deref(), withheld, "{args:?}");
             }
             assert_eq!(out.len(), 1, "{args:?}");
-            // Queued in a transaction: its result under EXEC is masked.
+            // Queued in a transaction: EXEC's reply is its shape only.
             let mut steps: Vec<(&[&str], &[u8])> = vec![(&["MULTI"], b"+OK\r\n")];
             steps.push((args, b"+QUEUED\r\n"));
             steps.push((&["GET", "k"], b"+QUEUED\r\n"));
             steps.push((&["EXEC"], b"*2\r\n$6\r\n482913\r\n$5\r\nvalue\r\n"));
             let out = exchange_all(&steps);
             let exec = out.last().unwrap().payload_text.as_deref().unwrap();
-            assert!(!exec.contains("482913"), "{args:?}: {exec}");
-            assert!(exec.ends_with("value"), "{args:?}: {exec}");
+            assert_eq!(exec, "(array, 2)", "{args:?}");
             for m in &out {
                 let all = format!("{:?} {:?} {:?}", m.path, m.request_text, m.payload_text);
                 assert!(!all.contains("1234") && !all.contains("otp"), "{all}");
             }
+        }
+    }
+
+    /// Review (HIGH): after `PSYNC`'s `+CONTINUE` the master propagates
+    /// commands on the same connection; a later `REPLCONF ACK` must not
+    /// take one as its reply. `SYNC`, `PSYNC`, `REPLCONF` and `MONITOR`
+    /// end the connection's export, also when queued in `MULTI`.
+    #[test]
+    fn test_replication_and_monitor_streams_export_nothing() {
+        let propagated = resp(&["SET", "user:1:otp", "839201"]);
+        for start in [
+            &["PSYNC", "8de1787ba490483314a4d30f1c628bc5025eb761", "1"][..],
+            &["SYNC"],
+            &["REPLCONF", "listening-port", "6380"],
+            &["MONITOR"],
+        ] {
+            let mut parser = RedisParser::new();
+            let mut out = Vec::new();
+            let mut feed = |p: &mut RedisParser, d: &[u8], dir| {
+                if let ParseResult::Messages(m) = p.feed(d, dir, 1) {
+                    out.extend(m);
+                }
+            };
+            feed(&mut parser, &resp(start), Direction::Egress);
+            feed(&mut parser, b"+CONTINUE\r\n", Direction::Ingress);
+            feed(
+                &mut parser,
+                &resp(&["REPLCONF", "ACK", "100"]),
+                Direction::Egress,
+            );
+            feed(&mut parser, &propagated, Direction::Ingress);
+            feed(&mut parser, &resp(&["GET", "k"]), Direction::Egress);
+            feed(&mut parser, b"$6\r\n839201\r\n", Direction::Ingress);
+            assert!(out.is_empty(), "{start:?}: {out:?}");
+        }
+        let out = exchange_all(&[
+            (&["MULTI"], b"+OK\r\n"),
+            (&["MONITOR"], b"+QUEUED\r\n"),
+            (&["EXEC"], b"*1\r\n+OK\r\n"),
+            (&["GET", "k"], b"$6\r\n839201\r\n"),
+        ]);
+        assert_eq!(out.len(), 1, "only MULTI's reply: {out:?}");
+    }
+
+    /// Review (MED): reply text is never exported, whatever the command:
+    /// `HVALS` (values with no names to match), `SLOWLOG GET` (other
+    /// commands' arguments), errors quoting arguments.
+    #[test]
+    fn test_reply_text_is_never_exported() {
+        let cases: &[(&[&str], &[u8], &str)] = &[
+            (&["HVALS", "user:1"], b"*2\r\n$3\r\nbob\r\n$9\r\nHunter2pw\r\n", "(array, 2)"),
+            (
+                &["SLOWLOG", "GET", "1"],
+                b"*1\r\n*6\r\n:14\r\n:1309448221\r\n:15\r\n*3\r\n$3\r\nSET\r\n$3\r\nk:1\r\n$9\r\nHunter2pw\r\n\
+                  $15\r\n127.0.0.1:58217\r\n$0\r\n\r\n",
+                "(array, 1)",
+            ),
+            (&["GET", "k"], b"$9\r\nHunter2pw\r\n", "(bulk, 9 bytes)"),
+            (&["INCR", "k"], b":815\r\n", "(integer)"),
+            (&["SET", "k", "v"], b"-ERR Hunter2pw is not valid\r\n", "(error)"),
+            (&["CLIENT", "INFO"], b"+id=3 addr=1.2.3.4:5 name=Hunter2pw\r\n", "(status)"),
+            (&["PING"], b"+PONG\r\n", "PONG"),
+            (&["TYPE", "k"], b"+string\r\n", "string"),
+            (&["SMEMBERS", "k"], b"~1\r\n$9\r\nHunter2pw\r\n", "(set, 1)"),
+            (&["GET", "nope"], b"$-1\r\n", "(nil)"),
+        ];
+        for (args, reply, shape) in cases {
+            let out = exchange_all(&[(args, reply)]);
+            assert_eq!(out.len(), 1, "{args:?}");
+            assert_eq!(out[0].payload_text.as_deref(), Some(*shape), "{args:?}");
+            let all = format!("{:?}", out[0]);
+            assert!(
+                !all.contains("Hunter2pw") && !all.contains("1.2.3.4"),
+                "{all}"
+            );
+        }
+    }
+
+    /// Review (LOW): a top-level request value that is not an array is
+    /// read by the server as inline lines, so its replies cannot be
+    /// paired: nothing more is exported for the connection.
+    #[test]
+    fn test_non_array_request_ends_export() {
+        for first in [
+            &b"$4\r\nPING\r\n"[..],
+            b"$-1\r\n",
+            b"_\r\n",
+            b"%1\r\n$1\r\na\r\n$1\r\nb\r\n",
+            b"+PING\r\n",
+        ] {
+            let mut parser = RedisParser::new();
+            parser.feed(first, Direction::Egress, 1);
+            parser.feed(&resp(&["GET", "k"]), Direction::Egress, 2);
+            let r = parser.feed(b"+PONG\r\n$6\r\n839201\r\n", Direction::Ingress, 3);
+            assert!(matches!(r, ParseResult::NeedMoreData), "{first:?}: {r:?}");
         }
     }
 
@@ -1399,33 +1460,23 @@ mod tests {
             };
             let text = msgs[0].payload_text.clone().unwrap_or_default();
             assert!(!text.contains("s3cretpw"), "{args:?} leaked: {text}");
-            // Masked, or withheld whole with a command that has
-            // credential context (`CONFIG GET masterauth`).
+            // The reply's shape only, or withheld whole with a command
+            // that has credential context (`CONFIG GET masterauth`).
             assert!(
-                text.contains(crate::protocol::REDACTED_CREDENTIAL)
-                    || text == crate::protocol::FIELD_WITHHELD,
+                text.starts_with('(') || text == crate::protocol::FIELD_WITHHELD,
                 "{text}"
             );
         }
-        // Other parameters stay readable.
         let mut parser = RedisParser::new();
         parser.feed(&resp(&["CONFIG", "GET", "*"]), Direction::Egress, 1);
         let ParseResult::Messages(msgs) = parser.feed(cases[1].1, Direction::Ingress, 2) else {
             panic!()
         };
-        assert!(
-            msgs[0]
-                .payload_text
-                .as_deref()
-                .unwrap()
-                .starts_with("maxmemory, 1gb, masterauth, <"),
-            "{:?}",
-            msgs[0].payload_text
-        );
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("(array, 6)"));
     }
 
     /// Feed client commands and server bytes in order; return every
-    /// exported reply text (None when withheld).
+    /// exported reply `payload_text` (None when not exported).
     fn exchange(steps: &[(&[&str], &[u8])]) -> Vec<Option<String>> {
         let mut parser = RedisParser::new();
         let mut out = Vec::new();
@@ -1450,9 +1501,10 @@ mod tests {
         out.iter().flatten().any(|t| t.contains("s3cretpw"))
     }
 
-    /// Results of credential commands queued in MULTI arrive under EXEC.
+    /// Results of credential commands queued in MULTI arrive under EXEC:
+    /// only the array's shape is exported.
     #[test]
-    fn test_exec_results_are_masked_per_queued_command() {
+    fn test_exec_results_export_their_shape_only() {
         let out = exchange(&[
             (&["MULTI"], b"+OK\r\n"),
             (&["CONFIG", "GET", "requirepass"], b"+QUEUED\r\n"),
@@ -1465,11 +1517,10 @@ mod tests {
             (&["ACL", "GENPASS"], b"$8\r\ns3cretpw\r\n"),
         ]);
         assert!(!leaks(&out), "{out:?}");
-        assert!(out[4].as_deref().unwrap().ends_with("value"), "{out:?}");
-        // EXEC whose MULTI came before capture started: the queued
-        // commands are unknown, so the whole result is masked.
+        assert_eq!(out[4].as_deref(), Some("(array, 3)"), "{out:?}");
+        // EXEC whose MULTI came before capture started: its shape only.
         let out = exchange(&[(&["EXEC"], b"*1\r\n$8\r\ns3cretpw\r\n")]);
-        assert_eq!(out, vec![Some("<REDACTED>".to_string())]);
+        assert_eq!(out, vec![Some("(array, 1)".to_string())]);
         // A subscription command inside MULTI is only queued.
         let out = exchange(&[
             (&["MULTI"], b"+OK\r\n"),
@@ -1489,7 +1540,7 @@ mod tests {
             (&["DISCARD"], b"+OK\r\n"),
             (&["GET", "k"], b"$5\r\nvalue\r\n"),
         ]);
-        assert_eq!(out[3].as_deref(), Some("value"));
+        assert_eq!(out[3].as_deref(), Some("(bulk, 5 bytes)"));
     }
 
     /// Replies stay matched to their commands through RESP3 subscription
@@ -1652,13 +1703,13 @@ mod tests {
             parser.feed(&resp(&["SET", &format!("k{i}"), "v"]), Direction::Egress, 3);
             parser.feed(b"+QUEUED\r\n", Direction::Ingress, 4);
         }
-        let kept = parser.transaction.as_ref().map_or(0, Vec::len);
+        let kept = parser.transaction.unwrap_or(0);
         assert!(kept <= 1024, "{kept} queued commands kept");
     }
 
-    /// A reply with no known command (capture joined mid-stream, MONITOR's
-    /// stream) is withheld; credential shapes are masked whatever the
-    /// command (a hash with a password field).
+    /// A reply with no known command (capture joined mid-stream) exports
+    /// no text; after MONITOR nothing is exported; a matched reply exports
+    /// its shape only (a hash with a password field).
     #[test]
     fn test_unmatched_replies_fail_closed() {
         let out = exchange(&[(&[], b"$8\r\ns3cretpw\r\n")]);
@@ -1670,17 +1721,13 @@ mod tests {
                 b"+1339518083.107412 [0 127.0.0.1:60866] \"GET\" \"s3cretpw\"\r\n",
             ),
         ]);
-        assert!(!leaks(&out), "{out:?}");
-        assert_eq!(out[1], None);
+        assert!(out.is_empty(), "{out:?}");
         let out = exchange(&[(
             &["HGETALL", "user:1"],
             b"*4\r\n$4\r\nname\r\n$3\r\nbob\r\n$8\r\npassword\r\n$8\r\ns3cretpw\r\n",
         )]);
         assert!(!leaks(&out), "{out:?}");
-        assert!(
-            out[0].as_deref().unwrap().starts_with("name, bob"),
-            "{out:?}"
-        );
+        assert_eq!(out[0].as_deref(), Some("(array, 4)"));
     }
 
     #[test]
@@ -1738,7 +1785,7 @@ mod tests {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("GET"));
                 assert_eq!(msgs[0].path.as_deref(), Some("mykey"));
-                assert_eq!(msgs[0].payload_text.as_deref(), Some("hello"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some("(bulk, 5 bytes)"));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -1767,7 +1814,7 @@ mod tests {
         match result {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
-                assert_eq!(msgs[0].payload_text.as_deref(), Some("helloworld"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some("(bulk, 10 bytes)"));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -1786,7 +1833,7 @@ mod tests {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].status, Some(1));
-                assert!(msgs[0].payload_text.as_ref().unwrap().contains("ERR"));
+                assert_eq!(msgs[0].payload_text.as_deref(), Some("(error)"));
             }
             other => panic!("expected Messages, got {other:?}"),
         }

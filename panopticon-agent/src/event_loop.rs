@@ -2441,7 +2441,10 @@ mod tests {
         evs.push(redis_pkt(true, 1000, 5000, 0, get));
         evs.push(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"));
         let out = run_redis(&evs);
-        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
+        assert_eq!(
+            out,
+            vec![(Some("GET".into()), Some("(bulk, 1 bytes)".into()))]
+        );
 
         // Handshake seen, then client bytes lost (the GENPASS command).
         let mut evs = handshake.to_vec();
@@ -2468,7 +2471,10 @@ mod tests {
             with_off(redis_pkt(true, 1000, 5000, 0, get), 0),
             with_off(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"), 0),
         ]);
-        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
+        assert_eq!(
+            out,
+            vec![(Some("GET".into()), Some("(bulk, 1 bytes)".into()))]
+        );
         let out = run_redis(&[
             with_off(redis_pkt(true, 1040, 5000, 0, get), 40),
             with_off(redis_pkt(false, 5000, 1040 + glen, 0, genpass), 0),
@@ -2538,7 +2544,7 @@ mod tests {
         assert_eq!(evs.len(), 2 + 3 + 1, "9 KiB reply: three chunk records");
         let out = run_redis(&evs);
         assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[1], (Some("GET".into()), Some("w".into())));
+        assert_eq!(out[1], (Some("GET".into()), Some("(bulk, 1 bytes)".into())));
 
         // One record cut at the capture window: the next reply has no text.
         let mut cut = at(
@@ -2548,7 +2554,8 @@ mod tests {
         cut.orig_len = blen;
         let out = run_redis(&head(vec![cut]));
         assert!(
-            out.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            out.iter()
+                .all(|(_, t)| t.as_deref() != Some("(bulk, 1 bytes)")),
             "{out:?}"
         );
     }
@@ -2645,7 +2652,7 @@ mod tests {
         let stats = EventStats::new();
         let out = run_reordered(&interleaved, &stats);
         assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[1], (Some("GET".into()), Some("w".into())));
+        assert_eq!(out[1], (Some("GET".into()), Some("(bulk, 1 bytes)".into())));
         assert!(stats.tcp_reorder_held.load(Ordering::Relaxed) > 0);
         assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 0);
         // In order, the window holds nothing and the result is the same.
@@ -2656,7 +2663,8 @@ mod tests {
         // Without the window, the interleave cost the next reply's text.
         let raw = run_redis(&interleaved);
         assert!(
-            raw.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            raw.iter()
+                .all(|(_, t)| t.as_deref() != Some("(bulk, 1 bytes)")),
             "{raw:?}"
         );
     }
@@ -2673,7 +2681,8 @@ mod tests {
         let out = run_reordered(&lost, &stats);
         assert_eq!(out, run_redis(&lost));
         assert!(
-            out.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            out.iter()
+                .all(|(_, t)| t.as_deref() != Some("(bulk, 1 bytes)")),
             "{out:?}"
         );
         assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 1);
@@ -2806,7 +2815,10 @@ mod tests {
             &mut out,
             feed_event(&m, &reply, connection_key(&reply), &stats, 0, false),
         );
-        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
+        assert_eq!(
+            out,
+            vec![(Some("GET".into()), Some("(bulk, 1 bytes)".into()))]
+        );
     }
 
     /// TLS plaintext carries no stream position: Redis replies over TLS
