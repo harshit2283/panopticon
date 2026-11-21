@@ -647,11 +647,10 @@ pub fn attach_each_retrying(
 }
 
 /// Go binaries whose attach put no probe on them, per file
-/// ([`probe_file_id`]): retried after 2, 4, 8, 16 and 32 scans, then not
-/// again until the agent restarts. Such an attempt leaves the Go probe
-/// floor as it was (loader.rs `attach_tls_uprobes`), so retries cost only
-/// the attempt; the bound keeps a binary that can never be probed from
-/// warning at every scan.
+/// ([`probe_file_id`]): retried after 2, 4, 8 and 16 scans, then every 32
+/// scans for as long as they keep failing (a failure may be transient, so
+/// the binary is never given up). The backoff keeps a binary that can never
+/// be probed from warning at every scan.
 #[derive(Debug, Default)]
 pub struct GoRetry {
     scan: u64,
@@ -659,8 +658,8 @@ pub struct GoRetry {
     failures: std::collections::HashMap<(u64, u64), (u32, u64)>,
 }
 
-/// Attempts after which a Go binary is not tried again.
-const GO_ATTACH_ATTEMPTS: u32 = 6;
+/// The longest wait between attempts, in scans (`1 << GO_RETRY_MAX_SHIFT`).
+const GO_RETRY_MAX_SHIFT: u32 = 5;
 
 impl GoRetry {
     fn waiting(&self, id: (u64, u64)) -> bool {
@@ -672,18 +671,18 @@ impl GoRetry {
     fn failed(&mut self, id: (u64, u64)) {
         let scan = self.scan;
         let (n, next) = self.failures.entry(id).or_insert((0, 0));
-        *n += 1;
-        *next = if *n >= GO_ATTACH_ATTEMPTS {
+        *n = n.saturating_add(1);
+        let wait = 1u64 << (*n).min(GO_RETRY_MAX_SHIFT);
+        if wait == 1 << GO_RETRY_MAX_SHIFT {
             tracing::warn!(
                 dev = id.0,
                 ino = id.1,
                 attempts = *n,
-                "Go binary attached no TLS probe; not tried again until the agent restarts"
+                scans = wait,
+                "Go binary attached no TLS probe; tried again after the wait"
             );
-            u64::MAX
-        } else {
-            scan + (1u64 << *n)
-        };
+        }
+        *next = scan + wait;
     }
 }
 
@@ -1202,7 +1201,7 @@ mod tests {
     }
 
     /// A Go binary none of whose paths attached a probe is tried again
-    /// after 2, 4, 8, 16 and 32 scans, then never; another path of it
+    /// after 2, 4, 8 and 16 scans, then every 32; another path of it
     /// still gets its try within a scan, an OpenSSL library is tried at
     /// every scan, and a later success clears the record.
     #[test]
@@ -1223,7 +1222,7 @@ mod tests {
         let mut attached = std::collections::HashSet::new();
         let mut retry = GoRetry::default();
         let mut tried_at = vec![];
-        for scan in 1..=80u64 {
+        for scan in 1..=130u64 {
             let mut tried = vec![];
             attach_each_retrying(&targets, &mut attached, &mut retry, |t| {
                 tried.push(t.pid);
@@ -1235,7 +1234,7 @@ mod tests {
             }
             assert!(tried.contains(&30), "the OpenSSL library, scan {scan}");
         }
-        assert_eq!(tried_at, vec![1, 3, 7, 15, 31, 63]);
+        assert_eq!(tried_at, vec![1, 3, 7, 15, 31, 63, 95, 127]);
 
         let mut retry = GoRetry::default();
         attach_each_retrying(&targets, &mut attached, &mut retry, |_| 0);
