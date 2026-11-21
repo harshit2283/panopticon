@@ -19,6 +19,18 @@
 //! Only an answer to a query seen on the same flow (same transaction ID and
 //! question name) carries them: an unsolicited or spoofed response is
 //! exported as a message but names nothing (F8, F12).
+//!
+//! Responses pair with queries by transaction ID and name, never by order.
+//! A parser that did not see its flow from the start
+//! ([`ProtocolParser::joined_late`], which the event loop also calls for
+//! every new UDP flow, since a datagram carries no stream position):
+//! - over UDP every datagram is a whole message, so there is no boundary to
+//!   lose, but such a parser cannot tell a UDP flow from a TCP connection
+//!   joined mid-stream that it took for UDP: it reads only datagrams whose
+//!   sections account for every byte, and drops the rest;
+//! - over TCP a length prefix found from there may lie inside a message,
+//!   so for the rest of the connection messages keep the method and sizes
+//!   only (no name, record, status or DNS answer).
 
 use std::collections::HashMap;
 
@@ -85,6 +97,8 @@ pub struct DnsParser {
     server_buf: StreamBuffer,
     /// Maps transaction ID → the query.
     pending_queries: HashMap<u16, PendingQuery>,
+    /// The flow was not seen from its start (see the module docs).
+    late: bool,
 }
 
 /// TCP if the first segment is a 2-byte length (sent on its own) or exactly
@@ -108,7 +122,29 @@ impl DnsParser {
             client_buf: StreamBuffer::new(),
             server_buf: StreamBuffer::new(),
             pending_queries: HashMap::new(),
+            late: false,
         }
+    }
+
+    /// TCP messages of a late parser: the method and sizes only.
+    fn scrub(&self, result: ParseResult) -> ParseResult {
+        let ParseResult::Messages(mut msgs) = result else {
+            return result;
+        };
+        if self.late && self.transport == Some(Transport::Tcp) {
+            for m in &mut msgs {
+                for f in [&mut m.path, &mut m.payload_text] {
+                    if let Some(mut s) = f.take() {
+                        zeroize::Zeroize::zeroize(&mut s);
+                    }
+                }
+                m.headers.clear();
+                m.dns_answers.clear();
+                m.status = None;
+                m.latency_ns = None;
+            }
+        }
+        ParseResult::Messages(msgs)
     }
 
     /// One complete DNS message. The QR bit says whether it is a query or
@@ -367,10 +403,20 @@ impl ProtocolParser for DnsParser {
         } else {
             Transport::Udp
         });
-        match transport {
+        let result = match transport {
+            // A late parser's "datagram" may be a TCP segment from inside a
+            // message: only one that is exactly a DNS message is read.
+            Transport::Udp if self.late && !is_whole_message(data) => ParseResult::NeedMoreData,
             Transport::Udp => self.message(data, timestamp_ns),
             Transport::Tcp => self.feed_tcp(data, direction, timestamp_ns),
-        }
+        };
+        self.scrub(result)
+    }
+
+    /// See the module docs: over UDP a message boundary cannot be lost;
+    /// over TCP it can, for the rest of the connection.
+    fn joined_late(&mut self) {
+        self.late = true;
     }
 
     fn protocol(&self) -> Protocol {
@@ -382,6 +428,39 @@ impl ProtocolParser for DnsParser {
             State::Idle => "idle",
         }
     }
+}
+
+/// Whether `data` is exactly one DNS message: a header, then questions
+/// and resource records whose encodings account for every byte.
+fn is_whole_message(data: &[u8]) -> bool {
+    if data.len() < 12 {
+        return false;
+    }
+    let count = |i: usize| u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+    let (qd, records) = (count(4), count(6) + count(8) + count(10));
+    let mut at = 12;
+    for _ in 0..qd {
+        let Some((_, end)) = parse_dns_name(data, at) else {
+            return false;
+        };
+        at = end + 4;
+        if at > data.len() {
+            return false;
+        }
+    }
+    for _ in 0..records {
+        let Some((_, end)) = parse_dns_name(data, at) else {
+            return false;
+        };
+        if end + 10 > data.len() {
+            return false;
+        }
+        at = end + 10 + u16::from_be_bytes([data[end + 8], data[end + 9]]) as usize;
+        if at > data.len() {
+            return false;
+        }
+    }
+    at == data.len()
 }
 
 // ── DNS Name Parsing ─────────────────────────────────────────────────────
@@ -1035,5 +1114,132 @@ mod tests {
         let parser = DnsParser::new();
         assert_eq!(ProtocolParser::protocol(&parser), Protocol::Dns);
         assert_eq!(parser.state_name(), "idle");
+    }
+
+    // ── Late joins ───────────────────────────────────────────────────────
+
+    const TYPE_TXT: u16 = 16;
+
+    /// A TXT answer whose text holds a whole length-prefixed forged
+    /// response naming a secret, over TCP; and the tail a parser joining
+    /// at the forged prefix reads.
+    fn txt_with_forged_response() -> (Vec<u8>, Vec<u8>) {
+        let name = encode_dns_name("s3cret-tok.example");
+        let forged = build_dns_response(
+            0x0707,
+            0,
+            "s3cret-tok.example",
+            TYPE_A,
+            &[(&name, TYPE_A, 60, &[10, 6, 6, 6])],
+        );
+        let mut txt = vec![(forged.len() + 2) as u8];
+        txt.extend_from_slice(&(forged.len() as u16).to_be_bytes());
+        txt.extend_from_slice(&forged);
+        let qname = encode_dns_name("cfg.example");
+        let real = tcp(&build_dns_response(
+            0x0101,
+            0,
+            "cfg.example",
+            TYPE_TXT,
+            &[(&qname, TYPE_TXT, 60, &txt)],
+        ));
+        let at = real
+            .windows(forged.len())
+            .position(|w| w == forged)
+            .unwrap()
+            - 2;
+        let tail = real[at..].to_vec();
+        (real, tail)
+    }
+
+    fn texts(r: ParseResult) -> Vec<L7Message> {
+        match r {
+            ParseResult::Messages(m) => m,
+            _ => vec![],
+        }
+    }
+
+    /// A TCP connection joined inside a message whose TXT text holds a
+    /// length-prefixed forged response: nothing of it is exported with
+    /// text, and it names no address.
+    #[test]
+    fn joined_late_tcp_inside_a_message_exports_no_forged_answer() {
+        let (_, tail) = txt_with_forged_response();
+        let mut p = DnsParser::new();
+        p.joined_late();
+        // The tail is exactly the forged prefix and message: read as TCP.
+        let out = texts(p.feed(&tail, Direction::Ingress, 1));
+        assert_eq!(p.transport, Some(Transport::Tcp));
+        assert_eq!(out.len(), 1);
+        for m in &out {
+            assert_eq!((m.path.as_deref(), m.status), (None, None));
+            assert!(m.dns_answers.is_empty() && m.payload_text.is_none());
+            assert!(m.headers.is_empty());
+        }
+        // A segment that is not a whole message, taken for UDP: dropped.
+        let mut p = DnsParser::new();
+        p.joined_late();
+        let mut segment = b"text".to_vec();
+        segment.extend_from_slice(&tail[2..]);
+        assert!(texts(p.feed(&segment, Direction::Ingress, 1)).is_empty());
+        assert_eq!(p.transport, Some(Transport::Udp));
+    }
+
+    /// The same connection seen from its start exports the real TXT
+    /// exchange, never the forged one.
+    #[test]
+    fn tcp_from_the_start_reads_the_real_message() {
+        let (real, _) = txt_with_forged_response();
+        let mut p = DnsParser::new();
+        p.feed(
+            &tcp(&build_dns_query(0x0101, "cfg.example", TYPE_TXT)),
+            Direction::Egress,
+            1,
+        );
+        let out = texts(p.feed(&real, Direction::Ingress, 2));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path.as_deref(), Some("cfg.example"));
+    }
+
+    /// UDP: every datagram is a whole message, so a flow the event loop
+    /// marks late (it does so for every new UDP flow) still pairs and
+    /// names addresses, through the manager.
+    #[test]
+    fn late_udp_flow_still_exports_answers() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let m = ConnectionFsmManager::new(16);
+        let (cl, sv) = ((1, 40000), (2, 53));
+        m.get_or_create_with_server(9, Protocol::Dns, Some(sv));
+        m.mark_joined_late(9);
+        m.process_packet_from(
+            9,
+            cl,
+            Direction::Egress,
+            &build_dns_query(0x0909, "db.example", TYPE_A),
+            1,
+        );
+        let name = encode_dns_name("db.example");
+        let resp = build_dns_response(
+            0x0909,
+            0,
+            "db.example",
+            TYPE_A,
+            &[(&name, TYPE_A, 60, &[10, 0, 0, 9])],
+        );
+        let out = match m.process_packet_from(9, sv, Direction::Ingress, &resp, 2) {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        };
+        assert_eq!(out[0].path.as_deref(), Some("db.example"));
+        assert_eq!(out[0].dns_answers.len(), 1);
+        assert!(out[0].latency_ns.is_some());
+        // A datagram with trailing bytes is not a whole message: dropped.
+        let mut bad = resp.clone();
+        bad.extend_from_slice(b"junk");
+        assert!(matches!(
+            m.process_packet_from(9, sv, Direction::Ingress, &bad, 3),
+            Some(FsmResult::WaitingForMore) | None
+        ));
     }
 }
