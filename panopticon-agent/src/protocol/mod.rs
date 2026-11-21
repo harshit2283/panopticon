@@ -149,9 +149,8 @@ pub use credential_rules::{
     set_credential_rules,
 };
 pub use secrets::{
-    Decision, FIELD_WITHHELD, FieldKind, STATEMENT_WITHHELD, decide, decide_as,
-    has_credential_context, is_credential_name, segmented_name_has_credential_word, sql_verb,
-    withheld_statement,
+    Decision, FIELD_WITHHELD, FieldKind, decide, decide_as, has_credential_context,
+    is_credential_name, segmented_name_has_credential_word, sql_verb, withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -173,13 +172,13 @@ pub fn set_mask_credentials(on: bool) {
 }
 
 /// A SQL statement (query text and its bound values) as a parser exports
-/// it, and whether its error text must be withheld. With credential
-/// context and `mask_credentials` on: only its verb as method and
+/// it, and whether it names a credential. With credential context and
+/// `mask_credentials` on: only its verb as method and
 /// `VERB <statement withheld>` as text, no bound value, and `true`. The
 /// query is wiped. A statement whose credential words are all bare names
 /// is exported as written but without its bound values (nothing ties them
-/// to a column), and its error text is withheld too: the server may echo
-/// a bound value in it (`malformed record literal: "(alice,hunter2)"`).
+/// to a column), also `true`. (No parser exports server error text, which
+/// echoes values; the flag is unused.)
 pub fn export_statement(
     mut query: String,
     mut bound: Option<String>,
@@ -202,21 +201,6 @@ pub fn export_statement(
     let verb = sql_verb(&query).map(str::to_string);
     let shown = truncate_utf8(&query, 4096).to_string();
     (verb, shown, bound, names_credential)
-}
-
-/// A MySQL server error message as exported: withheld when its
-/// statement names a credential (`error_withheld`, from
-/// [`export_statement`]), bare names included, or when it shows credential
-/// context itself. (PostgreSQL exports no error text at all, only the
-/// SQLSTATE and severity.)
-pub fn export_error_text(text: String, error_withheld: bool) -> String {
-    if mask_credentials_enabled() && (error_withheld || has_credential_context(&text)) {
-        let mut text = text;
-        zeroize::Zeroize::zeroize(&mut text);
-        STATEMENT_WITHHELD.to_string()
-    } else {
-        text
-    }
 }
 
 /// Protect `text` in place under `rules` (see [`decide`]; the built-in
@@ -345,15 +329,7 @@ mod tests {
         );
         assert_eq!(verb.as_deref(), Some("SELECT"));
         assert_eq!(shown, "SELECT password, email FROM users WHERE id = $1");
-        // Its error text is withheld: the server may echo a bound value.
         assert_eq!((bound, withheld), (None, true));
-        assert_eq!(
-            export_error_text(
-                "malformed record literal: \"(alice,hunter2,extra)\"".into(),
-                withheld
-            ),
-            STATEMENT_WITHHELD
-        );
         let (_, shown, bound, withheld) = export_statement(
             "SELECT password FROM users WHERE users = $1::users".into(),
             Some("(alice,hunter2)".into()),
@@ -367,7 +343,6 @@ mod tests {
             Some("7".into()),
         );
         assert_eq!((bound.as_deref(), withheld), (Some("7"), false));
-        assert_eq!(export_error_text("bad value".into(), withheld), "bad value");
     }
 
     #[test]

@@ -9,29 +9,71 @@
 //! and prepared statements (COM_STMT_PREPARE / EXECUTE, the binary protocol
 //! Go, JDBC and most ORMs use): statements are remembered by id so each
 //! EXECUTE is reported with its SQL and its bound parameter values.
+//!
+//! **Pairing.** MySQL answers commands in order, so a reply is paired
+//! with the command in flight. Commands are read only from an allowlist
+//! whose replies the parser models: one exchange per COM_QUERY /
+//! COM_STMT_EXECUTE (every result set of a multi-statement or `CALL`,
+//! up to the last without `SERVER_MORE_RESULTS_EXISTS`, and a
+//! `LOAD DATA LOCAL INFILE` file transfer), COM_STMT_PREPARE, the
+//! single-packet replies of COM_PING, COM_INIT_DB and similar, and the
+//! no-reply COM_QUIT, COM_STMT_CLOSE and COM_STMT_SEND_LONG_DATA. Any
+//! other command (COM_CHANGE_USER, COM_FIELD_LIST, COM_STMT_FETCH, a
+//! cursor EXECUTE, the replication commands, unknown ones), a reply packet
+//! out of sequence, server bytes with no command in flight, a reply the
+//! parser cannot read, or a connection joined mid-stream
+//! ([`ProtocolParser::joined_late`]) makes the connection `untrusted` for
+//! the rest of its life: exchanges are still exported, with the
+//! statement's keyword only (no statement text, bound value, status or
+//! latency). TLS (SSLRequest) and the compressed protocol stop parsing.
+//!
+//! **Errors.** A server error is exported as its code (`status`) and its
+//! SQLSTATE (header `sqlstate`), never its message: messages echo
+//! statement text and values (`Incorrect integer value: 'hunter2' for
+//! column 'pin'`). No OK `info` text, warning or row is exported either.
 
 use std::collections::{HashMap, VecDeque};
 
 use super::fsm::StreamBuffer;
 use super::{Direction, L7Message, ParseResult, Protocol, ProtocolParser};
 
+// Command bytes (include/my_command.h).
+const COM_QUIT: u8 = 0x01;
 const COM_INIT_DB: u8 = 0x02;
 const COM_QUERY: u8 = 0x03;
+const COM_CREATE_DB: u8 = 0x05;
+const COM_DROP_DB: u8 = 0x06;
+const COM_REFRESH: u8 = 0x07;
+const COM_SHUTDOWN: u8 = 0x08;
+const COM_STATISTICS: u8 = 0x09;
+const COM_PROCESS_KILL: u8 = 0x0c;
+const COM_DEBUG: u8 = 0x0d;
 const COM_PING: u8 = 0x0e;
+const COM_CHANGE_USER: u8 = 0x11;
+const COM_BINLOG_DUMP: u8 = 0x12;
 const COM_STMT_PREPARE: u8 = 0x16;
 const COM_STMT_EXECUTE: u8 = 0x17;
 const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 const COM_STMT_CLOSE: u8 = 0x19;
 const COM_STMT_RESET: u8 = 0x1a;
 const COM_SET_OPTION: u8 = 0x1b;
+const COM_STMT_FETCH: u8 = 0x1c;
 const COM_RESET_CONNECTION: u8 = 0x1f;
 
 /// Capability flags (HandshakeResponse41).
+const CLIENT_COMPRESS: u32 = 0x0000_0020;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+const CLIENT_SSL: u32 = 0x0000_0800;
 const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+const CLIENT_ZSTD_COMPRESSION: u32 = 0x0400_0000;
 const CLIENT_QUERY_ATTRIBUTES: u32 = 0x0800_0000;
+/// Server status flag: another result set follows this one.
+const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 /// COM_STMT_EXECUTE flag: a parameter count follows the iteration count.
 const PARAMETER_COUNT_AVAILABLE: u8 = 0x08;
+/// COM_STMT_EXECUTE cursor type bits (read-only, for-update, scrollable):
+/// the rows then come through COM_STMT_FETCH.
+const CURSOR_TYPE_MASK: u8 = 0x07;
 
 /// Prepared statements remembered per connection.
 const MAX_PREPARED: usize = 256;
@@ -40,8 +82,12 @@ const MAX_PARAM_TEXT: usize = 4096;
 const ERR_MARKER: u8 = 0xFF;
 const OK_MARKER: u8 = 0x00;
 const EOF_MARKER: u8 = 0xFE;
+/// LOCAL INFILE request: the client sends a file's contents next.
+const LOCAL_INFILE_MARKER: u8 = 0xFB;
 /// AuthMoreData packet header during authentication.
 const AUTH_MORE_DATA: u8 = 0x01;
+/// A packet this long is continued by the next one.
+const MAX_PACKET_PAYLOAD: usize = 0xFF_FFFF;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -56,6 +102,10 @@ enum State {
     },
     /// Skipping the parameter / column definitions after COM_STMT_PREPARE_OK.
     SkipDefs,
+    /// LOCAL INFILE: the client is sending the file, until an empty packet.
+    Infile,
+    /// TLS or compression: nothing more is read.
+    Opaque,
 }
 
 /// What the command in flight expects back.
@@ -88,6 +138,24 @@ struct Stmt {
     types: Vec<u8>,
 }
 
+/// One wire packet.
+struct Packet {
+    seq: u8,
+    payload: Vec<u8>,
+    /// Bytes on the wire, header included.
+    total: usize,
+}
+
+/// What reading one reply packet did.
+enum Reply {
+    /// The exchange is complete: its message.
+    Done(Box<L7Message>),
+    /// A packet was consumed; the exchange goes on (or the state moved).
+    Progress,
+    /// Needs more bytes.
+    Need,
+}
+
 pub struct MysqlParser {
     state: State,
     client_buf: StreamBuffer,
@@ -109,9 +177,23 @@ pub struct MysqlParser {
     skip_defs: VecDeque<DefSkip>,
     /// Bound parameter values of the EXECUTE in flight.
     param_text: Option<String>,
-    /// The last statement built names a credential (bare names included):
-    /// its error text is withheld ([`super::export_error_text`]).
-    error_withheld: bool,
+    /// Sequence id the next packet of the exchange in flight must carry.
+    next_seq: u8,
+    /// The last server packet was a full-size one: the next continues it.
+    server_cont: bool,
+    /// A server error answered the exchange in flight (multi-results stop
+    /// at it): its code and SQLSTATE.
+    error: Option<(u32, Option<String>)>,
+    /// The client sent a command before the previous reply ended: after a
+    /// server gap the next command no longer marks a reply boundary.
+    pipelined: bool,
+    /// Replies can no longer be tied to their command, or framing to the
+    /// stream; see the module docs. For good.
+    untrusted: bool,
+    /// The last call was [`ProtocolParser::skip`], which accounted for the
+    /// gap itself. The connection manager follows every skip with
+    /// [`ProtocolParser::joined_late`], which this flag lets through once.
+    skip_accounted: bool,
 }
 
 impl MysqlParser {
@@ -131,7 +213,12 @@ impl MysqlParser {
             preparing: None,
             skip_defs: VecDeque::new(),
             param_text: None,
-            error_withheld: false,
+            next_seq: 0,
+            server_cont: false,
+            error: None,
+            pipelined: false,
+            untrusted: false,
+            skip_accounted: false,
         }
     }
 
@@ -140,7 +227,7 @@ impl MysqlParser {
         self.client_caps.map(|c| c & CLIENT_DEPRECATE_EOF != 0)
     }
 
-    fn try_read_packet(buf: &StreamBuffer) -> Option<(Vec<u8>, usize)> {
+    fn try_read_packet(buf: &StreamBuffer) -> Option<Packet> {
         let data = buf.data();
         if data.len() < 4 {
             return None;
@@ -150,13 +237,41 @@ impl MysqlParser {
         if data.len() < total {
             return None;
         }
-        Some((data[4..total].to_vec(), total))
+        Some(Packet {
+            seq: data[3],
+            payload: data[4..total].to_vec(),
+            total,
+        })
+    }
+
+    /// Read the next server packet of the exchange in flight, checking its
+    /// sequence id; a continuation of a full-size packet is consumed and
+    /// skipped (it is never a reply boundary).
+    fn next_server_packet(&mut self) -> Option<Packet> {
+        loop {
+            let p = Self::try_read_packet(&self.server_buf)?;
+            self.server_buf.consume(p.total);
+            if p.seq != self.next_seq {
+                self.untrusted = true;
+            }
+            self.next_seq = p.seq.wrapping_add(1);
+            let cont =
+                std::mem::replace(&mut self.server_cont, p.payload.len() == MAX_PACKET_PAYLOAD);
+            if !cont {
+                return Some(p);
+            }
+        }
     }
 
     fn process(&mut self, ts: u64) -> ParseResult {
         let mut messages = Vec::new();
         loop {
             match self.state.clone() {
+                State::Opaque => {
+                    self.client_buf.clear();
+                    self.server_buf.clear();
+                    break;
+                }
                 State::WaitingForHandshake => {
                     if !self.parse_handshake() {
                         break;
@@ -169,6 +284,12 @@ impl MysqlParser {
                 }
                 State::Ready => {
                     if !self.parse_command(ts) {
+                        // Server bytes with no command in flight answer
+                        // nothing the parser knows of.
+                        if !self.server_buf.is_empty() && self.state == State::Ready {
+                            self.untrusted = true;
+                            self.server_buf.clear();
+                        }
                         break;
                     }
                 }
@@ -185,15 +306,21 @@ impl MysqlParser {
                     self.preparing = None;
                     if self.pending == Pending::Query {
                         let mut msg = self.build_msg(ts);
-                        msg.status = Some(0);
-                        // Closed by the next command, not by the response end:
-                        // the real latency is unknown.
+                        // Closed by the next command, not by the response
+                        // end: the outcome and latency are unknown.
+                        msg.status = None;
                         msg.latency_ns = None;
+                        msg.headers.clear();
+                        if self.untrusted {
+                            scrub(&mut msg);
+                        }
                         messages.push(msg);
                     } else {
                         self.query_text = None;
                         self.query_ts = None;
                     }
+                    self.error = None;
+                    self.server_cont = false;
                     self.resync_server = false;
                     self.state = State::Ready;
                 }
@@ -202,36 +329,42 @@ impl MysqlParser {
                         break;
                     }
                 }
+                State::Infile => {
+                    if !self.read_infile() {
+                        break;
+                    }
+                }
                 State::InQuery => match self.parse_response(ts) {
-                    Some(msg) => {
-                        messages.push(msg);
+                    Reply::Done(msg) => {
+                        messages.push(*msg);
                         self.state = State::Ready;
                     }
-                    // A response that was consumed without a message
-                    // (simple command, PREPARE_OK) moved the state on.
-                    None if self.state != State::InQuery => {}
-                    None => break,
+                    Reply::Progress => {}
+                    Reply::Need => break,
                 },
                 State::InResponse {
                     cols_expected,
                     cols_received,
                     past_col_eof,
                 } => match self.read_result_set(ts, cols_expected, cols_received, past_col_eof) {
-                    RsResult::Done(msg) => {
+                    Reply::Done(msg) => {
                         messages.push(*msg);
                         self.state = State::Ready;
                     }
-                    RsResult::Progress(a, b, c) => {
-                        self.state = State::InResponse {
-                            cols_expected: a,
-                            cols_received: b,
-                            past_col_eof: c,
-                        };
-                        break;
-                    }
-                    RsResult::Need => break,
+                    Reply::Progress => {}
+                    Reply::Need => break,
                 },
             }
+        }
+        // A command waiting while a reply is still being read: the client
+        // pipelines.
+        if matches!(
+            self.state,
+            State::InQuery | State::InResponse { .. } | State::SkipDefs
+        ) && !self.resync_server
+            && Self::try_read_packet(&self.client_buf).is_some()
+        {
+            self.pipelined = true;
         }
         if messages.is_empty() {
             ParseResult::NeedMoreData
@@ -241,78 +374,91 @@ impl MysqlParser {
     }
 
     fn parse_handshake(&mut self) -> bool {
-        let (payload, consumed) = match Self::try_read_packet(&self.server_buf) {
-            Some(p) => p,
-            None => {
-                // If the agent attaches after the server greeting was already exchanged,
-                // the first packet we observe can be a client auth packet or command.
-                if let Some((client_payload, _)) = Self::try_read_packet(&self.client_buf) {
-                    self.state = if !client_payload.is_empty()
-                        && matches!(
-                            client_payload[0],
-                            COM_QUERY | COM_STMT_PREPARE | COM_STMT_EXECUTE
-                        ) {
-                        State::Ready
-                    } else {
-                        State::InAuth
-                    };
-                    return true;
-                }
-                return false;
+        let Some(p) = Self::try_read_packet(&self.server_buf) else {
+            // The agent attached after the greeting: the first packet seen
+            // is a client one. Replies and framing are unproven.
+            if let Some(c) = Self::try_read_packet(&self.client_buf) {
+                self.untrusted = true;
+                // A command carries sequence id 0; auth packets never do.
+                self.state = if c.seq == 0 {
+                    State::Ready
+                } else {
+                    State::InAuth
+                };
+                return true;
             }
+            return false;
         };
-        self.server_buf.consume(consumed);
-        if payload.is_empty() || payload[0] != 0x0a {
+        self.server_buf.consume(p.total);
+        let payload = p.payload;
+        if p.seq != 0 || payload.is_empty() || payload[0] != 0x0a {
+            // Not a greeting: joined after it.
+            self.untrusted = true;
             self.state = State::Ready;
             return true;
         }
-        if let Some(null_pos) = payload[1..].iter().position(|&b| b == 0) {
-            self.server_version =
-                Some(String::from_utf8_lossy(&payload[1..1 + null_pos]).into_owned());
-        }
-        let payload_str = String::from_utf8_lossy(&payload);
-        if payload_str.contains("caching_sha2_password") {
-            self.auth_plugin = Some("caching_sha2_password".into());
-        } else if payload_str.contains("mysql_native_password") {
-            self.auth_plugin = Some("mysql_native_password".into());
+        if !self.untrusted {
+            if let Some(null_pos) = payload[1..].iter().position(|&b| b == 0) {
+                self.server_version =
+                    Some(String::from_utf8_lossy(&payload[1..1 + null_pos]).into_owned());
+            }
+            let payload_str = String::from_utf8_lossy(&payload);
+            if payload_str.contains("caching_sha2_password") {
+                self.auth_plugin = Some("caching_sha2_password".into());
+            } else if payload_str.contains("mysql_native_password") {
+                self.auth_plugin = Some("mysql_native_password".into());
+            }
         }
         self.state = State::InAuth;
         true
     }
 
     fn complete_auth(&mut self) -> bool {
-        if let Some((payload, c)) = Self::try_read_packet(&self.client_buf) {
-            // Late attach recovery: if we already see a command packet, auth is done.
-            // Drain a single pending auth ACK from server to avoid response misalignment.
-            if !payload.is_empty()
-                && matches!(payload[0], COM_QUERY | COM_STMT_PREPARE | COM_STMT_EXECUTE)
-            {
-                if let Some((server_payload, server_consumed)) =
-                    Self::try_read_packet(&self.server_buf)
-                    && !server_payload.is_empty()
-                    && (server_payload[0] == OK_MARKER || server_payload[0] == ERR_MARKER)
+        if let Some(c) = Self::try_read_packet(&self.client_buf) {
+            // A command (sequence id 0) while auth looked unfinished: the
+            // auth reply was missed, so the parser is out of step with the
+            // server. Drain one pending auth OK/ERR and go on untrusted.
+            if c.seq == 0 {
+                if let Some(s) = Self::try_read_packet(&self.server_buf)
+                    && matches!(s.payload.first(), Some(&OK_MARKER | &ERR_MARKER))
                 {
-                    self.server_buf.consume(server_consumed);
+                    self.server_buf.consume(s.total);
                 }
+                self.untrusted = true;
                 self.state = State::Ready;
                 return true;
             }
-            // HandshakeResponse41: capability flags first.
-            if self.client_caps.is_none() && payload.len() >= 32 {
-                let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            // HandshakeResponse41 (or SSLRequest): capability flags first.
+            if self.client_caps.is_none() && c.payload.len() >= 32 {
+                let caps =
+                    u32::from_le_bytes([c.payload[0], c.payload[1], c.payload[2], c.payload[3]]);
                 if caps & CLIENT_PROTOCOL_41 != 0 {
                     self.client_caps = Some(caps);
+                    if caps & CLIENT_SSL != 0 {
+                        // TLS records follow; the plaintext, if captured,
+                        // is another key.
+                        self.state = State::Opaque;
+                        return true;
+                    }
                 }
             }
-            self.client_buf.consume(c);
+            self.client_buf.consume(c.total);
         }
-        let (payload, consumed) = match Self::try_read_packet(&self.server_buf) {
-            Some(p) => p,
-            None => return false,
+        let Some(s) = Self::try_read_packet(&self.server_buf) else {
+            return false;
         };
-        self.server_buf.consume(consumed);
+        self.server_buf.consume(s.total);
+        let payload = s.payload;
         if !payload.is_empty() && (payload[0] == OK_MARKER || payload[0] == ERR_MARKER) {
             self.state = State::Ready;
+            if payload[0] == OK_MARKER
+                && self
+                    .client_caps
+                    .is_some_and(|c| c & (CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION) != 0)
+            {
+                // Compressed packets from here on: not parsed.
+                self.state = State::Opaque;
+            }
             return true;
         }
         // Auth continues: AuthMoreData (caching_sha2_password, MySQL 8's
@@ -322,20 +468,30 @@ impl MysqlParser {
         if !payload.is_empty() && (payload[0] == AUTH_MORE_DATA || payload[0] == EOF_MARKER) {
             return true;
         }
-        // Recovery: if auth response shape is unexpected, avoid getting stuck in InAuth.
+        // An auth reply of no known shape: go on, untrusted.
+        self.untrusted = true;
         self.state = State::Ready;
         true
     }
 
     fn parse_command(&mut self, ts: u64) -> bool {
-        let (payload, consumed) = match Self::try_read_packet(&self.client_buf) {
-            Some(p) => p,
-            None => return false,
-        };
-        self.client_buf.consume(consumed);
-        if payload.is_empty() {
+        let Some(p) = Self::try_read_packet(&self.client_buf) else {
             return false;
+        };
+        self.client_buf.consume(p.total);
+        let payload = p.payload;
+        if payload.is_empty() {
+            return true;
         }
+        // A command starts an exchange at sequence id 0; a full-size
+        // packet would continue into the next one (a statement of 16 MiB
+        // or more), which is not followed.
+        if p.seq != 0 || payload.len() == MAX_PACKET_PAYLOAD {
+            self.untrusted = true;
+        }
+        self.next_seq = p.seq.wrapping_add(1);
+        self.server_cont = false;
+        self.error = None;
         match payload[0] {
             COM_QUERY => {
                 let sql = self.strip_query_attributes(&payload[1..]);
@@ -349,24 +505,44 @@ impl MysqlParser {
                 self.begin(Pending::Prepare, ts);
             }
             COM_STMT_EXECUTE => {
+                // A cursor's rows come through COM_STMT_FETCH, which is not
+                // followed.
+                if payload.get(5).is_some_and(|f| f & CURSOR_TYPE_MASK != 0) {
+                    self.untrusted = true;
+                }
                 self.start_execute(&payload);
                 self.begin(Pending::Query, ts);
             }
+            // No reply.
             COM_STMT_CLOSE => {
                 if let Some(id) = payload.get(1..5) {
                     self.prepared
                         .remove(&u32::from_le_bytes([id[0], id[1], id[2], id[3]]));
                 }
             }
-            COM_INIT_DB | COM_PING | COM_STMT_RESET | COM_SET_OPTION | COM_RESET_CONNECTION => {
+            COM_STMT_SEND_LONG_DATA | COM_QUIT => {}
+            // One reply packet (OK, ERR, EOF, or COM_STATISTICS' string).
+            COM_INIT_DB | COM_PING | COM_STMT_RESET | COM_SET_OPTION | COM_RESET_CONNECTION
+            | COM_CREATE_DB | COM_DROP_DB | COM_REFRESH | COM_SHUTDOWN | COM_STATISTICS
+            | COM_PROCESS_KILL | COM_DEBUG => {
                 if payload[0] == COM_RESET_CONNECTION {
                     self.prepared.clear();
                 }
                 self.begin(Pending::Simple, ts);
             }
-            // SEND_LONG_DATA and QUIT have no response; other commands are
-            // not parsed.
-            _ => {}
+            // Replies the parser does not model: an auth exchange
+            // (COM_CHANGE_USER), definitions, fetched rows, a replication
+            // stream (COM_BINLOG_DUMP and the rest), or anything unknown.
+            // Their replies would be read as the next command's.
+            _ => {
+                if matches!(
+                    payload[0],
+                    COM_CHANGE_USER | COM_BINLOG_DUMP | COM_STMT_FETCH
+                ) {
+                    self.prepared.clear();
+                }
+                self.untrusted = true;
+            }
         }
         true
     }
@@ -464,12 +640,12 @@ impl MysqlParser {
     /// Consume definition packets queued by PREPARE_OK. False = need data.
     fn skip_definitions(&mut self) -> bool {
         while let Some(step) = self.skip_defs.front().copied() {
-            let Some((payload, consumed)) = Self::try_read_packet(&self.server_buf) else {
+            let Some(p) = Self::try_read_packet(&self.server_buf) else {
                 return false;
             };
             match step {
                 DefSkip::Packets(n) => {
-                    self.server_buf.consume(consumed);
+                    let _ = self.next_server_packet();
                     if n > 1 {
                         self.skip_defs[0] = DefSkip::Packets(n - 1);
                     } else {
@@ -477,8 +653,8 @@ impl MysqlParser {
                     }
                 }
                 DefSkip::OptionalEof => {
-                    if is_eof(&payload) {
-                        self.server_buf.consume(consumed);
+                    if is_eof(&p.payload) {
+                        let _ = self.next_server_packet();
                     }
                     self.skip_defs.pop_front();
                 }
@@ -488,23 +664,77 @@ impl MysqlParser {
         true
     }
 
-    fn parse_response(&mut self, ts: u64) -> Option<L7Message> {
-        let (payload, consumed) = Self::try_read_packet(&self.server_buf)?;
+    /// LOCAL INFILE: the client's file packets (never exported) up to the
+    /// empty one; then the server's OK or ERR answers the statement.
+    fn read_infile(&mut self) -> bool {
+        let Some(p) = Self::try_read_packet(&self.client_buf) else {
+            return false;
+        };
+        let mut payload = p.payload;
+        zeroize::Zeroize::zeroize(&mut payload);
+        self.client_buf.consume(p.total);
+        if p.seq != self.next_seq {
+            self.untrusted = true;
+        }
+        self.next_seq = p.seq.wrapping_add(1);
+        if p.total == 4 {
+            self.state = State::InQuery;
+        }
+        true
+    }
+
+    /// The exchange in flight ends here (no more result sets): its message.
+    fn finish(&mut self, ts: u64) -> Reply {
+        let mut m = self.build_msg(ts);
+        match self.error.take() {
+            Some((code, state)) => {
+                m.status = Some(code);
+                if let Some(s) = state {
+                    m.headers.push(("sqlstate".into(), s));
+                }
+            }
+            None => m.status = Some(0),
+        }
+        if self.untrusted {
+            scrub(&mut m);
+        }
+        Reply::Done(Box::new(m))
+    }
+
+    /// An OK or EOF ended a result (`payload`): finish, or wait for the
+    /// next result set when the server says more follow.
+    fn end_of_result(&mut self, ts: u64, payload: &[u8]) -> Reply {
+        match status_flags(payload) {
+            Some(f) if f & SERVER_MORE_RESULTS_EXISTS != 0 => {
+                self.state = State::InQuery;
+                Reply::Progress
+            }
+            Some(_) => self.finish(ts),
+            None => {
+                self.untrusted = true;
+                self.finish(ts)
+            }
+        }
+    }
+
+    fn parse_response(&mut self, ts: u64) -> Reply {
+        let Some(p) = self.next_server_packet() else {
+            return Reply::Need;
+        };
+        let payload = p.payload;
         if payload.is_empty() {
-            self.server_buf.consume(consumed);
-            return None;
+            self.untrusted = true;
+            return Reply::Progress;
         }
         match self.pending {
             Pending::Simple => {
-                self.server_buf.consume(consumed);
                 self.query_text = None;
                 self.query_ts = None;
                 self.state = State::Ready;
-                return None;
+                return Reply::Progress;
             }
             Pending::Prepare if payload[0] == OK_MARKER && payload.len() >= 12 => {
                 // COM_STMT_PREPARE_OK: [0x00][id:4][columns:2][params:2]...
-                self.server_buf.consume(consumed);
                 let id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
                 let cols = u16::from_le_bytes([payload[5], payload[6]]) as usize;
                 let params = u16::from_le_bytes([payload[7], payload[8]]) as usize;
@@ -537,65 +767,50 @@ impl MysqlParser {
                 self.query_text = None;
                 self.query_ts = None;
                 self.state = State::SkipDefs;
-                return None;
+                return Reply::Progress;
             }
             _ => {}
         }
         match payload[0] {
-            OK_MARKER => {
-                self.server_buf.consume(consumed);
-                let mut m = self.build_msg(ts);
-                m.status = Some(0);
-                Some(m)
-            }
+            OK_MARKER => self.end_of_result(ts, &payload),
             ERR_MARKER => {
-                self.server_buf.consume(consumed);
-                let mut m = self.build_msg(ts);
-                if payload.len() >= 3 {
-                    m.status = Some(u16::from_le_bytes([payload[1], payload[2]]) as u32);
-                }
-                // The message text follows the SQL state (`#` + 5 bytes)
-                // when there is one.
-                let text_at = if payload.len() > 9 && payload[3] == b'#' {
-                    9
-                } else {
-                    3
-                };
-                if payload.len() > text_at {
-                    // A parse error (1064) echoes the statement, secret included.
-                    let text = String::from_utf8_lossy(&payload[text_at..]).into_owned();
-                    m.payload_text = Some(super::export_error_text(text, self.error_withheld));
-                }
-                Some(m)
+                self.error = Some(err_code_and_state(&payload));
+                self.finish(ts)
             }
-            _ => {
-                self.server_buf.consume(consumed);
-                match decode_lenenc(&payload) {
-                    Some(cols) => {
-                        self.state = State::InResponse {
-                            cols_expected: cols as usize,
-                            cols_received: 0,
-                            past_col_eof: false,
-                        };
-                    }
-                    None => {
-                        // Malformed packet — insufficient bytes for lenenc integer.
-                        // Treat as no result set; stay Ready so the connection survives.
-                        self.state = State::Ready;
-                    }
-                }
-                None
+            LOCAL_INFILE_MARKER if self.pending == Pending::Query => {
+                // The packet names the file: not kept.
+                self.state = State::Infile;
+                Reply::Progress
             }
+            _ => match decode_lenenc(&payload) {
+                Some(cols) if cols > 0 => {
+                    self.state = State::InResponse {
+                        cols_expected: cols as usize,
+                        cols_received: 0,
+                        past_col_eof: false,
+                    };
+                    Reply::Progress
+                }
+                _ => {
+                    // Not a reply the parser can read.
+                    self.untrusted = true;
+                    self.finish(ts)
+                }
+            },
         }
     }
 
-    fn read_result_set(&mut self, ts: u64, ce: usize, mut cr: usize, mut past: bool) -> RsResult {
+    fn read_result_set(&mut self, ts: u64, ce: usize, mut cr: usize, mut past: bool) -> Reply {
         loop {
-            let (payload, consumed) = match Self::try_read_packet(&self.server_buf) {
-                Some(p) => p,
-                None => return RsResult::Progress(ce, cr, past),
+            let Some(p) = self.next_server_packet() else {
+                self.state = State::InResponse {
+                    cols_expected: ce,
+                    cols_received: cr,
+                    past_col_eof: past,
+                };
+                return Reply::Need;
             };
-            self.server_buf.consume(consumed);
+            let payload = p.payload;
             if payload.is_empty() {
                 continue;
             }
@@ -621,14 +836,12 @@ impl MysqlParser {
             // End of rows: EOF, or with CLIENT_DEPRECATE_EOF an OK packet
             // with a 0xFE header. Never 0x00: that starts every binary row
             // and any text row whose first value is an empty string.
-            if is_eof(&payload) || payload[0] == ERR_MARKER {
-                let mut m = self.build_msg(ts);
-                if payload[0] == ERR_MARKER && payload.len() >= 3 {
-                    m.status = Some(u16::from_le_bytes([payload[1], payload[2]]) as u32);
-                } else {
-                    m.status = Some(0);
-                }
-                return RsResult::Done(Box::new(m));
+            if payload[0] == ERR_MARKER {
+                self.error = Some(err_code_and_state(&payload));
+                return self.finish(ts);
+            }
+            if is_eof(&payload) {
+                return self.end_of_result(ts, &payload);
             }
         }
     }
@@ -637,14 +850,12 @@ impl MysqlParser {
         let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, ts);
         msg.method = Some("QUERY".into());
         let bound = self.param_text.take();
-        self.error_withheld = false;
         match self.query_text.take() {
             Some(q) => {
-                let (verb, shown, bound, withheld) = super::export_statement(q, bound);
+                let (verb, shown, bound, _) = super::export_statement(q, bound);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(shown);
                 msg.request_text = bound;
-                self.error_withheld = withheld;
             }
             None => msg.request_text = bound,
         }
@@ -662,14 +873,52 @@ impl MysqlParser {
             State::InQuery => "in_query",
             State::InResponse { .. } => "in_response",
             State::SkipDefs => "skip_definitions",
+            State::Infile => "local_infile",
+            State::Opaque => "opaque",
         }
     }
 }
 
-enum RsResult {
-    Done(Box<L7Message>),
-    Progress(usize, usize, bool),
-    Need,
+/// An untrusted connection's message: the statement keyword only.
+fn scrub(m: &mut L7Message) {
+    for f in [&mut m.payload_text, &mut m.request_text] {
+        if let Some(mut s) = f.take() {
+            zeroize::Zeroize::zeroize(&mut s);
+        }
+    }
+    m.headers.clear();
+    m.status = None;
+    m.latency_ns = None;
+}
+
+/// ERR_Packet: [0xFF][code:2][#][sqlstate:5][message]. The code and the
+/// SQLSTATE (when present and well formed) only; the message is never
+/// read.
+fn err_code_and_state(payload: &[u8]) -> (u32, Option<String>) {
+    let code = payload
+        .get(1..3)
+        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as u32);
+    let state = payload
+        .get(3..9)
+        .filter(|s| s[0] == b'#' && s[1..].iter().all(u8::is_ascii_alphanumeric))
+        .map(|s| String::from_utf8_lossy(&s[1..]).into_owned());
+    (code, state)
+}
+
+/// Server status flags of an OK packet ([hdr][affected:lenenc]
+/// [last_insert_id:lenenc][status:2]...) or a 5-byte EOF packet
+/// ([0xFE][warnings:2][status:2]).
+fn status_flags(payload: &[u8]) -> Option<u16> {
+    let at = if payload.first() == Some(&EOF_MARKER) && payload.len() == 5 {
+        3
+    } else {
+        let mut r = Reader::new(payload.get(1..)?);
+        r.lenenc()?;
+        r.lenenc()?;
+        1 + r.pos
+    };
+    let b = payload.get(at..at + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// Bound parameters of an EXECUTE (bytes after the iteration count), in
@@ -828,6 +1077,10 @@ fn decode_lenenc(data: &[u8]) -> Option<u64> {
 
 impl ProtocolParser for MysqlParser {
     fn feed(&mut self, data: &[u8], direction: Direction, ts: u64) -> ParseResult {
+        self.skip_accounted = false;
+        if self.state == State::Opaque {
+            return ParseResult::NeedMoreData;
+        }
         match direction {
             Direction::Ingress => {
                 if self.server_buf.extend(data).is_err() {
@@ -842,18 +1095,26 @@ impl ProtocolParser for MysqlParser {
         }
         self.process(ts)
     }
+
     fn skip(&mut self, direction: Direction, _n: usize, _timestamp_ns: u64) -> Option<ParseResult> {
         match (direction, &self.state) {
+            (_, State::Opaque) => {}
             // Lost part of a response (ring drops, or a large result set in
-            // a packet past `max_packet_bytes`): rows are not needed,
-            // wait for the next command.
+            // a packet past `max_packet_bytes`): rows are not needed, so
+            // the response is closed by the next command. That holds only
+            // while the client waits for each reply: one that pipelines
+            // may have sent the next command already.
             (Direction::Ingress, State::InQuery | State::InResponse { .. }) => {
+                if self.pipelined || !self.client_buf.is_empty() {
+                    self.untrusted = true;
+                }
                 self.server_buf.clear();
                 self.resync_server = true;
-                Some(ParseResult::NeedMoreData)
             }
-            _ => None,
+            _ => return None,
         }
+        self.skip_accounted = true;
+        Some(ParseResult::NeedMoreData)
     }
 
     fn protocol(&self) -> Protocol {
@@ -864,6 +1125,18 @@ impl ProtocolParser for MysqlParser {
     }
     fn protocol_version(&self) -> Option<&str> {
         self.server_version.as_deref()
+    }
+
+    /// The stream was not seen from its first byte (or bytes were lost
+    /// that `skip` could not place): a packet boundary found from here may
+    /// lie inside a statement or row, and a reply may answer a command
+    /// sent before capture. Untrusted for good. Not right after a `skip`
+    /// that accounted for its gap (`skip_accounted`).
+    fn joined_late(&mut self) {
+        if std::mem::take(&mut self.skip_accounted) {
+            return;
+        }
+        self.untrusted = true;
     }
 }
 
@@ -994,6 +1267,7 @@ mod tests {
         err_body.extend_from_slice(b"#42S02Table 'oracle.missing_tok_17_' doesn't exist");
         let err = pkt(1, &err_body);
         let mut p = MysqlParser::new();
+        p.state = State::Ready; // handshake seen
         let mut out = Vec::new();
         let mut feed = |p: &mut MysqlParser, d: &[u8], dir, ts| {
             if let ParseResult::Messages(m) = p.feed(d, dir, ts) {
@@ -1209,18 +1483,21 @@ mod tests {
         let result = p.feed(&make_packet(1, &err), Direction::Ingress, 2000);
         match result {
             ParseResult::Messages(m) => {
+                // The code and SQLSTATE; never the message.
                 assert_eq!(m[0].status, Some(1064));
-                assert!(m[0].payload_text.as_ref().unwrap().contains("syntax error"));
+                assert_eq!(m[0].payload_text.as_deref(), Some("BAD SQL"));
+                assert_eq!(m[0].headers, vec![("sqlstate".into(), "42000".into())]);
+                assert!(!format!("{m:?}").contains("syntax error"));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
     }
 
-    /// A server error that echoes the statement (1064) carries its secret:
-    /// the ERR text is withheld when the statement was, with and without a
-    /// SQL state, and when it shows credential context itself.
+    /// A server error echoes statement text and values (1064 quotes the
+    /// statement, 1366 a bound value): its message is never exported,
+    /// with or without a SQL state, whatever the statement.
     #[test]
-    fn test_error_text_is_withheld() {
+    fn test_error_text_is_never_exported() {
         let echo = b"You have an error in your SQL syntax; check the manual near 'IDENTIFIED BY 'my-s3cret'' at line 1";
         for (query, sql_state) in [
             (
@@ -1233,6 +1510,7 @@ mod tests {
             ),
             // A clean query whose error shows credential context.
             (b"SELECT 1", true),
+            (b"SELECT 1", false),
         ] {
             let mut p = MysqlParser::new();
             p.state = State::Ready;
@@ -1249,9 +1527,43 @@ mod tests {
             else {
                 panic!("expected a message");
             };
-            assert_eq!(m[0].payload_text.as_deref(), Some("<statement withheld>"));
+            let all = format!("{m:?}");
+            assert!(!all.contains("s3cret") && !all.contains("syntax"), "{all}");
             assert_eq!(m[0].status, Some(1064));
+            let state: Vec<_> = m[0].headers.iter().map(|(_, v)| v.as_str()).collect();
+            assert_eq!(state, if sql_state { vec!["42000"] } else { vec![] });
         }
+    }
+
+    /// 1366 quotes a bound value: the message is dropped, the code and
+    /// SQLSTATE stay.
+    #[test]
+    fn test_error_echoing_a_value_exports_code_and_state_only() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let mut err = vec![ERR_MARKER, 0x56, 0x05];
+        err.extend_from_slice(
+            b"#HY000Incorrect integer value: 'hunter2' for column 'pin' at row 1",
+        );
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03INSERT INTO t (pin) VALUES ('hunter2')"),
+                s(1, &err),
+            ],
+        );
+        assert_eq!(msgs[0].status, Some(1366));
+        assert_eq!(msgs[0].headers, vec![("sqlstate".into(), "HY000".into())]);
+        let all = format!("{:?} {:?}", msgs[0].request_text, msgs[0].headers);
+        assert!(!all.contains("Incorrect"), "{all}");
+        // A malformed SQLSTATE is not exported either.
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[c(0, b"\x03SELECT 1"), s(1, b"\xff\x56\x05#hu'2!rest")],
+        );
+        assert!(msgs[0].headers.is_empty(), "{:?}", msgs[0].headers);
     }
 
     #[test]
@@ -1273,7 +1585,9 @@ mod tests {
             ParseResult::NeedMoreData
         ));
 
-        // Server OK response should still produce a MySQL message.
+        // Server OK response should still produce a MySQL message, but the
+        // greeting was missed: the reply may answer an earlier command, so
+        // only the keyword is exported.
         let result = p.feed(
             &make_packet(1, &[OK_MARKER, 0, 0, 2, 0]),
             Direction::Ingress,
@@ -1284,7 +1598,7 @@ mod tests {
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0].protocol, Protocol::Mysql);
                 assert_eq!(m[0].method.as_deref(), Some("SELECT"));
-                assert_eq!(m[0].status, Some(0));
+                assert_eq!((m[0].status, &m[0].payload_text), (None, &None));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -1326,10 +1640,10 @@ mod tests {
         );
         match result {
             ParseResult::Messages(m) => {
+                // Joined mid-auth: one record, untrusted (keyword only).
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0].method.as_deref(), Some("SELECT"));
-                assert_eq!(m[0].status, Some(0));
-                assert_eq!(m[0].latency_ns, Some(1000));
+                assert_eq!((m[0].status, m[0].latency_ns), (None, None));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -1618,5 +1932,381 @@ mod tests {
         assert_eq!(decode_lenenc(&[0xFD, 1, 2]), None); // 3 bytes, needs 4
         assert_eq!(decode_lenenc(&[0xFC, 1]), None); // 0xFC needs 3 bytes
         assert_eq!(decode_lenenc(&[0xFE, 1, 2, 3, 4, 5, 6, 7]), None); // 0xFE needs 9 bytes
+    }
+
+    // ── Sync and pairing ─────────────────────────────────────────────────
+
+    fn all_text(m: &L7Message) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            m.method, m.path, m.payload_text, m.request_text, m.headers
+        )
+    }
+
+    fn pairs(msgs: &[L7Message]) -> Vec<(Option<&str>, Option<u32>)> {
+        msgs.iter()
+            .map(|m| (m.method.as_deref(), m.status))
+            .collect()
+    }
+
+    /// An INSERT whose value holds a forged command packet, and a reply
+    /// whose row holds a forged OK: what a parser joining inside them sees.
+    fn forged_tail() -> (Vec<u8>, Vec<u8>) {
+        let mut client = b"abc'),('".to_vec();
+        client.extend(make_packet(0, b"\x03SELECT 'S3CRET' FROM dual"));
+        let mut server = b"row".to_vec();
+        server.extend(make_packet(1, &[OK_MARKER, 0, 0, 2, 0, 0, 0]));
+        (client, server)
+    }
+
+    #[test]
+    fn joined_late_inside_a_statement_exports_no_forged_command() {
+        let (client, server) = forged_tail();
+        let mut p = MysqlParser::new();
+        p.joined_late();
+        let msgs = feed_all(
+            &mut p,
+            &[(Direction::Egress, client), (Direction::Ingress, server)],
+        );
+        for m in &msgs {
+            assert!(!all_text(m).contains("S3CRET"), "{}", all_text(m));
+            assert_eq!(m.status, None);
+        }
+        // A late parser that lands on real packet boundaries stays
+        // untrusted all the same.
+        let mut p = MysqlParser::new();
+        p.joined_late();
+        let msgs = feed_all(&mut p, &[c(0, b"\x03SELECT 1"), s(1, OK)]);
+        assert_eq!(pairs(&msgs), vec![(Some("SELECT"), None)]);
+        assert_eq!(msgs[0].payload_text, None);
+    }
+
+    fn manager_out(r: Option<crate::protocol::fsm::FsmResult>) -> Vec<L7Message> {
+        use crate::protocol::fsm::FsmResult;
+        match r {
+            Some(FsmResult::Messages(v)) => v,
+            Some(FsmResult::MessageComplete(v)) => vec![v],
+            _ => vec![],
+        }
+    }
+
+    /// The same through the manager (`mark_joined_late`).
+    #[test]
+    fn manager_join_mid_stream_exports_no_forged_command() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let (client, server) = forged_tail();
+        let m = ConnectionFsmManager::new(16);
+        let (cl, sv) = ((1, 40000), (2, 3306));
+        m.get_or_create_with_server(7, Protocol::Mysql, Some(sv));
+        m.mark_joined_late(7);
+        let mut out = manager_out(m.process_packet_from(7, cl, Direction::Egress, &client, 1));
+        out.extend(manager_out(m.process_packet_from(
+            7,
+            sv,
+            Direction::Ingress,
+            &server,
+            2,
+        )));
+        for msg in &out {
+            assert!(!all_text(msg).contains("S3CRET"), "{}", all_text(msg));
+        }
+    }
+
+    /// A gap inside a result set, through the manager (which follows every
+    /// skip with `joined_late`): accounted for, so the next command keeps
+    /// its text and status.
+    #[test]
+    fn manager_gap_inside_a_result_set_keeps_text() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let m = ConnectionFsmManager::new(16);
+        let (cl, sv) = ((1, 40000), (2, 3306));
+        m.get_or_create_with_server(8, Protocol::Mysql, Some(sv));
+        let mut greeting = vec![0x0a];
+        greeting.extend_from_slice(b"8.4.0\0");
+        greeting.extend_from_slice(&[0; 40]);
+        m.process_packet_from(8, sv, Direction::Ingress, &make_packet(0, &greeting), 1);
+        let mut auth = (CLIENT_PROTOCOL_41 | CLIENT_DEPRECATE_EOF)
+            .to_le_bytes()
+            .to_vec();
+        auth.extend_from_slice(&[0; 28]);
+        auth.extend_from_slice(b"root\0");
+        m.process_packet_from(8, cl, Direction::Egress, &make_packet(1, &auth), 2);
+        m.process_packet_from(8, sv, Direction::Ingress, &make_packet(2, OK), 3);
+        m.process_packet_from(
+            8,
+            cl,
+            Direction::Egress,
+            &make_packet(0, b"\x03SELECT * FROM big"),
+            4,
+        );
+        m.process_packet_from(8, sv, Direction::Ingress, &make_packet(1, &[0x01]), 5);
+        m.skip_from(8, sv, Direction::Ingress, 60_000, 6);
+        let mut out = manager_out(m.process_packet_from(
+            8,
+            cl,
+            Direction::Egress,
+            &make_packet(0, b"\x03UPDATE t SET a = 1"),
+            7,
+        ));
+        out.extend(manager_out(m.process_packet_from(
+            8,
+            sv,
+            Direction::Ingress,
+            &make_packet(1, OK),
+            8,
+        )));
+        assert_eq!(
+            pairs(&out),
+            vec![(Some("SELECT"), None), (Some("UPDATE"), Some(0))]
+        );
+        assert_eq!(out[1].payload_text.as_deref(), Some("UPDATE t SET a = 1"));
+    }
+
+    /// A command whose reply the parser does not model (here
+    /// COM_FIELD_LIST: definitions then EOF) used to leave its reply for
+    /// the next command, which then paired with the wrong packets.
+    #[test]
+    fn unmodelled_command_untrusts_the_connection() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x04users\0"),
+                s(1, b"\x03def\x03app\x05users"),
+                s(2, EOF),
+                c(0, b"\x03DELETE FROM t"),
+                s(1, b"\xff\x7a\x04#42S02x"),
+            ],
+        );
+        assert_eq!(pairs(&msgs), vec![(Some("DELETE"), None)]);
+        for cmd in [
+            &b"\x11app\0"[..],               // COM_CHANGE_USER
+            b"\x1c\x01\0\0\0\x0a\0\0\0",     // COM_STMT_FETCH
+            b"\x12\x04\0\0\0\0\0\x01\0\0\0", // COM_BINLOG_DUMP
+            b"\x0a",                         // COM_PROCESS_INFO
+            b"\x20",                         // COM_CLONE / unknown
+        ] {
+            let mut p = MysqlParser::new();
+            p.state = State::Ready;
+            feed_all(&mut p, &[c(0, cmd)]);
+            assert!(p.untrusted, "{cmd:?}");
+        }
+    }
+
+    /// Commands with one reply packet (COM_STATISTICS answers with a
+    /// string, not an OK) and commands with none keep pairing.
+    #[test]
+    fn single_and_no_reply_commands_keep_pairing() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, &[COM_STATISTICS]),
+                s(1, b"Uptime: 10  Threads: 1  Questions: 5"),
+                c(0, b"\x19\x01\0\0\0"),              // COM_STMT_CLOSE
+                c(0, b"\x18\x01\0\0\0\0\0long data"), // COM_STMT_SEND_LONG_DATA
+                c(0, b"\x03UPDATE t SET a = 1"),
+                s(1, OK),
+                c(0, b"\x0c\x07\0\0\0"), // COM_PROCESS_KILL
+                s(1, OK),
+                c(0, b"\x03DELETE FROM t"),
+                s(1, b"\xff\x7a\x04#42S02x"),
+            ],
+        );
+        assert_eq!(
+            pairs(&msgs),
+            vec![(Some("UPDATE"), Some(0)), (Some("DELETE"), Some(1146))]
+        );
+        assert!(!p.untrusted);
+    }
+
+    /// LOAD DATA LOCAL INFILE: the server asks for the file (0xFB), the
+    /// client sends it, then the server answers. The file's packets (here
+    /// holding what looks like a command) are never read as commands, nor
+    /// exported.
+    #[test]
+    fn local_infile_transfer_is_one_exchange() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03LOAD DATA LOCAL INFILE '/tmp/u.csv' INTO TABLE t"),
+                s(1, b"\xfb/tmp/u.csv"),
+                c(2, b"\x03SELECT 'S3CRET'\n"),
+                c(3, b"alice,S3CRET\n"),
+                c(4, b""),
+                s(5, OK),
+                c(0, b"\x03SELECT 1"),
+                s(1, OK),
+            ],
+        );
+        assert_eq!(
+            pairs(&msgs),
+            vec![(Some("LOAD"), Some(0)), (Some("SELECT"), Some(0))]
+        );
+        for m in &msgs {
+            assert!(!all_text(m).contains("S3CRET"), "{}", all_text(m));
+        }
+        assert!(!p.untrusted);
+    }
+
+    /// A multi-statement query or a `CALL` returns several results; only
+    /// the last lacks SERVER_MORE_RESULTS_EXISTS. The later ones used to
+    /// answer the next command.
+    #[test]
+    fn multi_results_are_one_exchange() {
+        const EOF_MORE: &[u8] = &[0xFE, 0x00, 0x00, 0x0a, 0x00];
+        const OK_MORE: &[u8] = &[0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00];
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03SELECT 1; UPDATE t SET a = 2; SELECT 3"),
+                s(1, &[0x01]),
+                s(2, b"col"),
+                s(3, EOF),
+                s(4, b"\x011"),
+                s(5, EOF_MORE),
+                s(6, OK_MORE),
+                s(7, &[0x01]),
+                s(8, b"col"),
+                s(9, EOF),
+                s(10, b"\x013"),
+                s(11, EOF),
+                c(0, b"\x03CALL p()"),
+                s(1, &[0x01]),
+                s(2, b"col"),
+                s(3, EOF),
+                s(4, EOF_MORE),
+                s(5, OK),
+                c(0, b"\x03DELETE FROM t"),
+                s(1, b"\xff\x7a\x04#42S02x"),
+            ],
+        );
+        assert_eq!(
+            pairs(&msgs),
+            vec![
+                (Some("SELECT"), Some(0)),
+                (Some("CALL"), Some(0)),
+                (Some("DELETE"), Some(1146))
+            ]
+        );
+        assert!(!p.untrusted);
+    }
+
+    /// A reply packet out of sequence, or server bytes with no command in
+    /// flight, means the parser is out of step: untrusted.
+    #[test]
+    fn sequence_breaks_and_unsolicited_replies_untrust() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(&mut p, &[c(0, b"\x03SELECT 1"), s(3, OK)]);
+        assert_eq!(pairs(&msgs), vec![(Some("SELECT"), None)]);
+
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03SELECT 1"),
+                s(1, OK),
+                s(1, OK),
+                c(0, b"\x03SELECT 2"),
+                s(1, OK),
+            ],
+        );
+        assert_eq!(
+            pairs(&msgs),
+            vec![(Some("SELECT"), Some(0)), (Some("SELECT"), None)]
+        );
+    }
+
+    /// After a server gap the next command closes the reply only when the
+    /// client waits for each reply; a pipelining client may already have
+    /// sent it.
+    #[test]
+    fn gap_on_a_pipelining_connection_untrusts() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03SELECT * FROM big"),
+                c(0, b"\x03SELECT 2"),
+                s(1, &[0x01]),
+            ],
+        );
+        assert!(p.pipelined);
+        assert!(p.skip(Direction::Ingress, 60_000, 5).is_some());
+        assert!(p.untrusted);
+    }
+
+    /// A cursor EXECUTE's rows come through COM_STMT_FETCH: untrusted.
+    #[test]
+    fn cursor_execute_untrusts() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        feed_all(&mut p, &[c(0, b"\x17\x01\0\0\0\x01\x01\0\0\0")]);
+        assert!(p.untrusted);
+    }
+
+    /// SSLRequest: TLS records follow, never parsed as packets.
+    #[test]
+    fn ssl_request_stops_parsing() {
+        let mut p = MysqlParser::new();
+        let mut greeting = vec![0x0a];
+        greeting.extend_from_slice(b"8.4.0\0");
+        greeting.extend_from_slice(&[0; 40]);
+        let mut ssl = (CLIENT_PROTOCOL_41 | CLIENT_SSL).to_le_bytes().to_vec();
+        ssl.extend_from_slice(&[0; 28]);
+        let msgs = feed_all(
+            &mut p,
+            &[
+                s(0, &greeting),
+                c(1, &ssl),
+                (
+                    Direction::Egress,
+                    b"\x16\x03\x01\x02\x00\x03SELECT 1".to_vec(),
+                ),
+            ],
+        );
+        assert!(msgs.is_empty());
+        assert_eq!(p.state_name(), "opaque");
+    }
+
+    /// OK `info` text and the rows of SHOW WARNINGS (which quote values)
+    /// are never exported.
+    #[test]
+    fn ok_info_and_warning_rows_are_never_exported() {
+        let mut p = MysqlParser::new();
+        p.state = State::Ready;
+        let mut ok_info = vec![0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00];
+        ok_info.extend_from_slice(b"Rows matched: 1  Changed: 1  Warnings: 1 hunter2");
+        let msgs = feed_all(
+            &mut p,
+            &[
+                c(0, b"\x03UPDATE t SET pin = 7"),
+                s(1, &ok_info),
+                c(0, b"\x03SHOW WARNINGS"),
+                s(1, &[0x03]),
+                s(2, b"col1"),
+                s(3, b"col2"),
+                s(4, b"col3"),
+                s(5, EOF),
+                s(
+                    6,
+                    b"\x07Warning\x041366\x37Incorrect integer value: 'hunter2' for column 'pin'",
+                ),
+                s(7, EOF),
+            ],
+        );
+        assert_eq!(msgs.len(), 2);
+        for m in &msgs {
+            assert!(!all_text(m).contains("hunter2"), "{}", all_text(m));
+        }
     }
 }
