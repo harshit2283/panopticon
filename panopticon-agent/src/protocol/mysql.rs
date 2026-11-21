@@ -375,12 +375,15 @@ impl MysqlParser {
 
     fn parse_handshake(&mut self) -> bool {
         let Some(p) = Self::try_read_packet(&self.server_buf) else {
-            // The agent attached after the greeting: the first packet seen
-            // is a client one. Replies and framing are unproven.
+            // The first packet seen is a client one. An auth packet
+            // (sequence id >= 1) is how a TLS key starts: the greeting went
+            // in cleartext, on another key. Whether this stream was seen
+            // from its start is the connection manager's call
+            // (`joined_late`). A command (sequence id 0) with no auth seen
+            // means the agent attached after it: replies are unproven.
             if let Some(c) = Self::try_read_packet(&self.client_buf) {
-                self.untrusted = true;
-                // A command carries sequence id 0; auth packets never do.
                 self.state = if c.seq == 0 {
+                    self.untrusted = true;
                     State::Ready
                 } else {
                     State::InAuth
@@ -434,9 +437,11 @@ impl MysqlParser {
                     u32::from_le_bytes([c.payload[0], c.payload[1], c.payload[2], c.payload[3]]);
                 if caps & CLIENT_PROTOCOL_41 != 0 {
                     self.client_caps = Some(caps);
-                    if caps & CLIENT_SSL != 0 {
-                        // TLS records follow; the plaintext, if captured,
-                        // is another key.
+                    // SSLRequest: the response cut after its 32 fixed bytes.
+                    // TLS records follow; the plaintext, if captured, is
+                    // another key, whose full response (CLIENT_SSL set too)
+                    // is parsed as usual.
+                    if caps & CLIENT_SSL != 0 && c.payload.len() == 32 {
                         self.state = State::Opaque;
                         return true;
                     }
@@ -1640,10 +1645,12 @@ mod tests {
         );
         match result {
             ParseResult::Messages(m) => {
-                // Joined mid-auth: one record, untrusted (keyword only).
+                // An auth packet first is how a TLS key starts; whether it
+                // was a late join is the manager's call (`joined_late`).
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0].method.as_deref(), Some("SELECT"));
-                assert_eq!((m[0].status, m[0].latency_ns), (None, None));
+                assert_eq!(m[0].status, Some(0));
+                assert_eq!(m[0].latency_ns, Some(1000));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
@@ -2252,6 +2259,53 @@ mod tests {
         p.state = State::Ready;
         feed_all(&mut p, &[c(0, b"\x17\x01\0\0\0\x01\x01\0\0\0")]);
         assert!(p.untrusted);
+    }
+
+    /// A TLS key's plaintext starts with the client's full
+    /// HandshakeResponse41 (sequence id 2, CLIENT_SSL set): parsed as
+    /// usual, with text when the manager has the key's start, keyword only
+    /// when it marks the key late.
+    #[test]
+    fn tls_plaintext_starts_at_the_full_handshake_response() {
+        use crate::protocol::fsm::ConnectionFsmManager;
+        let mut auth = (CLIENT_PROTOCOL_41 | CLIENT_SSL | CLIENT_DEPRECATE_EOF)
+            .to_le_bytes()
+            .to_vec();
+        auth.extend_from_slice(&[0; 28]);
+        auth.extend_from_slice(b"app\0\x14");
+        auth.extend_from_slice(&[0xAB; 20]);
+        for late in [false, true] {
+            let m = ConnectionFsmManager::new(16);
+            let (cl, sv) = ((1, 40000), (2, 3306));
+            m.get_or_create_with_server(3, Protocol::Mysql, Some(sv));
+            if late {
+                m.mark_joined_late(3);
+            }
+            m.process_packet_from(3, cl, Direction::Egress, &make_packet(2, &auth), 1);
+            m.process_packet_from(3, sv, Direction::Ingress, &make_packet(3, OK), 2);
+            m.process_packet_from(
+                3,
+                cl,
+                Direction::Egress,
+                &make_packet(0, b"\x03UPDATE t SET a = 1"),
+                3,
+            );
+            let out = manager_out(m.process_packet_from(
+                3,
+                sv,
+                Direction::Ingress,
+                &make_packet(1, OK),
+                4,
+            ));
+            assert_eq!(out.len(), 1, "late={late}");
+            if late {
+                assert_eq!(pairs(&out), vec![(Some("UPDATE"), None)]);
+                assert_eq!(out[0].payload_text, None);
+            } else {
+                assert_eq!(pairs(&out), vec![(Some("UPDATE"), Some(0))]);
+                assert_eq!(out[0].payload_text.as_deref(), Some("UPDATE t SET a = 1"));
+            }
+        }
     }
 
     /// SSLRequest: TLS records follow, never parsed as packets.
