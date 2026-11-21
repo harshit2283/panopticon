@@ -348,10 +348,16 @@ pub struct ConnInfo {
 /// connection's `Write` inside the outer one's.
 pub const GO_GUARD_NEST: usize = 4;
 
+/// `GoGuardCalls::depth` bit: the call passed its stack-check prologue
+/// (tls_probes.rs `go_tls_write_body`), so an entry seen again at its depth
+/// is not the prologue re-entering it.
+pub const GO_GUARD_RUNNING: u64 = 1 << 63;
+
 /// `GO_GUARD_CALLS` value: the recorded calls (tls_probes.rs `guard_call`)
 /// a goroutine is in, outermost first: each one's `*tls.Conn` and frame
 /// depth (top of the goroutine's stack minus SP at its entry, which equals
-/// SP at its RET instructions and survives a stack copy).
+/// SP at its RET instructions and survives a stack copy), with
+/// [`GO_GUARD_RUNNING`] once the call's body began.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GoGuardCalls {

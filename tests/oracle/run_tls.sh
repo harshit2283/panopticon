@@ -10,16 +10,17 @@
 #            address, the agent's key, is reused in either process
 #   go-h2-reuse
 #            HTTP/2 with each connection closed before the next opens, so
-#            Go reallocates *tls.Conn addresses: a reused key never
-#            decodes again (docs/adr/ADR-014-cgroup-skb-capture-scope.md),
-#            so recall is reported, not gated
+#            Go reallocates *tls.Conn addresses
 # Each runs on loopback. The uprobes see both ends, so every exchange is
 # exported twice: once from the client process and once from the server.
 # Each view is scored separately and must reach MIN_RECALL, as must the
-# share of its exchanges that carry the socket's addresses. go-h2 must also
-# show as many distinct keys as connections (tls_conns.py). go-h2-reuse is
-# gated instead on no raw PII in the export, on every record it could not
-# attribute carrying no path, status, content type or header, and on no
+# share of its exchanges that carry the socket's addresses (HTTP/1.1 parses
+# a latched TLS key in full). Every TLS key starts latched, so HTTP/2 over
+# TLS decodes no header (docs/adr/ADR-014-cgroup-skb-capture-scope.md):
+# both go-h2 stacks report recall without gating it, and are gated instead
+# on no raw PII in the export and on every record score.py cannot attribute
+# carrying no path, status, content type or header. go-h2 also checks that
+# no address was reused (tls_conns.py --distinct), go-h2-reuse that no
 # client exchange decoded on a reused key (tls_conns.py --reused-latched).
 #
 # Usage: sudo tests/oracle/run_tls.sh [requests=500] [seed=1234] [min_recall=0.99] [stacks="openssl go go-h2 go-h2-reuse"]
@@ -104,7 +105,9 @@ for stack in $STACKS; do
   python3 -I "$HERE/split_tls.py" "$D" "$SP_PID" "$CP" "$PORT" "$MIN_RECALL" || status=1
   gate=("$MIN_RECALL")
   case $stack in
-    go-h2) python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt" --distinct || status=1 ;;
+    go-h2)
+      python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt" --distinct || status=1
+      gate=(0 --withheld) ;;
     go-h2-reuse)
       python3 -I "$HERE/tls_conns.py" "$D/truth.jsonl" "$D/server_conns.txt" \
         --reused-latched "$D/client.jsonl" || status=1

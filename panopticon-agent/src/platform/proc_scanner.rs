@@ -580,6 +580,43 @@ fn resolve_probe_file(_target: &TlsTarget) -> Option<(u64, u64)> {
     None
 }
 
+/// The file a target's probes are attached through: for a target keyed by
+/// its real inode under an overlay ([`TlsTarget::probe_file`]), that layer
+/// file itself, looked up again now and opened only if it still is that
+/// inode, so the probe lands on the inode the agent records (a copy-up
+/// since the scan fails the lookup: the target is refused, and the next
+/// scan keys it by the file examined); otherwise the file examined
+/// ([`open_examined`]).
+pub fn open_probe_file(target: &TlsTarget) -> std::io::Result<std::fs::File> {
+    let examined = open_examined(target)?;
+    let Some(id) = target.probe_file else {
+        return Ok(examined);
+    };
+    let refused = || std::io::Error::other("the layer file is not the one recorded");
+    let file = open_layer_file(target).ok_or_else(refused)?;
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    if (m.dev(), m.ino()) != id {
+        return Err(refused());
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_layer_file(target: &TlsTarget) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = target
+        .library_path
+        .strip_prefix(&format!("/proc/{}/root", target.pid))?;
+    let (fd, _) = super::overlay::lower_file(target.pid, path, target.file_key?)?;
+    open_workload_file(&format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_layer_file(_target: &TlsTarget) -> Option<std::fs::File> {
+    None
+}
+
 /// Drop repeats of one path to one examined file, and keep every other
 /// path: each is a candidate for [`attach_each`]. A path's attach can be
 /// refused ([`open_examined`]: a co-tenant that shares the inode swapped a
@@ -647,11 +684,10 @@ pub fn attach_each_retrying(
 }
 
 /// Go binaries whose attach put no probe on them, per file
-/// ([`probe_file_id`]): retried after 2, 4, 8, 16 and 32 scans, then not
-/// again until the agent restarts. Such an attempt leaves the Go probe
-/// floor as it was (loader.rs `attach_tls_uprobes`), so retries cost only
-/// the attempt; the bound keeps a binary that can never be probed from
-/// warning at every scan.
+/// ([`probe_file_id`]): retried after 2, 4, 8 and 16 scans, then every 32
+/// scans for as long as they keep failing (a failure may be transient, so
+/// the binary is never given up). The backoff keeps a binary that can never
+/// be probed from warning at every scan.
 #[derive(Debug, Default)]
 pub struct GoRetry {
     scan: u64,
@@ -659,8 +695,8 @@ pub struct GoRetry {
     failures: std::collections::HashMap<(u64, u64), (u32, u64)>,
 }
 
-/// Attempts after which a Go binary is not tried again.
-const GO_ATTACH_ATTEMPTS: u32 = 6;
+/// The longest wait between attempts, in scans (`1 << GO_RETRY_MAX_SHIFT`).
+const GO_RETRY_MAX_SHIFT: u32 = 5;
 
 impl GoRetry {
     fn waiting(&self, id: (u64, u64)) -> bool {
@@ -672,18 +708,18 @@ impl GoRetry {
     fn failed(&mut self, id: (u64, u64)) {
         let scan = self.scan;
         let (n, next) = self.failures.entry(id).or_insert((0, 0));
-        *n += 1;
-        *next = if *n >= GO_ATTACH_ATTEMPTS {
+        *n = n.saturating_add(1);
+        let wait = 1u64 << (*n).min(GO_RETRY_MAX_SHIFT);
+        if wait == 1 << GO_RETRY_MAX_SHIFT {
             tracing::warn!(
                 dev = id.0,
                 ino = id.1,
                 attempts = *n,
-                "Go binary attached no TLS probe; not tried again until the agent restarts"
+                scans = wait,
+                "Go binary attached no TLS probe; tried again after the wait"
             );
-            u64::MAX
-        } else {
-            scan + (1u64 << *n)
-        };
+        }
+        *next = scan + wait;
     }
 }
 
@@ -1201,8 +1237,31 @@ mod tests {
         assert_eq!((files, tried), (3, vec![10, 12, 20]), "one per file");
     }
 
+    /// Codex #6 (copy-up): a target keyed by a real inode is attached only
+    /// through that layer file, found again at attach time. When it cannot
+    /// be (here: no overlay at all, as after a copy-up the lookup fails),
+    /// the attach is refused rather than made through the examined path,
+    /// whose real inode may no longer be the one recorded. A target keyed
+    /// by the file examined opens that file.
+    #[test]
+    fn test_probe_file_is_the_recorded_inode_or_refused() {
+        let dir = std::env::temp_dir().join(format!("probefile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("libssl.so.3");
+        std::fs::write(&path, b"elf").unwrap();
+        let key = file_key(&std::fs::File::open(&path).unwrap()).unwrap();
+        let examined = ssl_target(1, path.to_str().unwrap(), Some(key));
+        assert!(open_probe_file(&examined).is_ok());
+        let keyed_by_layer = TlsTarget {
+            probe_file: Some((key.0, key.1)),
+            ..examined.clone()
+        };
+        assert!(open_probe_file(&keyed_by_layer).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A Go binary none of whose paths attached a probe is tried again
-    /// after 2, 4, 8, 16 and 32 scans, then never; another path of it
+    /// after 2, 4, 8 and 16 scans, then every 32; another path of it
     /// still gets its try within a scan, an OpenSSL library is tried at
     /// every scan, and a later success clears the record.
     #[test]
@@ -1223,7 +1282,7 @@ mod tests {
         let mut attached = std::collections::HashSet::new();
         let mut retry = GoRetry::default();
         let mut tried_at = vec![];
-        for scan in 1..=80u64 {
+        for scan in 1..=130u64 {
             let mut tried = vec![];
             attach_each_retrying(&targets, &mut attached, &mut retry, |t| {
                 tried.push(t.pid);
@@ -1235,7 +1294,7 @@ mod tests {
             }
             assert!(tried.contains(&30), "the OpenSSL library, scan {scan}");
         }
-        assert_eq!(tried_at, vec![1, 3, 7, 15, 31, 63]);
+        assert_eq!(tried_at, vec![1, 3, 7, 15, 31, 63, 95, 127]);
 
         let mut retry = GoRetry::default();
         attach_each_retrying(&targets, &mut attached, &mut retry, |_| 0);
