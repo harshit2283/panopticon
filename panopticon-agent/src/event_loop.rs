@@ -2761,12 +2761,27 @@ mod tests {
         assert_eq!(out, vec![None]);
     }
 
+    /// The client's SYN (seq 99) and the server's SYN+ACK (seq 899): they
+    /// place each side's first byte, so the connection was seen from its
+    /// start (without them every side is unplaced: a late join).
+    fn handshake() -> [DataEvent; 2] {
+        let mut syn = tcp_pkt(CLI, 99, 0, 0, b"");
+        syn.tcp_flags = panopticon_common::TCP_FLAG_SYN;
+        [
+            syn,
+            tcp_pkt(SRV, 899, 100, panopticon_common::TCP_FLAG_SYN, b""),
+        ]
+    }
+
     #[test]
     fn retransmitted_segments_are_parsed_once() {
         let req = b"GET /orders/7 HTTP/1.1\r\nHost: shop\r\n\r\n";
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let (a, b) = req.split_at(20);
+        let [syn, syn_ack] = handshake();
         let (paths, ignored) = run_tcp(&[
+            syn,
+            syn_ack,
             tcp_pkt(CLI, 100, 900, 0, a),
             tcp_pkt(CLI, 100, 900, 0, a),          // retransmission
             tcp_pkt(CLI, 110, 900, 0, &req[10..]), // overlaps the first 10 bytes
@@ -2775,7 +2790,10 @@ mod tests {
             tcp_pkt(SRV, 900, 100 + req.len() as u32, 0, resp), // duplicate
         ]);
         assert_eq!(paths, vec![Some("/orders/7".to_string())]);
-        assert_eq!(ignored, vec![false, true, false, true, false, true]);
+        assert_eq!(
+            ignored,
+            vec![false, false, false, true, false, true, false, true]
+        );
     }
 
     #[test]
@@ -2785,14 +2803,17 @@ mod tests {
         let resp = b"HTTP/1.1 204 No Content\r\n\r\n";
         let next = 100 + req.len() as u32;
         let rst = panopticon_common::TCP_FLAG_RST;
+        let [syn, syn_ack] = handshake();
         let (paths, ignored) = run_tcp(&[
+            syn,
+            syn_ack,
             tcp_pkt(CLI, 100, 900, 0, req),
             tcp_pkt(CLI, next + 50_000_000, 900, 0, fake), // guessed sequence
             tcp_pkt(SRV, 77_777, next, rst, b""),          // spoofed RST
             tcp_pkt(SRV, 900, next, 0, resp),
         ]);
         assert_eq!(paths, vec![Some("/real".to_string())]);
-        assert_eq!(ignored, vec![false, true, true, false]);
+        assert_eq!(ignored, vec![false, false, false, true, true, false]);
         // The real RST, at the server's next sequence number, counts.
         let (_, ignored) = run_tcp(&[
             tcp_pkt(CLI, 100, 900, 0, req),
