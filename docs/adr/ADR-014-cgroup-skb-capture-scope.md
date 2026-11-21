@@ -124,9 +124,10 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     text).
   - AMQP: both directions count as unsynced; methods, status, timing and
     sizes stay, no text.
-  - HTTP/1.1, PostgreSQL, MySQL and Kafka: unchanged (their parsers
-    resynchronise on message boundaries and ignore the latch; PostgreSQL
-    marks a connection joined mid-stream untrusted by itself).
+  - HTTP/1.1, PostgreSQL, MySQL and Kafka: unchanged (their parsers'
+    `joined_late` is the trait's no-op, so the latch changes nothing for
+    them; PostgreSQL marks a connection untrusted, from its content, only
+    when its first client bytes are not a startup message).
 
   A `TlsNew` record (`SSL_new`'s return) still ends its key's connection,
   so a new object at a reused address gets a new, latched entry. Proving

@@ -282,8 +282,8 @@ production-hardened compliance platform.
     same latch costs Redis over TLS its command and reply text and AMQP
     over TLS its text; HTTP/1.1, PostgreSQL, MySQL and Kafka over TLS
     are not affected. Proving a TLS connection's start is a separate
-    design. While credential masking is on its bodies are not exported
-    either.
+    design. While credential masking is on, the bodies of such an HTTP/2
+    connection are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
