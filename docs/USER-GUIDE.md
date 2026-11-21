@@ -508,7 +508,7 @@ One JSON object per completed exchange. A real record (body shortened):
 | `latency_ns` | Request → response time as observed on this host |
 | `method`, `path` | HTTP method and path+query; SQL command and table; Redis command and key. Each of these and every header name and value is kept to at most 8 KB |
 | `status` | HTTP status, or database error code |
-| `payload_text` | Response body as text, at most `max_body_bytes` (default 4 KB), after redaction |
+| `payload_text` | Response body as text, at most `max_body_bytes` (default 4 KB), after redaction; for Redis only the reply's type and size (§5.3) |
 | `request_body` | HTTP request body (POST/PUT/PATCH, forms) as text, at most `max_body_bytes`, after redaction |
 | `response_size_bytes` | Full body size, even when the body was larger than what was kept |
 | `headers` | Header names and values as sent on the wire (HTTP, HTTP/2 and gRPC metadata including `:path`; DNS `qtype`) |
@@ -654,8 +654,8 @@ checked on text that no decoding has changed: a path on the field as
 captured, a `SELECT` on the statement as captured and only when decoding
 would change nothing in it, so no encoding can hide a value from the
 check. Anything outside the allowlist is context (when in doubt, the
-field is withheld). No other field has a bare name: a Redis argument or
-reply, a Kafka topic, an AMQP field, a DNS name, a gRPC path, a header,
+field is withheld). No other field has a bare name: a Redis argument,
+a Kafka topic, an AMQP field, a DNS name, a gRPC path, a header,
 a body or an error message that reads `/oauth/token` or
 `SELECT password FROM users` is withheld.
 
@@ -734,7 +734,6 @@ What is exported then:
   statement starting with anything else exports the method `QUERY`, and
   just `<statement withheld>` when withheld.
 - **Any other field** (path, header value, method, content type, bodies,
-  Redis replies with no credential context in their command (next item),
   Kafka and AMQP fields): `<field withheld>`,
   unless every credential in it is one of these, in which case only the
   value becomes `<REDACTED>` and the rest stays readable: a query or form
@@ -748,8 +747,9 @@ What is exported then:
 - **A Redis command** with credential context in any argument, or any
   argument (key, name or value, of any command) that names a credential
   read by segments (a credential word in it, or a short name as a whole
-  segment), is withheld as one unit: key, arguments and reply text
-  (below), even where a field alone would only have a value masked.
+  segment), is withheld as one unit: key, arguments and the reply's
+  shape (below), even where a field alone would only have a value masked.
+  No Redis reply text is exported at all (below).
 - **A header whose name is over 8 KiB** is replaced, name and value, by
   `<field withheld>`: a name is classified whole, never cut first.
 - **A body with bytes captured after a gap** (bytes lost to ring drops
@@ -881,9 +881,8 @@ one, any field of another kind that reads like a bare name, a body that
 mentions a token or a secret in prose, a path with a digit or a value
 around a credential word (`/v1/token`, `/reset/token/abc123`), a field
 that is just a credential name (a Kafka topic `user.password`, a header
-value `Authorization`), or a Redis command or reply naming
-`requirepass` (`CONFIG GET requirepass` and its reply) is withheld
-whole.
+value `Authorization`), or a Redis command naming `requirepass`
+(`CONFIG GET requirepass`) is withheld whole.
 
 A known limit of the path position: a segment of letters only before a
 credential word is exported, as in `/reset/abcdef/token`. With no route
@@ -891,26 +890,32 @@ table, a letters-only code there cannot be told apart from a route word
 such as `oauth` in `/oauth/token`; it is exposed as much as any
 letters-only path segment with no credential word nearby.
 
-Redis commands and replies are masked before this rule runs. The
-command's secret is masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`,
-`CONFIG SET` and `SENTINEL SET` of a credential-named parameter, and
-`ACL SETUSER` password rules. The reply is masked for `CONFIG GET` of those
-parameters, the whole of `ACL LIST|GETUSER|GENPASS` and the same results
-inside `EXEC`; in any reply the value after a credential-named element and
-`ACL LIST` lines with a password rule are masked too. The rule above then
-applies to the masked text: `AUTH <REDACTED>` and `HELLO 3 AUTH default
-<REDACTED>` stay readable (`auth` is not used as a name there), while an
-argument or reply holding a word from the first list, alone or with a
-value next to it, masked or not (`CONFIG GET requirepass`,
-`CONFIG SET requirepass <REDACTED>`, the `CONFIG GET requirepass` reply
-`requirepass, <REDACTED>`, `SET k swordfish_password`), is withheld
-whole: no Redis field has a bare name (above). A Redis command is
-protected as one unit: when any of its arguments has credential
-context, read together or one by one, or any argument names a credential
-read by segments (below), the key (`path`), the arguments
-(`request_text`) and the reply text are all exported as
-`<field withheld>` (method, status, timing and sizes stay), and its
-result inside an `EXEC` is masked. So `SET otp:+15551234567 482913 EX
+Redis reply text is never exported: a reply's `payload_text` is its
+type and size only, `(bulk, 6 bytes)`, `(array, 3)`, `(map, 2)`,
+`(set, 1)`, `(integer)`, `(error)`, `(nil)`, `(boolean)`, `(double)`.
+A status reply is kept only when it is one of a fixed set of protocol
+words (`OK`, `PONG`, `QUEUED`, `RESET`, and `TYPE`'s `none`, `string`,
+`list`, `set`, `zset`, `hash`, `stream`); any other status is
+`(status)`. So no value read (`GET`, `HVALS`, `HGETALL`), password
+(`ACL GENPASS`, `CONFIG GET`), error quoting an argument or other
+command's arguments (`SLOWLOG GET`) leaves the node, and the result of
+an `EXEC` is its shape, `(array, n)`.
+
+Redis commands are masked before this rule runs. The command's secret is
+masked in `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH`/`AUTH2`, `CONFIG SET`
+and `SENTINEL SET` of a credential-named parameter, and `ACL SETUSER`
+password rules. The rule above then applies to the masked text:
+`AUTH <REDACTED>` and `HELLO 3 AUTH default <REDACTED>` stay readable
+(`auth` is not used as a name there), while an argument holding a word
+from the first list, alone or with a value next to it, masked or not
+(`CONFIG GET requirepass`, `CONFIG SET requirepass <REDACTED>`,
+`SET k swordfish_password`), is withheld whole: no Redis field has a
+bare name (above). A Redis command is protected as one unit: when any of
+its arguments has credential context, read together or one by one, or
+any argument names a credential read by segments (below), the key
+(`path`), the arguments (`request_text`) and the reply's shape are all
+exported as `<field withheld>` (method, status, timing and sizes stay).
+So `SET otp:+15551234567 482913 EX
 300`, `SETEX password_reset_token:alice 3600 <token>` and
 `GET otp:+15551234567` export no key, value or reply, however opaque the
 value; field-by-field, the key would be withheld and the value next to it
@@ -918,14 +923,19 @@ exported. A key, field name or other argument has no free text around
 it to show that a short name is used as a name, so every argument of
 every command (key, names and values alike, known command or not) is
 also read by segments: every character that is not an ASCII letter or
-digit separates segments, and so does a lower-case letter or digit
-followed by an upper-case one (`pinCode` is `pin`, `Code`); case folded.
-An argument that contains a word of the first list above anywhere, with
-separators read as `_` (`u:1:apikey`, `session_token`,
-`clientAssertion`), or one of whose segments is a short name whole
-(`otp`, `user:1:pin`, `u|otp`, `u otp`, `api-key`, `pinCode`), names a
-credential. A short name inside a segment with no boundary does not
-count, so `mykey`, `spinner`, `author` and `otpcode` name no credential.
+digit separates segments, and so do case and digit boundaries: a
+lower-case letter or digit followed by an upper-case one (`pinCode` is
+`pin`, `Code`), an upper-case letter followed by an upper-case one and a
+lower-case one (`OTPCode` is `OTP`, `Code`), and a letter next to a
+digit (`otp2` is `otp`, `2`); case folded. An argument that contains a
+word of the first list above anywhere, with separators read as `_`
+(`u:1:apikey`, `session_token`, `clientAssertion`), or one of whose
+segments is a short name whole or with a plural `s` (`otp`,
+`user:1:pin`, `u|otp`, `u otp`, `api-key`, `pinCode`, `pins`, `otps`,
+`keys`, Django's `:1:django.contrib.sessions.cache<id>`), names a
+credential. A short name joined to other letters with no boundary does
+not count, so `mykey`, `spinner`, `author` and `otpcode` name no
+credential.
 So `SET otp 482913`, `SET user:1:otp 482913`, `HSET u:1 pin 1234`,
 `SET session_token abc`, `EVAL <script> 1 otp`, `XADD events * otp
 482913`, `LMOVE incoming user:1:otp LEFT RIGHT` and `JSON.GET u:1 $.pin`
@@ -939,15 +949,21 @@ state follow the server's replies only, and a subscription
 acknowledgement counts only as the reply to the pending subscription
 command (a script returning an array of the
 same shape changes nothing). A reply that cannot be matched to its command
-is exported without its text. No reply text is exported for the rest of
-the connection after any of: `MONITOR`; `UNSUBSCRIBE` with no channel;
-`CLIENT REPLY OFF|SKIP` (never acknowledged, so a refusal cannot be seen);
-any `CLIENT REPLY` other than `CLIENT REPLY ON`; `MULTI`, `EXEC`,
-`DISCARD` or `RESET` sent with arguments; `CLIENT`, `HELLO`, `MONITOR` or
-a subscription command queued inside `MULTI`; a transaction past 1024
-commands or 64 KiB; an array in place of a subscription command's
-acknowledgement. An `EXEC` whose `MULTI` came before capture started has
-its whole result masked.
+is exported with neither the command nor its shape (status, timing and
+sizes only). Every later reply of the connection is exported that way
+after any of: `UNSUBSCRIBE` with no channel; `CLIENT REPLY OFF|SKIP`
+(never acknowledged, so a refusal cannot be seen); any `CLIENT REPLY`
+other than `CLIENT REPLY ON`; `MULTI`, `EXEC`, `DISCARD` or `RESET` sent
+with arguments; `CLIENT`, `HELLO` or a subscription command queued
+inside `MULTI`; a transaction past 1024 commands or 64 KiB; an array in
+place of a subscription command's acknowledgement. Nothing more at all
+is exported for a connection after `MONITOR`, `SYNC`, `PSYNC` or
+`REPLCONF` (also queued inside `MULTI`): what follows is a stream of
+monitored commands or replication data (a master propagates writes such
+as `SET user:1:otp 839201` on the same connection) that answers no
+command. The same holds after a request that is not a RESP array (an
+inline command, a bare bulk string, a RESP3 null or map): the server
+reads it as inline lines, so its replies cannot be paired.
 
 Replies are paired with commands by order, which is only safe when the
 agent saw both directions of the connection from their first byte, which
@@ -1051,7 +1067,7 @@ Patterns use the Rust `regex` syntax (linear time, no backreferences).
 Every text field of every protocol is checked: method, path, content type,
 header names (also when the value was wiped as a credential header) and
 values, request and response bodies, SQL text and bound values, Redis
-arguments and replies, Kafka and AMQP fields; a DNS answer whose name a
+arguments, Kafka and AMQP fields; a DNS answer whose name a
 pattern matches is dropped. A match in the field as captured is replaced
 by `<REDACTED>`. When the field has escapes, entities or percent-encoding,
 its decoded view (case kept) is matched too: a match there that is not

@@ -310,10 +310,8 @@ production-hardened compliance platform.
     context is exported as `<field withheld>` unless each credential is a
     form parameter, a scalar JSON member or URI userinfo, whose value is
     then masked; credential-named headers are masked, and Redis
-    credential commands and replies are masked before the same rule (so
-    `AUTH` stays readable, while `CONFIG GET requirepass` and its reply
-    are withheld: with renamed commands a reply cannot be tied to its
-    request). A credential word that is a bare name is not credential
+    credential commands are masked before the same rule (so `AUTH` stays
+    readable, while `CONFIG GET requirepass` is withheld). A credential word that is a bare name is not credential
     context, by an allowlist tied to the field's kind: in an HTTP/1 or
     HTTP/2 request path, the last segment of a captured path part
     (before any `?` or `#`) of ASCII letters-only segments, any query or
@@ -326,16 +324,21 @@ production-hardened compliance platform.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`). A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.
-    Redis reply text is exported only on connections seen from their
-    first byte (the kernel's stream offset, no bytes lost):
-    not on connections open before the agent started, nor over TLS.
+    Redis reply text is never exported: a reply is exported as its type
+    and size only (`(bulk, 6 bytes)`, `(array, 3)`, `(error)`), a status
+    only when it is a fixed protocol word (`OK`, `PONG`, `QUEUED`, ...).
+    A reply is paired with its command only on connections seen from
+    their first byte (the kernel's stream offset, no bytes lost): not on
+    connections open before the agent started, nor over TLS. After
+    `MONITOR`, `SYNC`, `PSYNC` or `REPLCONF`, or a request that is not a
+    RESP array, nothing more is exported for the connection.
     A Redis command with credential context in any argument, or with any
     argument (key, name or value, of any command) containing a credential
-    word or a short name as a whole segment (segments split on every
-    character that is not an ASCII letter or digit and at a case boundary:
-    `user:1:otp`, `u|otp`, `pinCode`; not `mykey` or `otpcode`), is
-    withheld as one unit (key, arguments and reply text, and its result
-    inside `EXEC`), so `SET otp:<id> <code>`, `SET otp <code>`,
+    word or a short name as a whole segment, plural `s` included
+    (segments split on every character that is not an ASCII letter or
+    digit and at case and digit boundaries: `user:1:otp`, `u|otp`,
+    `pinCode`, `OTPCode`, `otp2`, `sessions`; not `mykey` or `otpcode`), is
+    withheld as one unit (key, arguments and the reply's shape), so `SET otp:<id> <code>`, `SET otp <code>`,
     `HSET u:1 pin <pin>`, `EVAL <script> 1 otp` and `XADD s * otp <code>`
     export no value. A value that only mentions a credential word
     withholds its command too.
