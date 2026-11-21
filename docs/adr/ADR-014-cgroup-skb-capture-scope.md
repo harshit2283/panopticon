@@ -115,14 +115,16 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   `TlsOrigin`); without it the entry is latched (HTTP/2: no headers decoded
   for its life):
   - OpenSSL: a `TlsNew` record (`SSL_new`'s return for that object),
-    emitted after the agent's last user-space drop. A reused `SSL*` the
-    agent saw created starts clean.
+    emitted after the agent's last user-space drop, whose process loss
+    mark (`SSL_LOSS`, below) the key's first record still carries. A
+    reused `SSL*` the agent saw created starts clean.
   - Go `crypto/tls` has no creation hook (`tls.Client` / `tls.Server` are
     inlined). Each Go record carries its process's `PROC_EPOCH` stamp
     (tls_probes.rs `emit_tls_event`, in `stream_off`), and a key starts
     clean only if the agent saw that process image start
     (`sched_process_exec` sets `GO_EPOCH_EXEC`) after the last completed
-    attach of Go probes (none during one), no Go record of the process was
+    attach that put Go probes live (none during one; an attempt that
+    attached nothing leaves the floor as it was), no Go record of the process was
     lost in the kernel (`GO_EPOCH_LOST`, below), nothing was dropped in
     user space since the image started, the pipeline was installed before
     it, and the key was never held by that instance before (a removed
@@ -143,9 +145,21 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
     and all of the process's keys latch. A failed `GO_READ_CALLS` insert is
     one such path. User space notes every drop before a parser
     (event_loop.rs `EventStats::note_drop`) and latches the TLS entries
-    created before it. Known gap: an OpenSSL record the kernel could not
-    emit (ring full) after its object's `TlsNew` marks nothing, so that
-    key's next record can still start clean.
+    created before it, a malformed ring record included. OpenSSL
+    likewise: a process gets a loss mark at its first `TlsNew` (maps.rs
+    `SSL_LOSS`, a clock reading), and every OpenSSL read or write of it
+    that is not emitted (capture off, out of scope, ring full, scratch
+    missing, a call slot not saved or not its frame's, a length that
+    cannot be read) increments it (tls_probes.rs `ssl_lose`). Every
+    OpenSSL record and `TlsNew` carries the mark (`stream_off`); a key
+    starts clean only if its first record carries its `TlsNew`'s mark, and
+    latches at the first record carrying another (protocol/fsm.rs
+    `check_tls`). The mark only grows, and a re-created one (after the
+    leader thread's exit) starts at a later clock reading, so it never
+    returns to an earlier value. Without a mark (more than 65,536 marked
+    processes) a process's keys never start clean. The TCP reorder window
+    (reorder.rs) never holds a TLS record (it has no TCP sequence) and
+    drops nothing.
   - `(*Conn).Write` is probed at its entry and every RET; the entry is
     emitted once per call (Go's stack-growth prologue re-enters a
     function: tls_probes.rs `go_tls_write_guarded`), all or nothing per

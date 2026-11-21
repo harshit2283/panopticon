@@ -604,24 +604,87 @@ fn dedup_targets(targets: &mut Vec<TlsTarget>) {
 pub fn attach_each(
     targets: &[TlsTarget],
     attached: &mut std::collections::HashSet<(u64, u64)>,
+    attach: impl FnMut(&TlsTarget) -> usize,
+) -> (usize, usize) {
+    attach_each_retrying(targets, attached, &mut GoRetry::default(), attach)
+}
+
+/// [`attach_each`] for a periodic scan: a Go binary none of whose paths
+/// attached a probe in a scan is tried again only after a backoff
+/// ([`GoRetry`]).
+pub fn attach_each_retrying(
+    targets: &[TlsTarget],
+    attached: &mut std::collections::HashSet<(u64, u64)>,
+    retry: &mut GoRetry,
     mut attach: impl FnMut(&TlsTarget) -> usize,
 ) -> (usize, usize) {
+    retry.scan += 1;
     let (mut files, mut probes) = (0, 0);
+    let mut failed = std::collections::HashSet::new();
     for target in targets {
         let Some(id) = probe_file_id(target) else {
             continue;
         };
-        if attached.contains(&id) {
+        let go = matches!(target.tls_type, TlsType::GoTls { .. });
+        if attached.contains(&id) || (go && retry.waiting(id)) {
             continue;
         }
         let n = attach(target);
         if n > 0 {
             attached.insert(id);
+            failed.remove(&id);
+            retry.failures.remove(&id);
             files += 1;
             probes += n;
+        } else if go {
+            failed.insert(id);
         }
     }
+    for id in failed {
+        retry.failed(id);
+    }
     (files, probes)
+}
+
+/// Go binaries whose attach put no probe on them, per file
+/// ([`probe_file_id`]): retried after 2, 4, 8, 16 and 32 scans, then not
+/// again until the agent restarts. Such an attempt leaves the Go probe
+/// floor as it was (loader.rs `attach_tls_uprobes`), so retries cost only
+/// the attempt; the bound keeps a binary that can never be probed from
+/// warning at every scan.
+#[derive(Debug, Default)]
+pub struct GoRetry {
+    scan: u64,
+    /// Failed attempts and the scan before which the file is not tried.
+    failures: std::collections::HashMap<(u64, u64), (u32, u64)>,
+}
+
+/// Attempts after which a Go binary is not tried again.
+const GO_ATTACH_ATTEMPTS: u32 = 6;
+
+impl GoRetry {
+    fn waiting(&self, id: (u64, u64)) -> bool {
+        self.failures
+            .get(&id)
+            .is_some_and(|&(_, next)| self.scan < next)
+    }
+
+    fn failed(&mut self, id: (u64, u64)) {
+        let scan = self.scan;
+        let (n, next) = self.failures.entry(id).or_insert((0, 0));
+        *n += 1;
+        *next = if *n >= GO_ATTACH_ATTEMPTS {
+            tracing::warn!(
+                dev = id.0,
+                ino = id.1,
+                attempts = *n,
+                "Go binary attached no TLS probe; not tried again until the agent restarts"
+            );
+            u64::MAX
+        } else {
+            scan + (1u64 << *n)
+        };
+    }
 }
 
 /// Scan a single PID's `/proc/<pid>/maps` for TLS libraries.
@@ -948,10 +1011,12 @@ fn attach_new_targets(
     // The set is checked again under the lock (another scan may have
     // raced).
     let mut attached = std::mem::take(&mut state.attached_libs);
-    let (newly_attached, _) = attach_each(&new_targets, &mut attached, |t| {
+    let mut retry = std::mem::take(&mut state.go_retry);
+    let (newly_attached, _) = attach_each_retrying(&new_targets, &mut attached, &mut retry, |t| {
         crate::loader::attach_tls_uprobes_on_state(&mut state, t)
     });
     state.attached_libs = attached;
+    state.go_retry = retry;
     drop(state);
 
     newly_attached
@@ -1134,6 +1199,49 @@ mod tests {
             1
         });
         assert_eq!((files, tried), (3, vec![10, 12, 20]), "one per file");
+    }
+
+    /// A Go binary none of whose paths attached a probe is tried again
+    /// after 2, 4, 8, 16 and 32 scans, then never; another path of it
+    /// still gets its try within a scan, an OpenSSL library is tried at
+    /// every scan, and a later success clears the record.
+    #[test]
+    fn test_go_binary_that_attached_nothing_backs_off() {
+        let go = |pid: u32| TlsTarget {
+            pid,
+            library_path: format!("/proc/{pid}/root/app"),
+            tls_type: TlsType::GoTls {
+                write_offset: 3,
+                read: None,
+                write_guard: None,
+            },
+            file_key: Some((1, 7, 5, 6)),
+            probe_file: None,
+        };
+        let ssl = ssl_target(30, "/proc/30/root/usr/lib/libssl.so.3", Some((1, 42, 5, 6)));
+        let targets = vec![go(20), go(21), ssl];
+        let mut attached = std::collections::HashSet::new();
+        let mut retry = GoRetry::default();
+        let mut tried_at = vec![];
+        for scan in 1..=80u64 {
+            let mut tried = vec![];
+            attach_each_retrying(&targets, &mut attached, &mut retry, |t| {
+                tried.push(t.pid);
+                0
+            });
+            if tried.contains(&20) {
+                assert!(tried.contains(&21), "both paths of the binary, scan {scan}");
+                tried_at.push(scan);
+            }
+            assert!(tried.contains(&30), "the OpenSSL library, scan {scan}");
+        }
+        assert_eq!(tried_at, vec![1, 3, 7, 15, 31, 63]);
+
+        let mut retry = GoRetry::default();
+        attach_each_retrying(&targets, &mut attached, &mut retry, |_| 0);
+        attach_each_retrying(&targets, &mut attached, &mut retry, |_| 0);
+        attach_each_retrying(&targets, &mut attached, &mut retry, |_| 1);
+        assert!(attached.contains(&(1, 7)) && retry.failures.is_empty());
     }
 
     /// The first path to a file is refused (a co-tenant sharing the inode

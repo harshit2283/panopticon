@@ -18,7 +18,7 @@ use panopticon_common::{EventType, GO_EPOCH_EXEC, GO_EPOCH_MASK, MAX_COMM_SIZE, 
 
 use crate::maps::{
     PID_CANDIDATES, PID_CGROUP_MAP, PID_EXITED, PID_EXITED_LOST, PID_FILTER, PROC_EPOCH,
-    PROCESS_EVENTS, TLS_CALL, TLS_SCRATCH,
+    PROCESS_EVENTS, SSL_LOSS, TLS_CALL, TLS_SCRATCH,
 };
 
 // ── Process Exec ───────────────────────────────────────────────────────────
@@ -131,8 +131,9 @@ fn try_sched_process_exit(ctx: &TracePointContext) -> Result<(), ()> {
         }
     }
     let _ = PID_FILTER.remove(&pid);
-    // The process instance ends (maps.rs PROC_EPOCH).
+    // The process instance ends (maps.rs PROC_EPOCH, SSL_LOSS).
     let _ = PROC_EPOCH.remove(&pid);
+    let _ = SSL_LOSS.remove(&pid);
 
     let comm = read_comm(ctx)?;
 

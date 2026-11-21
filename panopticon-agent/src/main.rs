@@ -365,6 +365,7 @@ async fn main() -> Result<()> {
             ebpf: programs.ebpf,
             links: programs._links,
             attached_libs,
+            go_retry: Default::default(),
             go_reads: programs.go_reads,
         }));
         let cgroup_root = programs_cgroup_root;

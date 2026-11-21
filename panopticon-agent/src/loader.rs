@@ -145,6 +145,8 @@ pub struct EbpfState {
     /// attached it again (duplicate probes) when a process mapped it
     /// again.
     pub attached_libs: HashSet<(u64, u64)>,
+    /// Go binaries that attached no probe, and when to try them again.
+    pub go_retry: crate::platform::proc_scanner::GoRetry,
     /// [`LoadedPrograms::go_reads`].
     pub go_reads: bool,
 }
@@ -408,13 +410,16 @@ pub fn attach_tls_uprobes(
         ..target.clone()
     };
     let go = matches!(target.tls_type, TlsType::GoTls { .. });
-    if go {
-        crate::protocol::fsm::go_attach_begin();
-    }
+    let floor = go.then(crate::protocol::fsm::go_attach_begin);
     let attached = attach_tls_uprobes_to(ebpf, &pinned, links, go_reads);
     drop(file); // the uprobes hold the inode now
-    if go {
-        crate::protocol::fsm::go_attach_end();
+    if let Some(before) = floor {
+        // The floor moves only if a probe went live. An emitting Go probe
+        // that attaches is never detached and is counted in `attached`
+        // (only the guard's RET probes, which emit nothing, are detached
+        // again: `attach_go_guards`), so with none attached no record of
+        // this binary was emitted, and the floor before stands.
+        crate::protocol::fsm::go_attach_end((attached == 0).then_some(before));
     }
     if attached > 0 {
         info!(

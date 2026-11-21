@@ -796,8 +796,11 @@ What is exported then:
   connection can reuse after a closed one. A key the agent sees for the
   first time starts clean, in every mode, only when:
   - **OpenSSL**: the agent saw `SSL_new` return the object at that
-    address, after its last dropped event. A reused `SSL*` the agent saw
-    created starts clean; nothing else resets a key (no client preface,
+    address, after its last dropped event, and no OpenSSL read or write
+    of the process went uncaptured since (the kernel marks the process on
+    every one it skips or cannot send; a later mark latches the key, and
+    every other key of the process, at its next record). A reused `SSL*`
+    the agent saw created starts clean; nothing else resets a key (no client preface,
     wherever it falls, nor `SSL_free`, which may drop one reference of
     several).
   - **Go `crypto/tls`**: the agent saw the process start (exec) after it
@@ -820,10 +823,9 @@ What is exported then:
   reused through `SSL_clear`, an object created before the agent attached,
   an object read or written inside `SSL_new` (a creation callback, so
   before the agent saw it created), any event the agent dropped (channel
-  full, rate limit), and for Go also any record lost in the kernel. Not
-  detected: an OpenSSL record the kernel could not send (ring full)
-  after its object's `SSL_new`, which can leave that key starting clean
-  at a later record. For Go also:
+  full, rate limit), any record lost in the kernel (ring full, capture
+  switched off, the process out of scope), and an OpenSSL process past
+  65,536 marked ones. For Go also:
   - **Processes already running when the probes attached.** A process
     running when the agent started, or when the agent attached a Go
     binary, keeps every key latched for its whole life. The agent finds Go
@@ -832,7 +834,9 @@ What is exported then:
     (re)starts, and a new binary's processes started before the scan that
     finds it (every 60 s by default, `tls_scan_interval_secs`). Each Go
     binary attached later also latches new connections of every Go
-    process started before that attach. New replicas and restarts of a
+    process started before that attach; an attempt that attached no
+    probe does not. A Go binary that attached no probe is tried again
+    after 2, 4, 8, 16 and 32 scans, then not until the agent restarts. New replicas and restarts of a
     binary already attached decode, in containers too:
     each container's overlay root shows the image file under a device of
     its own, and the agent finds the real inode all of them share in the

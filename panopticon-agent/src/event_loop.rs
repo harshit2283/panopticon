@@ -573,7 +573,9 @@ fn drain_ringbuf(
     while let Some(item) = ring.next() {
         drained += 1;
         if !read_data_event_into(item.as_ref(), scratch) {
-            continue; // Malformed event, skip
+            // Malformed, skipped: a hole like any drop.
+            reader.stats.note_drop();
+            continue;
         }
         admission.offer(scratch, &reader.rate_limiter);
     }
@@ -999,6 +1001,7 @@ pub(crate) async fn worker_task(
         };
         for record in batch.records() {
             if !read_data_event_into(record, &mut scratch) {
+                ctx.stats.note_drop(); // never: the reader checked it
                 continue;
             }
             let cookie = connection_key(&scratch);
@@ -1025,7 +1028,7 @@ pub(crate) async fn worker_task(
                     // Only OpenSSL sends one; the next entry on the key
                     // may start clean (fsm.rs `TlsOrigin::Object`).
                     if scratch.tls_library == panopticon_common::TlsLibrary::OpenSsl {
-                        manager.note_tls_object(cookie, scratch.timestamp_ns);
+                        manager.note_tls_object(cookie, scratch.timestamp_ns, ssl_mark(&scratch));
                     }
                     continue;
                 }
@@ -1336,7 +1339,7 @@ fn feed_event(
     if event.event_type == EventType::TlsData {
         manager.check_tls(
             cookie,
-            go_stamp(event),
+            tls_origin(event),
             stats.last_drop_ns.load(Ordering::Relaxed),
         );
     }
@@ -1752,8 +1755,16 @@ fn tls_origin(event: &DataEvent) -> crate::protocol::fsm::TlsOrigin {
         panopticon_common::TlsLibrary::GoTls => {
             crate::protocol::fsm::TlsOrigin::Go(go_stamp(event))
         }
-        _ => crate::protocol::fsm::TlsOrigin::Object,
+        _ => crate::protocol::fsm::TlsOrigin::Object(ssl_mark(event)),
     }
+}
+
+/// An OpenSSL record's process loss mark (`stream_off`: the kernel's
+/// `SSL_LOSS` value at emit, tls_probes.rs `ssl_stamp`; None without one).
+fn ssl_mark(event: &DataEvent) -> Option<u64> {
+    (event.tls_library == panopticon_common::TlsLibrary::OpenSsl
+        && event.stream_off != panopticon_common::scope::STREAM_OFF_UNKNOWN)
+        .then_some(event.stream_off)
 }
 
 fn tls_floors(stats: &EventStats) -> crate::protocol::fsm::TlsFloors {
@@ -2700,6 +2711,37 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(n, 4);
         assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 1);
+    }
+
+    /// TLS records carry no TCP sequence, so the window never holds one:
+    /// each goes straight to its parser (and so through `check_tls`), even
+    /// while a TCP hole is held, and none is ever dropped there.
+    #[test]
+    fn reorder_window_never_holds_a_tls_record() {
+        use crate::reorder::ReorderWindow;
+        let m = ConnectionFsmManager::new(16);
+        let stats = EventStats::new();
+        let mut w = ReorderWindow::default();
+        let mut seen = vec![];
+        let mut sink = |e: &DataEvent| {
+            seen.push(e.event_type);
+            feed_event(&m, e, connection_key(e), &stats, 0, false);
+        };
+        let t0 = Instant::now();
+        let get = at_off(redis_pkt(true, 1000, 5000, 0, GET), 0);
+        let glen = GET.len() as u32;
+        w.offer(&m, connection_key(&get), &get, t0, &stats, &mut sink);
+        let ahead = at_off(redis_pkt(false, 5000 + 1024, 1000 + glen, 0, b"x"), 1024);
+        w.offer(&m, connection_key(&ahead), &ahead, t0, &stats, &mut sink);
+        assert!(!w.is_empty(), "the TCP hole is held");
+        for dir in [Direction::Egress, Direction::Ingress] {
+            let tls = ssl_event(dir, b"x");
+            w.offer(&m, connection_key(&tls), &tls, t0, &stats, &mut sink);
+        }
+        assert_eq!(
+            seen,
+            vec![EventType::TcPacket, EventType::TlsData, EventType::TlsData]
+        );
     }
 
     /// A quiet connection: its hole expires on time, with no later record

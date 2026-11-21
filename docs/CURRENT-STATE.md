@@ -281,7 +281,9 @@ production-hardened compliance platform.
     later client preface on it does not lift this. Over TLS a key the
     agent sees for the first time starts clean only when proven to start
     at its connection's first record: OpenSSL's `SSL_new` returned that
-    object after the agent's last dropped event, or for Go the process
+    object after the agent's last dropped event and no OpenSSL call of
+    the process went uncaptured since (a kernel loss mark per process,
+    moved on every call it skips or cannot send), or for Go the process
     was seen starting after its probes attached, lost no record and
     never used the key before. A Go connection on a reused `*tls.Conn`
     address therefore never decodes headers. With a static or renamed
@@ -290,9 +292,7 @@ production-hardened compliance platform.
     (stripped, renamed), a Go process that was running when the agent
     started or attached a Go binary (the first process of every Go
     binary included), or a lost record, it is not decoded either. While
-    credential masking is on its bodies are not exported either. Not
-    detected: an OpenSSL record the kernel could not send (ring full)
-    after its object's `SSL_new`.
+    credential masking is on its bodies are not exported either.
   - Kafka, AMQP and DNS are scored against ground truth
     (`tests/oracle/run_messaging.sh`). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.

@@ -450,6 +450,39 @@ pub static GO_GUARD_CALLS: HashMap<GoReadKey, GoGuardCalls> =
 #[map]
 pub static PROC_EPOCH: HashMap<u32, u64> = HashMap::with_max_entries(TLS_SCRATCH_SIZE, 0);
 
+/// OpenSSL loss mark, per process: created at the process's first
+/// `TlsNew` (`bpf_ktime_get_ns`, never 0), incremented (never decreased)
+/// whenever an OpenSSL read or write of the process is not emitted
+/// (tls_probes.rs `ssl_lose`), removed when the thread group leader exits.
+/// Every OpenSSL record and `TlsNew` carries the value at emit
+/// (`DataEvent::stream_off`; `STREAM_OFF_UNKNOWN` without an entry). User
+/// space starts a key clean only when its first record carries its
+/// `TlsNew`'s value, and latches it at the first record that carries
+/// another (protocol/fsm.rs `TlsOrigin::Object`). The value never returns
+/// to an earlier one: a re-created entry starts at a later clock reading,
+/// which exceeds every earlier value (each increment is one probe run, far
+/// longer than a nanosecond). A full map creates no entry: that process's
+/// `TlsNew` records prove nothing.
+#[map]
+pub static SSL_LOSS: HashMap<u32, u64> =
+    HashMap::with_max_entries(SSL_LOSS_PROCESSES, BPF_F_NO_PREALLOC);
+
+/// Processes with an OpenSSL loss mark ([`SSL_LOSS`]).
+const SSL_LOSS_PROCESSES: u32 = 65_536;
+
+/// `*p += v` as one atomic instruction (BPF_XADD, every supported kernel).
+#[inline(always)]
+pub unsafe fn atomic_add_u64(p: *mut u64, v: u64) {
+    unsafe {
+        core::arch::asm!(
+            "lock *(u64 *)({p} + 0) += {v}",
+            p = in(reg) p,
+            v = in(reg) v,
+            options(nostack),
+        );
+    }
+}
+
 /// Go ABI metadata — maps PID to detected Go ABI version for register-based
 /// argument extraction. Key: pid, Value: ABI version flags.
 #[map]
