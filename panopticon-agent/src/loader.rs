@@ -636,9 +636,11 @@ fn attach_go_read(
 }
 
 /// Go Write guards (tls_probes.rs `guard_call`): every RET of `Write`
-/// first, then `Write`'s entry as `go_tls_write_guarded` (which also emits
-/// its plaintext), so a recorded call is always cleared. All or nothing:
-/// if any of them fails, the RET probes attached are detached again and
+/// first, then its body's first instruction (`go_tls_write_body`, which
+/// marks a recorded call running), then `Write`'s entry as
+/// `go_tls_write_guarded` (which also emits its plaintext), so a recorded
+/// call is always cleared. All or nothing: if any of them fails, the RET
+/// and body probes attached (which emit nothing) are detached again and
 /// None is returned; the caller then attaches the unguarded
 /// `go_tls_write_entry`. Not retried: a later swap of the live plaintext
 /// probe would emit a Write twice or not at all. Shares `PROC_EPOCH` and
@@ -666,12 +668,26 @@ fn attach_go_guards(
             }
         }
     }
+    let body = match try_attach_uprobe(ebpf, "go_tls_write_body", path, b.write_body, None) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                path,
+                offset = b.write_body,
+                error = %e,
+                "Go TLS Write not guarded: the Write body probe did not attach"
+            );
+            detach_uprobes(ebpf, "go_tls_guard_ret", rets);
+            return None;
+        }
+    };
     match try_attach_uprobe(ebpf, "go_tls_write_guarded", path, b.write_entry, None) {
         Ok(entry) => {
-            let n = rets.len() + 1;
+            let n = rets.len() + 2;
             for id in rets {
                 links.push(Box::new(id));
             }
+            links.push(Box::new(body));
             links.push(Box::new(entry));
             info!(path, probes = n, "Go TLS Write guarded");
             Some(n)
@@ -683,6 +699,7 @@ fn attach_go_guards(
                 "Go TLS Write not guarded: the guarded entry probe did not attach"
             );
             detach_uprobes(ebpf, "go_tls_guard_ret", rets);
+            detach_uprobes(ebpf, "go_tls_write_body", vec![body]);
             None
         }
     }

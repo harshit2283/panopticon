@@ -39,7 +39,8 @@ use crate::maps::{
 use crate::sock_capture::read_sock_tuple;
 use panopticon_common::scope::STREAM_OFF_UNKNOWN;
 use panopticon_common::{
-    GO_EPOCH_LOST, GO_EPOCH_MASK, GO_GUARD_NEST, GoGuardCalls, GoReadCall, GoReadKey,
+    GO_EPOCH_LOST, GO_EPOCH_MASK, GO_GUARD_NEST, GO_GUARD_RUNNING, GoGuardCalls, GoReadCall,
+    GoReadKey,
 };
 
 /// Mark `conn` as the TLS connection this thread is doing I/O for, so the
@@ -867,13 +868,29 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
     )
 }
 
+/// What [`guard_call`] found for an entering `Write`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    /// A new call, recorded.
+    New,
+    /// The same call entered again before its body began: emit nothing.
+    Again,
+    /// A recorded call on `conn` at this depth whose body had begun: it
+    /// ended without a RET seen (a panic unwound past it). Recorded anew
+    /// and emitted, with the instance marked (`go_lose`): what it was is
+    /// not known for sure.
+    Stale,
+}
+
 /// Record the `Write` call this goroutine is entering on `conn`
-/// (`GO_GUARD_CALLS`); its RETs clear it (`go_tls_guard_ret`). Ok(true)
-/// when the goroutine's innermost recorded call is on `conn` at the same
-/// frame depth: the same call entered again.
-/// A Go function's stack-growth prologue (`morestack`, also how a
-/// goroutine is preempted at a function entry) jumps back to the entry
-/// with the stack copied, so an entry probe fires again for one call; the
+/// (`GO_GUARD_CALLS`); its RETs clear it (`go_tls_guard_ret`).
+/// [`Guard::Again`] only on positive evidence of the stack-check prologue
+/// re-entering the call: the goroutine's innermost recorded call is on
+/// `conn` at the same frame depth and has not passed its prologue
+/// (`go_tls_write_body` sets `GO_GUARD_RUNNING` there). A Go function's
+/// stack-growth prologue (`morestack`, also how a goroutine is preempted
+/// at a function entry) jumps back to the entry before the body runs, with
+/// the stack copied, so an entry probe fires again for one call; the
 /// frame's depth from the stack top is unchanged by the copy. Calls nest
 /// (TLS inside TLS: the outer `Write` runs the inner connection's): a
 /// deeper call is pushed after the ones it runs inside; recorded calls at
@@ -883,9 +900,9 @@ fn try_go_tls_write(ctx: &ProbeContext) -> Result<(), ()> {
 /// Runs whether or not capture is on, so a call entered while capture was
 /// off is known when it is entered again.
 #[inline(always)]
-fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
+fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<Guard, ()> {
     if conn == 0 {
-        return Ok(false);
+        return Ok(Guard::New);
     }
     let key = go_read_key(ctx, true)?;
     let depth = frame_depth(ctx, &key)?;
@@ -898,11 +915,15 @@ fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
             n: 0,
         });
     let mut n = calls.n.min(GO_GUARD_NEST as u64);
+    let mut found = Guard::New;
     if let Some((c, d)) = guard_at(&calls, n)
         && c == conn
-        && d == depth
+        && d & !GO_GUARD_RUNNING == depth
     {
-        return Ok(true);
+        if d & GO_GUARD_RUNNING == 0 {
+            return Ok(Guard::Again);
+        }
+        found = Guard::Stale;
     }
     n = pop_from(&calls, n, depth);
     match n {
@@ -914,7 +935,7 @@ fn guard_call(ctx: &ProbeContext, conn: u64) -> Result<bool, ()> {
     }
     calls.n = n + 1;
     GO_GUARD_CALLS.insert(&key, &calls, 0).map_err(|_| ())?;
-    Ok(false)
+    Ok(found)
 }
 
 /// Top of the goroutine's stack minus SP: at a function's entry and at its
@@ -949,7 +970,7 @@ fn guard_at(calls: &GoGuardCalls, n: u64) -> Option<(u64, u64)> {
 fn pop_from(calls: &GoGuardCalls, mut n: u64, depth: u64) -> u64 {
     for _ in 0..GO_GUARD_NEST {
         match guard_at(calls, n) {
-            Some((_, d)) if d >= depth => n -= 1,
+            Some((_, d)) if d & !GO_GUARD_RUNNING >= depth => n -= 1,
             _ => break,
         }
     }
@@ -987,12 +1008,49 @@ fn try_go_tls_guard_ret(ctx: &ProbeContext) -> Result<(), ()> {
     Ok(())
 }
 
+/// The first instruction of `(*Conn).Write`'s body, just past its
+/// stack-check prologue (proc_scanner / go_read.rs `GoWriteProbes`): the
+/// goroutine's innermost recorded call, if it is this one (its `*tls.Conn`
+/// and frame depth; SP is still the entry's), began running, so an entry
+/// at its depth from now on is not the prologue re-entering it. Emits
+/// nothing.
+#[uprobe]
+pub fn go_tls_write_body(ctx: ProbeContext) {
+    let _ = try_go_tls_write_body(&ctx);
+}
+
+#[inline(always)]
+fn try_go_tls_write_body(ctx: &ProbeContext) -> Result<(), ()> {
+    let (conn, _, _) = read_go_write_args(ctx)?;
+    let key = go_read_key(ctx, false)?;
+    let depth = frame_depth(ctx, &key)?;
+    let calls = GO_GUARD_CALLS.get_ptr_mut(&key).ok_or(())?;
+    // SAFETY: this goroutine's own slot; only this goroutine writes it.
+    unsafe {
+        let n = core::ptr::read_volatile(&raw const (*calls).n).min(GO_GUARD_NEST as u64);
+        let i = match n {
+            1 => 0,
+            2 => 1,
+            3 => 2,
+            4 => 3,
+            _ => return Ok(()),
+        };
+        let c = &raw mut (*calls).conn[i];
+        let d = &raw mut (*calls).depth[i];
+        if core::ptr::read_volatile(c) == conn && core::ptr::read_volatile(d) == depth {
+            core::ptr::write_volatile(d, depth | GO_GUARD_RUNNING);
+        }
+    }
+    Ok(())
+}
+
 /// `(*Conn).Write`'s entry where its RETs are probed (`go_tls_guard_ret`):
 /// records the call (`guard_call`), then emits like `go_tls_write_entry`,
-/// once per call: an entry seen again for the same call (the stack-growth
-/// prologue re-entering it) emits nothing, where the unguarded probe would
-/// emit the same bytes twice. A call that cannot be recorded is emitted as
-/// by the unguarded probe.
+/// once per call: an entry seen again for the same call before its body
+/// began (the stack-growth prologue re-entering it) emits nothing, where
+/// the unguarded probe would emit the same bytes twice. A call that cannot
+/// be recorded, or that finds a stale record of a call at its depth, is
+/// emitted and the instance marked (`go_lose`).
 #[uprobe]
 pub fn go_tls_write_guarded(ctx: ProbeContext) {
     let _ = try_go_tls_write_guarded(&ctx);
@@ -1003,11 +1061,11 @@ fn try_go_tls_write_guarded(ctx: &ProbeContext) -> Result<(), ()> {
     let (conn, buf, len) = read_go_write_args(ctx)?;
     // A call that cannot be recorded may be emitted twice: the instance's
     // records are no longer whole.
-    let again = guard_call(ctx, conn).unwrap_or_else(|()| {
+    let guard = guard_call(ctx, conn).unwrap_or(Guard::Stale);
+    if guard == Guard::Stale {
         go_lose();
-        false
-    });
-    if again || len == 0 {
+    }
+    if guard == Guard::Again || len == 0 {
         return Ok(());
     }
     mark_active(conn);
