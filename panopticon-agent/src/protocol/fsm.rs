@@ -290,7 +290,10 @@ impl TcpTracker {
                 };
                 if off < 0 {
                     let behind = off.unsigned_abs();
-                    if behind >= span {
+                    // An RST is judged by its own sequence number, before
+                    // any overlap trim: behind the next byte it is stale
+                    // or forged, whatever bytes it carries past it.
+                    if seg.rst || behind >= span {
                         SegmentVerdict::Drop // already seen
                     } else {
                         SegmentVerdict::Accept {
@@ -988,8 +991,15 @@ mod tests {
         assert_eq!(admit(&m, SERVER, rst(7_000_010)), SegmentVerdict::Drop);
         // ...the real one, at the acknowledged sequence number, is.
         assert_eq!(admit(&m, SERVER, rst(7_000_000)), ACCEPT);
-        // A client RST behind the stream (stale) is dropped.
+        // A client RST behind the stream (stale) is dropped, also when its
+        // payload reaches past the next byte (Codex: seq 1099, 2 bytes, at
+        // 1100 expected): it is not trimmed into place.
         assert_eq!(admit(&m, CLIENT, rst(1050)), SegmentVerdict::Drop);
+        let overlap = TcpSegment {
+            rst: true,
+            ..seg(1099, 2)
+        };
+        assert_eq!(admit(&m, CLIENT, overlap), SegmentVerdict::Drop);
         assert_eq!(admit(&m, CLIENT, rst(1100)), ACCEPT);
     }
 
