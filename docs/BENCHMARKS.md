@@ -223,8 +223,9 @@ The full runs at seeds 7 and 42 (2026-10-19) had every protocol at 100%;
 Redis was also checked with seeds 21 and 99. Re-run on 2026-11-20 (seeds 7,
 11 and 23, kernel 6.8) Redis, MySQL, MySQL prepared and gRPC were still at
 100%, and PostgreSQL scored 83.8%, 84.6% and 84.2%: every exchange was
-exported, verb and error flag 100%, but bound values stop for the rest of
-a connection once server bytes are lost (USER-GUIDE §5.3), and about 200
+exported, verb and error flag 100%, but bound values stopped for the
+rest of a connection once server bytes were lost (since then, until an
+attributable `ReadyForQuery`: USER-GUIDE §5.3), and about 200
 operations into each run a 500-row result lost some. That result leaves
 the server as GSO packets of up to 8 KB, and each packet was captured as
 one record cut at 4,096 bytes: in the raw dump of a seed-7 run, 25 server

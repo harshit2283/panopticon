@@ -177,8 +177,9 @@ default 16384), each with its exact stream position; what lies past it is
 counted, not captured. A cut can cost a parser its message boundaries,
 and then some fields for the rest of the connection (§5.3). At one record
 (4096, the behaviour before this setting) a PostgreSQL 500-row result,
-sent in 8 KB packets, cost the bound values of the rest of its connection;
-the default covers it. A packet larger than the setting is still cut: on
+sent in 8 KB packets, was cut, and the connection's bound values and
+error text are withheld from then on until an attributable
+`ReadyForQuery` (§5.3); the default covers it. A packet larger than the setting is still cut: on
 RHEL 8.10 one RabbitMQ packet in about 300 to a consumer carries several
 deliveries in 23 KB, and after it the consumer's deliveries are exported
 without exchange, routing key or body (§5.3). AMQP consumers on RHEL 8
@@ -951,8 +952,20 @@ statement already confirmed. Its values are exported only under that SQL,
 once confirmed, when it is the SQL the event shows and is not withheld,
 even if the statement is redefined later; a `Bind` of another statement
 than the cycle's `Parse`, or of one the server rejected, exports no
-values. Past 4096 retained `Bind` snapshots (Binds read but not yet
-consumed by their cycle), no bound value is exported on the connection. A `Parse` the server rejects
+values. The agent keeps the client's messages that await an answer in
+order and pairs each answer with its own message: every `Execute` gets
+its own record, also when several statements share one `Sync` (JDBC
+batches, libpq pipelines), with its own values and status. An error is
+reported under the message that failed: a failed `Parse` under its own
+SQL, a failed `Bind` or `Execute` under the statement it ran. A failed
+`Describe` or `Close`, or an error answering the `Sync` (at commit), has
+no statement of its own and its text is withheld, as is the error text
+of a statement confirmed in an earlier exchange (it may have been
+redefined unseen, below). The statements the server then skips to the
+`Sync` are not reported, since they never ran.
+At most 4096 messages awaiting an answer are kept, holding at most 1 MiB
+of bound values (a `Bind` past that is exported without them); past
+4096 the connection is treated as joined mid-stream (below). A `Parse` the server rejects
 does not replace a statement, and a re-`Parse` or `Close` forgets it
 until confirmed. A simple Query ends the unnamed statement, so the agent
 forgets it. SQL that names `PREPARE`, `DEALLOCATE` or `DISCARD` as a
@@ -964,26 +977,41 @@ SQL leaves named statements as they are. Known limit: a server-side
 function can run `PREPARE` or `DEALLOCATE` dynamically (a PL/pgSQL
 `EXECUTE` of a string built at run time) and redefine a named statement
 the agent cannot see. A `Bind` of a statement confirmed in an earlier
-cycle therefore exports its values only when the server's
-`CommandComplete` names the same command as the SQL it was confirmed
-with (`INSERT 0 1` for an `INSERT`; no values after an error, or for SQL
-whose first keyword is not the command, such as `WITH`). That catches a
+exchange (whatever else its group runs) therefore exports its values
+only when the server's `CommandComplete` names the same command as the
+SQL it was confirmed with (`INSERT 0 1` for an `INSERT`; no values after
+an error, or for SQL whose first keyword is not the command, such as
+`WITH`). The check compares the command word only. It catches a
 redefinition to another command, not one to the same command: a
 statement redefined unseen from `INSERT INTO users (note) VALUES ($1)`
 to `INSERT INTO accounts (password) VALUES ($1)` would export the
 password under the first SQL. `PREPARE` accepts only `SELECT`,
 `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `VALUES`, so a statement
-cannot become `ALTER ROLE ... PASSWORD`. A `Bind` of a
+cannot become `ALTER ROLE ... PASSWORD`. The keyword test reads the text
+the agent sees, so dynamic SQL assembled at run time (`'DEALL' ||
+'OCATE s'`) is part of the same limit. A `Bind` of a
 statement whose SQL the agent does not know (prepared before capture, or
-forgotten) is still exported, as `EXECUTE` without SQL or bound values. Several `Parse` messages may be sent before one `Sync`
+forgotten) is still exported, as `EXECUTE` without SQL, bound values or
+error text (the error may quote a bound value). Several `Parse` messages may be sent before one `Sync`
 (pipelining); each `ParseComplete` confirms the oldest `Parse` still
 unanswered. After an error the server skips to the `Sync`, so the
 `Parse` messages before it are never confirmed; a `Close` of a name also
-cancels an unanswered `Parse` of it. If the agent ever cannot match the
-server's answers to the client's messages on a connection (it joined the
-connection mid-stream, server bytes were lost, an answer matches
-nothing), no `Parse` is confirmed for the rest of that connection and no
-bound value is exported on it, not even for a statement confirmed before,
+cancels an unanswered `Parse` of it. When server bytes are lost, or an
+answer matches no message awaiting one, the agent drops answers until a
+`ReadyForQuery` it can attribute: one read in the server's framing that
+arrives while exactly one group (up to a `Sync`, or a simple Query)
+awaits an answer. After lost bytes the next `ReadyForQuery` is found by
+its bytes, which may be row data: it re-establishes the framing and
+closes the oldest group, but never ends the doubt itself. Until then
+the groups are reported without bound values, error text or status, and
+the names their `Parse` messages defined are forgotten (they may or may
+not have been confirmed); statements confirmed before stay known. A
+`ReadyForQuery` that arrives while more groups wait cannot be
+attributed, so a client that sends its next query only after each answer
+keeps the connection in that state once a `ReadyForQuery` was lost. On a
+connection the agent joined mid-stream (or past 4096 messages awaiting
+an answer) answers to messages sent before capture may still come: no
+`Parse` is confirmed and no bound value or error text is exported on it,
 until a new connection is observed from its start.
 
 #### Your own credential formats: `[credentials]`
