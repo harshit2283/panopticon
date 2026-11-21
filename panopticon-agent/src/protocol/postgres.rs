@@ -110,11 +110,18 @@ enum Pending {
         sql: String,
         ts: u64,
     },
+    /// A FunctionCall (libpq PQfn, `lo_*`, the JDBC fastpath): answered
+    /// by FunctionCallResponse or ErrorResponse, then ReadyForQuery. Not
+    /// reported.
+    Function,
 }
 
 impl Pending {
     fn ends_group(&self) -> bool {
-        matches!(self, Pending::Sync | Pending::Query { .. })
+        matches!(
+            self,
+            Pending::Sync | Pending::Query { .. } | Pending::Function
+        )
     }
 }
 
@@ -162,28 +169,27 @@ pub struct PostgresParser {
     /// Bytes of bound values held in `portals` and `pending`.
     held_values: usize,
     /// The connection's answers cannot be trusted to match its messages
-    /// for the rest of its life (joined mid-stream, or more unanswered
+    /// for the rest of its life (joined mid-stream, lost server bytes, a
+    /// client message the queue does not model, or more unanswered
     /// messages than are tracked): records are still made, without bound
-    /// values or error text.
+    /// values, and no Parse is learned.
     untrusted: bool,
     /// The server's answers stopped matching the client's messages (bytes
     /// lost, an unexpected message): answers are dropped until a
     /// ReadyForQuery that can be attributed, see `ready_in_doubt`.
     in_doubt: bool,
     /// Server framing was lost with bytes: find the next ReadyForQuery by
-    /// its bytes. That one only re-anchors the framing (its bytes may be
-    /// row data): it never ends the doubt (`anchored`).
+    /// its bytes. Those bytes may be row data, and so may every frame read
+    /// after them, so the connection is `untrusted` from then on.
     framing_lost: bool,
-    /// The ReadyForQuery being read was found by its bytes.
-    anchored: bool,
     /// The current group: it already has a record (an Execute answered,
     /// or a message failed); its last Parse answered (SQL and start); an
     /// error answering its Sync.
     group_exec: bool,
     group_parse: Option<(Arc<str>, u64)>,
-    group_error: Option<String>,
+    group_error: Option<PgError>,
     /// The simple Query being answered: its error and status.
-    query_error: Option<String>,
+    query_error: Option<PgError>,
 }
 
 /// Max named statements remembered per connection.
@@ -273,7 +279,6 @@ impl PostgresParser {
             untrusted: false,
             in_doubt: false,
             framing_lost: false,
-            anchored: false,
             group_exec: false,
             group_parse: None,
             group_error: None,
@@ -516,7 +521,21 @@ impl PostgresParser {
                     }
                     Pending::Query { sql, ts }
                 }
-                _ => continue, // Flush, Terminate, CopyData, ...
+                b'F' => {
+                    if self.pending.back().is_some_and(|p| !p.ends_group()) {
+                        self.enter_doubt();
+                    }
+                    Pending::Function
+                }
+                // Flush, Terminate, CopyData, CopyDone, CopyFail: no answer
+                // of their own.
+                b'H' | b'X' | b'd' | b'c' | b'f' => continue,
+                // Anything else may be answered in a way the queue does not
+                // model: the answers can no longer be matched.
+                _ => {
+                    self.untrusted = true;
+                    continue;
+                }
             };
             if self.pending.len() >= MAX_PENDING {
                 // Not tracked any more: answers cannot be matched for the
@@ -607,7 +626,7 @@ impl PostgresParser {
     /// A pending message leaves the queue without its answer: its Parse
     /// may or may not have been committed, so its name is forgotten; its
     /// Execute or Query is reported (`out`) as an exchange whose outcome
-    /// is not known (no values, error text or status; latency only when
+    /// is not known (no values or status; latency only when
     /// the ReadyForQuery that ended it is known, `ready`).
     fn retire(&mut self, p: Pending, out: Option<&mut Vec<L7Message>>, ts: u64, ready: bool) {
         let (shown, start) = match &p {
@@ -661,19 +680,23 @@ impl PostgresParser {
     }
 
     /// A ReadyForQuery while in doubt. It answers some pending group; it
-    /// can be attributed only when exactly one group is pending (answers
-    /// come in order, and a ReadyForQuery cannot answer a group not yet
-    /// sent). Otherwise the oldest group is dropped and the doubt stays:
-    /// the ReadyForQuery may answer a later one. Each dropped group's
-    /// Executes and Query are reported without values, error text or
-    /// status, and the names it Parsed are forgotten.
+    /// can be attributed only when exactly one group is pending: with the
+    /// framing intact every ReadyForQuery is real and answers one tracked
+    /// group (each client message that can draw one is tracked, anything
+    /// else makes the connection untrusted), answers come in order, and a
+    /// ReadyForQuery cannot answer a group not yet sent, so the pending
+    /// groups are never fewer than those really waiting. Otherwise the
+    /// oldest group is dropped and the doubt stays: the ReadyForQuery may
+    /// answer a later one. Each dropped group's Executes and Query are
+    /// reported without values or status, and the names it Parsed are
+    /// forgotten. After lost server bytes a ReadyForQuery may be row data,
+    /// so the connection is untrusted and the doubt only re-aligns the
+    /// records.
     fn ready_in_doubt(&mut self, ts: u64, out: &mut Vec<L7Message>) {
         if self.groups == 0 {
             return; // answers a message sent before capture
         }
-        // One found by its bytes may be row data: it drops the oldest
-        // group (it may answer it) but never ends the doubt.
-        let attributable = self.groups == 1 && !self.anchored;
+        let attributable = self.groups == 1 && !self.untrusted;
         while let Some(p) = self.pop() {
             let end = p.ends_group();
             self.retire(p, Some(out), ts, attributable);
@@ -683,7 +706,7 @@ impl PostgresParser {
         }
         self.group_exec = false;
         self.group_parse = None;
-        if attributable || (self.untrusted && !self.anchored) {
+        if attributable || self.untrusted {
             self.in_doubt = false;
         }
     }
@@ -697,7 +720,6 @@ impl PostgresParser {
                 Some(off) => {
                     self.server_buf.consume(off);
                     self.framing_lost = false;
-                    self.anchored = true;
                 }
                 None => {
                     // Keep a tail in case the marker is split across packets.
@@ -740,7 +762,6 @@ impl PostgresParser {
         if self.in_doubt && kind == b'Z' {
             self.ready_in_doubt(ts, out);
         }
-        self.anchored = false;
         true
     }
 
@@ -756,6 +777,7 @@ impl PostgresParser {
             Execute,
             Close,
             Sync,
+            Function,
         }
         let front = match self.pending.front() {
             Some(Pending::Query { .. }) => Front::Query,
@@ -767,6 +789,7 @@ impl PostgresParser {
             Some(Pending::Execute(_)) => Front::Execute,
             Some(Pending::Close) => Front::Close,
             Some(Pending::Sync) => Front::Sync,
+            Some(Pending::Function) => Front::Function,
             None => return false,
         };
         match (front, kind) {
@@ -839,13 +862,17 @@ impl PostgresParser {
                     out.push(self.record(shown, None, None, Some(0), ts, Some(start), true));
                 }
                 // An error answering the Sync itself (at commit): no
-                // statement of its own, so its text is withheld.
+                // statement of its own.
                 if let Some(error) = self.group_error.take() {
                     let shown = Shown::Nothing;
                     out.push(self.record(shown, None, Some(error), Some(1), ts, None, true));
                 }
                 self.group_exec = false;
                 self.group_parse = None;
+            }
+            (Front::Function, b'V' | b'E') => {}
+            (Front::Function, b'Z') => {
+                self.pop();
             }
             (Front::Sync, b'E') => {
                 self.group_error = Some(parse_error_response(payload));
@@ -856,8 +883,8 @@ impl PostgresParser {
             ) => {
                 // The front message failed: it gets the record, under its
                 // own statement (a failed Parse its SQL, a failed Bind or
-                // Execute the statement it ran; a Describe or Close none,
-                // error text withheld). The server then skips to the Sync:
+                // Execute the statement it ran; a Describe or Close none).
+                // The server then skips to the Sync:
                 // the messages before it never ran and are not reported.
                 let error = Some(parse_error_response(payload));
                 let record = match self.pop().expect("front checked") {
@@ -878,10 +905,7 @@ impl PostgresParser {
                             Some(sql) => Shown::Sql(sql),
                             None => Shown::Unknown,
                         };
-                        // A statement confirmed earlier may have been
-                        // redefined unseen: its error text is withheld.
-                        let trusted = !bind.reused;
-                        self.record(shown, None, error, Some(1), ts, Some(start), trusted)
+                        self.record(shown, None, error, Some(1), ts, Some(start), true)
                     }
                     _ => self.record(Shown::Nothing, None, error, Some(1), ts, None, true),
                 };
@@ -908,7 +932,7 @@ impl PostgresParser {
         &mut self,
         exec: Exec,
         tag: Option<String>,
-        error: Option<String>,
+        error: Option<PgError>,
         ts: u64,
     ) -> L7Message {
         self.group_exec = true;
@@ -932,22 +956,18 @@ impl PostgresParser {
             None => Shown::Unknown,
         };
         let status = Some(error.is_some() as u32);
-        // A statement confirmed earlier may have been redefined unseen:
-        // its error text (which may quote a value) is withheld.
-        let trusted = !(bind.reused && error.is_some());
-        self.record(shown, values, error, status, ts, Some(start), trusted)
+        self.record(shown, values, error, status, ts, Some(start), true)
     }
 
-    /// One exchange's record, at `ts` (latency from `start`). Values and
-    /// error text only when `trusted` and the connection's answers are
-    /// matched; error text never for an unknown statement, nor for one
-    /// that names a credential.
+    /// One exchange's record, at `ts` (latency from `start`). Values only
+    /// when `trusted` and the connection's answers are matched. An error
+    /// adds its SQLSTATE and severity, never its text ([`PgError`]).
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         shown: Shown<'_>,
         values: Option<Values>,
-        error: Option<String>,
+        error: Option<PgError>,
         status: Option<u32>,
         ts: u64,
         start: Option<u64>,
@@ -958,30 +978,30 @@ impl PostgresParser {
         msg.method = Some("QUERY".into());
         msg.latency_ns = start.map(|s| ts.saturating_sub(s));
         let values = values.filter(|_| trusted).map(Values::take);
-        let mut withhold_error = !trusted;
         match shown {
             Shown::Sql(sql) => {
-                let (verb, text, bound, withheld) =
-                    super::export_statement(sql.to_string(), values);
+                let (verb, text, bound, _) = super::export_statement(sql.to_string(), values);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(text);
                 msg.request_text = bound;
-                withhold_error |= withheld;
             }
             Shown::Unknown | Shown::Nothing => {
                 if matches!(shown, Shown::Unknown) {
                     msg.method = Some("EXECUTE".into());
                     msg.payload_text = Some("EXECUTE".into());
                 }
-                withhold_error = true;
                 if let Some(mut v) = values {
                     zeroize::Zeroize::zeroize(&mut v);
                 }
             }
         }
         if let Some(err) = error {
-            // The error takes the statement's place; it may quote it.
-            msg.payload_text = Some(super::export_error_text(err, withhold_error));
+            if let Some(code) = err.sqlstate {
+                msg.headers.push(("sqlstate".into(), code));
+            }
+            if let Some(sev) = err.severity {
+                msg.headers.push(("severity".into(), sev.into()));
+            }
         }
         msg.status = status;
         msg
@@ -1054,24 +1074,60 @@ fn extract_second_string(data: &[u8]) -> String {
     }
 }
 
-fn parse_error_response(data: &[u8]) -> String {
+/// What an ErrorResponse exports: its SQLSTATE and severity, nothing
+/// else. The message, detail, hint, context and the schema, table,
+/// column, type and constraint names can echo a bound value or a row
+/// (`invalid input syntax for type integer: "hunter2"`), and which
+/// statement an error answers is only as sure as the pairing, so no text
+/// field is ever read out. SQLSTATE is five characters from a fixed
+/// alphabet; the severity is one of a fixed set.
+#[derive(Debug, Clone, PartialEq)]
+struct PgError {
+    sqlstate: Option<String>,
+    severity: Option<&'static str>,
+}
+
+const SEVERITIES: &[&str] = &[
+    "ERROR", "FATAL", "PANIC", "WARNING", "NOTICE", "DEBUG", "INFO", "LOG",
+];
+
+fn parse_error_response(data: &[u8]) -> PgError {
     // ErrorResponse: series of type(1) + string\0, terminated by \0
-    let mut message = String::new();
+    let mut err = PgError {
+        sqlstate: None,
+        severity: None,
+    };
     let mut i = 0;
     while i < data.len() && data[i] != 0 {
-        let field_type = data[i] as char;
+        let field_type = data[i];
         i += 1;
         let end = data[i..]
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(data.len() - i);
-        let value = String::from_utf8_lossy(&data[i..i + end]);
-        if field_type == 'M' {
-            message = value.into_owned();
+        let value = &data[i..i + end];
+        match field_type {
+            b'C' if value.len() == 5
+                && value
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase()) =>
+            {
+                err.sqlstate = Some(String::from_utf8_lossy(value).into_owned());
+            }
+            // 'V' is never localised; 'S' may be, and is kept only when it
+            // is one of the fixed English words.
+            b'V' | b'S' => {
+                if let Some(sev) = SEVERITIES.iter().find(|s| s.as_bytes() == value)
+                    && (field_type == b'V' || err.severity.is_none())
+                {
+                    err.severity = Some(sev);
+                }
+            }
+            _ => {}
         }
         i += end + 1;
     }
-    message
+    err
 }
 
 impl ProtocolParser for PostgresParser {
@@ -1099,6 +1155,7 @@ impl ProtocolParser for PostgresParser {
             (Direction::Ingress, State::Ready) => {
                 self.server_buf.clear();
                 self.framing_lost = true;
+                self.untrusted = true;
                 self.enter_doubt();
                 Some(ParseResult::NeedMoreData)
             }
@@ -1109,6 +1166,12 @@ impl ProtocolParser for PostgresParser {
 
     fn protocol(&self) -> Protocol {
         Protocol::Postgres
+    }
+    /// The stream was not seen from its first byte: bytes that look like a
+    /// StartupMessage may be the inside of a message, and answers to
+    /// messages sent before capture may still come.
+    fn joined_late(&mut self) {
+        self.untrusted = true;
     }
     fn state_name(&self) -> &'static str {
         self.current_state()
@@ -1216,32 +1279,31 @@ mod tests {
         let mut tail = vec![7u8; 13];
         tail.extend_from_slice(&make_backend_msg(b'C', b"SELECT 900\0"));
         tail.extend_from_slice(&make_backend_msg(b'Z', b"I"));
-        // Found by its bytes, the ReadyForQuery re-anchors the framing and
-        // closes the query (reported without status or latency: its bytes
-        // may have been row data), but does not end the doubt.
+        // Found by its bytes, the ReadyForQuery re-establishes the framing
+        // and closes the query (without status: its bytes may have been
+        // row data). From lost server bytes on the connection is
+        // untrusted: records go on, never with bound values.
         match p.feed(&tail, Direction::Ingress, 2000) {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
                 assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
-                assert_eq!((msgs[0].latency_ns, msgs[0].status), (None, None));
+                assert_eq!(msgs[0].status, None);
             }
             other => panic!("expected the query's message after resync, got {other:?}"),
         }
-        assert!(p.in_doubt);
-        // The next query's own (framed) ReadyForQuery, with one query
-        // waiting, ends it; the one after is reported in full.
-        for (sql, t) in [(&b"SELECT 1\0"[..], 3000), (&b"SELECT 2\0"[..], 4000)] {
-            p.feed(&make_frontend_msg(b'Q', sql), Direction::Egress, t);
-            let mut r = make_backend_msg(b'C', b"SELECT 1\0");
-            r.extend_from_slice(&make_backend_msg(b'Z', b"I"));
-            let ParseResult::Messages(msgs) = p.feed(&r, Direction::Ingress, t + 500) else {
-                panic!("expected a record");
-            };
-            // The first is answered in doubt: no status.
-            let want = if t == 3000 { None } else { Some(0) };
-            assert_eq!((msgs[0].latency_ns, msgs[0].status), (Some(500), want));
-        }
-        assert!(!p.in_doubt);
+        assert!(p.untrusted);
+        p.feed(
+            &extended_cycle(Some(("", "SELECT $1")), "", &["v"]),
+            Direction::Egress,
+            3000,
+        );
+        let ParseResult::Messages(msgs) = p.feed(&insert_done(), Direction::Ingress, 3500) else {
+            panic!("expected a record");
+        };
+        assert_eq!(
+            (msgs[0].latency_ns, msgs[0].request_text.as_deref()),
+            (Some(500), None)
+        );
         assert_eq!(p.state, State::Ready);
     }
 
@@ -1276,29 +1338,15 @@ mod tests {
         };
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert_eq!(msgs[0].method.as_deref(), Some("SELECT"));
-        assert_eq!((msgs[0].latency_ns, msgs[0].status), (None, None));
-        assert!(p.in_doubt);
-        // Sent once nothing else is pending: its ReadyForQuery is
-        // attributed, so the doubt ends with it (reported without status).
+        assert_eq!(msgs[0].status, None);
+        assert!(p.untrusted);
         p.feed(
             &make_frontend_msg(b'Q', b"SELECT 2\0"),
             Direction::Egress,
             4000,
         );
         let out = format!("{:?}", p.feed(&resp, Direction::Ingress, 4500));
-        assert!(!out.contains("hunter2"), "{out}");
-        assert!(out.contains("UPDATE"), "{out}");
-        assert!(p.in_doubt, "two queries were pending");
-        p.feed(
-            &make_frontend_msg(b'Q', b"SELECT 3\0"),
-            Direction::Egress,
-            5000,
-        );
-        let ParseResult::Messages(msgs) = p.feed(&resp, Direction::Ingress, 5500) else {
-            panic!("expected a record");
-        };
-        assert_eq!(msgs[0].payload_text.as_deref(), Some("SELECT 2"));
-        assert!(p.in_doubt);
+        assert!(!out.contains("hunter2") && !out.contains("boom"), "{out}");
     }
 
     /// Bind for `statement` with text-format parameters.
@@ -1769,8 +1817,10 @@ mod tests {
         assert_eq!(m[1].request_text, None);
         assert_eq!(
             m[1].payload_text.as_deref(),
-            Some("invalid input syntax for type integer: \"two\"")
+            Some("INSERT INTO t (n) VALUES ($1::int)")
         );
+        assert!(m[1].headers.contains(&("sqlstate".into(), "22P02".into())));
+        assert!(!format!("{m:?}").contains("invalid input"));
         p.feed(
             &extended_cycle(Some(("", "SELECT $1")), "", &["four"]),
             Direction::Egress,
@@ -1841,16 +1891,17 @@ mod tests {
         assert_eq!(m[0].request_text.as_deref(), Some("v1"));
         assert_eq!(
             (m[1].status, m[1].payload_text.as_deref()),
-            (Some(1), Some("division by zero"))
+            (Some(1), Some("SELECT 2"))
         );
+        assert!(!format!("{m:?}").contains("division"));
         assert_eq!(m[2].request_text.as_deref(), Some("v3"));
     }
 
     /// Server bytes lost mid-group: the answered statements keep their
-    /// records; the rest are reported without values, status or error
-    /// text, and the names Parsed in the group are forgotten. Trust
-    /// returns at a framed ReadyForQuery that arrives with one group
-    /// waiting.
+    /// records; the rest are reported without values or status, and the
+    /// names Parsed in the group are forgotten. A ReadyForQuery found by
+    /// its bytes may be row data, so the connection is untrusted from then
+    /// on (records, no bound values).
     #[test]
     fn test_lost_server_bytes_inside_a_group() {
         let mut p = setup_ready_parser();
@@ -1869,21 +1920,17 @@ mod tests {
         let m = records(p.feed(&tail, Direction::Ingress, 4));
         assert_eq!(m.len(), 1, "{m:?}");
         assert_eq!((m[0].request_text.as_deref(), m[0].status), (None, None));
-        assert!(p.in_doubt, "found by its bytes");
+        assert!(p.untrusted, "framing was lost");
         assert!(p.prepared.contains_key("a") && !p.prepared.contains_key("b"));
-        // Reused `a`, a statement confirmed before the gap: its first
-        // group's framed ReadyForQuery (one group waiting) ends the doubt;
-        // the next is trusted.
+        // Reused `a`: records go on, never with values.
         let mut done = make_backend_msg(b'2', b"");
         done.extend(make_backend_msg(b'C', b"SELECT 1\0"));
         done.extend(make_backend_msg(b'Z', b"I"));
-        p.feed(&extended_cycle(None, "a", &["v3"]), Direction::Egress, 5);
-        let m = records(p.feed(&done, Direction::Ingress, 6));
-        assert_eq!(m[0].request_text, None);
-        assert!(!p.in_doubt);
-        p.feed(&extended_cycle(None, "a", &["v4"]), Direction::Egress, 7);
-        let m = records(p.feed(&done, Direction::Ingress, 8));
-        assert_eq!(m[0].request_text.as_deref(), Some("v4"));
+        for (v, t) in [("v3", 5), ("v4", 7)] {
+            p.feed(&extended_cycle(None, "a", &[v]), Direction::Egress, t);
+            let m = records(p.feed(&done, Direction::Ingress, t + 1));
+            assert_eq!((m.len(), m[0].request_text.as_deref()), (1, None));
+        }
     }
 
     /// An answer that matches nothing pending: doubt, no error text, until
@@ -2143,6 +2190,119 @@ mod tests {
         assert!(!out.contains("hunter2"), "{out}");
     }
 
+    /// Final review HIGH-1: a FunctionCall (PQfn, `lo_*`, JDBC fastpath)
+    /// is answered by FunctionCallResponse and ReadyForQuery. It is a
+    /// group of its own, so the answers after it stay paired.
+    #[test]
+    fn test_function_call_is_a_group() {
+        let mut p = setup_ready_parser();
+        let mut call = 952u32.to_be_bytes().to_vec(); // lo_open
+        call.extend_from_slice(&0i16.to_be_bytes());
+        call.extend_from_slice(&0i16.to_be_bytes());
+        call.extend_from_slice(&0i16.to_be_bytes());
+        let mut c = make_frontend_msg(b'F', &call);
+        c.extend(make_frontend_msg(b'Q', b"SELECT 1\0"));
+        c.extend(pbe(
+            "",
+            "UPDATE users SET password = $1::int WHERE id = 1",
+            &["hunter2"],
+        ));
+        c.extend(sync());
+        c.extend(extended_cycle(Some(("", "SELECT $1")), "", &["v4"]));
+        p.feed(&c, Direction::Egress, 1);
+        let mut r = make_backend_msg(b'V', &[0, 0, 0, 4, 0, 0, 0, 1]);
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r.extend(make_backend_msg(b'C', b"SELECT 1\0"));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r.extend(make_backend_msg(b'1', b""));
+        r.extend(make_backend_msg(b'2', b""));
+        r.extend(error("invalid input syntax for type integer: \"hunter2\""));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r.extend(insert_done());
+        let m = records(p.feed(&r, Direction::Ingress, 2));
+        let out = format!("{m:?}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert_eq!(m.len(), 3, "{out}");
+        assert_eq!(
+            (m[0].payload_text.as_deref(), m[0].status),
+            (Some("SELECT 1"), Some(0))
+        );
+        assert_eq!(
+            (m[1].method.as_deref(), m[1].status),
+            (Some("UPDATE"), Some(1))
+        );
+        assert_eq!(m[2].request_text.as_deref(), Some("v4"));
+        assert!(!p.in_doubt && !p.untrusted);
+    }
+
+    /// A client message the queue does not model may draw answers it
+    /// cannot place: the connection's answers are no longer trusted.
+    #[test]
+    fn test_unmodelled_client_message_untrusts_the_connection() {
+        let mut p = setup_ready_parser();
+        p.feed(&make_frontend_msg(b'p', b"x\0"), Direction::Egress, 1);
+        assert!(p.untrusted);
+    }
+
+    /// Final review HIGH-2: a connection joined mid-stream whose first
+    /// byte is 0 looks like a StartupMessage. The connection manager says
+    /// the stream was not seen from its start (`joined_late`): it is
+    /// untrusted for life, whatever its bytes parse as.
+    #[test]
+    fn test_joined_late_untrusts_even_a_startup_lookalike() {
+        let mut p = PostgresParser::new();
+        p.joined_late();
+        p.feed(&make_startup_msg(), Direction::Egress, 0);
+        p.feed(&make_backend_msg(b'Z', b"I"), Direction::Ingress, 0);
+        assert_eq!(p.state, State::Ready);
+        p.feed(
+            &extended_cycle(Some(("s", "SELECT $1")), "s", &["hunter2"]),
+            Direction::Egress,
+            1,
+        );
+        let out = format!("{:?}", p.feed(&insert_done(), Direction::Ingress, 2));
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(p.untrusted && p.prepared.is_empty());
+    }
+
+    /// Final review HIGH-3: pipelining, lost server bytes, and a row that
+    /// holds a ReadyForQuery's bytes. The byte search may stop on the
+    /// fake one, so the connection is untrusted from the loss on: no bound
+    /// value, and no error text ever, whatever the pairing.
+    #[test]
+    fn test_fake_ready_for_query_in_a_row_after_lost_bytes() {
+        let mut p = setup_ready_parser();
+        let mut c = make_frontend_msg(b'Q', b"SELECT note FROM users\0");
+        c.extend(pbe(
+            "",
+            "UPDATE users SET password = $1::int WHERE id = 1",
+            &["hunter2"],
+        ));
+        c.extend(sync());
+        c.extend(extended_cycle(Some(("", "SELECT $1")), "", &["v3"]));
+        p.feed(&c, Direction::Egress, 1);
+        p.feed(
+            &make_backend_msg(b'T', &[0, 1, b'n', 0]),
+            Direction::Ingress,
+            2,
+        );
+        assert!(p.skip(Direction::Ingress, 9000, 3).is_some());
+        // The tail of a row whose text holds `Z\0\0\0\x05I`, the row's end,
+        // the Query's real ReadyForQuery, then the next groups' answers.
+        let mut r = b"..Z\0\0\0\x05I..".to_vec();
+        r.extend(make_backend_msg(b'D', &[0, 1, 0, 0, 0, 1, b'x']));
+        r.extend(make_backend_msg(b'C', b"SELECT 2\0"));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r.extend(make_backend_msg(b'1', b""));
+        r.extend(make_backend_msg(b'2', b""));
+        r.extend(error("invalid input syntax for type integer: \"hunter2\""));
+        r.extend(make_backend_msg(b'Z', b"I"));
+        r.extend(insert_done());
+        let out = format!("{:?}", p.feed(&r, Direction::Ingress, 4));
+        assert!(!out.contains("hunter2") && !out.contains("v3"), "{out}");
+        assert!(p.untrusted);
+    }
+
     /// Pipelines: several Parses before one Sync; each ParseComplete
     /// answers the oldest Parse pending. (Which statements are known is
     /// read from `prepared`: a pipeline's later cycles are exported one
@@ -2195,9 +2355,8 @@ mod tests {
         assert_eq!(known(&p, "s3").as_deref(), Some("SELECT 3"));
 
         // A lost response: the group's Parses may or may not have been
-        // committed, so both names are forgotten. The ReadyForQuery found
-        // by its bytes does not end the doubt; the next group's own does
-        // (one group waiting), and later Parses are learned again.
+        // committed, so both names are forgotten, and from then on the
+        // connection is untrusted: no Parse is learned.
         let mut p = setup_ready_parser();
         pipeline(&mut p, "SELECT $1 AS two");
         assert!(p.skip(Direction::Ingress, 30, 2).is_some());
@@ -2208,16 +2367,9 @@ mod tests {
             4,
         );
         p.feed(&insert_done(), Direction::Ingress, 5);
-        assert_eq!(known(&p, "s3"), None, "answered in doubt");
-        p.feed(
-            &extended_cycle(Some(("s4", "SELECT 4")), "s4", &[]),
-            Direction::Egress,
-            6,
-        );
-        p.feed(&insert_done(), Direction::Ingress, 7);
         assert_eq!(known(&p, "s1"), None);
         assert_eq!(known(&p, "s2"), None);
-        assert_eq!(known(&p, "s4").as_deref(), Some("SELECT 4"));
+        assert_eq!(known(&p, "s3"), None);
     }
 
     /// Codex R5 H3: on a connection joined mid-stream an empty queue does
@@ -2539,7 +2691,7 @@ mod tests {
         let ParseResult::Messages(msgs) = p.feed(&r, Direction::Ingress, 11) else {
             panic!("expected the SELECT");
         };
-        assert_eq!(msgs[0].payload_text.as_deref(), Some("boom"));
+        assert_eq!(msgs[0].payload_text.as_deref(), Some("SELECT 2"));
         assert_eq!(msgs[0].status, Some(1));
     }
 
@@ -2850,23 +3002,58 @@ mod tests {
     /// shows credential context itself.
     #[test]
     fn test_error_text_is_withheld() {
-        for query in [
-            &b"ALTER ROLE app PASSWORD 'pg-s3cret' BAD\0"[..],
-            b"SELECT 1\0",
+        for (query, shown) in [
+            (
+                &b"ALTER ROLE app PASSWORD 'pg-s3cret' BAD\0"[..],
+                "ALTER <statement withheld>",
+            ),
+            (b"SELECT 1\0", "SELECT 1"),
         ] {
             let mut p = setup_ready_parser();
             p.feed(&make_frontend_msg(b'Q', query), Direction::Egress, 1000);
-            let mut response =
-                make_backend_msg(b'E', b"SERROR\0Mnear \"PASSWORD 'pg-s3cret' BAD\"\0\0");
+            let mut response = make_backend_msg(
+                b'E',
+                b"SERROR\0VERROR\0C42601\0Mnear \"PASSWORD 'pg-s3cret' BAD\"\0Dd\0Hh\0\0",
+            );
             response.extend_from_slice(&make_backend_msg(b'Z', b"I"));
             let ParseResult::Messages(msgs) = p.feed(&response, Direction::Ingress, 2000) else {
                 panic!("expected a message");
             };
+            let out = format!("{msgs:?}");
+            assert!(!out.contains("near"), "{out}");
+            assert_eq!(msgs[0].payload_text.as_deref(), Some(shown));
             assert_eq!(
-                msgs[0].payload_text.as_deref(),
-                Some("<statement withheld>")
+                msgs[0].headers,
+                vec![
+                    ("sqlstate".to_string(), "42601".to_string()),
+                    ("severity".to_string(), "ERROR".to_string())
+                ]
             );
         }
+    }
+
+    /// Only a well-formed SQLSTATE and a known severity are read out of an
+    /// ErrorResponse; every text field is dropped.
+    #[test]
+    fn test_error_response_exports_only_code_and_severity() {
+        let e = parse_error_response(
+            b"SFEHLER\0VERROR\0C22P02\0Mhunter2\0Dhunter2\0tusers\0ccol\0nk\0\0",
+        );
+        assert_eq!(
+            e,
+            PgError {
+                sqlstate: Some("22P02".into()),
+                severity: Some("ERROR")
+            }
+        );
+        let e = parse_error_response(b"Shunter2\0Chunter2\0\0");
+        assert_eq!(
+            e,
+            PgError {
+                sqlstate: None,
+                severity: None
+            }
+        );
     }
 
     #[test]

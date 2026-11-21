@@ -263,11 +263,15 @@ production-hardened compliance platform.
     parsed. MySQL statements prepared before the agent started are
     reported as `EXECUTE` without their SQL, and so is a PostgreSQL
     `Bind` of a statement whose SQL the agent does not know (prepared
-    before capture, or forgotten), without error text. Each `Execute`
-    is paired with its own answer, also under one `Sync`. PostgreSQL
-    bound values and error text are not exported on a connection the
-    agent joined mid-stream, nor after lost server bytes until a
-    `ReadyForQuery` that can be attributed (exactly one group waiting).
+    before capture, or forgotten). Each `Execute` is paired with its own
+    answer, also under one `Sync`; FunctionCalls are tracked. PostgreSQL
+    error and notice text is never exported: an error adds only its
+    SQLSTATE and severity. PostgreSQL bound values are not exported on a
+    connection the agent joined mid-stream or did not see from its first
+    byte, after lost server bytes, or after a client message the parser
+    does not model (for the rest of the connection), nor after an answer
+    that matches nothing until a `ReadyForQuery` that can be attributed
+    (exactly one group waiting).
     A simple Query forgets the unnamed statement, and SQL
     naming `PREPARE`, `DEALLOCATE` or `DISCARD` (simple Query or `Parse`)
     forgets every statement. Known limit: a server-side function that
@@ -321,7 +325,7 @@ production-hardened compliance platform.
     `SELECT item, … FROM table [rest]` read on its raw tokens, each item
     `*` or a plain identifier (not a value keyword such as `TRUE`) and
     no credential word from the table on
-    (exported without bound values or error text). No other field has a
+    (exported without bound values or MySQL error text). No other field has a
     bare name; anything outside the allowlist is withheld as before.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`). A letters-only segment before the word
@@ -354,9 +358,10 @@ production-hardened compliance platform.
     redefined later (SQL naming `PREPARE`, `DEALLOCATE` or `DISCARD`
     forgets every statement, a simple Query the unnamed one; a reused
     statement needs a `CommandComplete` of the same command), and not at
-    all on a connection joined mid-stream or past 4096 messages awaiting
-    an answer, nor after lost server bytes until an attributable
-    `ReadyForQuery` (error text likewise);
+    all on a connection joined mid-stream, after lost server bytes or
+    past 4096 messages awaiting an answer, nor after an unmatched answer
+    until an attributable `ReadyForQuery`; PostgreSQL error text is never
+    exported (SQLSTATE and severity only);
     only known SQL keywords are exported as methods. `[credentials]
     patterns` adds the user's own formats (masked in every field, matching
     DNS answers dropped, counted in `panopticon_credential_matches_total`;
