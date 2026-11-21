@@ -857,7 +857,7 @@ impl MysqlParser {
         let bound = self.param_text.take();
         match self.query_text.take() {
             Some(q) => {
-                let (verb, shown, bound, _) = super::export_statement(q, bound);
+                let (verb, shown, bound) = super::export_statement(q, bound);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(shown);
                 msg.request_text = bound;

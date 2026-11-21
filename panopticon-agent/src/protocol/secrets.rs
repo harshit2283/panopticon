@@ -58,8 +58,9 @@
 //! `/reset/token/abc123`, `WHERE password = 'x'`, `WHERE pwd LIKE 'x'`,
 //! `SELECT password, 0x68756e74657232`, `token abc123`, `hunter2 is my
 //! password`, `CONFIG GET requirepass` and a Redis value `/oauth/token`
-//! are. A statement exported this way loses its bound values and its
-//! error text ([`has_any_sql_credential_context`]).
+//! are. A statement exported this way loses its bound values
+//! ([`has_any_sql_credential_context`]); no SQL parser exports server
+//! error text for any statement.
 //!
 //! The certain structures, on the raw text: a query or form parameter
 //! (`name=value` at the start of the text or after `?` or `&`), a JSON
@@ -246,8 +247,7 @@ pub fn has_sql_credential_context(sql: &str) -> bool {
 }
 
 /// [`has_sql_credential_context`] counting bare names too: a statement
-/// whose bound values and error text cannot be shown to be unrelated to a
-/// credential.
+/// whose bound values cannot be shown to be unrelated to a credential.
 pub fn has_any_sql_credential_context(sql: &str) -> bool {
     context(sql, true, Slot::None)
 }

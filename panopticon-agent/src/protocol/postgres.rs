@@ -980,7 +980,7 @@ impl PostgresParser {
         let values = values.filter(|_| trusted).map(Values::take);
         match shown {
             Shown::Sql(sql) => {
-                let (verb, text, bound, _) = super::export_statement(sql.to_string(), values);
+                let (verb, text, bound) = super::export_statement(sql.to_string(), values);
                 msg.method = verb.or(msg.method);
                 msg.payload_text = Some(text);
                 msg.request_text = bound;

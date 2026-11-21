@@ -172,17 +172,16 @@ pub fn set_mask_credentials(on: bool) {
 }
 
 /// A SQL statement (query text and its bound values) as a parser exports
-/// it, and whether it names a credential. With credential context and
+/// it: (method, text, bound values). With credential context and
 /// `mask_credentials` on: only its verb as method and
-/// `VERB <statement withheld>` as text, no bound value, and `true`. The
-/// query is wiped. A statement whose credential words are all bare names
-/// is exported as written but without its bound values (nothing ties them
-/// to a column), also `true`. (No parser exports server error text, which
-/// echoes values; the flag is unused.)
+/// `VERB <statement withheld>` as text, no bound value. The query is
+/// wiped. A statement whose credential words are all bare names is
+/// exported as written but without its bound values (nothing ties them
+/// to a column).
 pub fn export_statement(
     mut query: String,
     mut bound: Option<String>,
-) -> (Option<String>, String, Option<String>, bool) {
+) -> (Option<String>, String, Option<String>) {
     let names_credential =
         mask_credentials_enabled() && secrets::has_any_sql_credential_context(&query);
     if names_credential && let Some(mut b) = bound.take() {
@@ -196,11 +195,11 @@ pub fn export_statement(
             zeroize::Zeroize::zeroize(&mut b);
         }
         let verb = sql_verb(&shown).map(str::to_string);
-        return (verb, shown, None, true);
+        return (verb, shown, None);
     }
     let verb = sql_verb(&query).map(str::to_string);
     let shown = truncate_utf8(&query, 4096).to_string();
-    (verb, shown, bound, names_credential)
+    (verb, shown, bound)
 }
 
 /// Protect `text` in place under `rules` (see [`decide`]; the built-in
@@ -332,26 +331,26 @@ mod tests {
     /// without a credential word keeps them.
     #[test]
     fn test_bare_select_drops_bound_values() {
-        let (verb, shown, bound, withheld) = export_statement(
+        let (verb, shown, bound) = export_statement(
             "SELECT password, email FROM users WHERE id = $1".into(),
             Some("(alice,hunter2)".into()),
         );
         assert_eq!(verb.as_deref(), Some("SELECT"));
         assert_eq!(shown, "SELECT password, email FROM users WHERE id = $1");
-        assert_eq!((bound, withheld), (None, true));
-        let (_, shown, bound, withheld) = export_statement(
+        assert_eq!(bound, None);
+        let (_, shown, bound) = export_statement(
             "SELECT password FROM users WHERE users = $1::users".into(),
             Some("(alice,hunter2)".into()),
         );
         assert_eq!(
-            (shown.as_str(), bound, withheld),
-            ("SELECT <statement withheld>", None, true)
+            (shown.as_str(), bound),
+            ("SELECT <statement withheld>", None)
         );
-        let (_, _, bound, withheld) = export_statement(
+        let (_, _, bound) = export_statement(
             "SELECT email FROM users WHERE id = $1".into(),
             Some("7".into()),
         );
-        assert_eq!((bound.as_deref(), withheld), (Some("7"), false));
+        assert_eq!(bound.as_deref(), Some("7"));
     }
 
     #[test]
