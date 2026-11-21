@@ -37,6 +37,8 @@ pub struct AgentMetrics {
     pub drops_export_full: Counter<u64>,
     pub worker_panics: Counter<u64>,
     pub tcp_segments_ignored: Counter<u64>,
+    pub tcp_reorder_held: Counter<u64>,
+    pub tcp_reorder_gaps: Counter<u64>,
     /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
     pub credential_matches_user: Counter<u64>,
     pub credential_matches_builtin: Counter<u64>,
@@ -130,6 +132,22 @@ impl AgentMetrics {
             tcp_segments_ignored.clone(),
         );
 
+        let tcp_reorder_held = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_reorder_held",
+            "TCP records held briefly because their bytes arrived ahead of the next \
+             expected byte (chunks of two packets interleaved)",
+            tcp_reorder_held.clone(),
+        );
+
+        let tcp_reorder_gaps = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_reorder_gaps",
+            "TCP records that went on with a hole before them still open (reorder \
+             window time or space bound reached): a gap for the parser",
+            tcp_reorder_gaps.clone(),
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -216,6 +234,8 @@ impl AgentMetrics {
             drops_export_full,
             worker_panics,
             tcp_segments_ignored,
+            tcp_reorder_held,
+            tcp_reorder_gaps,
             credential_matches_user,
             credential_matches_builtin,
             pod_unresolved,
@@ -316,6 +336,14 @@ impl AgentMetrics {
         );
         self.tcp_segments_ignored.inner().store(
             stats.tcp_segments_ignored.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_reorder_held.inner().store(
+            stats.tcp_reorder_held.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_reorder_gaps.inner().store(
+            stats.tcp_reorder_gaps.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         let (user, builtin) = crate::protocol::credential_matches();

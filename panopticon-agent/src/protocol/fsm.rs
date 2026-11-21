@@ -246,7 +246,7 @@ pub enum SegmentVerdict {
 /// segments or RSTs the receiver would reject. Only bytes at the next
 /// expected sequence number reach the parser, once each; a FIN counts only
 /// in window and an RST only at the next expected byte (RFC 5961).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct TcpTracker {
     /// Next expected sequence number from the client (0) / server (1).
     next: [Option<u32>; 2],
@@ -817,6 +817,24 @@ impl ConnectionFsmManager {
             entry.fsm.joined_late();
         }
         Some(verdict)
+    }
+
+    /// What [`Self::admit_segment`] would answer for `seg` now, without
+    /// recording it. `None` if the connection is not tracked.
+    pub fn peek_segment(
+        &self,
+        conn_id: u64,
+        src: Endpoint,
+        capture_direction: Direction,
+        seg: TcpSegment,
+    ) -> Option<SegmentVerdict> {
+        let entry = self.connections.get(&conn_id)?;
+        let side = match entry.direction_of(src, capture_direction) {
+            Direction::Egress => 0,
+            Direction::Ingress => 1,
+        };
+        let mut tcp = entry.tcp;
+        Some(tcp.admit(side, seg))
     }
 
     /// A SYN sent by `src` (`ack`: a SYN+ACK, from the server): that side's

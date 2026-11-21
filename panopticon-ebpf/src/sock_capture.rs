@@ -1289,11 +1289,18 @@ fn mark_emitted(st: *mut SockState) {
 /// `orig_len` sum to the packet's and user space accounts every byte
 /// exactly. The last chunk's `orig_len` also counts whatever is left
 /// uncaptured (past MAX_SKB_CHUNKS, or past a head-only cut), and it alone
-/// carries FIN / RST. Every chunk goes to the same shard, in order. If a
+/// carries FIN / RST. Every chunk goes to the same shard, in order; two
+/// CPUs capturing one socket at once (ingress runs before the socket lock)
+/// can interleave two packets' chunks there, and user space puts them back
+/// in stream order (panopticon-agent `reorder.rs`). If a
 /// chunk cannot be reserved the rest of the packet is not sent: user space
 /// sees the missing bytes as a gap at the connection's next record, as for
 /// any ring drop. A UDP datagram stays one record (one datagram is one
-/// message to the parsers).
+/// message to the parsers), as does a packet carrying RST: user space
+/// accepts an RST only at the next expected sequence number, and that
+/// check must see the packet's own `tcp_seq`, not a later chunk's (an RST
+/// at a wrong sequence number would otherwise pass it on its last chunk).
+/// Both are cut at MAX_PAYLOAD_SIZE, the rest counted in `orig_len`.
 ///
 /// Every record is reserved in the ring, never built in a shared per-CPU
 /// buffer: egress runs in process context, where a softirq or (on a
@@ -1303,8 +1310,9 @@ fn mark_emitted(st: *mut SockState) {
 /// this: every chunk carries the same generation stamp.
 #[inline(always)]
 fn emit(ctx: &SkBuffContext, h: &Hdr) -> Result<(), ()> {
+    use panopticon_common::TCP_FLAG_RST;
     let mut off = 0u32;
-    if h.ip_proto != IPPROTO_UDP as u8 {
+    if h.ip_proto != IPPROTO_UDP as u8 && h.tcp_flags & TCP_FLAG_RST == 0 {
         for _ in 0..MAX_SKB_CHUNKS - 1 {
             if h.take <= off + MAX_PAYLOAD_SIZE as u32 {
                 break;

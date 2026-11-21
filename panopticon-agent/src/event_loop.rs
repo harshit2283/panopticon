@@ -120,6 +120,13 @@ pub struct EventStats {
     /// TCP segments ignored whole: retransmissions of bytes already parsed,
     /// or outside the connection's window (forged, or a stale RST / FIN).
     pub tcp_segments_ignored: AtomicU64,
+    /// TCP records held in the reorder window (`reorder.rs`) because their
+    /// bytes arrived ahead of the next expected one.
+    pub tcp_reorder_held: AtomicU64,
+    /// Held (or holdable) TCP records that went on with their hole still
+    /// open: the window's time or space bound was reached, or the hole was
+    /// wider than one packet. Each is a gap for the parser.
+    pub tcp_reorder_gaps: AtomicU64,
     /// Events dropped at the ring read because their scope
     /// generation is below the admission floor (a narrowing came after it).
     pub drops_stale_scope_gen: AtomicU64,
@@ -168,6 +175,8 @@ impl EventStats {
             drops_export_full: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
             tcp_segments_ignored: AtomicU64::new(0),
+            tcp_reorder_held: AtomicU64::new(0),
+            tcp_reorder_gaps: AtomicU64::new(0),
             drops_stale_scope_gen: AtomicU64::new(0),
             drops_no_pipeline: AtomicU64::new(0),
             capture_stopped: AtomicBool::new(false),
@@ -973,7 +982,9 @@ pub(crate) async fn worker_task(
     // copied in; past payload_len it keeps earlier bytes, never read.
     // SAFETY: all-zero is a valid DataEvent (every enum has a 0 variant).
     let mut scratch: Box<DataEvent> = Box::new(unsafe { std::mem::zeroed() });
+    let mut reorder = crate::reorder::ReorderWindow::default();
     loop {
+        let deadline = reorder.deadline();
         let batch = tokio::select! {
             b = rx.recv() => match b {
                 Some(b) => b,
@@ -981,6 +992,10 @@ pub(crate) async fn worker_task(
             },
             // No traffic: run the timed work below with an empty batch.
             _ = sweep_timer.tick() => EventBatch::default(),
+            // A reorder hole is due to be taken as a loss.
+            _ = tokio::time::sleep_until(
+                tokio::time::Instant::from_std(deadline.unwrap_or_else(Instant::now))
+            ), if deadline.is_some() => EventBatch::default(),
         };
         for record in batch.records() {
             if !read_data_event_into(record, &mut scratch) {
@@ -1017,12 +1032,32 @@ pub(crate) async fn worker_task(
                 // The kernel made every scope decision (DESIGN §8): nothing
                 // is filtered, held or cut here.
                 _ => {
-                    process_event(worker_id, &ctx, &manager, &scratch, cookie);
+                    arrive_event(worker_id, &ctx, &scratch, cookie);
+                    reorder.offer(
+                        &manager,
+                        cookie,
+                        &scratch,
+                        Instant::now(),
+                        &ctx.stats,
+                        &mut |e: &DataEvent| process_event(worker_id, &ctx, &manager, e, cookie),
+                    );
                     continue;
                 }
             }
             ctx.stats.events_processed.fetch_add(1, Ordering::Relaxed);
+            // What the connection still holds goes first, holes and all.
+            reorder.flush(&manager, cookie, &ctx.stats, &mut |e: &DataEvent| {
+                process_event(worker_id, &ctx, &manager, e, cookie)
+            });
             end_connection(&ctx, &manager, cookie);
+        }
+        if !reorder.is_empty() {
+            reorder.expire(
+                &manager,
+                Instant::now(),
+                &ctx.stats,
+                &mut |c: u64, e: &DataEvent| process_event(worker_id, &ctx, &manager, e, c),
+            );
         }
 
         // Periodic idle connection sweep
@@ -1041,17 +1076,15 @@ pub(crate) async fn worker_task(
         }
     }
 
+    reorder.flush_all(&manager, &ctx.stats, &mut |c: u64, e: &DataEvent| {
+        process_event(worker_id, &ctx, &manager, e, c)
+    });
     debug!(worker_id, "Worker shutting down");
 }
 
-/// Raw dump, logging, parsing, PII, graph and export of one admitted event.
-fn process_event(
-    worker_id: usize,
-    ctx: &WorkerTaskContext,
-    manager: &ConnectionFsmManager,
-    event: &DataEvent,
-    cookie: u64,
-) {
+/// Raw dump, count and log of one admitted event, as it arrives (before
+/// the reorder window, `reorder.rs`).
+fn arrive_event(worker_id: usize, ctx: &WorkerTaskContext, event: &DataEvent, cookie: u64) {
     crate::test_hooks::pause(crate::test_hooks::WORKER_BEFORE_SINK, &ctx.io_gate);
     // Read per event (an atomic load): a reload may have tightened it.
     let privacy = ctx.privacy.get();
@@ -1080,6 +1113,20 @@ fn process_event(
             "Event"
         );
     }
+}
+
+/// Parsing, PII, graph and export of one admitted event, in stream order
+/// (after the reorder window).
+fn process_event(
+    worker_id: usize,
+    ctx: &WorkerTaskContext,
+    manager: &ConnectionFsmManager,
+    event: &DataEvent,
+    cookie: u64,
+) {
+    // Read when processed: a reload may have tightened it since arrival.
+    let privacy = ctx.privacy.get();
+    let log_events = ctx.log_events && privacy != PrivacyMode::MetricsOnly;
 
     // ── Protocol detection + parsing (Phase 3) ───────────────────
     let Some(results) = feed_event(manager, event, cookie, &ctx.stats, worker_id, log_events)
@@ -1193,7 +1240,7 @@ fn guarded<T>(stats: &EventStats, worker_id: usize, f: impl FnOnce() -> T) -> Op
 
 /// The sequence fields of a TCP packet; None for other events (UDP,
 /// TLS plaintext, socket events), which have no sequence to check.
-fn tcp_segment(event: &DataEvent) -> Option<crate::protocol::fsm::TcpSegment> {
+pub(crate) fn tcp_segment(event: &DataEvent) -> Option<crate::protocol::fsm::TcpSegment> {
     use panopticon_common::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN};
     const IP_PROTO_TCP: u8 = 6;
     (event.event_type == EventType::TcPacket && event.ip_proto == IP_PROTO_TCP).then(|| {
@@ -2493,6 +2540,231 @@ mod tests {
             out.iter().all(|(_, t)| t.as_deref() != Some("w")),
             "{out:?}"
         );
+    }
+
+    type Exported = Vec<(Option<String>, Option<String>)>;
+
+    fn collect(out: &mut Exported, results: Option<Vec<FsmResult>>) {
+        for r in results.into_iter().flatten() {
+            match r {
+                FsmResult::Messages(ms) => {
+                    out.extend(ms.into_iter().map(|m| (m.method, m.payload_text)))
+                }
+                FsmResult::MessageComplete(m) => out.push((m.method, m.payload_text)),
+                _ => {}
+            }
+        }
+    }
+
+    /// `events` through the worker's reorder window (`reorder.rs`), all
+    /// arriving at once; then every hole still open expires.
+    fn run_reordered(events: &[DataEvent], stats: &EventStats) -> Exported {
+        use crate::reorder::{HOLD_TIME, ReorderWindow};
+        let m = ConnectionFsmManager::new(16);
+        let mut w = ReorderWindow::default();
+        let mut out = vec![];
+        let t0 = Instant::now();
+        let mut sink = |e: &DataEvent| {
+            collect(
+                &mut out,
+                feed_event(&m, e, connection_key(e), stats, 0, false),
+            )
+        };
+        for e in events {
+            w.offer(&m, connection_key(e), e, t0, stats, &mut sink);
+        }
+        w.expire(&m, t0 + HOLD_TIME, stats, &mut |_, e: &DataEvent| sink(e));
+        assert!(w.is_empty());
+        out
+    }
+
+    fn at_off(mut e: DataEvent, off: u64) -> DataEvent {
+        e.cgroup_id = 7;
+        e.stream_off = off;
+        e
+    }
+
+    /// The kernel's chunk records (sock_capture.rs `emit`) of one server
+    /// packet carrying `data` at stream offset `off`.
+    fn server_chunks(seq: u32, ack: u32, off: u64, data: &[u8]) -> Vec<DataEvent> {
+        data.chunks(MAX_PAYLOAD_SIZE)
+            .enumerate()
+            .map(|(i, c)| {
+                let o = (i * MAX_PAYLOAD_SIZE) as u32;
+                at_off(redis_pkt(false, seq + o, ack, 0, c), off + o as u64)
+            })
+            .collect()
+    }
+
+    const GET: &[u8] = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+
+    /// GET, a 20 KB reply sent as two 10 KB packets whose chunk records
+    /// arrive in `order` (indices into A0 A1 A2 B0 B1 B2), GET, "w".
+    fn two_packet_reply(order: &[usize]) -> Vec<DataEvent> {
+        let glen = GET.len() as u32;
+        let mut big = b"$20000\r\n".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 20000));
+        big.extend(b"\r\n");
+        let blen = big.len() as u32;
+        let (a, b) = big.split_at(10_000);
+        let mut chunks = server_chunks(5000, 1000 + glen, 0, a);
+        chunks.extend(server_chunks(15_000, 1000 + glen, 10_000, b));
+        let mut evs = vec![at_off(redis_pkt(true, 1000, 5000, 0, GET), 0)];
+        evs.extend(order.iter().map(|&i| chunks[i]));
+        evs.push(at_off(
+            redis_pkt(true, 1000 + glen, 5000 + blen, 0, GET),
+            glen as u64,
+        ));
+        evs.push(at_off(
+            redis_pkt(false, 5000 + blen, 1000 + 2 * glen, 0, b"$1\r\nw\r\n"),
+            blen as u64,
+        ));
+        evs
+    }
+
+    /// Two CPUs ran the capture of one socket at once (cgroup_skb ingress
+    /// runs before the socket lock): the chunk records of two packets
+    /// arrive interleaved. The reorder window puts them back in stream
+    /// order; taken as they arrive, the second packet's first chunk opened
+    /// a gap, the first packet's later chunks were dropped as behind, and
+    /// the next reply lost its text.
+    #[test]
+    fn interleaved_chunks_of_two_packets_are_reordered() {
+        let interleaved = two_packet_reply(&[0, 3, 1, 4, 2, 5]);
+        let stats = EventStats::new();
+        let out = run_reordered(&interleaved, &stats);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[1], (Some("GET".into()), Some("w".into())));
+        assert!(stats.tcp_reorder_held.load(Ordering::Relaxed) > 0);
+        assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 0);
+        // In order, the window holds nothing and the result is the same.
+        let stats = EventStats::new();
+        let in_order = run_reordered(&two_packet_reply(&[0, 1, 2, 3, 4, 5]), &stats);
+        assert_eq!(in_order, out);
+        assert_eq!(stats.tcp_reorder_held.load(Ordering::Relaxed), 0);
+        // Without the window, the interleave cost the next reply's text.
+        let raw = run_redis(&interleaved);
+        assert!(
+            raw.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            "{raw:?}"
+        );
+    }
+
+    /// A real loss (a ring drop): the hole never fills. Held records,
+    /// the other direction's included, go on in arrival order once it
+    /// expires, the hole a gap: the parsers see what they saw before the
+    /// window existed.
+    #[test]
+    fn reorder_hole_that_never_fills_expires_as_a_gap() {
+        // B0 B1 B2 without A: the first 10 KB of the reply were lost.
+        let lost = two_packet_reply(&[3, 4, 5]);
+        let stats = EventStats::new();
+        let out = run_reordered(&lost, &stats);
+        assert_eq!(out, run_redis(&lost));
+        assert!(
+            out.iter().all(|(_, t)| t.as_deref() != Some("w")),
+            "{out:?}"
+        );
+        assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 1);
+    }
+
+    /// Past the per-connection byte bound, what is held goes on at once,
+    /// in arrival order, its hole a gap.
+    #[test]
+    fn reorder_window_full_releases_with_a_gap() {
+        use crate::reorder::{HOLD_BYTES_PER_CONN, ReorderWindow};
+        let m = ConnectionFsmManager::new(16);
+        let stats = EventStats::new();
+        let mut w = ReorderWindow::default();
+        let mut n = 0;
+        let mut sink = |e: &DataEvent| {
+            n += 1;
+            feed_event(&m, e, connection_key(e), &stats, 0, false);
+        };
+        let t0 = Instant::now();
+        let get = at_off(redis_pkt(true, 1000, 5000, 0, GET), 0);
+        let glen = GET.len() as u32;
+        w.offer(&m, connection_key(&get), &get, t0, &stats, &mut sink);
+        let reply = at_off(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"), 0);
+        w.offer(&m, connection_key(&reply), &reply, t0, &stats, &mut sink);
+        // A packet 1 KB past the next byte, most of its bytes uncaptured.
+        let mut ahead = at_off(redis_pkt(false, 5007 + 1024, 1000 + glen, 0, b"x"), 1031);
+        ahead.orig_len = (HOLD_BYTES_PER_CONN - 100) as u32;
+        w.offer(&m, connection_key(&ahead), &ahead, t0, &stats, &mut sink);
+        assert!(!w.is_empty());
+        let mut more = ahead;
+        more.tcp_seq += ahead.orig_len;
+        more.stream_off += ahead.orig_len as u64;
+        more.orig_len = 200;
+        w.offer(&m, connection_key(&more), &more, t0, &stats, &mut sink);
+        assert!(w.is_empty());
+        assert_eq!(n, 4);
+        assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 1);
+    }
+
+    /// A quiet connection: its hole expires on time, with no later record
+    /// to trigger it.
+    #[test]
+    fn reorder_hole_expires_on_a_quiet_connection() {
+        use crate::reorder::{HOLD_TIME, ReorderWindow};
+        let m = ConnectionFsmManager::new(16);
+        let stats = EventStats::new();
+        let mut w = ReorderWindow::default();
+        let mut n = 0;
+        let mut sink = |e: &DataEvent| {
+            n += 1;
+            feed_event(&m, e, connection_key(e), &stats, 0, false);
+        };
+        let t0 = Instant::now();
+        let get = at_off(redis_pkt(true, 1000, 5000, 0, GET), 0);
+        w.offer(&m, connection_key(&get), &get, t0, &stats, &mut sink);
+        let ahead = at_off(redis_pkt(true, 1000 + 500, 5000, 0, GET), 500);
+        w.offer(&m, connection_key(&ahead), &ahead, t0, &stats, &mut sink);
+        assert_eq!(w.deadline(), Some(t0 + HOLD_TIME));
+        w.expire(&m, t0 + HOLD_TIME / 2, &stats, &mut |_, e: &DataEvent| {
+            sink(e)
+        });
+        assert!(!w.is_empty());
+        w.expire(&m, t0 + HOLD_TIME, &stats, &mut |_, e: &DataEvent| sink(e));
+        assert!(w.is_empty());
+        assert_eq!(n, 2);
+        assert_eq!(stats.tcp_reorder_gaps.load(Ordering::Relaxed), 1);
+    }
+
+    /// A packet carrying RST is one record (sock_capture.rs `emit`), at the
+    /// packet's own sequence number, however large. One at a wrong sequence
+    /// number is ignored, payload and RST: the connection goes on. Split
+    /// into chunks, its last chunk carried the RST at an advanced sequence
+    /// number that passed the next-byte check.
+    #[test]
+    fn large_rst_at_a_wrong_sequence_number_is_ignored() {
+        let glen = GET.len() as u32;
+        let mut rst = at_off(
+            redis_pkt(
+                false,
+                5000 + 4096,
+                1000 + glen,
+                TCP_FLAG_RST,
+                &[b'x'; MAX_PAYLOAD_SIZE],
+            ),
+            4096,
+        );
+        rst.orig_len = 8192;
+        let reply = at_off(redis_pkt(false, 5000, 1000 + glen, 0, b"$1\r\nv\r\n"), 0);
+        let m = ConnectionFsmManager::new(16);
+        let stats = EventStats::new();
+        let get = at_off(redis_pkt(true, 1000, 5000, 0, GET), 0);
+        let mut out = vec![];
+        collect(
+            &mut out,
+            feed_event(&m, &get, connection_key(&get), &stats, 0, false),
+        );
+        assert!(feed_event(&m, &rst, connection_key(&rst), &stats, 0, false).is_none());
+        collect(
+            &mut out,
+            feed_event(&m, &reply, connection_key(&reply), &stats, 0, false),
+        );
+        assert_eq!(out, vec![(Some("GET".into()), Some("v".into()))]);
     }
 
     /// TLS plaintext carries no stream position: Redis replies over TLS

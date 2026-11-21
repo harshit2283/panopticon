@@ -11,10 +11,11 @@
 //! - Writing stops at `max_bytes` so a forgotten flag cannot fill the disk.
 //! - Writing stops, and the file is closed, as soon as a reload tightens
 //!   the privacy mode below `full`: events still queued are not written.
-//! - Payloads are the captured bytes, up to 4096 per record: a larger
-//!   packet is split over records up to `max_packet_bytes` (default 16
-//!   KiB, 4 records; at most 64 KiB), a TLS read or write over up to 4
-//!   (16 KiB). `orig_len` in each record counts its bytes on
+//! - Payloads are the captured bytes, up to 4096 per record: a larger TCP
+//!   packet is split over `ceil(max_packet_bytes / 4096)` records at most
+//!   (default 16 KiB, 4 records; at most 64 KiB, 16), a TLS read or write
+//!   over up to 4 (16 KiB); a UDP datagram or an RST-bearing packet is one
+//!   record. `orig_len` in each record counts its bytes on
 //!   the wire; in a packet's or TLS call's last record it also counts what
 //!   was not captured.
 //!

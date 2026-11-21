@@ -24,6 +24,7 @@ mod pipeline;
 mod narrowing_tests;
 mod platform;
 mod protocol;
+mod reorder;
 pub mod replay;
 #[cfg(target_os = "linux")]
 mod scope_loader;

@@ -87,7 +87,7 @@ production-hardened compliance platform.
   seen on a VRF device) only with
   `capture_loopback = true` (default false; it covers packets only: TLS
   plaintext over loopback is scoped by process either way). IPv6 is not
-  captured. Large packets (GSO, TSO, GRO) are captured in 4 KiB records
+  captured. Large TCP packets (GSO, TSO, GRO) are captured in 4 KiB records
   up to `max_packet_bytes` (default 16384, at most 65536); bytes past it
   are counted, not captured. That costs kernel time in the sending
   application and ring space: at 200 KB bodies on 200 connections (7.0,
@@ -154,8 +154,10 @@ production-hardened compliance platform.
     seed 7, and at 65536 in six of six, with nothing truncated (see
     BENCHMARKS.md). AMQP consumers on RHEL 8 should set
     `max_packet_bytes = 32768` (USER-GUIDE §4.2).
-    Kafka `Fetch` was 100% at 16384 (two runs at seed 7, one at seed 42)
-    and at 65536 in five of six runs; the sixth, 94.9%, lost no bytes: its
+    Kafka `Fetch` at 16384 was 100% in three of four runs (seeds 7 and 42)
+    and 96.5% in one (no truncated packet, no ignored segment, no reorder
+    gap), and at 65536 100% in five of six runs; the sixth, 94.9%, lost no
+    bytes: its
     13 missing records were in one Fetch response of about 20 records,
     whose exported text ends at the per-exchange body cap (`max_body_bytes`,
     default 4096, an export limit kept on purpose). On a slow node, where
@@ -242,8 +244,13 @@ production-hardened compliance platform.
     was parsed and the genuine retransmission dropped as a duplicate).
     Forging one needs the connection's current sequence numbers (an
     on-path attacker).
-  - Segments are not reordered: one that arrives before an earlier one is
-    taken as a gap, and the earlier one is then ignored. The kernel's
+  - Reordering is bounded: a segment that arrives ahead of the next
+    expected byte is held, with the rest of its connection's records, for
+    at most 5 ms (128 KiB per connection, 1,024 records per worker) until
+    the missing bytes arrive. This covers the chunk records of two packets
+    of one socket captured on two CPUs at once. Past those bounds it is
+    taken as a gap, and an earlier segment arriving later is ignored
+    (`panopticon_tcp_reorder_gaps_total`). The kernel's
     stream offset places each direction's first byte. A connection is
     keyed by its socket, so a new connection on a reused 5-tuple is a new
     socket with no state from the old one.
