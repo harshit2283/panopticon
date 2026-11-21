@@ -126,45 +126,60 @@ const NAMES: &[&str] = &[
 /// Whether a string read as segments (a Redis argument: no free text
 /// around it to show a short name is used as a name) names a credential.
 /// Every character that is not an ASCII letter or digit separates segments
-/// (`u:1:otp`, `u|otp`, `u otp`, `u{1}otp`), and so does a lower-case
-/// letter or digit followed by an upper-case one (`pinCode` is `pin`,
-/// `Code`); case folded. It names a credential when it contains a word of
-/// [`PARTS`] anywhere, separators read as `_` (`u:1:apikey`,
-/// `session_token`, `client-assertion`, `clientAssertion`), or when one of
-/// its segments is a word of [`NAMES`] whole (`otp`, `user:1:pin`,
-/// `api-key`, `pinCode`). Both readings are tried, with and without the
-/// case boundary (`masterUser`). A short name inside a segment with no
-/// boundary does not count: `mykey`, `spinner`, `author` and `otpcode`
-/// name no credential.
+/// (`u:1:otp`, `u|otp`, `u otp`, `u{1}otp`), and so do case and digit
+/// boundaries: a lower-case letter or digit followed by an upper-case one
+/// (`pinCode` is `pin`, `Code`), an upper-case letter followed by an
+/// upper-case one and a lower-case one (`OTPCode` is `OTP`, `Code`), and a
+/// letter next to a digit (`otp2` is `otp`, `2`); case folded. It names a
+/// credential when it contains a word of [`PARTS`] anywhere, separators
+/// read as `_` (`u:1:apikey`, `session_token`, `client-assertion`,
+/// `clientAssertion`), or when one of its segments is a word of [`NAMES`]
+/// whole or with a plural `s` (`otp`, `user:1:pin`, `api-key`, `pinCode`,
+/// `sessions`, `otps`). Both readings are tried, with and without the case
+/// and digit boundaries (`masterUser`). A short name joined to other
+/// letters with no boundary does not count: `mykey`, `spinner`, `author`
+/// and `otpcode` name no credential.
 pub fn segmented_name_has_credential_word(name: &str) -> bool {
-    [true, false].into_iter().any(|camel| {
-        let mut norm = segments_joined(name, camel);
-        let found =
-            PARTS.iter().any(|p| norm.contains(p)) || norm.split('_').any(|s| NAMES.contains(&s));
+    [true, false].into_iter().any(|bounded| {
+        let mut norm = segments_joined(name, bounded);
+        let found = PARTS.iter().any(|p| norm.contains(p))
+            || norm.split('_').any(|s| {
+                NAMES.contains(&s) || s.strip_suffix('s').is_some_and(|t| NAMES.contains(&t))
+            });
         zeroize::Zeroize::zeroize(&mut norm);
         found
     })
 }
 
 /// `name` case folded, with `_` for each run of characters that are not
-/// ASCII letters or digits and, if `camel`, before an upper-case letter
-/// that follows a lower-case letter or digit.
-fn segments_joined(name: &str, camel: bool) -> String {
+/// ASCII letters or digits and, if `bounded`, at each case or digit
+/// boundary (see [`segmented_name_has_credential_word`]).
+fn segments_joined(name: &str, bounded: bool) -> String {
+    let b = name.as_bytes();
     let mut out = String::with_capacity(name.len() + 8);
-    let mut after_lower = false;
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            if camel && after_lower && c.is_ascii_uppercase() {
-                out.push('_');
-            }
-            after_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
-            out.push(c.to_ascii_lowercase());
-        } else {
+    for (i, &c) in b.iter().enumerate() {
+        if !c.is_ascii_alphanumeric() {
             if !out.ends_with('_') {
                 out.push('_');
             }
-            after_lower = false;
+            continue;
         }
+        let prev = i
+            .checked_sub(1)
+            .map(|j| b[j])
+            .filter(u8::is_ascii_alphanumeric);
+        let next = b.get(i + 1).copied();
+        let boundary = prev.is_some_and(|p| {
+            (c.is_ascii_uppercase() && (p.is_ascii_lowercase() || p.is_ascii_digit()))
+                || (c.is_ascii_uppercase()
+                    && p.is_ascii_uppercase()
+                    && next.is_some_and(|n| n.is_ascii_lowercase()))
+                || (c.is_ascii_digit() != p.is_ascii_digit())
+        });
+        if bounded && boundary && !out.ends_with('_') {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase() as char);
     }
     out
 }
@@ -2302,7 +2317,7 @@ mod tests {
     /// ASCII letter or digit, and at a lower-to-upper case boundary; a
     /// short name inside a segment with no boundary does not count.
     #[test]
-    fn segments_split_on_any_separator_and_case_boundary() {
+    fn segments_split_on_any_separator_case_and_digit_boundary() {
         for name in [
             "otp",
             "u:1:otp",
@@ -2325,6 +2340,19 @@ mod tests {
             "SessionToken",
             "API_KEY",
             "u:1:apikey",
+            // Review: plural `s`, an acronym before a word, digits.
+            "sessions",
+            ":1:django.contrib.sessions.cachexk3v9",
+            "pins",
+            "u:otps",
+            "tokens",
+            "keys",
+            "OTPCode",
+            "PINCode",
+            "otp2",
+            "user1pin",
+            "pin_2fa",
+            "API2Key",
         ] {
             assert!(segmented_name_has_credential_word(name), "{name}");
         }
@@ -2337,7 +2365,8 @@ mod tests {
             "OTPCODE",
             "pinto",
             "2fa:alice",
-            "keys",
+            "pinsx",
+            "otpcodes",
             "",
         ] {
             assert!(!segmented_name_has_credential_word(name), "{name}");
