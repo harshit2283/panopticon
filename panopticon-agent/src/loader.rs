@@ -390,7 +390,10 @@ pub fn sync_config_to_ebpf(
 /// The probes go into the file the offsets were read from, opened again
 /// and checked against its examined identity, and attached through
 /// `/proc/self/fd/<n>`: the kernel resolves that magic link to the open
-/// inode, not the workload-controlled path (F14).
+/// inode, not the workload-controlled path (F14). A file keyed by its real
+/// inode under an overlay is attached through that layer file, so the
+/// probe lands on the inode recorded as attached
+/// (`proc_scanner::open_probe_file`).
 pub fn attach_tls_uprobes(
     ebpf: &mut Ebpf,
     target: &TlsTarget,
@@ -398,7 +401,7 @@ pub fn attach_tls_uprobes(
     go_reads: bool,
 ) -> usize {
     use std::os::fd::AsRawFd;
-    let file = match crate::platform::proc_scanner::open_examined(target) {
+    let file = match crate::platform::proc_scanner::open_probe_file(target) {
         Ok(file) => file,
         Err(e) => {
             warn!(pid = target.pid, path = %target.library_path, error = %e, "Not attaching TLS uprobes");

@@ -20,6 +20,12 @@
 //! takes the upper copy first, and the copy's own number then fails the
 //! check. Any doubt gives `None`, and the caller keys the file by the
 //! examined `(dev, ino)`. That can attach a file twice, never zero times.
+//!
+//! The probe is attached through the layer file found ([`lower_file`]),
+//! looked up again at attach time, never through the overlay path: a copy-up
+//! between the scan and the attach would otherwise put the probe on the
+//! upper copy while the agent records the lower file as attached, and skip
+//! every other container of the image.
 
 /// An overlay mount that serves a path: its layer directories (upper
 /// first, then the lower ones in order), as the mounter named them, and
@@ -160,6 +166,17 @@ pub fn lower_file_id(
     path: &str,
     key: super::proc_scanner::FileKey,
 ) -> Option<(u64, u64)> {
+    lower_file(pid, path, key).map(|(_, id)| id)
+}
+
+/// [`lower_file_id`] with the layer file itself (an `O_PATH` descriptor),
+/// the file the probe is attached through.
+#[cfg(target_os = "linux")]
+pub fn lower_file(
+    pid: u32,
+    path: &str,
+    key: super::proc_scanner::FileKey,
+) -> Option<(std::os::fd::OwnedFd, (u64, u64))> {
     use std::os::unix::fs::MetadataExt;
     let (dev, ino, mtime, size) = key;
     if !cap_sys_admin() || !mount_ns_in_init_userns(pid) {
@@ -179,15 +196,15 @@ pub fn lower_file_id(
         layers.push(fd);
     }
     let comps: Vec<&str> = ovl.rel[1..].split('/').collect();
-    let found = find_in_layers(&layers, &comps)?;
-    let m = std::fs::File::from(found).metadata().ok()?;
+    let found = std::fs::File::from(find_in_layers(&layers, &comps)?);
+    let m = found.metadata().ok()?;
     let m_mtime = m.mtime().saturating_mul(1_000_000_000) + m.mtime_nsec();
     (m.is_file()
         && Some(m.dev()) == layer_dev
         && m.ino() == ino
         && m.size() == size
         && m_mtime == mtime)
-        .then_some((m.dev(), ino))
+        .then(|| (found.into(), (m.dev(), ino)))
 }
 
 /// What one layer holds at a path ([`walk_layer`]).

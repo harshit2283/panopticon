@@ -580,6 +580,43 @@ fn resolve_probe_file(_target: &TlsTarget) -> Option<(u64, u64)> {
     None
 }
 
+/// The file a target's probes are attached through: for a target keyed by
+/// its real inode under an overlay ([`TlsTarget::probe_file`]), that layer
+/// file itself, looked up again now and opened only if it still is that
+/// inode, so the probe lands on the inode the agent records (a copy-up
+/// since the scan fails the lookup: the target is refused, and the next
+/// scan keys it by the file examined); otherwise the file examined
+/// ([`open_examined`]).
+pub fn open_probe_file(target: &TlsTarget) -> std::io::Result<std::fs::File> {
+    let examined = open_examined(target)?;
+    let Some(id) = target.probe_file else {
+        return Ok(examined);
+    };
+    let refused = || std::io::Error::other("the layer file is not the one recorded");
+    let file = open_layer_file(target).ok_or_else(refused)?;
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    if (m.dev(), m.ino()) != id {
+        return Err(refused());
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_layer_file(target: &TlsTarget) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = target
+        .library_path
+        .strip_prefix(&format!("/proc/{}/root", target.pid))?;
+    let (fd, _) = super::overlay::lower_file(target.pid, path, target.file_key?)?;
+    open_workload_file(&format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_layer_file(_target: &TlsTarget) -> Option<std::fs::File> {
+    None
+}
+
 /// Drop repeats of one path to one examined file, and keep every other
 /// path: each is a candidate for [`attach_each`]. A path's attach can be
 /// refused ([`open_examined`]: a co-tenant that shares the inode swapped a
@@ -1198,6 +1235,29 @@ mod tests {
             1
         });
         assert_eq!((files, tried), (3, vec![10, 12, 20]), "one per file");
+    }
+
+    /// Codex #6 (copy-up): a target keyed by a real inode is attached only
+    /// through that layer file, found again at attach time. When it cannot
+    /// be (here: no overlay at all, as after a copy-up the lookup fails),
+    /// the attach is refused rather than made through the examined path,
+    /// whose real inode may no longer be the one recorded. A target keyed
+    /// by the file examined opens that file.
+    #[test]
+    fn test_probe_file_is_the_recorded_inode_or_refused() {
+        let dir = std::env::temp_dir().join(format!("probefile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("libssl.so.3");
+        std::fs::write(&path, b"elf").unwrap();
+        let key = file_key(&std::fs::File::open(&path).unwrap()).unwrap();
+        let examined = ssl_target(1, path.to_str().unwrap(), Some(key));
+        assert!(open_probe_file(&examined).is_ok());
+        let keyed_by_layer = TlsTarget {
+            probe_file: Some((key.0, key.1)),
+            ..examined.clone()
+        };
+        assert!(open_probe_file(&keyed_by_layer).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A Go binary none of whose paths attached a probe is tried again
