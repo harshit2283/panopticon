@@ -25,6 +25,10 @@ compose() {
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+# A fresh PostgreSQL superuser password per run (docker-compose.yaml).
+E2E_PG_PASSWORD="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export E2E_PG_PASSWORD
+
 wait_for_url() {
   local url="$1"
   local attempts="${2:-60}"
@@ -126,7 +130,7 @@ record_host_debug() {
 print_agent_attach_summary() {
   echo "Agent attach summary:"
   compose logs --no-color agent 2>/dev/null \
-    | grep -E "Kernel capabilities detected|TC classifier attached|Failed to attach TC classifier|eBPF programs loaded and attached|Initial TLS scan complete" \
+    | grep -E "Kernel capabilities detected|eBPF programs loaded and attached|Initial TLS scan complete" \
     || true
 }
 
@@ -149,11 +153,28 @@ dump_debug() {
   compose logs --no-color || true
 }
 
+# The agent runs as root and creates its JSON export owner-only (0600), a
+# privacy control. Hand the file to the user running this script (the
+# validator below and the CI artifact upload read it as that user) by
+# chowning it from a throwaway container on the agent image; the mode stays.
+release_export() {
+  local cid image
+  [[ -e "${JSON_OUT}" && ! -r "${JSON_OUT}" ]] || return 0
+  cid="$(compose ps -aq agent 2>/dev/null || true)"
+  [[ -n "${cid}" ]] || return 0
+  image="$(docker inspect -f '{{.Image}}' "${cid}" 2>/dev/null || true)"
+  [[ -n "${image}" ]] || return 0
+  docker run --rm --network none --entrypoint chown \
+    -v "${OUTPUT_DIR}:/output" "${image}" \
+    "$(id -u):$(id -g)" /output/events.jsonl || true
+}
+
 cleanup() {
   local exit_code=$?
   if [[ ${exit_code} -ne 0 ]]; then
     dump_debug
   fi
+  release_export
   compose down --volumes --remove-orphans || true
   exit "${exit_code}"
 }
@@ -213,7 +234,7 @@ for _ in $(seq 1 3); do
 done
 
 echo "Generating PostgreSQL traffic..."
-PGPASSWORD=test psql -h localhost -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
+PGPASSWORD="${E2E_PG_PASSWORD}" psql -h 127.0.0.1 -U test -d testdb -c "SELECT 1;" || echo "psql not installed, skipping"
 
 echo "Generating Redis traffic..."
 redis-cli -h localhost PING || echo "redis-cli not installed, skipping"
@@ -243,6 +264,8 @@ if [[ ${agent_exit} -ne 0 ]]; then
   compose logs --tail=200 agent || true
   exit 1
 fi
+
+release_export
 
 echo "Waiting for JSON export artifact..."
 wait_for_file_quiescence "${JSON_OUT}" 30 || {

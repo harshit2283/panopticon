@@ -33,9 +33,21 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
+# has_capability CAP: whether sudo's process holds CAP. libcap 2.x prints a
+# full set as "Current: =ep" (no names), less any "cap_x-ep" drops after it.
+has_capability() {
+    local cap="$1" cur
+    cur="$(sudo -n capsh --print 2>/dev/null | sed -n 's/^Current: //p')"
+    if [[ "${cur}" == "=ep"* ]]; then
+        ! grep -Eq "\\b${cap}\\b[^ ]*-" <<<"${cur}"
+        return
+    fi
+    grep -Eq "\\b${cap}\\b" <<<"${cur}"
+}
+
 require_capability() {
     local cap="$1"
-    if ! sudo -n capsh --print 2>/dev/null | grep -Eq "Current: .*\\b${cap}\\b"; then
+    if ! has_capability "${cap}"; then
         fail "Missing required Linux capability: ${cap} (run with elevated privileges that include it)"
     fi
 }
@@ -65,7 +77,7 @@ kernel_has_cap_bpf_support() {
 }
 
 require_bpf_or_sys_admin_for_legacy_kernel() {
-    if sudo -n capsh --print 2>/dev/null | grep -Eq "Current: .*\\bcap_bpf\\b"; then
+    if has_capability cap_bpf; then
         return 0
     fi
 
@@ -73,7 +85,7 @@ require_bpf_or_sys_admin_for_legacy_kernel() {
         fail "Missing required Linux capability: cap_bpf (kernel supports CAP_BPF)"
     fi
 
-    if ! sudo -n capsh --print 2>/dev/null | grep -Eq "Current: .*\\bcap_sys_admin\\b"; then
+    if ! has_capability cap_sys_admin; then
         fail "Missing required Linux capability: cap_bpf (preferred) or cap_sys_admin (fallback for kernels older than 5.8)"
     fi
 }
@@ -244,8 +256,9 @@ TLS_PID="$!"
 wait_for_http "http://127.0.0.1:${HTTP_PORT}/" || fail "HTTP server failed to become ready"
 wait_for_https_insecure "https://127.0.0.1:${TLS_PORT}/" || fail "TLS server failed to become ready"
 
-log "Starting agent on loopback with JSON export"
-sudo -E bash -c "echo \$\$ > '${AGENT_PID_FILE}'; exec '${AGENT_BIN}' --interface lo --json-export '${JSON_OUT}' --log-events" \
+log "Starting agent (loopback capture on) with JSON export"
+printf 'capture_loopback = true\n' >"${TMP_DIR}/agent.toml"
+sudo -E bash -c "echo \$\$ > '${AGENT_PID_FILE}'; exec '${AGENT_BIN}' --config '${TMP_DIR}/agent.toml' --json-export '${JSON_OUT}' --log-events" \
     >"${AGENT_LOG}" 2>&1 &
 AGENT_SUDO_PID="$!"
 
@@ -270,6 +283,9 @@ log "Stopping agent"
 stop_agent
 
 [[ -f "${JSON_OUT}" ]] || fail "Expected JSON output file not found: ${JSON_OUT}"
+# The agent (root) creates its export owner-only (0600). Hand the file to the
+# user running this script so the checks below can read it; the mode stays.
+sudo chown "$(id -u):$(id -g)" "${JSON_OUT}"
 
 log "Validating JSON output contains HTTP protocol events"
 python3 - "${JSON_OUT}" <<'PY'

@@ -2,12 +2,15 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y curl netcat-openbsd && rm -rf /var/lib/apt/lists/*
 
+# Pinned: an unpinned rebuild pulled kafka-python 3.0, which rejects the
+# 2.x-only `api_version_auto_timeout_ms` option, and the Kafka step failed
+# for reasons unrelated to the agent.
 RUN pip install --no-cache-dir \
-    requests \
-    kafka-python \
-    pymysql \
-    psycopg2-binary \
-    redis
+    requests==2.34.2 \
+    kafka-python==3.0.13 \
+    pymysql==1.2.4 \
+    psycopg2-binary==2.9.13 \
+    redis==8.1.0
 
 COPY traffic/ /traffic/
 

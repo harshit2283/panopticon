@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Score the agent's Redis / PostgreSQL / MySQL / gRPC capture against ground
+# truth.
+#
+# Starts the three database servers in Docker, published on the veth address
+# $HOST_IP only (never on the host's LAN interfaces), and a gRPC server
+# (grpc_oracle.py) on a non-standard port, puts a client in a netns behind a
+# veth (the agent attaches to the host end, server side), runs each oracle
+# with a fresh agent, and scores with score_db.py / score_h2.py. All three
+# servers use a random per-run password, passed to db_oracle.py and
+# score_db.py as ORACLE_PASSWORD (score_db.py fails if it reaches the export).
+# Exits non-zero if any protocol's recall is below MIN_RECALL, counted both
+# over all records and per view: client and server run on this node, so the
+# agent sees each exchange on both sockets, and each must be parsed (the
+# scorers' VIEWS argument, 2 here).
+#
+# Usage: sudo tests/oracle/run_protocols.sh [ops=500] [seed=7] [min_recall=0.99]
+# Needs: root, docker, iproute2, a built agent, python3 3.7+ (the
+# first new enough, or set PYTHON) with redis,
+# psycopg[binary], pymysql, cryptography (MySQL 8 full auth over plaintext),
+# grpcio:
+#   pip install redis 'psycopg[binary]' pymysql cryptography grpcio \
+#     mysql-connector-python
+# Images can be overridden, e.g. REDIS_IMAGE=mirror.gcr.io/library/redis:7.4.
+set -euo pipefail
+# Topology (see netns.py): override ORACLE_NS / ORACLE_IF / ORACLE_NET to
+# run several oracles at once.
+NS=${ORACLE_NS:-pclient}
+HOST_IP=10.99.${ORACLE_NET:-0}.1
+N=${1:-500}
+SEED=${2:-7}
+MIN_RECALL=${3:-0.99}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+AGENT=${AGENT:-$ROOT/target/release/panopticon-agent}
+# One python3 >= 3.7 for every step (RHEL 8's python3 is 3.6): $PYTHON, or
+# the first of these that is new enough.
+PY=${PYTHON:-}
+if [[ -z $PY ]]; then
+  for c in python3 python3.12 python3.11 python3.9 python3.8; do
+    if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 7))'; then
+      PY=$c
+      break
+    fi
+  done
+fi
+[[ -n $PY ]] || { echo "needs python3 >= 3.7 (set PYTHON)" >&2; exit 1; }
+REDIS_IMAGE=${REDIS_IMAGE:-redis:7.4}
+POSTGRES_IMAGE=${POSTGRES_IMAGE:-postgres:16}
+MYSQL_IMAGE=${MYSQL_IMAGE:-mysql:8.4}
+OUT=$(mktemp -d)
+# Random per run; Redis keeps protected mode on (the image default) and
+# requires this password too.
+ORACLE_PASSWORD=$("$PY" -c 'import secrets; print(secrets.token_hex(16))')
+export ORACLE_PASSWORD
+
+# stop_bounded PID: SIGINT, then up to 90 s for the process to flush and
+# exit; past that SIGKILL and a failure (message, returns 1). Sets
+# STOP_EXIT to the process's exit status.
+stop_bounded() {
+  local p=$1 i
+  STOP_EXIT=0
+  [[ -n $p ]] || return 0
+  if kill -INT "$p" 2>/dev/null; then
+    for ((i = 0; i < 900; i++)); do
+      kill -0 "$p" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$p" 2>/dev/null; then
+      echo "FAIL: pid $p still running 90 s after SIGINT: killed (SIGKILL), its output may be incomplete" >&2
+      kill -KILL "$p" 2>/dev/null || true
+      wait "$p" 2>/dev/null || true
+      STOP_EXIT=137
+      return 1
+    fi
+  fi
+  wait "$p" 2>/dev/null || STOP_EXIT=$?
+  return 0
+}
+
+cleanup() {
+  [[ -n ${AP:-} ]] && stop_bounded "$AP" || true
+  [[ -n ${GP:-} ]] && kill "$GP" 2>/dev/null || true
+  docker rm -f o-redis o-pg o-mysql >/dev/null 2>&1 || true
+  "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+docker rm -f o-redis o-pg o-mysql >/dev/null 2>&1 || true
+"$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
+"$PY" "$HERE/netns.py" up  # first: the published ports bind to $HOST_IP
+# ponytail: the password is visible in `docker inspect` / host ps to local
+# root and users; fine for a throwaway run, use --env-file + a config file if
+# the lab ever gets untrusted local users.
+docker run -d --name o-redis -p "$HOST_IP:6379:6379" "$REDIS_IMAGE" \
+  --requirepass "$ORACLE_PASSWORD" >/dev/null
+docker run -d --name o-pg -p "$HOST_IP:5432:5432" -e POSTGRES_PASSWORD="$ORACLE_PASSWORD" \
+  -e POSTGRES_DB=oracle "$POSTGRES_IMAGE" >/dev/null
+docker run -d --name o-mysql -p "$HOST_IP:3306:3306" -e MYSQL_ROOT_PASSWORD="$ORACLE_PASSWORD" \
+  -e MYSQL_DATABASE=oracle "$MYSQL_IMAGE" >/dev/null
+
+wait_ready() {
+  for _ in $(seq 1 120); do
+    HOST_IP=$HOST_IP nsenter --net=/var/run/netns/$NS "$PY" - <<'EOF' 2>/dev/null && return 0
+import os, redis, psycopg, pymysql
+host, pw = os.environ["HOST_IP"], os.environ["ORACLE_PASSWORD"]
+redis.Redis(host=host, password=pw).ping()
+psycopg.connect(host=host, user="postgres", password=pw, dbname="oracle").close()
+pymysql.connect(host=host, user="root", password=pw, database="oracle",
+                ssl_disabled=True).close()
+EOF
+    sleep 2
+  done
+  echo "servers did not become ready" >&2
+  return 1
+}
+wait_ready
+
+status=0
+# mysql-prepared: MySQL through prepared statements (binary protocol).
+for run in redis postgres mysql mysql-prepared; do
+  proto=${run%-prepared}
+  mode=; [[ $run == *-prepared ]] && mode=prepared
+  echo "== $run"
+  "$AGENT" --json-export "$OUT/$run-agent.jsonl" >"$OUT/$run-agent.log" 2>&1 &
+  AP=$!
+  sleep 4
+  MYSQL_MODE=$mode nsenter --net=/var/run/netns/$NS "$PY" "$HERE/db_oracle.py" \
+    "$proto" "$HOST_IP" "$N" "$OUT/$run-truth.jsonl" "$SEED"
+  sleep 3
+  stop_bounded "$AP" || status=1; AP=
+  "$PY" -I "$HERE/score_db.py" "$OUT/$run-truth.jsonl" "$OUT/$run-agent.jsonl" \
+    "$MIN_RECALL" 2 || status=1
+  echo
+done
+# gRPC on a non-standard port: identified by the HTTP/2 preface (the client's,
+# or the server's SETTINGS when that reaches the agent first), not the port.
+"$PY" "$HERE/grpc_oracle.py" server "$HOST_IP:9443" >"$OUT/grpc-server.log" 2>&1 &
+GP=$!
+"$AGENT" --json-export "$OUT/grpc-agent.jsonl" >"$OUT/grpc-agent.log" 2>&1 &
+AP=$!
+sleep 4
+nsenter --net=/var/run/netns/$NS "$PY" "$HERE/grpc_oracle.py" \
+  client "$HOST_IP:9443" "$N" "$OUT/grpc-truth.jsonl" "$SEED"
+sleep 3
+stop_bounded "$AP" || status=1; AP=
+"$PY" -I "$HERE/score_h2.py" "$OUT/grpc-truth.jsonl" "$OUT/grpc-agent.jsonl" \
+  "$MIN_RECALL" 2 || status=1
+echo
+echo "artifacts: $OUT"
+exit $status

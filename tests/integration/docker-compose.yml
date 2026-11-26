@@ -86,14 +86,17 @@ services:
       - SYS_ADMIN
       - NET_ADMIN
       - BPF
-    network_mode: "service:traffic-gen"
-    pid: "service:traffic-gen"
+    # As docs/DEPLOYMENT.md runs it: host network, PID and cgroup namespaces.
+    # Capture attaches to the host cgroup v2 root and sees every container's
+    # sockets; the kernel reports host PIDs, which /proc must resolve.
+    network_mode: host
+    pid: host
+    cgroup: host
     volumes:
       - ./output:/output
       - /sys/kernel/debug:/sys/kernel/debug:ro
       - /sys/fs/bpf:/sys/fs/bpf
     command: >
-      --interface eth0
       --log-events
       --json-export /output/events.jsonl
 

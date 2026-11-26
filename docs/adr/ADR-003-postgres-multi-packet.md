@@ -231,7 +231,7 @@ sequenceDiagram
 
 4. **Version Detection**: `server_version` captured during auth enables protocol-specific handling (e.g., PostgreSQL 12-16 differences).
 
-5. **Error Correlation**: `pending_error` accumulates error details and emits them with the query text on `ReadyForQuery`, providing full context.
+5. **Error Correlation**: `pending_error` accumulates error details and emits them with the query text on `ReadyForQuery`, providing full context. (Superseded in 2026-11: the parser now keeps the client's unanswered messages in order and pairs each `Execute` with its own answer, so several statements under one `Sync` each get their own record and error, and an error exports only its SQLSTATE and severity, never its text; see USER-GUIDE §5.3.)
 
 ### Negative
 

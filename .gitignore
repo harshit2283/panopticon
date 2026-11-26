@@ -4,7 +4,6 @@ target/
 
 # Project-specific
 .claude/
-.dockerignore
 
 # Rust backup files
 **/*.rs.bk
@@ -63,3 +62,6 @@ criterion/
 # Core dumps
 core
 vgcore.*
+
+# Python bytecode
+__pycache__/

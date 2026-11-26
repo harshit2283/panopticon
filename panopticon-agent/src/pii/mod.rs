@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 //! PII detection pipeline: regex prefilter -> optional ML inference -> redaction.
 
+#[cfg(test)]
+mod accuracy;
 pub mod classifier;
 pub mod external;
 pub mod redactor;
@@ -25,6 +27,180 @@ use self::redactor::redact;
 use self::regex_prefilter::RegexPrefilter;
 use self::sampler::{InferenceSampler, template_hash};
 use crate::config::{PiiConfig, PiiMode};
+use crate::protocol::{L7Message, Protocol};
+
+use crate::protocol::{
+    CredentialRules, Decision, FieldKind, REDACTED_CREDENTIAL, credential_rules, decide, decide_as,
+    protect_text_in,
+};
+
+/// Headers whose values are credentials or session tokens, masked wholesale
+/// when redaction is on: regexes cannot recognise opaque tokens and session
+/// cookies. Matched by name: any name containing one of [`CREDENTIAL_NAME_PARTS`],
+/// so vendor headers (`X-Vault-Token`, `PRIVATE-TOKEN`, `X-Goog-Api-Key`,
+/// `X-Hub-Signature-256`, `X-CSRF-Token`, ...) are covered without a list.
+fn is_credential_header(name: &str) -> bool {
+    const CREDENTIAL_NAME_PARTS: &[&str] = &[
+        "token",
+        "auth",
+        "key",
+        "secret",
+        "session",
+        "csrf",
+        "xsrf",
+        "signature",
+        "password",
+        "passwd",
+        "cookie",
+        "credential",
+    ];
+    let name = name.to_ascii_lowercase();
+    !is_readable_http_header(&name) && CREDENTIAL_NAME_PARTS.iter().any(|p| name.contains(p))
+}
+
+/// HTTP header names that read as credential names but carry nothing
+/// secret: the HTTP/2 authority (the host) and the WebSocket handshake
+/// nonce. Kept readable by both name rules ([`is_credential_header`] and
+/// [`crate::protocol::is_credential_name`], whose `key` segment matches
+/// `sec-websocket-key`).
+fn is_readable_http_header(name: &str) -> bool {
+    [":authority", "sec-websocket-key"]
+        .iter()
+        .any(|r| name.eq_ignore_ascii_case(r))
+}
+
+/// Header names whose value is not wiped whole although the name reads as
+/// a credential name: [`is_readable_http_header`] for HTTP, HTTP/2 and
+/// gRPC, and the AMQP parser's own `routing_key` field (its `key` segment
+/// matches; the value is still protected as text, as every header value
+/// is).
+fn is_readable_header(protocol: Protocol, name: &str) -> bool {
+    match protocol {
+        Protocol::Http1 | Protocol::Http2 | Protocol::Grpc => is_readable_http_header(name),
+        Protocol::Amqp => name == "routing_key",
+        _ => false,
+    }
+}
+
+/// Mask the credentials that are whole fields: the arguments of an `AUTH`
+/// command and the values of credential-named headers (HTTP header names
+/// by [`is_credential_header`], any protocol's by
+/// [`crate::protocol::is_credential_name`]); drop DNS answers whose name has
+/// credential context or matches one of the user's patterns (before export
+/// and before the name reaches the service graph's DNS cache).
+fn mask_credential_fields(rules: &CredentialRules, msg: &mut L7Message) {
+    let wipe = |f: &mut String| {
+        f.zeroize();
+        *f = REDACTED_CREDENTIAL.to_string();
+    };
+    if msg
+        .method
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("AUTH"))
+    {
+        [&mut msg.path, &mut msg.request_text]
+            .into_iter()
+            .flatten()
+            .for_each(wipe);
+    }
+    let http = matches!(
+        msg.protocol,
+        Protocol::Http1 | Protocol::Http2 | Protocol::Grpc
+    );
+    msg.headers
+        .iter_mut()
+        .filter(|(name, _)| {
+            !is_readable_header(msg.protocol, name)
+                && ((http && is_credential_header(name))
+                    || crate::protocol::is_credential_name(name))
+        })
+        .for_each(|(_, value)| {
+            crate::protocol::count_builtin();
+            wipe(value)
+        });
+    msg.dns_answers.retain(|a| {
+        !crate::protocol::has_credential_context(&a.name)
+            && decide(rules, &a.name, false) == Decision::Keep
+    });
+}
+
+/// Protect known credential forms in every string field of `msg` (best
+/// effort, USER-GUIDE §5.3) without the PII
+/// engine (see [`crate::protocol::decide`]), under one rule set: what
+/// [`PiiEngine::scan_message_with`] does when `mask_credentials` is on, for
+/// `full` mode with `[pii] enabled = false`.
+pub fn mask_credentials(msg: &mut L7Message) {
+    mask_credentials_with(&credential_rules(), msg);
+}
+
+/// [`mask_credentials`] under one rule set for the whole message.
+fn mask_credentials_with(rules: &CredentialRules, msg: &mut L7Message) {
+    mask_credential_fields(rules, msg);
+    let (path_kind, payload_kind) = field_kinds(msg.protocol);
+    for (field, kind) in [
+        (&mut msg.method, FieldKind::Other),
+        (&mut msg.path, path_kind),
+        (&mut msg.content_type, FieldKind::Other),
+        (&mut msg.request_text, FieldKind::Other),
+        (&mut msg.payload_text, payload_kind),
+    ] {
+        if let Some(field) = field {
+            crate::protocol::protect_field_in(rules, field, kind);
+        }
+    }
+    for (name, value) in msg.headers.iter_mut() {
+        // A wiped credential header keeps its name readable; the user's
+        // patterns still apply to it.
+        // A value that reads `<REDACTED>` (wiped, or sent so by the peer)
+        // still gets the user's patterns; the built-in rules find nothing
+        // in it.
+        let wiped = value == REDACTED_CREDENTIAL;
+        protect_text_in(rules, name, !wiped);
+        protect_text_in(rules, value, !wiped);
+    }
+}
+
+/// The kinds of a message's `path` and `payload_text` for the bare-name
+/// rule: an HTTP request path, a SQL statement; every other field holds no
+/// bare name.
+fn field_kinds(protocol: Protocol) -> (FieldKind, FieldKind) {
+    let path = match protocol {
+        Protocol::Http1 | Protocol::Http2 => FieldKind::HttpPath,
+        _ => FieldKind::Other,
+    };
+    let payload = match protocol {
+        Protocol::Mysql | Protocol::Postgres => FieldKind::SqlStatement,
+        _ => FieldKind::Other,
+    };
+    (path, payload)
+}
+
+/// Decode `%XX` escapes and `+` (form encoding) for PII scanning.
+/// Invalid escapes are kept verbatim; invalid UTF-8 is replaced lossily.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| (b as char).to_digit(16);
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                        continue;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 #[cfg(feature = "ml")]
 use self::inference::OnnxInference;
@@ -34,6 +210,7 @@ use self::inference::OnnxInference;
 pub enum PiiCategory {
     Email,
     PhoneUs,
+    PhoneIn,
     PhoneIntl,
     Ssn,
     CreditCard,
@@ -43,6 +220,10 @@ pub enum PiiCategory {
     AwsKey,
     Aadhaar,
     Pan,
+    Upi,
+    Gstin,
+    PassportIn,
+    Iban,
     PersonName,
     Location,
     Organization,
@@ -54,6 +235,7 @@ impl std::fmt::Display for PiiCategory {
         match self {
             PiiCategory::Email => write!(f, "EMAIL"),
             PiiCategory::PhoneUs => write!(f, "PHONE_US"),
+            PiiCategory::PhoneIn => write!(f, "PHONE_IN"),
             PiiCategory::PhoneIntl => write!(f, "PHONE_INTL"),
             PiiCategory::Ssn => write!(f, "SSN"),
             PiiCategory::CreditCard => write!(f, "CREDIT_CARD"),
@@ -63,6 +245,10 @@ impl std::fmt::Display for PiiCategory {
             PiiCategory::AwsKey => write!(f, "AWS_KEY"),
             PiiCategory::Aadhaar => write!(f, "AADHAAR"),
             PiiCategory::Pan => write!(f, "PAN"),
+            PiiCategory::Upi => write!(f, "UPI"),
+            PiiCategory::Gstin => write!(f, "GSTIN"),
+            PiiCategory::PassportIn => write!(f, "PASSPORT_IN"),
+            PiiCategory::Iban => write!(f, "IBAN"),
             PiiCategory::PersonName => write!(f, "PERSON_NAME"),
             PiiCategory::Location => write!(f, "LOCATION"),
             PiiCategory::Organization => write!(f, "ORGANIZATION"),
@@ -103,6 +289,9 @@ pub struct PiiReport {
     pub entities: Vec<PiiEntity>,
     pub redacted_text: Option<String>,
     pub scanned_bytes: usize,
+    /// True when the detected values were replaced in the message before it
+    /// was logged or exported (redaction enabled).
+    pub redacted: bool,
 }
 
 impl Drop for PiiReport {
@@ -113,13 +302,29 @@ impl Drop for PiiReport {
     }
 }
 
+/// Findings accumulated over the fields of one message.
+#[derive(Default)]
+struct Found {
+    entities: Vec<PiiEntity>,
+    scanned_bytes: usize,
+}
+
 /// Thread-safe PII detection engine. Cloneable (Arc internals).
+///
+/// Built once at startup; each capture pipeline then takes its own copy
+/// ([`for_pipeline`](Self::for_pipeline)): the regexes and the ONNX model
+/// session are immutable and shared, while everything that holds captured
+/// state (the sampler's seen templates, the tokenizer, the external client
+/// and its connections) is per pipeline (DESIGN §3, Revision 1 item 6).
 #[derive(Clone)]
 pub struct PiiEngine {
     config: PiiConfig,
     regex: Arc<RegexPrefilter>,
     sampler: Arc<InferenceSampler>,
+    max_inferences: u32,
     external: Option<Arc<ExternalPiiClient>>,
+    /// The validated external service settings: (url, timeout_ms, rate).
+    external_service: Option<(String, u32, f64)>,
     #[cfg(feature = "ml")]
     onnx: Option<Arc<OnnxInference>>,
 }
@@ -134,7 +339,7 @@ impl PiiEngine {
             _ => 100,
         };
 
-        let external = match &config.mode {
+        let external_service = match &config.mode {
             PiiMode::External {
                 url,
                 sample_rate,
@@ -150,11 +355,7 @@ impl PiiEngine {
                     }
 
                     if allowed {
-                        Some(Arc::new(ExternalPiiClient::new(
-                            url.clone(),
-                            *timeout_ms,
-                            *sample_rate,
-                        )))
+                        Some((url.clone(), *timeout_ms, *sample_rate))
                     } else {
                         tracing::warn!(url = %url, "External PII URL rejected by allowlist");
                         None
@@ -167,14 +368,57 @@ impl PiiEngine {
         #[cfg(feature = "ml")]
         let onnx = Self::init_onnx(config);
 
-        Self {
+        let mut engine = Self {
             config: config.clone(),
             regex: Arc::new(RegexPrefilter::new()),
             sampler: Arc::new(InferenceSampler::new(max_inferences)),
-            external,
+            max_inferences,
+            external: None,
+            external_service,
             #[cfg(feature = "ml")]
             onnx,
-        }
+        };
+        // Standalone use (tests, replay): an external client on a gate of
+        // its own. The agent gives each pipeline its own instead.
+        engine.external =
+            engine.external_client(crate::io_gate::IoGate::new(), tracing::Dispatch::default());
+        engine
+    }
+
+    fn external_client(
+        &self,
+        gate: Arc<crate::io_gate::IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> Option<Arc<ExternalPiiClient>> {
+        let (url, timeout_ms, rate) = self.external_service.clone()?;
+        Some(Arc::new(ExternalPiiClient::new(
+            url, timeout_ms, rate, gate, dispatch,
+        )))
+    }
+
+    /// This engine for one capture pipeline: shared regexes and model, a
+    /// fresh sampler, tokenizer and external client (writing under `gate`,
+    /// logging through `dispatch`).
+    pub fn for_pipeline(
+        &self,
+        gate: Arc<crate::io_gate::IoGate>,
+        dispatch: tracing::Dispatch,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            config: self.config.clone(),
+            regex: Arc::clone(&self.regex),
+            sampler: Arc::new(InferenceSampler::new(self.max_inferences)),
+            max_inferences: self.max_inferences,
+            external: self.external_client(gate, dispatch),
+            external_service: self.external_service.clone(),
+            // A tokenizer that does not build fails the pipeline build:
+            // ML detection never silently turns into regex alone.
+            #[cfg(feature = "ml")]
+            onnx: match &self.onnx {
+                Some(o) => Some(Arc::new(o.for_pipeline()?)),
+                None => None,
+            },
+        })
     }
 
     fn pii_url_allowed(url: &str, allowlist: &[String]) -> bool {
@@ -250,8 +494,19 @@ impl PiiEngine {
         }
     }
 
+    /// Whether the engine's config asks for redaction (`pii.redact`).
+    pub fn redacts(&self) -> bool {
+        self.config.redact
+    }
+
     /// Scan text for PII. Returns None if PII detection is disabled or no PII found.
     pub fn scan(&self, text: &str) -> Option<PiiReport> {
+        self.scan_with(text, self.config.redact)
+    }
+
+    /// [`scan`](Self::scan) with redaction decided by the caller (the
+    /// privacy mode in effect) instead of the engine's config.
+    pub fn scan_with(&self, text: &str, redact_enabled: bool) -> Option<PiiReport> {
         if !self.config.enabled || text.is_empty() {
             return None;
         }
@@ -280,7 +535,7 @@ impl PiiEngine {
             return None;
         }
 
-        let redacted_text = if self.config.redact {
+        let redacted_text = if redact_enabled {
             Some(redact(text, &entities))
         } else {
             None
@@ -289,8 +544,167 @@ impl PiiEngine {
         Some(PiiReport {
             scanned_bytes: text.len(),
             entities,
+            redacted: redacted_text.is_some(),
             redacted_text,
         })
+    }
+
+    /// Scan every user-controlled field of a message — path/query, HTTP header
+    /// values and payload — and, when redaction is enabled, rewrite those
+    /// fields in place so that no exporter (JSON, OTLP, logs) or the service
+    /// graph ever sees the raw values.
+    ///
+    /// Entity offsets in the returned report are relative to the field they
+    /// were found in. `redacted_text` is the redacted payload, if any.
+    pub fn scan_message(&self, msg: &mut L7Message) -> Option<PiiReport> {
+        self.scan_message_with(msg, self.config.redact)
+    }
+
+    /// [`scan_message`](Self::scan_message) with redaction decided by the
+    /// caller (the privacy mode in effect).
+    ///
+    /// Every string field an exporter can carry is scanned: method, path,
+    /// content type, header names and values (all protocols), request and
+    /// response body. A DNS answer (`dns_a_record`, `domain|ip|ttl`) is not
+    /// rewritten, since it feeds the DNS cache; with redaction on, one whose
+    /// name holds PII (`123-45-6789.example.com`) is removed instead, so the
+    /// name never becomes a service identity. Its PII is counted once,
+    /// from the query name in `path`. With redaction on, credentials
+    /// are also masked whatever the protocol: credential-named HTTP headers
+    /// wholesale, the arguments of an `AUTH` command, and keyword-introduced
+    /// secrets (`PASSWORD '…'`, `IDENTIFIED BY '…'`, `requirepass …`,
+    /// `password=…`) in any field.
+    pub fn scan_message_with(
+        &self,
+        msg: &mut L7Message,
+        redact_enabled: bool,
+    ) -> Option<PiiReport> {
+        if !self.config.enabled {
+            return None;
+        }
+        // Known credential forms are protected whenever values are redacted,
+        // and also in `full` mode unless `[privacy] mask_credentials = false`,
+        // under one rule set for the whole message.
+        let rules = (redact_enabled || self.config.mask_credentials).then(credential_rules);
+        self.scan_message_under(msg, redact_enabled, rules.as_deref())
+    }
+
+    /// [`Self::scan_message_with`], credentials protected under `rules`
+    /// (not at all when None).
+    fn scan_message_under(
+        &self,
+        msg: &mut L7Message,
+        redact_enabled: bool,
+        rules: Option<&CredentialRules>,
+    ) -> Option<PiiReport> {
+        let mut found = Found::default();
+        if let Some(rules) = rules {
+            mask_credential_fields(rules, msg);
+        }
+
+        let (path_kind, payload_kind) = field_kinds(msg.protocol);
+        let other = FieldKind::Other;
+        if let Some(path) = msg.path.as_mut() {
+            // Query strings are usually percent-encoded (alice%40example.com),
+            // which the regexes would miss: scan the decoded form.
+            self.scan_field(path, true, path_kind, redact_enabled, rules, &mut found);
+        }
+        for field in [&mut msg.method, &mut msg.content_type]
+            .into_iter()
+            .flatten()
+        {
+            self.scan_field(field, false, other, redact_enabled, rules, &mut found);
+        }
+
+        if redact_enabled {
+            msg.dns_answers
+                .retain(|a| self.scan_with(&a.name, false).is_none());
+        }
+        for (name, value) in msg.headers.iter_mut() {
+            // A wiped credential header keeps its name readable; the user's
+            // patterns still apply to it, and to a value reading
+            // `<REDACTED>` (wiped, or sent so by the peer).
+            if let Some(rules) = rules.filter(|_| value == REDACTED_CREDENTIAL) {
+                protect_text_in(rules, name, false);
+                protect_text_in(rules, value, false);
+                continue;
+            }
+            self.scan_field(value, false, other, redact_enabled, rules, &mut found);
+            self.scan_field(name, false, other, redact_enabled, rules, &mut found);
+        }
+
+        if let Some(body) = msg.request_text.as_mut() {
+            self.scan_field(body, false, other, redact_enabled, rules, &mut found);
+        }
+
+        let mut redacted_payload = None;
+        if let Some(text) = msg.payload_text.as_mut() {
+            let before = found.entities.len();
+            self.scan_field(text, false, payload_kind, redact_enabled, rules, &mut found);
+            if redact_enabled && found.entities.len() > before {
+                redacted_payload = Some(text.clone());
+            }
+        }
+
+        if found.entities.is_empty() {
+            return None;
+        }
+        Some(PiiReport {
+            entities: found.entities,
+            redacted_text: redacted_payload,
+            scanned_bytes: found.scanned_bytes,
+            redacted: redact_enabled,
+        })
+    }
+
+    /// Scan one field (percent-decoded first when `decode`) for PII and,
+    /// under `rules`, protect its credentials (masked or the field
+    /// withheld, see [`crate::protocol::decide`]). The credential decision
+    /// and the PII entities are both taken on the original field, before
+    /// either rewrites it (an `<EMAIL>` must not hide a user pattern's
+    /// match, a mask must not hide an entity from the counts). With
+    /// redaction on, PII left outside the masked values is then redacted.
+    /// Entity offsets stay relative to the field as first scanned.
+    fn scan_field(
+        &self,
+        field: &mut String,
+        decode: bool,
+        kind: FieldKind,
+        redact: bool,
+        rules: Option<&CredentialRules>,
+        found: &mut Found,
+    ) {
+        let decision = rules.map_or(Decision::Keep, |r| decide_as(r, field, true, kind));
+        let protected = decision.apply(field);
+        let decoded = decode.then(|| percent_decode(field));
+        let text = decoded.as_deref().unwrap_or(field.as_str());
+        let report = self.scan_with(text, redact && protected.is_none());
+        drop(decoded);
+        if let Some(mut report) = report {
+            found.scanned_bytes += report.scanned_bytes;
+            if let Some(redacted) = report.redacted_text.take() {
+                field.zeroize();
+                *field = redacted;
+            }
+            found.entities.append(&mut report.entities);
+        }
+        let Some(protected) = protected else {
+            return;
+        };
+        field.zeroize();
+        *field = protected;
+        if redact && matches!(decision, Decision::Mask(_) | Decision::Cut(..)) {
+            let decoded = decode.then(|| percent_decode(field));
+            let text = decoded.as_deref().unwrap_or(field.as_str());
+            let redacted = self
+                .scan_with(text, true)
+                .and_then(|mut r| r.redacted_text.take());
+            drop(decoded);
+            if let Some(redacted) = redacted {
+                field.zeroize();
+                *field = redacted;
+            }
+        }
     }
 
     /// Scan text with external service (async).
@@ -348,8 +762,10 @@ mod tests {
 
     #[test]
     fn test_pii_engine_disabled() {
-        let mut config = PiiConfig::default();
-        config.enabled = false;
+        let config = PiiConfig {
+            enabled: false,
+            ..PiiConfig::default()
+        };
         let engine = PiiEngine::new(&config, &[]);
         assert!(engine.scan("my email is test@example.com").is_none());
     }
@@ -393,10 +809,639 @@ mod tests {
         assert!(redacted.contains("<SSN>"));
     }
 
+    fn http_msg() -> L7Message {
+        use panopticon_common::Direction;
+        let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, 1);
+        msg.path = Some("/login?user=alice%40example.com&ssn=123-45-6789".to_string());
+        msg.headers = vec![
+            (
+                "authorization".to_string(),
+                "Bearer opaque-token-xyz".to_string(),
+            ),
+            ("Cookie".to_string(), "session=abc123".to_string()),
+            (
+                "x-forwarded-for-user".to_string(),
+                "bob@example.com".to_string(),
+            ),
+            ("accept".to_string(), "*/*".to_string()),
+        ];
+        msg.payload_text = Some("card 4111 1111 1111 1111".to_string());
+        msg
+    }
+
+    #[test]
+    fn test_scan_message_redacts_path_headers_and_payload() {
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = http_msg();
+        let report = engine.scan_message(&mut msg).expect("PII found");
+
+        let path = msg.path.as_deref().unwrap();
+        assert!(!path.contains("alice"), "path: {path}");
+        assert!(!path.contains("123-45-6789"), "path: {path}");
+        assert!(path.contains("<EMAIL>") && path.contains("<SSN>"));
+
+        let header = |n: &str| msg.headers.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        assert_eq!(header("authorization"), REDACTED_CREDENTIAL);
+        assert_eq!(header("Cookie"), REDACTED_CREDENTIAL);
+        assert_eq!(header("x-forwarded-for-user"), "<EMAIL>");
+        assert_eq!(header("accept"), "*/*");
+
+        assert!(!msg.payload_text.as_deref().unwrap().contains("4111"));
+        assert_eq!(report.redacted_text.as_deref(), msg.payload_text.as_deref());
+        assert!(report.redacted);
+        let cats: Vec<_> = report.entities.iter().map(|e| e.category).collect();
+        assert!(cats.contains(&PiiCategory::Email));
+        assert!(cats.contains(&PiiCategory::Ssn));
+        assert!(cats.contains(&PiiCategory::CreditCard));
+    }
+
+    #[test]
+    fn test_scan_message_redacts_request_body() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Http1, Direction::Ingress, 1);
+        msg.request_text =
+            Some(r#"{"email":"bob@example.com","card":"4111 1111 1111 1111"}"#.to_string());
+        let report = engine.scan_message(&mut msg).expect("PII in request body");
+        let body = msg.request_text.as_deref().unwrap();
+        assert!(
+            !body.contains("bob@example.com") && !body.contains("4111"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<EMAIL>") && body.contains("<CREDIT_CARD>"),
+            "{body}"
+        );
+        assert!(report.redacted);
+    }
+
+    #[test]
+    fn test_scan_message_detects_without_rewriting_when_redact_off() {
+        let config = PiiConfig {
+            redact: false,
+            mask_credentials: false,
+            ..PiiConfig::default()
+        };
+        let engine = PiiEngine::new(&config, &[]);
+        let mut msg = http_msg();
+        let original = msg.clone();
+        assert!(!engine.scan_message(&mut msg).unwrap().redacted);
+        assert_eq!(msg.path, original.path);
+        assert_eq!(msg.headers, original.headers);
+        assert_eq!(msg.payload_text, original.payload_text);
+    }
+
+    #[test]
+    fn test_scan_message_leaves_dns_answers_alone() {
+        use panopticon_common::Direction;
+        // DNS answers feed the DNS cache; the address must not be rewritten.
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, 1);
+        msg.dns_answers = vec![answer("api.internal", 167772161)];
+        let _ = engine.scan_message(&mut msg);
+        assert_eq!(msg.dns_answers, vec![answer("api.internal", 167772161)]);
+    }
+
+    /// Codex #4: a DNS name carrying PII must not become a service name
+    /// (audit `service_identity`, graph nodes) or reach the export when
+    /// redacting; in full mode it is kept like any other payload.
+    #[test]
+    fn test_dns_answer_naming_pii_is_dropped_when_redacting() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let dns = || {
+            let mut msg = L7Message::new(Protocol::Dns, Direction::Ingress, 1);
+            msg.path = Some("123-45-6789.attacker.test".to_string());
+            msg.headers = vec![("qtype".to_string(), "A".to_string())];
+            msg.dns_answers = vec![
+                answer("123-45-6789.attacker.test", 167772161),
+                answer("api.internal", 167772162),
+            ];
+            msg
+        };
+        let mut msg = dns();
+        let report = engine.scan_message_with(&mut msg, true).unwrap();
+        assert_eq!(report.entities.len(), 1, "the SSN, counted once (path)");
+        let all = format!("{:?} {:?}", msg.path, msg.dns_answers);
+        assert!(!all.contains("123-45-6789"), "{all}");
+        assert_eq!(
+            msg.dns_answers,
+            vec![answer("api.internal", 167772162)],
+            "the clean answer stays"
+        );
+        let mut full = dns();
+        engine.scan_message_with(&mut full, false);
+        assert_eq!(full.dns_answers, dns().dns_answers);
+    }
+
+    fn answer(name: &str, ip: u32) -> crate::protocol::DnsAnswer {
+        crate::protocol::DnsAnswer {
+            name: name.into(),
+            ip,
+            ttl_secs: 30,
+        }
+    }
+
+    #[test]
+    fn test_credential_header_names() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "Cookie",
+            "set-cookie",
+            "x-api-key",
+            "X-Auth-Token",
+            "x-amz-security-token",
+            "X-Vault-Token",
+            "PRIVATE-TOKEN",
+            "x-goog-api-key",
+            "x-csrf-token",
+            "X-XSRF-TOKEN",
+            "x-hub-signature-256",
+            "x-session-id",
+            "x-client-secret",
+            "x-db-password",
+            "x-amz-credential",
+        ] {
+            assert!(is_credential_header(name), "{name} must be masked");
+        }
+        for name in [
+            "content-type",
+            "keep-alive",
+            "accept-encoding",
+            "accept",
+            "host",
+            ":authority",
+            ":path",
+            "sec-websocket-key",
+            "user-agent",
+            "x-request-id",
+            "content-length",
+        ] {
+            assert!(!is_credential_header(name), "{name} must stay readable");
+        }
+    }
+
+    #[test]
+    fn test_vendor_token_headers_are_masked() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Http2, Direction::Egress, 1);
+        msg.headers = vec![
+            ("x-vault-token".into(), "hvs.CAESIJopaqueVaultToken".into()),
+            ("private-token".into(), "glpat-opaqueGitlabToken".into()),
+            ("content-type".into(), "application/json".into()),
+        ];
+        let _ = engine.scan_message_with(&mut msg, true);
+        assert_eq!(msg.headers[0].1, REDACTED_CREDENTIAL);
+        assert_eq!(msg.headers[1].1, REDACTED_CREDENTIAL);
+        assert_eq!(msg.headers[2].1, "application/json");
+    }
+
+    /// Security scan F1: header names that join a short credential name
+    /// to other words, as the parsers deliver them (lowercased: `x-old-pwd`,
+    /// `x-card-pin`, `x-loginpwd`, `x-cardpin`) are masked in
+    /// any protocol; the WebSocket handshake nonce stays readable.
+    #[test]
+    fn test_compound_credential_header_names_are_masked() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for protocol in [Protocol::Http1, Protocol::Kafka] {
+            let mut msg = L7Message::new(protocol, Direction::Egress, 1);
+            msg.headers = vec![
+                // As the parsers deliver them: lowercased (http1, http2).
+                ("x-old-pwd".into(), "hunter2".into()),
+                ("x-card-pin".into(), "7392".into()),
+                ("x-loginpwd".into(), "hunter3".into()),
+                ("x_sms_otp".into(), "482913".into()),
+                ("x-newpwd".into(), "hunter4".into()),
+                ("x-cardpin".into(), "7393".into()),
+                ("x-smsotp".into(), "482914".into()),
+                ("x-mpin".into(), "7394".into()),
+                (
+                    "sec-websocket-key".into(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".into(),
+                ),
+                ("x-shipping-option".into(), "ground".into()),
+            ];
+            let _ = engine.scan_message_with(&mut msg, true);
+            for i in 0..8 {
+                assert_eq!(
+                    msg.headers[i].1, REDACTED_CREDENTIAL,
+                    "{:?}",
+                    msg.headers[i]
+                );
+            }
+            if protocol == Protocol::Http1 {
+                assert_eq!(msg.headers[8].1, "dGhlIHNhbXBsZSBub25jZQ==");
+            }
+            assert_eq!(msg.headers[9].1, "ground");
+        }
+        // The AMQP parser's own fields: `routing_key` is not a credential
+        // name; its value is protected as text.
+        let mut msg = L7Message::new(Protocol::Amqp, Direction::Egress, 1);
+        msg.headers = vec![
+            ("exchange".into(), "orders".into()),
+            ("routing_key".into(), "orders.created".into()),
+            ("consumer_tag".into(), "ctag-1".into()),
+            ("delivery_tag".into(), "7".into()),
+        ];
+        let original = msg.headers.clone();
+        let _ = engine.scan_message_with(&mut msg, true);
+        assert_eq!(msg.headers, original);
+        // Every other synthetic header name a parser emits stays readable.
+        for name in [
+            "consumer_tag",
+            "delivery_tag",
+            "exchange",
+            "reply_text",
+            "empty",
+            "binding",
+            "api_version",
+            "client_id",
+            "qtype",
+            "sqlstate",
+            "severity",
+            "rst_stream",
+        ] {
+            assert!(!crate::protocol::is_credential_name(name), "{name}");
+        }
+    }
+
+    /// Credential-named parameters (percent-encoded names too), JSON
+    /// fields, header-style values and URI passwords are masked with and
+    /// without the engine, in every copy (HTTP/2 keeps `:path` as a header
+    /// too); ordinary values stay readable.
+    #[test]
+    fn test_credential_params_and_uri_passwords_are_masked() {
+        use panopticon_common::Direction;
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http2, Direction::Egress, 1);
+            let path = "/login?%70assword=canary-1&token=canary-2&api_key=canary-3&q=keep";
+            m.path = Some(path.into());
+            m.headers = vec![
+                (":path".into(), path.into()),
+                ("x-note".into(), "Authorization: Bearer canary-6".into()),
+                (
+                    "x-redirect".into(),
+                    "/cb?access_token=canary-7&state=keep".into(),
+                ),
+            ];
+            m.request_text = Some(
+                r#"{"dsn":"postgresql://app:canary-4@db/app","client_secret": "canary-5","note":"don't","keyword":"keep"}"#
+                    .into(),
+            );
+            m.payload_text = Some("redis://:canary-8@cache:6379/0 and pass%77ord=canary-9".into());
+            m
+        };
+        let check = |m: &L7Message, how: &str| {
+            let all = format!(
+                "{:?} {:?} {:?} {:?}",
+                m.path, m.headers, m.request_text, m.payload_text
+            );
+            assert!(!all.contains("canary"), "{how}: {all}");
+            assert!(
+                all.contains("q=keep") && all.contains("state=keep"),
+                "{how}: {all}"
+            );
+            assert!(all.contains(r#"\"note\":\"don't\""#), "{how}: {all}");
+            assert!(all.contains(r#"\"keyword\":\"keep\""#), "{how}: {all}");
+            assert!(all.contains("postgresql://app:"), "{how}: {all}");
+        };
+        let mut m = msg();
+        mask_credentials(&mut m);
+        check(&m, "no engine");
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for redact in [true, false] {
+            let mut m = msg();
+            let _ = engine.scan_message_with(&mut m, redact);
+            check(&m, &format!("engine, redact {redact}"));
+        }
+    }
+
+    /// A wire header that borrows the DNS-answer name gets no exemption.
+    #[test]
+    fn test_wire_header_named_like_dns_metadata_is_masked() {
+        use panopticon_common::Direction;
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.headers = vec![("dns_a_record".into(), "password=canary-dns".into())];
+            m
+        };
+        let mut m = msg();
+        mask_credentials(&mut m);
+        assert_eq!(m.headers[0].1, "password=<REDACTED>");
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for redact in [true, false] {
+            let mut m = msg();
+            let _ = engine.scan_message_with(&mut m, redact);
+            assert_eq!(m.headers[0].1, "password=<REDACTED>", "redact {redact}");
+        }
+    }
+
+    /// `[credentials] patterns` mask in every field of every protocol, with
+    /// and without the engine, and are counted. The only test that installs
+    /// global rules (its pattern matches no other test's data).
+    #[test]
+    fn test_user_patterns_mask_every_field() {
+        use crate::protocol::{Builtin, CredentialRules, credential_matches, set_credential_rules};
+        let token = "acmetok_q7w8e9r0t1y2";
+        let pattern = vec!["acmetok_[a-z0-9]{12}".to_string()];
+        set_credential_rules(CredentialRules::compile(&pattern, Builtin::Full).unwrap());
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let (user_before, builtin_before) = credential_matches();
+        let mut checked = 0;
+        for protocol in [
+            Protocol::Http1,
+            Protocol::Http2,
+            Protocol::Mysql,
+            Protocol::Postgres,
+            Protocol::Redis,
+            Protocol::Kafka,
+        ] {
+            for engine_on in [false, true] {
+                let mut msg = L7Message::new(protocol, crate::protocol::Direction::Egress, 0);
+                msg.method = Some(format!("GET{token}"));
+                msg.path = Some(format!("/v1/{token}/x"));
+                msg.content_type = Some(format!("text/{token}"));
+                msg.headers = vec![
+                    ("x-note".into(), format!("a {token} b")),
+                    (format!("x-{token}"), "v".into()),
+                ];
+                // SQL text, Redis arguments, bound values, bodies.
+                msg.payload_text = Some(format!("SELECT * FROM t WHERE k = '{token}'"));
+                msg.request_text = Some(format!("{token}, 42"));
+                if engine_on {
+                    engine.scan_message_with(&mut msg, false);
+                } else {
+                    mask_credentials(&mut msg);
+                }
+                let dump = format!("{msg:?}");
+                assert!(!dump.contains(token), "{protocol:?} {engine_on}: {dump}");
+                checked += 1;
+            }
+        }
+        let (user_after, builtin_after) = credential_matches();
+        // 7 fields per message.
+        assert!(
+            user_after - user_before >= 7 * checked,
+            "{user_before} {user_after}"
+        );
+        // A plain Authorization header counts as builtin.
+        let mut msg = L7Message::new(Protocol::Http1, crate::protocol::Direction::Egress, 0);
+        msg.headers = vec![("authorization".into(), "Bearer x".into())];
+        mask_credentials(&mut msg);
+        assert!(credential_matches().1 > builtin_after.max(builtin_before));
+        set_credential_rules(CredentialRules::default());
+    }
+
+    /// Codex round 5 #4, #5: user patterns see the original field, before
+    /// PII redaction rewrites it; they apply to header names whatever the
+    /// value, and a DNS answer they match is dropped.
+    #[test]
+    fn test_user_patterns_see_the_original_field() {
+        use crate::protocol::{Builtin, CredentialRules, Direction, DnsAnswer};
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let rules = CredentialRules::compile(
+            &s(&[r"alice@example\.com:[A-Za-z0-9]+", "acme[-_][a-z0-9]{8}"]),
+            Builtin::Full,
+        )
+        .unwrap();
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for how in ["no engine", "redact", "full"] {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.request_text = Some("alice@example.com:Z7mQp2vK".into());
+            m.headers = vec![("x-acme-abcd1234".into(), REDACTED_CREDENTIAL.into())];
+            m.dns_answers = vec![DnsAnswer {
+                name: "acme_abcd1234.example.com".into(),
+                ip: 1,
+                ttl_secs: 60,
+            }];
+            match how {
+                "no engine" => mask_credentials_with(&rules, &mut m),
+                h => {
+                    let _ = engine.scan_message_under(&mut m, h == "redact", Some(&rules));
+                }
+            }
+            let dump = format!("{m:?}");
+            for secret in ["Z7mQp2vK", "abcd1234"] {
+                assert!(!dump.contains(secret), "{how}: {dump}");
+            }
+            assert!(m.dns_answers.is_empty(), "{how}");
+        }
+    }
+
+    /// Codex R6 N5: a header value that reads `<REDACTED>` but was not
+    /// wiped by the agent still gets the user's patterns.
+    #[test]
+    fn test_marker_looking_header_value_is_scanned() {
+        use crate::protocol::{Builtin, CredentialRules, Direction};
+        let rules = CredentialRules::compile(&["REDACTED".to_string()], Builtin::Full).unwrap();
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        for how in ["no engine", "redact", "full"] {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.headers = vec![("x-note".into(), REDACTED_CREDENTIAL.into())];
+            match how {
+                "no engine" => mask_credentials_with(&rules, &mut m),
+                h => {
+                    let _ = engine.scan_message_under(&mut m, h == "redact", Some(&rules));
+                }
+            }
+            assert_eq!(m.headers[0].1, "<<REDACTED>>", "{how}");
+        }
+    }
+
+    /// Codex round 5 #6: one message is protected under one rule set,
+    /// loaded once when its scan starts.
+    #[test]
+    fn test_one_rule_set_per_message() {
+        use crate::protocol::CREDENTIAL_RULE_LOADS as LOADS;
+        use crate::protocol::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let msg = || {
+            let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+            m.method = Some("GET".into());
+            m.path = Some("/beta1234".into());
+            m.content_type = Some("text/plain".into());
+            m.headers = vec![("x-a".into(), "b".into()), ("x-c".into(), "d".into())];
+            m.request_text = Some("alpha1234".into());
+            m.payload_text = Some("alpha1234".into());
+            m
+        };
+        for how in ["no engine", "redact", "full"] {
+            let before = LOADS.with(|n| n.get());
+            let mut m = msg();
+            match how {
+                "no engine" => mask_credentials(&mut m),
+                h => {
+                    let _ = engine.scan_message_with(&mut m, h == "redact");
+                }
+            }
+            assert_eq!(LOADS.with(|n| n.get()) - before, 1, "{how}");
+        }
+    }
+
+    /// Codex round 3: credential context the value masker could not
+    /// delimit. Each field must leave without its secret, with and without
+    /// the engine.
+    #[test]
+    fn test_credential_context_fields_leave_no_secret() {
+        use panopticon_common::Direction;
+        let long = format!("{}_password", "a".repeat(70));
+        let cases: Vec<(&str, String)> = vec![
+            ("json", r#"{"password":"canary-1"}"#.into()),
+            ("long name", format!("{long}=canary-2&q=1")),
+            ("double-encoded", "/x?%2570assword=canary-3".into()),
+            (
+                "array",
+                r#"{"access_tokens":["canary-4a","canary-4b"]}"#.into(),
+            ),
+            ("object", r#"{"password":{"value":"canary-5"}}"#.into()),
+            ("scheme-less authority", "//alice:canary-6@[::1]/db".into()),
+            (
+                "userinfo in a query value",
+                "/cb?next=alice:canary-7@db.internal".into(),
+            ),
+        ];
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut leaks = Vec::new();
+        for (what, text) in &cases {
+            for how in ["no engine", "redact", "full"] {
+                let mut m = L7Message::new(Protocol::Http1, Direction::Egress, 1);
+                m.path = Some(text.clone());
+                m.request_text = Some(text.clone());
+                match how {
+                    "no engine" => mask_credentials(&mut m),
+                    h => {
+                        let _ = engine.scan_message_with(&mut m, h == "redact");
+                    }
+                }
+                let all = format!("{:?} {:?}", m.path, m.request_text);
+                if all.contains("canary") {
+                    leaks.push(format!("{what} ({how}): {all}"));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+    }
+
+    #[test]
+    fn test_protocol_credentials_masked_when_redacting() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        // A Redis AUTH as a parser that did not mask it would emit it.
+        let auth = || {
+            let mut m = L7Message::new(Protocol::Redis, Direction::Ingress, 1);
+            m.method = Some("AUTH".into());
+            m.path = Some("alice".into());
+            m.request_text = Some("r3dis-s3cret".into());
+            m
+        };
+        let mut msg = auth();
+        let _ = engine.scan_message_with(&mut msg, true);
+        assert_eq!(msg.path.as_deref(), Some(REDACTED_CREDENTIAL));
+        assert_eq!(msg.request_text.as_deref(), Some(REDACTED_CREDENTIAL));
+
+        let mut msg = L7Message::new(Protocol::Mysql, Direction::Ingress, 1);
+        msg.payload_text = Some("CREATE USER bob IDENTIFIED BY 'sql-s3cret'".into());
+        msg.request_text = Some("requirepass r3dis-s3cret".into());
+        let _ = engine.scan_message_with(&mut msg, true);
+        let all = format!("{:?} {:?}", msg.payload_text, msg.request_text);
+        assert!(!all.contains("s3cret"), "{all}");
+
+        // full mode, redaction off: credentials still protected by default
+        // ([privacy] mask_credentials = true), PII left as captured.
+        let mut msg = auth();
+        msg.payload_text = Some("mail alice@example.com".into());
+        let _ = engine.scan_message_with(&mut msg, false);
+        assert_eq!(msg.request_text.as_deref(), Some(REDACTED_CREDENTIAL));
+        assert_eq!(msg.payload_text.as_deref(), Some("mail alice@example.com"));
+
+        // full mode with mask_credentials = false: exported as captured.
+        let raw = PiiEngine::new(
+            &PiiConfig {
+                mask_credentials: false,
+                ..PiiConfig::default()
+            },
+            &[],
+        );
+        let mut msg = auth();
+        let _ = raw.scan_message_with(&mut msg, false);
+        assert_eq!(msg.request_text.as_deref(), Some("r3dis-s3cret"));
+    }
+
+    /// A bare name is exported only from a field of its kind: an HTTP/1 or
+    /// HTTP/2 request path, a MySQL or PostgreSQL statement. The same text
+    /// in another protocol's field is withheld, in both masking paths.
+    #[test]
+    fn test_bare_names_only_in_their_field_kind() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let withheld = Some(crate::protocol::FIELD_WITHHELD);
+        let path = "/oauth/token";
+        let sql = "SELECT password, email FROM users";
+        for protocol in [
+            Protocol::Http1,
+            Protocol::Http2,
+            Protocol::Grpc,
+            Protocol::Redis,
+            Protocol::Mysql,
+            Protocol::Postgres,
+            Protocol::Kafka,
+            Protocol::Amqp,
+        ] {
+            let http = matches!(protocol, Protocol::Http1 | Protocol::Http2);
+            let db = matches!(protocol, Protocol::Mysql | Protocol::Postgres);
+            for engine_path in [false, true] {
+                let mut m = L7Message::new(protocol, Direction::Ingress, 1);
+                m.path = Some(path.into());
+                m.payload_text = Some(sql.into());
+                m.request_text = Some(sql.into());
+                if engine_path {
+                    let _ = engine.scan_message_with(&mut m, true);
+                } else {
+                    mask_credentials(&mut m);
+                }
+                let want_path = if http { Some(path) } else { withheld };
+                let want_sql = if db { Some(sql) } else { withheld };
+                assert_eq!(m.path.as_deref(), want_path, "{protocol:?}");
+                assert_eq!(m.payload_text.as_deref(), want_sql, "{protocol:?}");
+                assert_eq!(m.request_text.as_deref(), withheld, "{protocol:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_exported_field_is_scanned() {
+        use panopticon_common::Direction;
+        let engine = PiiEngine::new(&PiiConfig::default(), &[]);
+        let mut msg = L7Message::new(Protocol::Kafka, Direction::Ingress, 1);
+        msg.method = Some("/pkg.Svc/carol@example.com".into());
+        msg.content_type = Some("text/plain; owner=dave@example.com".into());
+        msg.headers = vec![
+            ("client_id".into(), "erin@example.com".into()),
+            ("frank@example.com".into(), "v".into()),
+        ];
+        let report = engine.scan_message_with(&mut msg, true).expect("PII found");
+        let all = format!("{:?} {:?} {:?}", msg.method, msg.content_type, msg.headers);
+        assert!(!all.contains("example.com"), "{all}");
+        assert_eq!(report.entities.len(), 4);
+    }
+
+    #[test]
+    fn test_percent_decode() {
+        assert_eq!(percent_decode("a%40b.com"), "a@b.com");
+        assert_eq!(percent_decode("x+y"), "x y");
+        assert_eq!(percent_decode("bad%zzescape%4"), "bad%zzescape%4");
+        assert_eq!(percent_decode("%"), "%");
+    }
+
     #[test]
     fn test_pii_engine_no_redact_when_disabled() {
-        let mut config = PiiConfig::default();
-        config.redact = false;
+        let config = PiiConfig {
+            redact: false,
+            ..PiiConfig::default()
+        };
         let engine = PiiEngine::new(&config, &[]);
         let report = engine.scan("ssn is 123-45-6789").unwrap();
         assert!(report.redacted_text.is_none());
@@ -412,12 +1457,37 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_copies_share_regexes_but_not_captured_state() {
+        let config = PiiConfig {
+            mode: PiiMode::External {
+                url: "http://pii.local/detect".to_string(),
+                sample_rate: 1.0,
+                timeout_ms: 100,
+            },
+            ..PiiConfig::default()
+        };
+        let engine = PiiEngine::new(&config, &[]);
+        let gate = crate::io_gate::IoGate::new();
+        let p = engine
+            .for_pipeline(gate, tracing::Dispatch::default())
+            .unwrap();
+        assert!(Arc::ptr_eq(&engine.regex, &p.regex));
+        assert!(!Arc::ptr_eq(&engine.sampler, &p.sampler));
+        assert!(!Arc::ptr_eq(
+            engine.external.as_ref().unwrap(),
+            p.external.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
     fn test_pii_engine_with_external_mode() {
-        let mut config = PiiConfig::default();
-        config.mode = PiiMode::External {
-            url: "http://localhost:8080/pii".to_string(),
-            sample_rate: 0.01,
-            timeout_ms: 5000,
+        let config = PiiConfig {
+            mode: PiiMode::External {
+                url: "http://localhost:8080/pii".to_string(),
+                sample_rate: 0.01,
+                timeout_ms: 5000,
+            },
+            ..PiiConfig::default()
         };
         let engine = PiiEngine::new(&config, &[]);
         assert!(engine.has_external());
@@ -425,11 +1495,13 @@ mod tests {
 
     #[test]
     fn test_pii_engine_external_rejects_invalid_url_without_allowlist() {
-        let mut config = PiiConfig::default();
-        config.mode = PiiMode::External {
-            url: "not a valid url".to_string(),
-            sample_rate: 0.01,
-            timeout_ms: 5000,
+        let config = PiiConfig {
+            mode: PiiMode::External {
+                url: "not a valid url".to_string(),
+                sample_rate: 0.01,
+                timeout_ms: 5000,
+            },
+            ..PiiConfig::default()
         };
         let engine = PiiEngine::new(&config, &[]);
         assert!(!engine.has_external());

@@ -1,0 +1,177 @@
+"""Ground-truth HTTP/1.1 traffic generator for scoring the agent.
+
+Runs a local HTTP/1.1 server and a client that issues a seeded random mix of
+requests over keep-alive connections: small/large Content-Length bodies,
+chunked responses, POST bodies, 204/404. Every exchange the client actually
+completed is written to truth.jsonl — the oracle the agent's JSONL export is
+scored against (score.py).
+
+TLS=1 serves and connects over TLS (server needs TLS_CERT / TLS_KEY; the
+client does not verify), which exercises the agent's OpenSSL uprobes instead
+of packet capture.
+"""
+import http.client
+import json
+import os
+import random
+import ssl
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18090
+# MODE=both (default) | server | client; HOST is the bind/connect address.
+MODE = os.environ.get("MODE", "both")
+HOST = os.environ.get("HOST", "127.0.0.1")
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
+OUT = sys.argv[3] if len(sys.argv) > 3 else "truth.jsonl"
+SEED = int(os.environ.get("SEED", "1234"))
+TLS = os.environ.get("TLS") == "1"
+# PLANT=<tag> (run_modes.sh): body PII derived from <tag>, plus unique PII in
+# every request's query string, an X-Contact header and a Content-Type
+# parameter, so several runs can share one agent without colliding. It also
+# plants credentials that must never reach a redacted sink ("secrets"): an
+# X-Vault-Token and a JWT after "access_token=" and 100 spaces (whose tail an
+# overlapping ApiKey match once left exposed). SSN_AREA sets the SSNs' first
+# group.
+PLANT = os.environ.get("PLANT", "")
+SSN_AREA = os.environ.get("SSN_AREA", "123")
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _body(self, n):
+        return (b"x" * n)
+
+    def do_GET(self):
+        parts = self.path.split("?")[0].strip("/").split("/")
+        kind = parts[0]
+        n = int(parts[1]) if len(parts) > 1 else 0
+        if kind == "len":
+            b = self._body(n)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif kind == "chunked":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            left = n
+            while left > 0:
+                c = min(left, 700)
+                self.wfile.write(b"%x\r\n" % c + self._body(c) + b"\r\n")
+                left -= c
+            self.wfile.write(b"0\r\n\r\n")
+        elif kind == "empty":
+            self.send_response(204)
+            self.end_headers()
+        else:
+            b = b"not found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(n)
+        b = b'{"ok":true}'
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+
+def make_server():
+    srv = ThreadingHTTPServer((HOST, PORT), H)
+    if TLS:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(os.environ["TLS_CERT"], os.environ["TLS_KEY"])
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    return srv
+
+
+def connect():
+    if not TLS:
+        return http.client.HTTPConnection(HOST, PORT)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return http.client.HTTPSConnection(HOST, PORT, context=ctx)
+
+
+def main():
+    if MODE == "server":
+        make_server().serve_forever()
+        return
+    srv = None
+    if MODE == "both":
+        srv = make_server()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    rnd = random.Random(SEED)
+    out = open(OUT, "w")
+    conn = None
+    conn_no, pos = -1, 0
+    for i in range(N):
+        if conn is None or rnd.random() < 0.15:  # new connection sometimes
+            if conn:
+                conn.close()
+            conn = connect()
+            conn_no, pos = conn_no + 1, 0
+        else:
+            pos += 1
+        r = rnd.random()
+        tag = f"q{i}"
+        headers, query_pii, header_pii, secrets = {}, [], [], []
+        if r < 0.35:
+            n = rnd.choice([0, 10, 500, 1400, 3000, 9000, 70000])
+            method, path, body = "GET", f"/len/{n}?id={tag}", None
+        elif r < 0.55:
+            n = rnd.choice([100, 2000, 12000])
+            method, path, body = "GET", f"/chunked/{n}?id={tag}", None
+        elif r < 0.75:
+            n = rnd.choice([5, 800, 5000])
+            # JSON body carrying PII, padded to roughly n bytes.
+            email, ssn = f"user{i}@example.com", f"123-45-{i % 10000:04d}"
+            if PLANT:  # unique per tag; serial 0000 is not a valid SSN
+                email, ssn = f"{PLANT}b{i}@example.com", f"{SSN_AREA}-45-{1000 + i % 9000}"
+            body = json.dumps({"email": email, "ssn": ssn, "note": "p" * n}).encode()
+            method, path = "POST", f"/submit?id={tag}"
+        elif r < 0.85:
+            method, path, body = "GET", f"/empty?id={tag}", None
+        else:
+            method, path, body = "GET", f"/missing?id={tag}", None
+        if PLANT:
+            query_pii, header_pii = [f"{PLANT}q{i}@example.org"], [f"{PLANT}h{i}@example.net"]
+            path += f"&contact={query_pii[0]}"
+            headers["X-Contact"] = header_pii[0]
+            header_pii.append(f"{PLANT}c{i}@example.net")
+            headers["Content-Type"] = f"application/json; owner={header_pii[1]}"
+            vault = f"hvs.{PLANT}vault{i}tokenAAAAAAAAAAAA"
+            jwt_tail = f"eyJzdWIiOi{PLANT}j{i}In0.sig{PLANT}x{i}"
+            secrets = [vault, jwt_tail]
+            headers["X-Vault-Token"] = vault
+            headers["X-Note"] = "access_token=" + " " * 100 + "eyJhbGciOiJIUzI1NiJ9." + jwt_tail
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        body_pii = [email, ssn] if method == "POST" else []
+        out.write(json.dumps({"id": tag, "method": method, "path": path, "body_pii": body_pii,
+                              "query_pii": query_pii, "header_pii": header_pii, "secrets": secrets,
+                              "status": resp.status, "response_size": len(data),
+                              "conn": conn_no, "pos": pos}) + "\n")
+    out.close()
+    if srv:
+        srv.shutdown()
+
+
+if __name__ == "__main__":
+    main()

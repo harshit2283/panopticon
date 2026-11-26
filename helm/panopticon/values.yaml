@@ -1,31 +1,68 @@
 # Default values for panopticon.
 
 image:
-  repository: panopticon
-  tag: "0.1.0"
+  repository: ghcr.io/harshit2283/panopticon
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  # Pin by digest for reproducible rollouts (overrides tag), e.g. "sha256:abc...".
+  digest: ""
   pullPolicy: IfNotPresent
 
+nameOverride: ""
+fullnameOverride: ""
+
 agent:
-  # Network interfaces to attach TC classifiers to
-  interfaces:
-    - eth0
-  # Log raw events to stdout
+  # Capture attaches to the host's cgroup v2 root (mounted from
+  # /sys/fs/cgroup) and sees every local socket; select what is captured
+  # with pid_filter, cgroup_filter or [[pod_filter]] in agent.config
+  # (docs/USER-GUIDE.md §4). The TC backend and its `interfaces` list were
+  # removed; setting agent.interfaces fails the render.
+  # Log level (RUST_LOG filter).
+  logLevel: info
+  # Log every captured event to stdout (very verbose; development only).
   logEvents: false
-  # Path to write JSON event export (empty = disabled)
-  jsonExportPath: ""
-  # Inline TOML config (rendered into a ConfigMap).
-  # Set to a raw TOML string, e.g.:
+  # Inline TOML config file (see panopticon-agent/src/config.rs for the schema).
+  # Example:
   #   config: |
+  #     max_events_per_sec = 200000
   #     [pii]
-  #     mode = "regex"
-  #     [export]
-  #     json_path = "/var/log/panopticon/events.json"
-  # Leave as empty string or false to disable ConfigMap creation.
+  #     min_confidence = 0.8
   config: ""
-  # PII detection mode: regex | in-agent | external
-  piiMode: "regex"
-  # Address for metrics/health HTTP server
-  metricsBind: "0.0.0.0:9090"
+
+# What captured data may leave the node (docs/USER-GUIDE.md §5.1):
+#   full          unredacted event export and the raw dump allowed (decrypted TLS!)
+#   redacted      PII values masked in every export (default)
+#   metrics_only  metrics, service map and PII audit (type and count) only;
+#                 export.jsonEvents is then skipped
+# Passed as --privacy-mode, so it overrides `[privacy] mode` in agent.config.
+privacy:
+  mode: redacted
+
+metrics:
+  # Port for /healthz, /readyz, /metrics. 9435 avoids the common clash with a
+  # host-network Prometheus or node-exporter on 9090/9100.
+  port: 9435
+  # Bind address. Default: the pod IP, which with hostNetwork is the node IP —
+  # reachable by Prometheus and the kubelet, but not every host interface.
+  # Set to "0.0.0.0" to listen on all interfaces.
+  bindAddress: "$(POD_IP)"
+  serviceMonitor:
+    # Create a prometheus-operator ServiceMonitor.
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# Exported data (JSONL events, PII audit log) on the host. Treat as sensitive.
+export:
+  # Host directory mounted at /var/lib/panopticon; empty disables file export.
+  hostPath: ""
+  jsonEvents: true
+  piiAuditLog: true
+  # Write every captured payload UNREDACTED, decrypted TLS included, to
+  # <hostPath>/raw.pncap (decode with `panopticon-agent --privacy-mode full --decode-capture`, add
+  # `--pcap out.pcap` for Wireshark). Needs privacy.mode=full. Off by default.
+  # Size cap: `capture_raw_max_bytes` in agent.config (default 1 GiB).
+  rawCapture: false
 
 resources:
   requests:
@@ -35,26 +72,53 @@ resources:
     cpu: "1"
     memory: 512Mi
 
+# Loading eBPF and attaching uprobes into other containers needs broad kernel
+# privileges. `privileged: true` is the compatible default. On kernels >= 5.8
+# you can instead drop privileged and grant only:
+#   capabilities: { add: [BPF, PERFMON, NET_ADMIN, SYS_PTRACE, SYS_RESOURCE, SYS_ADMIN] }
+#   seccompProfile: { type: Unconfined }
+#   appArmorProfile: { type: Unconfined }
+securityContext:
+  privileged: true
+
 tolerations:
   - operator: Exists
 
 nodeSelector: {}
 
-priorityClassName: system-node-critical
+affinity: {}
+
+# "system-node-critical" is only admitted in kube-system (unless a
+# ResourceQuota allows it elsewhere); set it when installing there.
+priorityClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# Kubernetes-aware identity: the agent lists and watches Pods and Services
+# cluster-wide so the service graph and exports name endpoints
+# `namespace/workload` (e.g. `payments/checkout`) instead of IPs. Enabling it
+# grants get/list/watch on pods and services (ClusterRole, when rbac.create)
+# and mounts the service account token. Disabled: no API access, no token,
+# endpoints keep DNS/IP names. Tune it with a [kubernetes] section in
+# agent.config (relist_interval_secs, watch).
+kubernetes:
+  enabled: true
 
 serviceAccount:
   create: true
-  name: panopticon
+  name: ""
   annotations: {}
+  # Mount the service account token even when kubernetes.enabled is false
+  # (the token is always mounted when it is true).
+  automountToken: false
 
 rbac:
   create: true
-
-mapPinPath: "/sys/fs/bpf/panopticon"
-
-onnx:
-  enabled: false
-  modelPath: /opt/panopticon/models/distilbert-ner
 
 imagePullSecrets: []
 
