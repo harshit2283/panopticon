@@ -8,7 +8,7 @@
 use super::{Direction, Protocol};
 
 /// HTTP/2 connection preface (24 bytes), sent by client.
-const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(crate) const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Detect the application-layer protocol from packet payload and port hints.
 ///
@@ -73,6 +73,89 @@ pub fn detect_protocol(
         }
     }
     None
+}
+
+/// [`detect_protocol`] for the first record of a TLS key: never DNS. DNS
+/// over TLS (port 853) is not decoded, and the port-53 fallback would
+/// otherwise read a TLS key's learned port as DNS and parse whatever its
+/// plaintext holds (dns.rs module docs).
+pub fn detect_tls_protocol(
+    payload: &[u8],
+    src_port: u16,
+    dst_port: u16,
+    direction: Direction,
+) -> Option<Protocol> {
+    detect_protocol(payload, src_port, dst_port, direction).filter(|&p| p != Protocol::Dns)
+}
+
+/// Whether the payload that triggered detection was sent by the *client*
+/// (`Some(true)`), by the *server* (`Some(false)`), or cannot tell (`None`).
+///
+/// Capture direction says nothing about role: at the server's socket,
+/// requests arrive on ingress and responses leave on egress — the opposite of
+/// the client's socket. Parsers expect `Egress` = client→server, so the caller
+/// uses this to pin which endpoint is the server.
+pub fn sent_by_client(protocol: Protocol, payload: &[u8]) -> Option<bool> {
+    match protocol {
+        Protocol::Http1 if is_http1_request(payload) => Some(true),
+        Protocol::Http1 if is_http1_response(payload) => Some(false),
+        Protocol::Http2 | Protocol::Grpc if payload.starts_with(HTTP2_PREFACE) => Some(true),
+        // MySQL is server-first: detection keys on the server greeting.
+        Protocol::Mysql if payload.len() >= 5 && payload[3] == 0x00 && payload[4] == 0x0a => {
+            Some(false)
+        }
+        Protocol::Postgres if payload.len() >= 8 => {
+            let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            if code == 80877103 || code == 196608 {
+                Some(true) // SSLRequest / StartupMessage
+            } else if matches!(
+                payload[0],
+                b'R' | b'K' | b'Z' | b'T' | b'D' | b'C' | b'E' | b'N' | b'S'
+            ) {
+                Some(false) // backend message
+            } else {
+                None
+            }
+        }
+        // Clients send commands as RESP arrays; servers reply with scalars.
+        Protocol::Redis if payload.first() == Some(&b'*') => Some(true),
+        Protocol::Redis if matches!(payload.first(), Some(b'+' | b'-' | b':' | b'$')) => {
+            Some(false)
+        }
+        Protocol::Amqp if payload.starts_with(b"AMQP") => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether `payload` starts with an HTTP/2 *server* connection preface: a
+/// SETTINGS frame (not an ACK) on stream 0 whose payload is whole settings
+/// (RFC 9113 §3.4, §6.5) and is all in `payload`. A server may send it
+/// before the client's preface arrives (grpc-go and grpc C-core write it on
+/// accept). Only meaningful as the first byte of a stream: the caller
+/// proves that (event_loop.rs `detect_event`); anywhere else these nine
+/// bytes can be any data.
+pub fn is_http2_server_preface(payload: &[u8]) -> bool {
+    const SETTINGS: u8 = 0x4;
+    /// More settings than RFC 9113 defines plus extensions in use.
+    const MAX_SETTINGS: usize = 32;
+    let Some(h) = payload.get(..9) else {
+        return false;
+    };
+    let len = (h[0] as usize) << 16 | (h[1] as usize) << 8 | h[2] as usize;
+    h[3] == SETTINGS
+        && h[4] == 0
+        && h[5..9] == [0; 4]
+        && len.is_multiple_of(6)
+        && len <= 6 * MAX_SETTINGS
+        && payload.len() >= 9 + len
+}
+
+/// Well-known service ports used by the port-based detection fallback.
+pub fn is_service_port(port: u16) -> bool {
+    matches!(
+        port,
+        3306 | 5432 | 6379 | 50051 | 80 | 8080 | 8000 | 443 | 8443 | 53 | 9092 | 5672
+    )
 }
 
 /// Check for HTTP/1.x request method prefixes.
@@ -164,6 +247,32 @@ mod tests {
             detect_protocol(preface, 54321, 8080, Direction::Egress),
             Some(Protocol::Http2)
         );
+    }
+
+    /// A server's SETTINGS frame, whole in the payload; not an ACK, not
+    /// on a stream, not part settings, not cut.
+    #[test]
+    fn http2_server_preface_shape() {
+        // grpc C-core's first write (lab capture): SETTINGS + WINDOW_UPDATE.
+        let grpc = b"\x00\x00\x18\x04\x00\x00\x00\x00\x00\
+            \x00\x04\x00\x40\x00\x00\x00\x05\x00\x40\x00\x00\x00\x06\x00\x00\x40\x00\
+            \xfe\x03\x00\x00\x00\x01\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x3f\x00\x01";
+        assert!(is_http2_server_preface(grpc));
+        assert!(is_http2_server_preface(
+            b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+        ));
+        for bad in [
+            &b"\x00\x00\x00\x04\x01\x00\x00\x00\x00"[..], // ACK
+            b"\x00\x00\x00\x04\x00\x00\x00\x00\x01",      // stream 1
+            b"\x00\x00\x05\x04\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00", // 5 bytes
+            b"\x00\x00\x06\x04\x00\x00\x00\x00\x00\x00\x03", // cut
+            b"\x00\x00\x00\x01\x04\x00\x00\x00\x01",      // HEADERS
+            b"\x00\x00\x00\x04\x00\x00\x00",              // short
+        ] {
+            assert!(!is_http2_server_preface(bad), "{bad:?}");
+        }
+        // Not detected by content alone: the caller proves a stream start.
+        assert_eq!(detect_protocol(grpc, 9443, 55840, Direction::Egress), None);
     }
 
     // ── HTTP/1.x ─────────────────────────────────────────────────────
@@ -346,5 +455,22 @@ mod tests {
     #[test]
     fn test_detect_empty_payload() {
         assert_eq!(detect_protocol(&[], 54321, 80, Direction::Egress), None);
+    }
+
+    /// Codex R12 #1: a TLS key on port 53 is never DNS; other port
+    /// fallbacks are unchanged.
+    #[test]
+    fn test_tls_key_is_never_dns() {
+        let p = b"\x00\x1d\x12\x34\x01\x00";
+        assert_eq!(
+            detect_protocol(p, 40000, 53, Direction::Egress),
+            Some(Protocol::Dns)
+        );
+        assert_eq!(detect_tls_protocol(p, 40000, 53, Direction::Egress), None);
+        assert_eq!(detect_tls_protocol(p, 53, 40000, Direction::Ingress), None);
+        assert_eq!(
+            detect_tls_protocol(p, 40000, 6379, Direction::Egress),
+            Some(Protocol::Redis)
+        );
     }
 }

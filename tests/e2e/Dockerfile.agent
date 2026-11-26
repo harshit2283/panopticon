@@ -1,5 +1,5 @@
 ARG RUST_VERSION=1.93-bookworm
-ARG BPF_LINKER_VERSION=0.10.2
+ARG BPF_LINKER_VERSION=0.10.3
 
 FROM rust:${RUST_VERSION} as builder
 ARG BPF_LINKER_VERSION
@@ -33,4 +33,4 @@ RUN if [ "$INCLUDE_MODEL" = "true" ] && [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/
 ENV PANOPTICON_MODEL_PATH=/opt/panopticon/models/distilbert-ner
 
 ENTRYPOINT ["panopticon-agent"]
-CMD ["--interface", "eth0", "--log-events"]
+CMD ["--log-events"]

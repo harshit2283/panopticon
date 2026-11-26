@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! Append-only audit log for PII events.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::io_gate::{IoGate, RecordFile};
 use crate::pii::{PiiCategory, PiiSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23,41 +23,68 @@ pub struct AuditEntry {
     pub source: PiiSource,
     pub confidence: f32,
     pub action: AuditAction,
+    /// The server end, named like the service graph names it.
     pub service_identity: String,
+    /// The server end's `ip:port`, always: a name taken from DNS answers
+    /// seen in the traffic is only as good as those answers.
+    #[serde(default)]
+    pub service_addr: String,
 }
 
+/// One capture pipeline's writer of the audit log: whole lines, straight
+/// to the shared file under the pipeline's gate. Nothing is kept for a
+/// later flush: a refused or failed write drops its lines.
+#[derive(Clone)]
 pub struct PiiAuditLog {
-    writer: BufWriter<File>,
+    file: Arc<RecordFile>,
+    gate: Arc<IoGate>,
 }
 
 impl PiiAuditLog {
-    pub fn new(path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("Failed to open PII audit log file: {}", path))?;
-
-        Ok(Self {
-            writer: BufWriter::new(file),
-        })
+    /// Open the audit log file, appending, owner-only (0600) like the JSON
+    /// export: findings name services and PII categories.
+    pub fn open(path: &str) -> Result<Arc<RecordFile>> {
+        RecordFile::create(path, b"", u64::MAX, true).context("PII audit log file")
     }
 
-    pub fn emit(&mut self, entries: &[AuditEntry]) -> Result<()> {
+    /// A writer on its own open gate (tests).
+    pub fn new(path: &str) -> Result<Self> {
+        Ok(Self::on(Self::open(path)?, IoGate::new()))
+    }
+
+    pub fn on(file: Arc<RecordFile>, gate: Arc<IoGate>) -> Self {
+        Self { file, gate }
+    }
+
+    pub fn emit(&self, entries: &[AuditEntry]) -> Result<()> {
+        let mut buf = Vec::with_capacity(entries.len() * 160);
         for entry in entries {
             // TODO: HMAC signing for tamper detection
-            serde_json::to_writer(&mut self.writer, entry)
-                .context("Failed to serialize audit entry")?;
-            self.writer.write_all(b"\n")?;
+            serde_json::to_writer(&mut buf, entry).context("Failed to serialize audit entry")?;
+            buf.push(b'\n');
         }
-        self.writer.flush()?;
-        Ok(())
+        self.file
+            .write(&self.gate, &buf)
+            .map_err(|e| anyhow::anyhow!("audit log write refused: {e:?}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join("panopticon_test_audit_mode.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _log = PiiAuditLog::new(path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn test_audit_log_append_only() {
@@ -66,7 +93,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         {
-            let mut log1 = PiiAuditLog::new(path_str).unwrap();
+            let log1 = PiiAuditLog::new(path_str).unwrap();
             log1.emit(&[AuditEntry {
                 timestamp_ns: 1000,
                 category: PiiCategory::Email,
@@ -74,12 +101,13 @@ mod tests {
                 confidence: 1.0,
                 action: AuditAction::Redacted,
                 service_identity: "unknown".to_string(),
+                service_addr: "unknown".to_string(),
             }])
             .unwrap();
         }
 
         {
-            let mut log2 = PiiAuditLog::new(path_str).unwrap();
+            let log2 = PiiAuditLog::new(path_str).unwrap();
             log2.emit(&[AuditEntry {
                 timestamp_ns: 2000,
                 category: PiiCategory::Ssn,
@@ -87,6 +115,7 @@ mod tests {
                 confidence: 0.9,
                 action: AuditAction::Detected,
                 service_identity: "unknown".to_string(),
+                service_addr: "unknown".to_string(),
             }])
             .unwrap();
         }

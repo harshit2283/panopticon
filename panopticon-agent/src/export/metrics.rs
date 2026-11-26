@@ -8,12 +8,14 @@
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 
 use crate::event_loop::EventStats;
+use panopticon_common::scope::SCOPE_DROP_NAMES;
 
 /// Agent metrics backed by prometheus-client.
 ///
@@ -29,6 +31,32 @@ pub struct AgentMetrics {
     pub drops_channel_full: Counter<u64>,
     pub drops_parser_error: Counter<u64>,
     pub pii_detections: Counter<u64>,
+    pub truncated_events: Counter<u64>,
+    pub raw_capture_dropped: Counter<u64>,
+    pub kernel_drops: Counter<u64>,
+    pub drops_export_full: Counter<u64>,
+    pub worker_panics: Counter<u64>,
+    pub tcp_segments_ignored: Counter<u64>,
+    pub tcp_reorder_held: Counter<u64>,
+    pub tcp_reorder_gaps: Counter<u64>,
+    /// `raise_packet_cap` (conn_cap.rs): connections raised, packets that
+    /// used the raised cap, packets still cut at it, records cut before the
+    /// raise was written, and failed raises.
+    pub conn_cap_raised: Counter<u64>,
+    pub conn_cap_packets: Counter<u64>,
+    pub conn_cap_cut: Counter<u64>,
+    pub conn_cap_truncated_before_raise: Counter<u64>,
+    pub conn_cap_write_failed: Counter<u64>,
+    /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
+    pub credential_matches_user: Counter<u64>,
+    pub credential_matches_builtin: Counter<u64>,
+    /// `panopticon_pod_filter_unresolved_total{reason}`, one per
+    /// `scope_select::POD_UNRESOLVED_REASONS` entry in that order.
+    pub pod_unresolved: Vec<Counter<u64>>,
+    /// Kernel scope drops ([`Self::register_scope_drops`]), one per
+    /// `SCOPE_DROP_NAMES` entry in that order; empty until registered.
+    pub scope_drops: Vec<Counter<u64>>,
+    pub drops_stale_scope_gen: Option<Counter<u64>>,
     // Self-telemetry (6.6)
     pub parse_latency: Histogram,
     // eBPF map monitoring (6.8)
@@ -82,6 +110,52 @@ impl AgentMetrics {
             drops_channel_full.clone(),
         );
 
+        let kernel_drops = Counter::<u64>::default();
+        registry.register(
+            "panopticon_kernel_ringbuf_drops",
+            "Events lost in the kernel because the ring buffer was full (agent not keeping up)",
+            kernel_drops.clone(),
+        );
+
+        let drops_export_full = Counter::<u64>::default();
+        registry.register(
+            "panopticon_drops_export_full",
+            "Parsed exchanges not written because the JSON exporter was behind",
+            drops_export_full.clone(),
+        );
+
+        let worker_panics = Counter::<u64>::default();
+        registry.register(
+            "panopticon_worker_panics",
+            "Parser or PII steps that panicked on captured data and were skipped; \
+             the worker keeps running. Any increase is a bug worth reporting",
+            worker_panics.clone(),
+        );
+
+        let tcp_segments_ignored = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_segments_ignored",
+            "TCP segments not parsed: retransmissions of bytes already parsed, or \
+             outside the connection's sequence window (forged segments, stale RST / FIN)",
+            tcp_segments_ignored.clone(),
+        );
+
+        let tcp_reorder_held = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_reorder_held",
+            "TCP records held briefly because their bytes arrived ahead of the next \
+             expected byte (chunks of two packets interleaved)",
+            tcp_reorder_held.clone(),
+        );
+
+        let tcp_reorder_gaps = Counter::<u64>::default();
+        registry.register(
+            "panopticon_tcp_reorder_gaps",
+            "TCP records that went on with a hole before them still open (reorder \
+             window time or space bound reached): a gap for the parser",
+            tcp_reorder_gaps.clone(),
+        );
+
         let drops_parser_error = Counter::<u64>::default();
         registry.register(
             "panopticon_drops_parser_error",
@@ -96,6 +170,53 @@ impl AgentMetrics {
             pii_detections.clone(),
         );
 
+        let truncated_events = Counter::<u64>::default();
+        registry.register(
+            "panopticon_capture_truncated",
+            "Events whose payload exceeded the capture cap (parsers skip the gap)",
+            truncated_events.clone(),
+        );
+
+        let conn_cap = |registry: &mut Registry, name: &str, help: &str| {
+            let c = Counter::<u64>::default();
+            registry.register(name, help, c.clone());
+            c
+        };
+        let conn_cap_raised = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_raised_connections",
+            "TCP connections whose packet cap was raised to 64 KiB (raise_packet_cap: \
+             a protocol whose parser loses frame sync on a cut packet)",
+        );
+        let conn_cap_packets = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_raised_packets",
+            "Packets over max_packet_bytes captured past it on raised connections",
+        );
+        let conn_cap_cut = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_cut_packets",
+            "Packets of raised connections still cut, at the raised 64 KiB cap",
+        );
+        let conn_cap_truncated_before_raise = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_truncated_before_raise",
+            "Records of raised connections cut at max_packet_bytes because the kernel \
+             sent them before the raise was written",
+        );
+        let conn_cap_write_failed = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_write_failures",
+            "Raises the kernel map refused (the connection stays at max_packet_bytes)",
+        );
+
+        let raw_capture_dropped = Counter::<u64>::default();
+        registry.register(
+            "panopticon_raw_capture_dropped",
+            "Events not written to the raw capture file because its writer fell behind",
+            raw_capture_dropped.clone(),
+        );
+
         // Parse latency histogram with buckets from 1µs to 100ms
         let parse_latency = Histogram::new(exponential_buckets(0.000_001, 10.0, 6));
         registry.register(
@@ -107,9 +228,39 @@ impl AgentMetrics {
         let ringbuf_approx_pending: Gauge<i64, std::sync::atomic::AtomicI64> = Gauge::default();
         registry.register(
             "panopticon_ringbuf_approx_pending",
-            "Approximate pending events in RingBuf (received - processed)",
+            "Approximate events queued to workers but not yet processed",
             ringbuf_approx_pending.clone(),
         );
+
+        let credential_matches =
+            Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_credential_matches",
+            "Credentials protected: user-pattern matches replaced (source=user), fields the \
+             built-in rules masked or withheld (source=builtin). Never values.",
+            credential_matches.clone(),
+        );
+        let credential_matches_user = credential_matches
+            .get_or_create(&[("source", "user")])
+            .clone();
+        let credential_matches_builtin = credential_matches
+            .get_or_create(&[("source", "builtin")])
+            .clone();
+
+        let unresolved = Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_pod_filter_unresolved",
+            "Resolutions of a pod pod_filter selected that left it uncaptured: no cgroup \
+             directory in the kubepods roots searched (not_found), several (ambiguous), or one \
+             that could not be used (unusable). Every resolution counts: the selected pods are \
+             resolved again on each pod change, so a pod that stays unresolved (Pending) keeps \
+             adding",
+            unresolved.clone(),
+        );
+        let pod_unresolved = crate::scope_select::POD_UNRESOLVED_REASONS
+            .iter()
+            .map(|r| unresolved.get_or_create(&[("reason", *r)]).clone())
+            .collect();
 
         let metrics = Self {
             events_received,
@@ -120,11 +271,53 @@ impl AgentMetrics {
             drops_channel_full,
             drops_parser_error,
             pii_detections,
+            truncated_events,
+            raw_capture_dropped,
+            kernel_drops,
+            drops_export_full,
+            worker_panics,
+            tcp_segments_ignored,
+            tcp_reorder_held,
+            tcp_reorder_gaps,
+            conn_cap_raised,
+            conn_cap_packets,
+            conn_cap_cut,
+            conn_cap_truncated_before_raise,
+            conn_cap_write_failed,
+            credential_matches_user,
+            credential_matches_builtin,
+            pod_unresolved,
+            scope_drops: Vec::new(),
+            drops_stale_scope_gen: None,
             parse_latency,
             ringbuf_approx_pending,
         };
 
         (metrics, registry)
+    }
+
+    /// Register the capture-scope counters:
+    /// `panopticon_scope_dropped_events_total{reason}` (the kernel's
+    /// `SCOPE_DROPS`, labels only from the fixed `SCOPE_DROP_NAMES`) and
+    /// `panopticon_drops_stale_scope_gen_total` (the ring readers' floor).
+    pub fn register_scope_drops(&mut self, registry: &mut Registry) {
+        let family = Family::<[(&'static str, &'static str); 1], Counter<u64>>::default();
+        registry.register(
+            "panopticon_scope_dropped_events",
+            "Events the kernel did not capture because of the capture scope, by reason",
+            family.clone(),
+        );
+        self.scope_drops = SCOPE_DROP_NAMES
+            .iter()
+            .map(|&reason| family.get_or_create(&[("reason", reason)]).clone())
+            .collect();
+        let stale = Counter::<u64>::default();
+        registry.register(
+            "panopticon_drops_stale_scope_gen",
+            "Events dropped at the ring read: computed under a scope a narrowing revoked",
+            stale.clone(),
+        );
+        self.drops_stale_scope_gen = Some(stale);
     }
 
     /// Snapshot current values from `EventStats` atomics into prometheus metrics.
@@ -170,8 +363,80 @@ impl AgentMetrics {
             .inner()
             .store(parser, Ordering::Relaxed);
 
-        // Approximate RingBuf pending = received - processed
-        let pending = received.saturating_sub(processed) as i64;
+        let pii = stats.pii_detections.load(Ordering::Relaxed);
+        self.pii_detections.inner().store(pii, Ordering::Relaxed);
+        let truncated = stats.truncated_events.load(Ordering::Relaxed);
+        self.truncated_events
+            .inner()
+            .store(truncated, Ordering::Relaxed);
+
+        self.kernel_drops.inner().store(
+            stats.kernel_drops.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.drops_export_full.inner().store(
+            stats.drops_export_full.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.worker_panics.inner().store(
+            stats.worker_panics.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_segments_ignored.inner().store(
+            stats.tcp_segments_ignored.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_reorder_held.inner().store(
+            stats.tcp_reorder_held.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.tcp_reorder_gaps.inner().store(
+            stats.tcp_reorder_gaps.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        for (counter, value) in [
+            (&self.conn_cap_raised, &stats.conn_cap_raised),
+            (&self.conn_cap_packets, &stats.conn_cap_packets),
+            (&self.conn_cap_cut, &stats.conn_cap_cut),
+            (
+                &self.conn_cap_truncated_before_raise,
+                &stats.conn_cap_truncated_before_raise,
+            ),
+            (&self.conn_cap_write_failed, &stats.conn_cap_write_failed),
+        ] {
+            counter
+                .inner()
+                .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        let (user, builtin) = crate::protocol::credential_matches();
+        self.credential_matches_user
+            .inner()
+            .store(user, Ordering::Relaxed);
+        self.credential_matches_builtin
+            .inner()
+            .store(builtin, Ordering::Relaxed);
+        for (counter, value) in self
+            .pod_unresolved
+            .iter()
+            .zip(crate::scope_select::pod_unresolved())
+        {
+            counter.inner().store(value, Ordering::Relaxed);
+        }
+        for (counter, value) in self.scope_drops.iter().zip(&stats.scope_drops) {
+            counter
+                .inner()
+                .store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        if let Some(stale) = &self.drops_stale_scope_gen {
+            stale.inner().store(
+                stats.drops_stale_scope_gen.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+
+        // Approximate queued-but-unprocessed events (dropped ones are gone,
+        // not pending)
+        let pending = received.saturating_sub(processed).saturating_sub(dropped) as i64;
         self.ringbuf_approx_pending
             .inner()
             .store(pending, Ordering::Relaxed);
@@ -200,6 +465,31 @@ mod tests {
         assert_eq!(metrics.drops_channel_full.get(), 0);
         assert_eq!(metrics.drops_parser_error.get(), 0);
         assert_eq!(metrics.pii_detections.get(), 0);
+    }
+
+    #[test]
+    fn conn_cap_counters_are_exported() {
+        use std::sync::atomic::Ordering;
+        let (metrics, registry) = AgentMetrics::new();
+        let stats = crate::event_loop::EventStats::new();
+        stats.conn_cap_raised.store(3, Ordering::Relaxed);
+        stats.conn_cap_packets.store(40, Ordering::Relaxed);
+        stats.conn_cap_cut.store(1, Ordering::Relaxed);
+        stats
+            .conn_cap_truncated_before_raise
+            .store(2, Ordering::Relaxed);
+        stats.conn_cap_write_failed.store(5, Ordering::Relaxed);
+        metrics.sync_from_stats(&stats);
+        let out = encode_metrics(&registry);
+        for line in [
+            "panopticon_conn_cap_raised_connections_total 3",
+            "panopticon_conn_cap_raised_packets_total 40",
+            "panopticon_conn_cap_cut_packets_total 1",
+            "panopticon_conn_cap_truncated_before_raise_total 2",
+            "panopticon_conn_cap_write_failures_total 5",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in\n{out}");
+        }
     }
 
     #[test]
@@ -241,9 +531,21 @@ mod tests {
         stats
             .active_connections
             .fetch_add(11, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .kernel_drops
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .drops_export_full
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .worker_panics
+            .store(2, std::sync::atomic::Ordering::Relaxed);
 
         metrics.sync_from_stats(&stats);
+        assert_eq!(metrics.worker_panics.get(), 2);
 
+        assert_eq!(metrics.kernel_drops.get(), 5);
+        assert_eq!(metrics.drops_export_full.get(), 4);
         assert_eq!(metrics.events_received.get(), 100);
         assert_eq!(metrics.events_processed.get(), 90);
         assert_eq!(metrics.events_dropped.get(), 10);
@@ -251,7 +553,8 @@ mod tests {
         assert_eq!(metrics.drops_channel_full.get(), 3);
         assert_eq!(metrics.drops_parser_error.get(), 2);
         assert_eq!(metrics.active_connections.get(), 11);
-        assert_eq!(metrics.ringbuf_approx_pending.get(), 10);
+        // 100 received = 90 processed + 10 dropped: nothing is pending.
+        assert_eq!(metrics.ringbuf_approx_pending.get(), 0);
     }
 
     #[test]
@@ -279,6 +582,46 @@ mod tests {
         assert_eq!(metrics.events_received.get(), 31);
         assert_eq!(metrics.events_processed.get(), 22);
         assert_eq!(metrics.ringbuf_approx_pending.get(), 9);
+    }
+
+    #[test]
+    fn scope_drops_only_on_cgroup_skb_with_the_fixed_labels() {
+        let stats = EventStats::new();
+        for (i, c) in stats.scope_drops.iter().enumerate() {
+            c.store(10 + i as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        stats
+            .drops_stale_scope_gen
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+
+        // Not registered: nothing.
+        let (bare, registry) = AgentMetrics::new();
+        bare.sync_from_stats(&stats);
+        let out = encode_metrics(&registry);
+        assert!(!out.contains("scope"), "{out}");
+
+        let (mut cg, mut registry) = AgentMetrics::new();
+        cg.register_scope_drops(&mut registry);
+        cg.sync_from_stats(&stats);
+        let out = encode_metrics(&registry);
+        let mut labels: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("panopticon_scope_dropped_events_total{reason=\""))
+            .map(|l| {
+                let (reason, value) = l.split_once("\"} ").unwrap();
+                let i = SCOPE_DROP_NAMES.iter().position(|&n| n == reason).unwrap();
+                assert_eq!(value, (10 + i).to_string(), "{reason}");
+                reason.to_string()
+            })
+            .collect();
+        labels.sort();
+        let mut want: Vec<String> = SCOPE_DROP_NAMES.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(labels, want);
+        assert!(
+            out.contains("panopticon_drops_stale_scope_gen_total 4"),
+            "{out}"
+        );
     }
 
     #[test]

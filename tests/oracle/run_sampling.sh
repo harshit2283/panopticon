@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# Ground-truth test for the capture-scope settings: pid_filter,
+# sampling_mode = "connection_sample" and sampling_mode = "head_only".
+#
+# Traffic legs (as run_modes.sh), with planted PII and credentials:
+#   http   http_oracle.py over a veth pair, captured at both sockets'
+#          cgroup hooks
+#   tls    http_oracle.py over TLS on loopback, captured by the OpenSSL
+#          uprobes in both the client and the server process
+# Runs, each with its own agent, privacy mode full and every sink on (event
+# export, raw dump, PII audit log, --log-events at debug level, /metrics):
+#   pid_servers   pid_filter = [http server, tls server], with
+#                 pid_filter_listener at its default ("acceptor"): bytes
+#                 that reach an accepted socket before accept() returns are
+#                 held in the kernel and released to the listed acceptor
+#                 (the pre-accept hold, DESIGN §3.1), so every HTTP
+#                 connection is captured from offset 0 and every exchange
+#                 is exported with method and path (all of them, not a
+#                 recall); TLS (uprobes, in the process) at full recall;
+#                 the TLS client's traffic is not captured.
+#   pid_servers_creator  the same with pid_filter_listener = "creator"
+#                 (listeners created by the servers under the agent): both
+#                 servers' traffic captured at full recall.
+#   pid_other     pid_filter = [an unrelated, idle python3]: nothing is
+#                 exported and no planted value reaches any sink.
+#   sample_0, sample_50, sample_100   connection_sample at 0.0 / 0.5 / 1.0
+#                 (http leg): about 0%, a binomially plausible 50%, and all
+#                 connections exported, never part of a connection.
+#   head          head_only with head_only_bytes = HEAD: no direction of any
+#                 connection passes more than HEAD bytes, values planted
+#                 beyond them reach no sink, and each connection's first
+#                 request is still captured.
+#   cgroup_filter (on a unified cgroup2 host only; in the default runs
+#                 there) cgroup_filter = the cgroup both servers
+#                 were started in: as pid_servers, selected by cgroup.
+# Scope is decided in the kernel per socket, so each connection has two
+# views, one per endpoint socket, each
+# scoped and sampled on its own. score_sampling.py scores each run.
+#
+# Usage: sudo tests/oracle/run_sampling.sh [requests=600] [seed=1234] [min_recall=0.99] [runs="..."]
+# Env: AGENT, HTTP_PORT, TLS_PORT, METRICS, and
+# ORACLE_NS / ORACLE_IF / ORACLE_NET (netns.py).
+# Needs: root, a built agent (target/release/panopticon-agent), openssl,
+# python3 3.7+ (the first new enough, or set PYTHON) linked against a shared libssl, iproute2, nsenter,
+# curl.
+set -euo pipefail
+NS=${ORACLE_NS:-pclient}
+HOST_IP=10.99.${ORACLE_NET:-0}.1
+N=${1:-600}
+SEED=${2:-1234}
+MIN_RECALL=${3:-0.99}
+CGROUP2=/sys/fs/cgroup
+SEL=$CGROUP2/$NS-sel  # the servers' cgroup
+UNIFIED=0
+[[ $(stat -fc %T $CGROUP2) == cgroup2fs ]] && UNIFIED=1
+DEFAULT_RUNS="pid_servers pid_servers_creator pid_other sample_0 sample_50 sample_100 head"
+[[ $UNIFIED == 1 ]] && DEFAULT_RUNS+=" cgroup_filter"
+RUNS=${4:-$DEFAULT_RUNS}
+HEAD=600
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+AGENT=${AGENT:-$ROOT/target/release/panopticon-agent}
+OUT=$(mktemp -d)
+# One python3 >= 3.7 for every step (RHEL 8's python3 is 3.6): $PYTHON, or
+# the first of these that is new enough.
+PY=${PYTHON:-}
+if [[ -z $PY ]]; then
+  for c in python3 python3.12 python3.11 python3.9 python3.8; do
+    if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 7))'; then
+      PY=$c
+      break
+    fi
+  done
+fi
+[[ -n $PY ]] || { echo "needs python3 >= 3.7 (set PYTHON)" >&2; exit 1; }
+HTTP_PORT=${HTTP_PORT:-18092}
+TLS_PORT=${TLS_PORT:-18446}
+METRICS=${METRICS:-127.0.0.1:19191}
+
+# stop_bounded PID: SIGINT, then up to 90 s for the process to flush and
+# exit; past that SIGKILL and a failure (message, returns 1). Sets
+# STOP_EXIT to the process's exit status.
+stop_bounded() {
+  local p=$1 i
+  STOP_EXIT=0
+  [[ -n $p ]] || return 0
+  if kill -INT "$p" 2>/dev/null; then
+    for ((i = 0; i < 900; i++)); do
+      kill -0 "$p" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$p" 2>/dev/null; then
+      echo "FAIL: pid $p still running 90 s after SIGINT: killed (SIGKILL), its output may be incomplete" >&2
+      kill -KILL "$p" 2>/dev/null || true
+      wait "$p" 2>/dev/null || true
+      STOP_EXIT=137
+      return 1
+    fi
+  fi
+  wait "$p" 2>/dev/null || STOP_EXIT=$?
+  return 0
+}
+
+cleanup() {
+  [[ -n ${AP:-} ]] && stop_bounded "$AP" || true
+  for p in ${SPS:-}; do kill "$p" 2>/dev/null || true; done
+  "$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true
+  [[ $UNIFIED == 1 ]] && rmdir "$SEL" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=oracle \
+  -keyout "$OUT/key.pem" -out "$OUT/cert.pem" 2>/dev/null
+"$PY" "$HERE/netns.py" down >/dev/null 2>&1 || true  # leftovers from an aborted run
+"$PY" "$HERE/netns.py" up
+
+# Servers. Each run starts its own, before the agent
+# (pid_filter lists their pids) but held until the agent is ready, so their
+# listeners are created under the agent and carry their owner. That matters
+# for pid_servers_creator: the creator rule selects a connection from its
+# first byte only on a listener a listed process created under the agent,
+# and drops the bytes before accept() on one that predates it. Under the
+# default acceptor rule (pid_servers) the bytes before accept() are held
+# in the kernel on any listener (the pre-accept hold, DESIGN §3.1). The
+# servers also start inside their own cgroup, so their sockets carry it for
+# life (cgroup_filter). The hold-until-ready is a shell that execs the
+# server, so $! stays the server's pid.
+start_servers() {
+  local hold
+  [[ $UNIFIED == 1 ]] && mkdir -p "$SEL"
+  hold=(sh -c 'if [ -n "$1" ]; then echo $$ >"$1/cgroup.procs"; fi
+    while [ ! -e "$0" ]; do sleep 0.1; done; shift; exec "$@"' "$OUT/go")
+  if [[ $UNIFIED == 1 ]]; then hold+=("$SEL"); else hold+=(""); fi
+  rm -f "$OUT/go"
+  "${hold[@]}" env MODE=server HOST=$HOST_IP "$PY" -I "$HERE/http_oracle.py" "$HTTP_PORT" &
+  HTTP_SP=$!
+  "${hold[@]}" env TLS=1 HOST=127.0.0.1 TLS_CERT="$OUT/cert.pem" TLS_KEY="$OUT/key.pem" \
+    MODE=server "$PY" -I "$HERE/http_oracle.py" "$TLS_PORT" &
+  TLS_SP=$!
+  SPS="$OTHER $HTTP_SP $TLS_SP"
+}
+stop_servers() {
+  kill "$HTTP_SP" "$TLS_SP" 2>/dev/null || true
+  wait "$HTTP_SP" "$TLS_SP" 2>/dev/null || true
+}
+
+# An idle python3 with libssl loaded, alive for every run: pid_other's pid,
+# and (servers start per run) what the agent's start-up TLS
+# scan finds libssl in (the probes cover every process mapping it).
+"$PY" -c 'import ssl, time; time.sleep(100000)' &
+OTHER=$!
+SPS=$OTHER
+sleep 1
+
+status=0
+for run in $RUNS; do
+  D=$OUT/$run
+  mkdir -p "$D/http" "$D/tls"
+  legs="http tls"
+  case $run in
+    pid_servers) scope="pid_filter = [\$HTTP_SP, \$TLS_SP]" ;;
+    pid_servers_creator)
+      scope=$'pid_filter_listener = "creator"\npid_filter = [$HTTP_SP, $TLS_SP]' ;;
+    pid_other)   scope="pid_filter = [$OTHER]" ;;
+    sample_0)    scope=$'sampling_mode = "connection_sample"\nsample_rate = 0.0'; legs=http ;;
+    sample_50)   scope=$'sampling_mode = "connection_sample"\nsample_rate = 0.5'; legs=http ;;
+    sample_100)  scope=$'sampling_mode = "connection_sample"\nsample_rate = 1.0'; legs=http ;;
+    head)        scope=$'sampling_mode = "head_only"\nhead_only_bytes = '"$HEAD" ;;
+    cgroup_filter) scope="cgroup_filter = [\"${SEL#"$CGROUP2"/}\"]" ;;
+    *) echo "unknown run $run"; exit 2 ;;
+  esac
+  start_servers
+  # The TLS leg runs over 127.0.0.1: capture loopback (off by default).
+  capture=$'capture_loopback = true\n\n'
+  scope=${scope//\$HTTP_SP/$HTTP_SP}
+  scope=${scope//\$TLS_SP/$TLS_SP}
+  printf '%s\n\n%s[privacy]\nmode = "full"\n' "$scope" "$capture" >"$D/agent.toml"
+  echo "==== $run: $(head -c 200 "$D/agent.toml" | tr '\n' ' ')"
+  "$AGENT" -v --config "$D/agent.toml" --log-events --metrics-bind "$METRICS" \
+    --json-export "$D/agent.jsonl" --pii-audit-log "$D/audit.jsonl" \
+    --capture-raw "$D/raw.pncap" >"$D/agent.log" 2>&1 &
+  AP=$!
+  for _ in $(seq 120); do curl -sf "http://$METRICS/readyz" >/dev/null && break; sleep 0.5; done
+  touch "$OUT/go"
+  sleep 1
+  PLANT=${run}http SEED=$SEED MODE=client HOST=$HOST_IP nsenter --net=/var/run/netns/$NS \
+    "$PY" -I "$HERE/http_oracle.py" "$HTTP_PORT" "$N" "$D/http/truth.jsonl"
+  if [[ $legs == *tls* ]]; then
+    env PLANT=${run}tls SSN_AREA=234 TLS=1 HOST=127.0.0.1 SEED=$SEED MODE=client \
+      "$PY" -I "$HERE/http_oracle.py" "$TLS_PORT" "$N" "$D/tls/truth.jsonl"
+  fi
+  sleep 3
+  curl -sf "http://$METRICS/metrics" >"$D/metrics.txt" || echo "metrics scrape failed"
+  stop_bounded "$AP" || status=1; AP=
+  stop_servers
+  "$AGENT" --privacy-mode full --decode-capture "$D/raw.pncap" >"$D/raw.jsonl"
+  "$PY" -I "$HERE/score_sampling.py" "$run" "$D" "$MIN_RECALL" "$HTTP_SP" "$TLS_SP" "$HEAD" \
+    cgroup_skb "$HTTP_PORT" ||
+    status=1
+done
+echo "artifacts: $OUT"
+exit $status

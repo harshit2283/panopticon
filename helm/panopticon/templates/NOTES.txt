@@ -14,12 +14,10 @@ Panopticon has been deployed as a DaemonSet.
 
 4. Access Prometheus metrics:
 
-    The metrics service is available at:
-    {{ include "panopticon.fullname" . }}-metrics.{{ .Release.Namespace }}.svc:{{ (split ":" .Values.agent.metricsBind)._1 | default "9090" }}/metrics
-    The default chart bind is `0.0.0.0:9090` so probes and scraping work with `hostNetwork: true`.
+    {{ include "panopticon.fullname" . }}-metrics.{{ .Release.Namespace }}.svc:{{ .Values.metrics.port }}/metrics
 
-{{- if .Values.onnx.enabled }}
+    The agent binds {{ .Values.metrics.bindAddress }}:{{ .Values.metrics.port }} on each node (hostNetwork).
+    /metrics and /debug/state are unauthenticated: keep the port off untrusted networks.
 
-5. ONNX ML inference is enabled. Ensure the model is available at:
-   {{ .Values.onnx.modelPath }}
-{{- end }}
+5. Panopticon is EXPERIMENTAL. Exported events and the PII audit log are
+   sensitive data{{ if .Values.export.hostPath }} (written under {{ .Values.export.hostPath }} on each node){{ end }}.

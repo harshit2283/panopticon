@@ -1,136 +1,102 @@
 #!/bin/bash
+# Download the DistilBERT-NER ONNX model and tokenizer for in-agent PII
+# detection, pinned to one HuggingFace commit and checked against SHA-256
+# digests before anything lands in $MODEL_DIR.
 set -euo pipefail
 
 MODEL_DIR="models/distilbert-ner"
-MODEL_NAME="dslim/distilbert-ner"
-MODEL_URL="https://huggingface.co/${MODEL_NAME}/resolve/main"
+MODEL_NAME="dslim/distilbert-NER"
+# Immutable revision: a branch ref (resolve/main) can change under us.
+MODEL_REV="dfa2838a127384aabb82ed7719e16dab84c42a2a"
+MODEL_URL="https://huggingface.co/${MODEL_NAME}/resolve/${MODEL_REV}"
+
+# local name | path in the repo | SHA-256
+FILES=(
+    "model.onnx|onnx/model.onnx|4440f9fc64cd28ac75d83a38d89716f25947799640cd0e5f1f9f6e57b9c14160"
+    "tokenizer.json|onnx/tokenizer.json|cb26b43c98e8266ae3e99c2a583cf8315d73b33a17e6b20b4df7ff1f22392d34"
+    "config.json|onnx/config.json|8f9f01d47f61087197f9fa85185d4a7a6248333c15af1b221aa5e8b9b76462b5"
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m'
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        log_error "$1 is required but not installed"
-        exit 1
-    fi
-}
-
-download_file() {
-    local url="$1"
-    local output="$2"
-    local description="$3"
-    
-    if [ -f "$output" ]; then
-        log_info "$description already exists, skipping"
-        return 0
-    fi
-    
-    log_info "Downloading $description..."
-    
-    if command -v curl &> /dev/null; then
-        if ! curl -L --progress-bar -o "$output" "$url" 2>&1; then
-            log_error "Failed to download $description"
-            rm -f "$output"
-            return 1
-        fi
-    elif command -v wget &> /dev/null; then
-        if ! wget -q --show-progress -O "$output" "$url" 2>&1; then
-            log_error "Failed to download $description"
-            rm -f "$output"
-            return 1
-        fi
+sha256_of() {
+    if command -v sha256sum &> /dev/null; then
+        sha256sum "$1" | cut -d' ' -f1
     else
-        log_error "Neither curl nor wget is available"
-        exit 1
+        shasum -a 256 "$1" | cut -d' ' -f1
     fi
-    
-    log_info "Downloaded $description ($(du -h "$output" | cut -f1))"
 }
 
-verify_file() {
-    local file="$1"
-    local min_size="$2"
-    
-    if [ ! -f "$file" ]; then
-        log_error "File not found: $file"
+# HTTPS only, redirects included (the LFS files redirect to a CDN).
+fetch() {
+    if command -v curl &> /dev/null; then
+        curl -fL --proto '=https' --proto-redir '=https' --progress-bar -o "$2" "$1"
+    else
+        wget -q --show-progress --https-only -O "$2" "$1"
+    fi
+}
+
+# Download $1 (repo path) to a temporary file next to $2, verify it against
+# $3, and only then move it into place.
+download_verified() {
+    local url="$MODEL_URL/$1" output="$2" want="$3"
+    local tmp
+    tmp=$(mktemp "$output.XXXXXX")
+
+    log_info "Downloading $1 @ ${MODEL_REV:0:12}..."
+    if ! fetch "$url" "$tmp"; then
+        rm -f "$tmp"
+        log_error "Failed to download $1"
         return 1
     fi
-    
-    local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
-    if [ "$size" -lt "$min_size" ]; then
-        log_error "File too small: $file (expected >${min_size} bytes, got ${size})"
-        rm -f "$file"
+
+    local got
+    got=$(sha256_of "$tmp")
+    if [ "$got" != "$want" ]; then
+        rm -f "$tmp"
+        log_error "$1: SHA-256 mismatch (expected $want, got $got)"
         return 1
     fi
-    
-    return 0
+    mv "$tmp" "$output"
+    log_info "Verified $(basename "$output") ($(du -h "$output" | cut -f1))"
 }
 
 main() {
     log_info "Setting up DistilBERT-NER model for PII detection"
-    
-    check_command curl || check_command wget
-    
-    if [ -f "$MODEL_DIR/model.onnx" ] && [ -f "$MODEL_DIR/tokenizer.json" ]; then
-        log_info "Model already exists at $MODEL_DIR/"
-        log_info "To re-download, remove the directory first: rm -rf $MODEL_DIR"
-        ls -lh "$MODEL_DIR/"
-        exit 0
+
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
+        log_error "curl or wget is required"
+        exit 1
     fi
-    
+    if ! command -v sha256sum &> /dev/null && ! command -v shasum &> /dev/null; then
+        log_error "sha256sum or shasum is required"
+        exit 1
+    fi
+
     mkdir -p "$MODEL_DIR"
-    
-    log_info "Downloading from HuggingFace: $MODEL_NAME"
-    
-    local failed=0
-    
-    if ! download_file "$MODEL_URL/model.onnx" "$MODEL_DIR/model.onnx" "model.onnx"; then
-        failed=1
-    fi
-    
-    if ! download_file "$MODEL_URL/tokenizer.json" "$MODEL_DIR/tokenizer.json" "tokenizer.json"; then
-        failed=1
-    fi
-    
-    download_file "$MODEL_URL/config.json" "$MODEL_DIR/config.json" "config.json" || true
-    
-    if [ $failed -eq 1 ]; then
-        log_error "Download failed. Check your internet connection and try again."
-        exit 1
-    fi
-    
-    log_info "Verifying downloads..."
-    
-    if ! verify_file "$MODEL_DIR/model.onnx" 100000000; then
-        log_error "model.onnx verification failed (expected >100MB)"
-        exit 1
-    fi
-    
-    if ! verify_file "$MODEL_DIR/tokenizer.json" 100000; then
-        log_error "tokenizer.json verification failed (expected >100KB)"
-        exit 1
-    fi
-    
+    for entry in "${FILES[@]}"; do
+        IFS='|' read -r name path sha <<< "$entry"
+        local output="$MODEL_DIR/$name"
+        # An existing file is kept only if it is the pinned one.
+        if [ -f "$output" ] && [ "$(sha256_of "$output")" = "$sha" ]; then
+            log_info "$name already present and verified, skipping"
+            continue
+        fi
+        download_verified "$path" "$output" "$sha"
+    done
+
     log_info "Download complete!"
-    echo ""
-    echo "Files:"
     ls -lh "$MODEL_DIR/"
-    echo ""
-    log_info "Total size: $(du -sh "$MODEL_DIR" | cut -f1)"
 }
 
 main "$@"

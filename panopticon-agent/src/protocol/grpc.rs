@@ -62,6 +62,16 @@ impl ProtocolParser for GrpcParser {
         }
     }
 
+    fn skip(&mut self, direction: Direction, n: usize, timestamp_ns: u64) -> Option<ParseResult> {
+        match self.inner.skip(direction, n, timestamp_ns)? {
+            ParseResult::Messages(mut msgs) => {
+                Self::enrich_grpc_messages(&mut msgs);
+                Some(ParseResult::Messages(msgs))
+            }
+            other => Some(other),
+        }
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::Grpc
     }
@@ -72,6 +82,20 @@ impl ProtocolParser for GrpcParser {
 
     fn protocol_version(&self) -> Option<&str> {
         Some("2")
+    }
+
+    fn joined_late(&mut self) {
+        self.inner.joined_late();
+    }
+
+    /// Over TLS this parser latches as for a late join (its ruling;
+    /// [`ProtocolParser::tls_unproven_start`]).
+    fn tls_unproven_start(&mut self) {
+        self.inner.tls_unproven_start();
+    }
+
+    fn uncertain(&self) -> bool {
+        self.inner.uncertain()
     }
 }
 
@@ -111,7 +135,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
-        encoder.encode(h.into_iter())
+        encoder.encode(h)
     }
 
     #[test]
@@ -136,8 +160,20 @@ mod tests {
         grpc_frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         grpc_frame.extend_from_slice(body);
         data.extend_from_slice(&make_frame(0x0, 0x1, 1, &grpc_frame)); // DATA + END_STREAM
+        assert!(matches!(
+            parser.feed(&data, Direction::Egress, 1000),
+            ParseResult::NeedMoreData
+        ));
 
-        let result = parser.feed(&data, Direction::Egress, 1000);
+        // Response: trailers-only OK (HEADERS + END_STREAM). The stream is
+        // complete when the server ends it.
+        let resp = make_frame(
+            0x1,
+            0x4 | 0x1,
+            1,
+            &encode_headers(&[(":status", "200"), ("grpc-status", "0")]),
+        );
+        let result = parser.feed(&resp, Direction::Ingress, 2000);
         match result {
             ParseResult::Messages(msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -146,9 +182,61 @@ mod tests {
                     msgs[0].method.as_deref(),
                     Some("mypackage.MyService/GetUser")
                 );
+                assert_eq!(msgs[0].status, Some(0));
             }
             other => panic!("expected Messages, got {other:?}"),
         }
+    }
+
+    /// Responses pair by stream ID, never by order: calls answered out of
+    /// order, a call reset without a response and a call that is never
+    /// answered do not move any other call's status.
+    #[test]
+    fn test_streams_pair_by_id_not_order() {
+        let mut parser = GrpcParser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(HTTP2_PREFACE);
+        data.extend_from_slice(&make_frame(0x4, 0, 0, &[]));
+        for (id, method) in [(1, "A"), (3, "B"), (5, "C"), (7, "D"), (9, "E")] {
+            let path = format!("/pkg.Svc/{method}");
+            let hdrs = encode_headers(&[
+                (":method", "POST"),
+                (":path", path.as_str()),
+                ("content-type", "application/grpc"),
+            ]);
+            data.extend_from_slice(&make_frame(0x1, 0x4, id, &hdrs));
+            data.extend_from_slice(&make_frame(0x0, 0x1, id, &[0, 0, 0, 0, 0]));
+        }
+        parser.feed(&data, Direction::Egress, 1000);
+        let trailers = |id, status: &str| {
+            make_frame(
+                0x1,
+                0x4 | 0x1,
+                id,
+                &encode_headers(&[(":status", "200"), ("grpc-status", status)]),
+            )
+        };
+        let mut resp = trailers(3, "5");
+        resp.extend(make_frame(0x3, 0, 5, &8u32.to_be_bytes())); // RST_STREAM CANCEL
+        resp.extend(trailers(7, "14"));
+        resp.extend(trailers(1, "0"));
+        // Stream 9 is never answered.
+        let ParseResult::Messages(msgs) = parser.feed(&resp, Direction::Ingress, 2000) else {
+            panic!("expected messages");
+        };
+        let got: Vec<_> = msgs
+            .iter()
+            .map(|m| (m.method.as_deref(), m.status))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("pkg.Svc/B"), Some(5)),
+                (Some("pkg.Svc/C"), None),
+                (Some("pkg.Svc/D"), Some(14)),
+                (Some("pkg.Svc/A"), Some(0)),
+            ]
+        );
     }
 
     #[test]

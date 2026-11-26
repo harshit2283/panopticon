@@ -56,14 +56,31 @@ impl GraphBuilder {
 
     /// Record an L7 message observation. Called from each worker task.
     ///
-    /// Resolves source/destination identities and records the flow in the
-    /// aggregator. The aggregator handles deduplication via normalized templates.
+    /// Orients the connection client → server (guessing the server from
+    /// ports), then records the flow in the aggregator, which deduplicates
+    /// via normalized templates.
     pub fn record(&self, conn: &ConnectionTuple, msg: &L7Message, pii_report: Option<&PiiReport>) {
-        // Resolve identities: prefer well-known port side for dst
-        let (src_port, dst_port) =
-            server_port_heuristic(conn.src_port, conn.dst_port, msg.protocol);
-        let src_id = self.identity.resolve(conn.src_addr, src_port);
-        let dst_id = self.identity.resolve(conn.dst_addr, dst_port);
+        self.record_with_server(conn, None, msg, pii_report);
+    }
+
+    /// Like [`record`](Self::record), with the server side known:
+    /// `Some(true)` if `conn.src` is the server (e.g. a response packet),
+    /// `Some(false)` if `conn.dst` is.
+    ///
+    /// The client is identified by address only: its ephemeral port changes
+    /// with every connection, and keeping it made every connection a new
+    /// graph node and edge, so the graph grew with traffic instead of with
+    /// services.
+    pub fn record_with_server(
+        &self,
+        conn: &ConnectionTuple,
+        src_is_server: Option<bool>,
+        msg: &L7Message,
+        pii_report: Option<&PiiReport>,
+    ) {
+        let (client_addr, server) = orient(conn, src_is_server, msg.protocol);
+        let src_id = self.identity.resolve(client_addr, 0);
+        let dst_id = self.identity.resolve(server.0, server.1);
 
         self.aggregator.record(
             &src_id.name,
@@ -78,6 +95,39 @@ impl GraphBuilder {
             pii_report.is_some(),
             msg.timestamp_ns,
         );
+    }
+
+    /// Feed the DNS cache from a parsed DNS message: its `dns_answers`,
+    /// which the DNS parser adds only
+    /// for answers to a query seen on the same flow, and which the PII scan
+    /// removes when a name holds PII. The cache refuses names that are not
+    /// plain hostnames and caps the TTL.
+    pub fn observe_dns(&self, msg: &L7Message) {
+        if msg.protocol != Protocol::Dns {
+            return;
+        }
+        for a in &msg.dns_answers {
+            self.dns_cache
+                .insert_observed(&a.name, a.ip, Duration::from_secs(a.ttl_secs.into()));
+        }
+    }
+
+    /// Name of the server end of a connection, as the graph names it
+    /// (Kubernetes workload, DNS name, else `ip:port`), or without the DNS
+    /// name when `dns` is false, and whether that name came from DNS.
+    pub fn server_identity(
+        &self,
+        conn: &ConnectionTuple,
+        src_is_server: Option<bool>,
+        protocol: Protocol,
+        dns: bool,
+    ) -> identity::ServiceIdentity {
+        let (_, (addr, port)) = orient(conn, src_is_server, protocol);
+        if dns {
+            self.identity.resolve(addr, port)
+        } else {
+            self.identity.resolve_without_dns(addr, port)
+        }
     }
 
     /// Flush the current aggregation window, update the DAG, and return flows.
@@ -101,17 +151,36 @@ impl GraphBuilder {
         self.identity.evict_expired();
     }
 
+    /// Name endpoints from Kubernetes metadata when available.
+    pub fn with_k8s(mut self, k8s: Option<Arc<crate::k8s::K8sMetadata>>) -> Self {
+        self.identity = self.identity.with_k8s(k8s);
+        self
+    }
+
     pub fn dag(&self) -> &Arc<Mutex<ServiceDag>> {
         &self.dag
     }
 }
 
-/// Choose which port to use for identity resolution.
-///
-/// For requests, we want the server-side (well-known) port to be the dst_port.
-/// Ephemeral ports (>= 32768) are useless for identity — they change per connection.
-fn server_port_heuristic(src_port: u16, dst_port: u16, protocol: Protocol) -> (u16, u16) {
-    // Known server ports by protocol
+/// Split a connection into (client address, server endpoint), using
+/// `src_is_server` when known and the port heuristic otherwise.
+pub fn orient(
+    conn: &ConnectionTuple,
+    src_is_server: Option<bool>,
+    protocol: Protocol,
+) -> (u32, (u32, u16)) {
+    let src_is_server = src_is_server
+        .unwrap_or_else(|| src_is_server_heuristic(conn.src_port, conn.dst_port, protocol));
+    if src_is_server {
+        (conn.dst_addr, (conn.src_addr, conn.src_port))
+    } else {
+        (conn.src_addr, (conn.dst_addr, conn.dst_port))
+    }
+}
+
+/// Guess whether `src` is the server end of a connection, for callers that
+/// don't know: a well-known port for the protocol wins, else the lower port.
+fn src_is_server_heuristic(src_port: u16, dst_port: u16, protocol: Protocol) -> bool {
     let well_known = match protocol {
         Protocol::Http1 | Protocol::Http2 | Protocol::Grpc => &[80, 443, 8080, 8443][..],
         Protocol::Mysql => &[3306][..],
@@ -122,21 +191,13 @@ fn server_port_heuristic(src_port: u16, dst_port: u16, protocol: Protocol) -> (u
         Protocol::Amqp => &[5672][..],
         Protocol::Unknown => &[][..],
     };
-
-    // If dst_port is a well-known port, use as-is
     if well_known.contains(&dst_port) {
-        return (src_port, dst_port);
+        return false;
     }
-    // If src_port is well-known, swap — src is actually the server
     if well_known.contains(&src_port) {
-        return (dst_port, src_port);
+        return true;
     }
-    // Fallback: prefer the lower port (more likely to be server-side)
-    if src_port < dst_port {
-        (dst_port, src_port)
-    } else {
-        (src_port, dst_port)
-    }
+    src_port < dst_port
 }
 
 #[cfg(test)]
@@ -220,24 +281,188 @@ mod tests {
     }
 
     #[test]
-    fn test_server_port_heuristic_well_known_dst() {
-        let (src, dst) = server_port_heuristic(54321, 80, Protocol::Http1);
-        assert_eq!(src, 54321);
-        assert_eq!(dst, 80);
-    }
-
-    #[test]
-    fn test_server_port_heuristic_well_known_src() {
-        // Server response: src=80, dst=54321 -> swap
-        let (src, dst) = server_port_heuristic(80, 54321, Protocol::Http1);
-        assert_eq!(src, 54321);
-        assert_eq!(dst, 80);
-    }
-
-    #[test]
-    fn test_server_port_heuristic_fallback() {
+    fn test_server_heuristic() {
+        assert!(!src_is_server_heuristic(54321, 80, Protocol::Http1));
+        assert!(src_is_server_heuristic(80, 54321, Protocol::Http1));
         // Neither is well-known — prefer lower port as server
-        let (_src, dst) = server_port_heuristic(45000, 8888, Protocol::Unknown);
-        assert_eq!(dst, 8888);
+        assert!(!src_is_server_heuristic(45000, 8888, Protocol::Unknown));
+        assert!(src_is_server_heuristic(8888, 45000, Protocol::Unknown));
+    }
+
+    fn edges(gb: &GraphBuilder) -> Vec<(String, String)> {
+        gb.flush();
+        let dag = gb.dag().lock().unwrap();
+        let mut e: Vec<_> = dag
+            .to_adjacency_list()
+            .into_iter()
+            .map(|(s, d, _)| (s, d))
+            .collect();
+        e.sort();
+        e
+    }
+
+    #[test]
+    fn test_response_packet_keeps_addresses_with_ports() {
+        // A response travels server -> client; the edge must still be
+        // client -> server with each address next to its own port.
+        let gb = make_builder();
+        let resp = ConnectionTuple {
+            src_addr: 0x0A630001, // 10.99.0.1 (server)
+            dst_addr: 0x0A630002, // 10.99.0.2 (client)
+            src_port: 18090,
+            dst_port: 51000,
+            pid: 1,
+        };
+        let msg = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
+        gb.record_with_server(&resp, Some(true), &msg, None);
+        assert_eq!(
+            edges(&gb),
+            vec![("10.99.0.2".to_string(), "10.99.0.1:18090".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_server_identity_names_the_server_end() {
+        let gb = make_builder();
+        let resp = ConnectionTuple {
+            src_addr: 0x0A630001, // 10.99.0.1 (server)
+            dst_addr: 0x0A630002,
+            src_port: 18090,
+            dst_port: 51000,
+            pid: 1,
+        };
+        assert_eq!(
+            gb.server_identity(&resp, Some(true), Protocol::Http1, true)
+                .name,
+            "10.99.0.1:18090"
+        );
+        // Unknown orientation: the port heuristic picks the lower port.
+        assert_eq!(
+            gb.server_identity(&resp, None, Protocol::Http1, true).name,
+            "10.99.0.1:18090"
+        );
+    }
+
+    /// F8 / F12: a DNS answer nobody asked for on that flow must not rename
+    /// an address; the answer to a query seen on it does.
+    #[test]
+    fn test_unsolicited_dns_answer_does_not_rename_an_ip() {
+        use crate::protocol::{ParseResult, ProtocolParser, dns::DnsParser};
+        let gb = make_builder();
+        let exfil = ConnectionTuple {
+            src_addr: 0x0A000001,
+            dst_addr: 0xCB007105, // 203.0.113.5
+            src_port: 40000,
+            dst_port: 443,
+            pid: 1,
+        };
+        let server = |gb: &GraphBuilder| {
+            gb.server_identity(&exfil, Some(false), Protocol::Http1, true)
+                .name
+        };
+        let wire = |id: u16, query: bool| {
+            let mut m = id.to_be_bytes().to_vec();
+            m.extend(if query { [0u8, 0] } else { [0x80, 0] }); // QR
+            m.extend([0, 1, 0, if query { 0 } else { 1 }, 0, 0, 0, 0]);
+            for label in ["api", "stripe", "com"] {
+                m.push(label.len() as u8);
+                m.extend(label.as_bytes());
+            }
+            m.extend([0, 0, 1, 0, 1]); // root, A, IN
+            if !query {
+                m.extend([0xC0, 12, 0, 1, 0, 1]); // name ptr, A, IN
+                m.extend(u32::MAX.to_be_bytes()); // a TTL of ~68 years
+                m.extend([0, 4, 203, 0, 113, 5]);
+            }
+            m
+        };
+        let feed = |gb: &GraphBuilder, p: &mut DnsParser, bytes: &[u8], dir| {
+            if let ParseResult::Messages(msgs) = p.feed(bytes, dir, 1) {
+                msgs.iter().for_each(|m| gb.observe_dns(m));
+            }
+        };
+        // A forged answer arrives on a flow that asked nothing.
+        feed(
+            &gb,
+            &mut DnsParser::new(),
+            &wire(0x4242, false),
+            Direction::Ingress,
+        );
+        assert_eq!(gb.dns_cache.resolve(0xCB007105), None);
+        assert_eq!(server(&gb), "203.0.113.5:443");
+
+        // A real query and its answer on one flow name it.
+        let gb = make_builder();
+        let mut p = DnsParser::new();
+        feed(&gb, &mut p, &wire(0x4243, true), Direction::Egress);
+        feed(&gb, &mut p, &wire(0x4243, false), Direction::Ingress);
+        assert_eq!(server(&gb), "api.stripe.com");
+    }
+
+    #[test]
+    fn test_client_connections_collapse_to_one_edge() {
+        let gb = make_builder();
+        let msg = L7Message::new(Protocol::Redis, Direction::Egress, 1000);
+        for port in 40000..41000 {
+            let conn = ConnectionTuple {
+                src_addr: 0x0A000001,
+                dst_addr: 0x0A000002,
+                src_port: port,
+                dst_port: 6379,
+                pid: 1,
+            };
+            gb.record(&conn, &msg, None);
+        }
+        assert_eq!(edges(&gb).len(), 1, "one client, one server: one edge");
+        assert_eq!(gb.dag().lock().unwrap().node_count(), 2);
+    }
+
+    #[test]
+    fn test_graph_nodes_named_by_kubernetes_workload() {
+        let meta = crate::k8s::K8sMetadata::new("http://test");
+        let pod = |ns: &str, rs: &str, hash: &str, ip: &str| -> crate::k8s::model::Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": format!("{rs}-x"), "namespace": ns,
+                    "labels": {"pod-template-hash": hash},
+                    "ownerReferences": [{"kind": "ReplicaSet", "name": rs, "controller": true}]},
+                "spec": {"nodeName": "worker-1"},
+                "status": {"phase": "Running", "podIP": ip, "hostIP": "192.168.0.1"}
+            }))
+            .unwrap()
+        };
+        meta.replace_pods(&[
+            pod("payments", "web-5c6d7e8f9a", "5c6d7e8f9a", "10.0.0.1"),
+            pod("payments", "checkout-7d9f8b6c5d", "7d9f8b6c5d", "10.0.0.2"),
+        ]);
+        meta.publish_if_dirty();
+        let gb = make_builder().with_k8s(Some(meta));
+
+        let msg = L7Message::new(Protocol::Http1, Direction::Egress, 1000);
+        for port in 40000..40010 {
+            let conn = ConnectionTuple {
+                src_addr: 0x0A000001,
+                dst_addr: 0x0A000002,
+                src_port: port,
+                dst_port: 8080,
+                pid: 1,
+            };
+            gb.record(&conn, &msg, None);
+        }
+        // An unknown peer keeps its address.
+        let ext = ConnectionTuple {
+            src_addr: 0x0A000001,
+            dst_addr: 0x08080808,
+            src_port: 40100,
+            dst_port: 443,
+            pid: 1,
+        };
+        gb.record(&ext, &msg, None);
+        assert_eq!(
+            edges(&gb),
+            vec![
+                ("payments/web".to_string(), "8.8.8.8:443".to_string()),
+                ("payments/web".to_string(), "payments/checkout".to_string()),
+            ]
+        );
     }
 }

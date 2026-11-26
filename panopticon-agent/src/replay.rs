@@ -22,70 +22,40 @@ use std::mem;
 use std::path::Path;
 
 use panopticon_common::DataEvent;
-#[cfg(target_os = "linux")]
 use panopticon_common::parse_data_event_bytes;
-#[cfg(not(target_os = "linux"))]
-use panopticon_common::{Direction, EventType, MAX_PAYLOAD_SIZE, TlsLibrary};
 
 /// Magic bytes identifying a Panopticon capture file.
 const MAGIC: &[u8; 6] = b"PNCAP\x01";
 
-/// Current file format version.
-const FORMAT_VERSION: u32 = 1;
+/// Current file format version. v2: DataEvent gained `orig_len` (4160
+/// bytes). v3: `tcp_seq` and `tcp_ack` (4168 bytes). v4: capture-scope
+/// fields (`cgroup_id`, `stream_off`, owner/acceptor, `scope_gen`, `role`;
+/// 4192 bytes).
+const FORMAT_VERSION: u32 = 4;
 
-#[cfg(not(target_os = "linux"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RawDataEvent {
-    pub timestamp_ns: u64,
-    pub socket_cookie: u64,
-    pub event_type: u32,
-    pub direction: u32,
-    pub pid: u32,
-    pub tgid: u32,
-    pub src_addr: u32,
-    pub dst_addr: u32,
-    pub payload_len: u32,
-    pub tls_library: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub ip_proto: u8,
-    pub _pad: [u8; 3],
-    pub payload: [u8; MAX_PAYLOAD_SIZE],
+/// Bytes per record: u32 length prefix + fixed-size DataEvent.
+pub const CAPTURE_RECORD_BYTES: usize = 4 + mem::size_of::<DataEvent>();
+
+/// The file header: magic, version, `start_timestamp_ns` and a zero event
+/// count (readers count records instead).
+pub fn capture_header(start_timestamp_ns: u64) -> Vec<u8> {
+    let mut h = Vec::with_capacity(MAGIC.len() + 20);
+    h.extend_from_slice(MAGIC);
+    h.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    h.extend_from_slice(&start_timestamp_ns.to_le_bytes());
+    h.extend_from_slice(&0u64.to_le_bytes());
+    h
 }
 
-#[cfg(not(target_os = "linux"))]
-impl RawDataEvent {
-    fn to_data_event(self) -> Option<DataEvent> {
-        Some(DataEvent {
-            timestamp_ns: self.timestamp_ns,
-            socket_cookie: self.socket_cookie,
-            event_type: EventType::from_u32(self.event_type)?,
-            direction: Direction::from_u32(self.direction)?,
-            pid: self.pid,
-            tgid: self.tgid,
-            src_addr: self.src_addr,
-            dst_addr: self.dst_addr,
-            payload_len: self.payload_len,
-            tls_library: TlsLibrary::from_u32(self.tls_library)?,
-            src_port: self.src_port,
-            dst_port: self.dst_port,
-            ip_proto: self.ip_proto,
-            _pad: self._pad,
-            payload: self.payload,
-        })
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn parse_data_event_bytes(bytes: &[u8]) -> Option<DataEvent> {
-    if bytes.len() != mem::size_of::<RawDataEvent>() {
-        return None;
-    }
-    // SAFETY: `RawDataEvent` is repr(C) with plain integer/byte fields, and
-    // `bytes` length is checked to exactly match the struct size.
-    let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawDataEvent) };
-    raw.to_data_event()
+/// Append one `[u32 length][DataEvent bytes]` record to `out`.
+pub fn encode_capture_record(event: &DataEvent, out: &mut Vec<u8>) {
+    let event_size = mem::size_of::<DataEvent>();
+    out.extend_from_slice(&(event_size as u32).to_le_bytes());
+    // SAFETY: DataEvent is #[repr(C)], Copy, and contains no pointers.
+    // This is the same guarantee that makes it safe for eBPF ring buffer transfer.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(event as *const DataEvent as *const u8, event_size) };
+    out.extend_from_slice(bytes);
 }
 
 /// File header metadata.
@@ -112,15 +82,7 @@ impl<W: Write> CaptureWriter<W> {
     /// Create a new capture writer. Writes the magic bytes and a placeholder header.
     pub fn new(inner: W, start_timestamp_ns: u64) -> io::Result<Self> {
         let mut writer = BufWriter::new(inner);
-
-        // Write magic
-        writer.write_all(MAGIC)?;
-
-        // Write placeholder header (will be updated on finish if seekable)
-        writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
-        writer.write_all(&start_timestamp_ns.to_le_bytes())?;
-        writer.write_all(&0u64.to_le_bytes())?; // event_count placeholder
-
+        writer.write_all(&capture_header(start_timestamp_ns))?;
         Ok(Self {
             writer,
             start_timestamp_ns,
@@ -132,18 +94,16 @@ impl<W: Write> CaptureWriter<W> {
     ///
     /// The event is written as `[u32 length][raw bytes]`.
     pub fn write_event(&mut self, event: &DataEvent) -> io::Result<()> {
-        let event_size = mem::size_of::<DataEvent>() as u32;
-        self.writer.write_all(&event_size.to_le_bytes())?;
-
-        // SAFETY: DataEvent is #[repr(C)], Copy, and contains no pointers.
-        // This is the same guarantee that makes it safe for eBPF ring buffer transfer.
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(event as *const DataEvent as *const u8, event_size as usize)
-        };
-        self.writer.write_all(bytes)?;
-
+        let mut record = Vec::with_capacity(CAPTURE_RECORD_BYTES);
+        encode_capture_record(event, &mut record);
+        self.writer.write_all(&record)?;
         self.event_count += 1;
         Ok(())
+    }
+
+    /// Flush buffered events to the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 
     /// Returns the number of events written so far.

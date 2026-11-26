@@ -13,12 +13,33 @@ hardening work.
 
 ## What Panopticon Does
 
-- Captures cleartext traffic with TC eBPF hooks.
-- Captures some TLS plaintext paths through targeted uprobes.
+- Captures cleartext traffic at every socket on the node with `cgroup_skb`
+  eBPF hooks on the host's cgroup v2 root, scoped in the kernel by process,
+  cgroup or Kubernetes pod (see the
+  [capture-scope ADR](docs/adr/ADR-014-cgroup-skb-capture-scope.md)).
+- Captures TLS plaintext through uprobes: OpenSSL (shared `libssl`, including
+  the `SSL_read_ex`/`SSL_write_ex` API used by OpenSSL 3 applications) and Go
+  `crypto/tls` (reads and writes; gc builds of Go 1.18+, amd64 or arm64, with symbols).
 - Parses HTTP/1.1, HTTP/2, gRPC, MySQL, PostgreSQL, Redis, Kafka, DNS, and AMQP.
 - Runs regex-first PII detection with optional ONNX-backed ML inference.
-- Builds a DNS/IP-based service graph.
+- Builds a service graph named by Kubernetes workload (`namespace/workload`)
+  in a cluster, else by DNS name or IP.
 - Exports JSONL, Prometheus metrics, OTLP spans, and a PII audit log.
+- One privacy mode decides what leaves the node: `full` (unredacted export
+  and a raw dump of every payload, TLS decrypted, convertible to pcap for
+  Wireshark), `redacted` (PII masked; default) or `metrics_only` (metrics,
+  service map and PII audit only). Each mode is checked against planted PII
+  in every output (`tests/oracle/run_modes.sh`).
+
+## Documentation
+
+- [User guide](docs/USER-GUIDE.md): first run, configuration, reading the
+  event log, PII audit log and metrics, troubleshooting.
+- [Deployment](docs/DEPLOYMENT.md): Kubernetes (Helm), Docker, systemd,
+  hardening, upgrades and releases.
+- [Benchmarks](docs/BENCHMARKS.md): measured capture accuracy, kernel and
+  agent overhead, a 64-vCPU scale test, parser/PII micro-benchmarks,
+  fuzzing, and how to reproduce.
 
 ## Public Source Of Truth
 
@@ -36,31 +57,35 @@ current release report.
 | Capability | MVP Status | Notes |
 |---|---|---|
 | Linux x86_64 on kernel 5.8+ | Supported | Primary development path with RingBuf support. |
-| Linux x86_64 on kernel 4.15-5.7 | Partial | Works through PerfEventArray fallback with higher overhead. |
+| RHEL 8 / 9 (Rocky Linux 8.10 on 4.18, 9.8 on 5.14) | Supported | Red Hat backports the BPF ring buffer and the 5.5+ probe-read helpers. On 8.10 the messaging, protocol and TLS oracles pass at the default config (2026-11-26), AMQP deliveries included (AMQP, Kafka and every protocol but HTTP/1.1 capture whole packets by default, `raise_packet_cap`). On 9.8 the eBPF program matrix (`scope_attach`) loads and the capture-scope oracle passes; its HTTP, HTTPS, database, gRPC, Kafka and DNS accuracy was last measured on 2026-11-04 (99.4-100% recall), and the messaging oracle has not been re-run there since the AMQP fail-closed change. Kafka fetch records past the export body cap (`max_body_bytes`) are not exported by design and are reported apart by the messaging oracle when the run lost nothing (see [current state](docs/CURRENT-STATE.md)). |
+| Linux x86_64 on upstream kernel 4.15-5.7 | Unsupported | A PerfEventArray fallback path exists, but the eBPF object always creates a RingBuf map and uses 5.5+ helpers, so it fails to load on kernels without them. |
 | Linux ARM64 | Partial | Build/runtime path exists, but validation coverage is still limited. |
 | macOS agent development | Partial | User-space code compiles and tests run, but eBPF loading is Linux-only. |
 | Windows runtime | Unsupported | No Windows eBPF/runtime support. |
-| HTTP/1.1 parsing | Supported | FSM parser with multi-packet handling. |
-| HTTP/2 parsing | Supported | Stream handling works; some edge cases remain. |
-| gRPC parsing | Partial | Compression and schema-dependent decoding gaps remain. |
-| MySQL parsing | Partial | Core query flows supported; binary protocol gaps remain. |
-| PostgreSQL parsing | Partial | Core query flows supported; COPY and large-object paths remain incomplete. |
-| Redis parsing | Partial | RESP core supported; advanced command families remain incomplete. |
-| Kafka parsing | Supported | Covered by cleartext integration traffic and validator gating. |
-| AMQP parsing | Partial | Parser exists with unit coverage; no integration gating yet. |
-| DNS parsing | Partial | Parser exists with unit coverage; integration assertions remain limited. |
-| OpenSSL TLS plaintext capture | Partial | Targeted path support with runtime-specific caveats. |
-| Go TLS plaintext capture | Partial | Write-path capture only. |
-| Regex-first PII detection | Supported | Baseline detection path. |
+| HTTP/1.1 parsing | Supported | 100% recall against ground truth, incl. keep-alive, chunked and >4KB bodies ([benchmarks](docs/BENCHMARKS.md)). Pipelined requests pair in order; `1xx`, `HEAD`, `CONNECT` and `Upgrade` are framed per RFC 9112. On a TCP connection the agent did not see from its first byte (joined mid-stream, or bytes it could not place) records keep only the method and sizes. Over TLS it is not latched, but a path with a credential word (`/oauth/token` included) is withheld; a key first seen mid-connection or a lost TLS record can misattribute responses, or export the rest of a body whose start was lost ([user guide §5.3](docs/USER-GUIDE.md)). |
+| HTTP/2 parsing | Supported | Per-direction HPACK; on a connection the agent did not see whole (joined an existing connection, a side's start not captured, or the parser restarted after lost bytes) headers are not decoded for the rest of that connection, and bodies are withheld whether or not credential masking is on (frame boundaries are unproven too); an `RST_STREAM` code is exported only by its RFC 9113 name, and not at all on such a connection. Every connection over TLS (OpenSSL and Go) starts latched, since nothing proves a TLS record is its connection's first: HTTP/2 and gRPC over TLS export no headers (timing, sizes and addresses only). |
+| gRPC parsing | Supported | 100% recall, method path and `grpc-status` against ground truth; payloads are not exported while credential masking is on (the default); with it off they are shown as printable strings (no schema decoding, no compressed messages), except on a connection the agent did not see whole. Over TLS no path, method, `grpc-status` or payload is decoded (every TLS connection starts latched, as for HTTP/2). |
+| MySQL parsing | Supported | Text protocol (incl. MySQL 8 query attributes) and prepared statements (binary protocol, with bound parameter values) at 100% recall against ground truth on plaintext connections. MySQL 8 clients default to TLS, which needs the OpenSSL uprobe path. Error text is never exported, only the error code and SQLSTATE. Multi-result queries, `CALL` and `LOAD DATA LOCAL INFILE` are one exchange each; after a command whose reply is not modelled, or on a connection joined mid-stream, records keep only the statement keyword. Over TLS records keep the statement keyword only, since a TLS record may be framed from inside a bound value ([user guide §5.3](docs/USER-GUIDE.md)). |
+| PostgreSQL parsing | Supported | Simple, extended and named prepared statements at 100% recall against ground truth, including 500-row results (at the default `max_packet_bytes`, 16384). Each statement is paired with its own answer, also several under one `Sync`. Error and notice text is never exported, only the SQLSTATE and severity. Bound values and SQLSTATEs stop for the rest of a connection once server bytes are lost (ring drops, or a packet past `max_packet_bytes`), and are not exported on connections joined mid-stream. On a connection whose client stream is unproven (joined mid-stream, client bytes lost, or over TLS: every TLS connection starts latched) records keep the statement keyword only. COPY and large objects not parsed. |
+| Redis parsing | Supported | RESP2 and RESP3, pipelining; 100% recall against ground truth. Over TLS replies keep status, timing and sizes only (no command or reply text), since replies pair with commands only on a connection seen from its first byte. |
+| Kafka parsing | Supported | Classic and flexible (KIP-482) versions, topic IDs; 100% recall, topic and error code against ground truth (librdkafka, kafka-python). Record keys/values of uncompressed batches are PII-scanned; compressed batches are not decoded. Detected on port 9092 only. Over TLS, topic IDs named by a Metadata response resolve on that connection only. |
+| AMQP parsing | Supported | AMQP 0-9-1 (RabbitMQ): publish, deliver, get, return with bodies, synchronous methods with reply codes; 100% recall against ground truth. Over TLS known method names, reply codes, timing and sizes only (no text). |
+| DNS parsing | Supported | UDP and TCP; query name, type, rcode and answers at 100% against ground truth. |
+| OpenSSL TLS plaintext capture | Supported | Shared `libssl` 1.1.1/3.x, `SSL_read`/`SSL_write` and `_ex` variants; 100% recall against ground truth from both client and server processes. Exchanges carry socket addresses (validated with the `sock_send/recv_length` tracepoints, 6.3+, and with the fentry fallback on RHEL 8 and 9; kprobe fallback untested). Statically linked OpenSSL/BoringSSL is not found. |
+| Go TLS plaintext capture | Supported | `crypto/tls` reads and writes (gc builds of Go 1.18+ for amd64 or arm64 with the register ABI, established from the binary's build information; amd64 validated; binaries stripped of symbols are not found). Received plaintext is taken per TLS record where `(*halfConn).decrypt` returns it, in the connection's own input buffer, never from the caller's `Read` buffer ([current state](docs/CURRENT-STATE.md)). |
+| Regex-first PII detection | Supported | 16 validated patterns, including Aadhaar, PAN, UPI, GSTIN, Indian passport and phone, and IBAN. Precision and recall are measured per type on a labelled corpus, and a `cargo test` gate fails on regressions (`docs/BENCHMARKS.md`). Names and addresses need the ML path. |
+| Privacy modes (`full`, `redacted`, `metrics_only`) | Supported | Enforced at startup and only tightened on reload. Ground-truth leak test over HTTP, OpenSSL TLS, Redis AUTH and Kafka: planted values found only where the mode allows, at 100% recall ([current state](docs/CURRENT-STATE.md)). |
 | ONNX-backed ML inference | Partial | Optional runtime/model dependency with throughput trade-offs. |
+| Kubernetes identity (`namespace/workload` names) | Partial | Pod/Service list + watch with owner → workload mapping; validated only against a fake API server in unit tests, not on a real cluster yet. IPv4 only. |
 | Kubernetes deployment hardening | Out of scope | Helm chart exists, but production hardening is not part of this MVP. |
 
 ## Explicitly Not Done Yet
 
 - IPv6 capture is not implemented.
-- Kubernetes pod/service identity resolution is not implemented; graph identity
-  is DNS/IP-based today.
-- Go TLS read-path capture is not implemented.
+- Kubernetes pod/service identity has not been validated on a real cluster
+  (only against a fake API server).
+- On kernels without BTF (no fentry), TLS socket addresses come from a kprobe
+  fallback that has not been validated yet.
 - Broad TLS library coverage beyond the current OpenSSL and partial Go paths is
   not implemented.
 - Full runtime hot-reload is not implemented end to end.
@@ -82,11 +107,34 @@ ABI types, but it does **not** validate live eBPF attachment.
 
 ### Linux build and smoke-test path
 
+Requires the pinned eBPF toolchain (`nightly-2026-02-17` with `rust-src`) and
+`bpf-linker` 0.10.3 (newer releases need a system LLVM 23):
+
 ```bash
+rustup toolchain install nightly-2026-02-17 --component rust-src
+cargo +nightly-2026-02-17 install bpf-linker --locked --version 0.10.3
 cargo xtask build-ebpf
 cargo build -p panopticon-agent
-sudo ./target/debug/panopticon-agent --interface lo --log-events --smoke-test
+# --smoke-test exits 0 on the first captured event, 1 after 30s without one.
+sudo ./target/debug/panopticon-agent --log-events --smoke-test
 ```
+
+The agent captures at every socket on the node (loopback packets only with
+`capture_loopback = true`); there is no interface to choose.
+
+### Kubernetes (Helm)
+
+Releases publish a signed image to `ghcr.io/harshit2283/panopticon` and the
+chart as an OCI artifact:
+
+```bash
+helm install panopticon oci://ghcr.io/harshit2283/charts/panopticon \
+  --version 0.1.0 -n panopticon --create-namespace
+```
+
+The DaemonSet runs privileged with `hostNetwork`/`hostPID`, serves
+`/healthz`, `/readyz` and `/metrics` on the node IP at port 9435, and
+auto-detects each node's uplink interface. See `helm/panopticon/values.yaml`.
 
 For TLS or cleartext harnesses, see `tests/e2e/README.md` and
 `tests/integration/README.md`.
@@ -95,6 +143,8 @@ For TLS or cleartext harnesses, see `tests/e2e/README.md` and
 
 - Fast correctness: `cargo test -p panopticon-common`, `cargo test -p xtask`,
   `cargo test -p panopticon-agent`
+- Capture accuracy against ground truth: `sudo tests/oracle/run.sh`
+- Parser robustness: `cd fuzz && cargo +nightly-2026-02-17 fuzz run parsers`
 - eBPF build correctness: `cargo xtask build-ebpf`
 - Cleartext integration: `tests/integration/`
 - TLS behavior: `tests/e2e/`
@@ -108,10 +158,15 @@ correctness across every kernel.
 - Do **not** expose `/healthz`, `/readyz`, `/metrics`, or `/debug/state` to
   public or untrusted networks.
 - Prefer loopback or a private management network for observability endpoints.
-- OTLP should stay on trusted internal networks for the current MVP. If the
-  exposure boundary grows, use TLS or mTLS and stronger endpoint
-  authentication.
+- OTLP export is cleartext gRPC: only `http://` endpoints are accepted
+  (`https://` refuses to start) and there is no TLS or authentication
+  option. Keep the collector on the node or a trusted internal network; to
+  cross an untrusted one, send to a collector on the node that forwards
+  over TLS.
 - Treat JSONL export and the PII audit log as sensitive artifacts.
+- `--privacy-mode full` writes decrypted TLS plaintext and unredacted
+  personal data to the export and raw dump; enable it only when you need it
+  and protect those files.
 
 ## Open Source
 
