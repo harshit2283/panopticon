@@ -275,14 +275,12 @@ fn case_or_digit_boundary(b: &[u8], i: usize) -> bool {
 /// word before it counts too ([`glued_short_name`]: `cardpin`, `SMSOTP`,
 /// `mpin`, `dbpass`, `reqsig`, `userjwt`, `phpsessid`). Any other short
 /// name inside a segment with no boundary is not one: `spinner`, `pinned`,
-/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. Nor is a
-/// whole token that names a record key ([`names_a_non_secret_key`]:
-/// `sort_key`, `partitionKey`). No allocation:
+/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. A record key
+/// (`sort_key`) is exempted by the callers on the whole name or token
+/// ([`names_a_non_secret_key`], [`in_a_non_secret_key_name`]), never on a
+/// part of it here (`user.sort_key` stays a name). No allocation:
 /// one pass over the token.
 fn has_name_segment(token: &[u8]) -> bool {
-    if names_a_non_secret_key(token) {
-        return false;
-    }
     let is_name = |seg: &[u8]| {
         NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || glued_short_name(seg)
     };
@@ -321,7 +319,9 @@ const NON_SECRET_KEY_KINDS: &[&str] = &["sort", "partition", "foreign", "row", "
 /// Only the whole name: `x-sort-key`, `user.sort_key`, `sort_key_secret`
 /// and `sort_key2` stay credential names, and a value is read as ever (a
 /// credential word in it is context). No check of the value's shape
-/// applies (there is none). Not for Redis arguments
+/// applies (there is none). Decided on the whole name ([`decoded_name_is_credential`])
+/// or the whole token in free text and SQL ([`in_a_non_secret_key_name`]:
+/// `user.sort_key: …` and `pin.sort_key = …` are context). Not for Redis arguments
 /// ([`segmented_name_has_credential_word`]), which are read as before.
 fn names_a_non_secret_key(name: &[u8]) -> bool {
     NON_SECRET_KEY_KINDS.iter().any(|q| {
@@ -456,6 +456,10 @@ pub fn is_credential_name(name: &str) -> bool {
 /// segments is a short name ([`has_name_segment`]). No allocation for a
 /// name of up to 128 bytes.
 fn decoded_name_is_credential(name: &[u8]) -> bool {
+    // A record key, decided on the whole name ([`names_a_non_secret_key`]).
+    if names_a_non_secret_key(name) {
+        return false;
+    }
     if has_name_segment(name) {
         return true;
     }
@@ -596,7 +600,11 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
         if w != "identified" && strong_word(w) || short_name(b, cased, segments, w, start, end) {
             return true;
         }
-        if strict && !NAMES.contains(&w) && has_name_segment(&cased[start..end]) {
+        if strict
+            && !NAMES.contains(&w)
+            && has_name_segment(&cased[start..end])
+            && !in_a_non_secret_key_name(b, start, end)
+        {
             return true;
         }
     }
@@ -3089,6 +3097,25 @@ mod tests {
         // The value is still read: a credential word in it withholds.
         assert_eq!(p(r#"{"sort_key":"x","note":"token abc"}"#), FIELD_WITHHELD);
         assert_eq!(p("sort_key: 1, pin: 7392"), FIELD_WITHHELD);
+        // Review: the exemption is decided on the whole token, not on the
+        // part after a `.` or `-` (withheld at the baseline, as these are
+        // in JSON, form and XML positions).
+        for t in [
+            "user.sort_key: Zq9Xv7Wk",
+            "x-sort_key: Zq9Xv7Wk",
+            "pin.sort_key: 1234",
+            "otp.sort_key: 123456",
+            "session.sort_key: Zq9Xv7Wk",
+            "key.sort_key: Zq9Xv7Wk",
+            "auth.row_key: Zq9Xv7Wk",
+            "pin-sort_key: 1234",
+            r#"{"pwd":"x","note":"user.sort_key 1234"}"#,
+        ] {
+            assert_eq!(p(t), FIELD_WITHHELD, "{t}");
+        }
+        let sql = "SELECT * FROM t WHERE pin.sort_key = 'Zq9Xv7Wk'";
+        assert!(has_any_sql_credential_context(sql), "{sql}");
+        assert!(has_sql_credential_context(sql), "{sql}");
     }
 
     /// F1's fix matches a short name only as a whole segment: letters of
