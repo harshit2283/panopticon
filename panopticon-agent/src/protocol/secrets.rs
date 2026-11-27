@@ -25,7 +25,7 @@
 //! with the letter kept (`C:\token` is `C: token`, `dir\key` is
 //! `dir key`). Credential context is:
 //! - a word containing a credential part ([`PARTS`]: `password`, `pwd`,
-//!   `secret`, `token`, `api_key`, ..., each part of two words also
+//!   `secret`, `token`, `api_key`, `passcode`, ..., each part of two words also
 //!   folded: `apikey`, `privatekey`, so `privateKey` is one), ending in
 //!   `_pass` or `_auth`, or `identified` followed by `by`, `with`, `via`,
 //!   `as` or `using`;
@@ -134,6 +134,9 @@ const PARTS: &[&str] = &[
     // header name as the parsers deliver it, lowercased).
     "pwd",
     "passphrase",
+    // A PIN by another name (owner ruling); not `passkey`, whose WebAuthn
+    // ids are public.
+    "passcode",
     "secret",
     "token",
     "apikey",
@@ -2978,6 +2981,38 @@ mod tests {
         ] {
             assert_eq!(protect_text(t), None, "{t}");
         }
+    }
+
+    /// Owner ruling: `passcode` is a credential part (a PIN by another
+    /// name), anywhere in a word; `passkey` is not (WebAuthn passkey ids
+    /// are public).
+    #[test]
+    fn passcode_is_a_credential_word() {
+        const R: &str = REDACTED_CREDENTIAL;
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for (input, want) in [
+            (r#"{"passcode":"1234"}"#, format!(r#"{{"passcode":"{R}"}}"#)),
+            ("passcode=1234&q=1", format!("passcode={R}&q=1")),
+            (
+                r#"{"userPasscode":"1234"}"#,
+                format!(r#"{{"userPasscode":"{R}"}}"#),
+            ),
+        ] {
+            assert_eq!(p(input), want, "{input}");
+            assert_eq!(
+                protect_text_with(&names_only, input).as_deref(),
+                Some(want.as_str()),
+                "{input}"
+            );
+        }
+        for n in ["passcode", "x-passcode", "userPasscode", "PASSCODE"] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        assert_eq!(p("your passcode is 1234"), FIELD_WITHHELD);
+        for n in ["passkey", "x-passkey-id", "passport", "passenger"] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        assert_eq!(protect_text(r#"{"passkeyId":"abc","passport":"x"}"#), None);
     }
 
     /// M5: a name that is exactly a qualifier naming a non-secret kind of

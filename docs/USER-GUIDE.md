@@ -811,7 +811,7 @@ and as a separator with the letter kept, as in a Windows path, prose or
 LaTeX (`C:\token` is `C: token`, `dir\key=…` is `dir key=…`). The words
 and forms:
 
-- a word containing `password`, `passwd`, `pwd`, `passphrase`, `secret`,
+- a word containing `password`, `passwd`, `pwd`, `passphrase`, `passcode`, `secret`,
   `token`,
   `apikey`, `api_key`, `accesskey`, `access_key`, `privatekey`,
   `private_key`, `credential`, `signature`, `authorization`,
