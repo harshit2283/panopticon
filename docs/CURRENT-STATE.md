@@ -538,7 +538,10 @@ production-hardened compliance platform.
     `sessionid`, `cardpin`, `smsotp`, `mpin`, `x-reqsig`, `x-dbpass`,
     `x-userjwt`, `jsessionid`, and `pwd` anywhere, `x-newpwd`, as
     lowercased header names arrive; not `spinner`, `pinned` or
-    `x-usersid`, which reads as `users` + `id` too, and no plural); two-word
+    `x-usersid`, which reads as `users` + `id` too, no plural, and not
+    a whole name that is `sort`, `partition`, `foreign`, `row`, `shard` or
+    `range` and `key`, `sort_key`, `partitionKey`, while `primary_key`,
+    `routing_key` and `cache_key` stay credential names); two-word
     credential parts match camelCase too (`privateKey`, `accessKey`,
     `clientAssertion`), in bodies, header names, form and query names and
     SQL columns alike. A name in a position that delimits it (JSON member,

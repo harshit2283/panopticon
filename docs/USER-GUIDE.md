@@ -840,7 +840,14 @@ and forms:
   `keyboard`, `otpcode`, `bypass`, `signal`), nor is `sid` glued to a
   word (`x-usersid` reads as `users` + `id` as much as `user` + `sid`,
   like `x-processid`: a known limit), nor is a plural (`keys`, `pins`, `sessions`;
-  Redis arguments differ, below). These names are also looked for with
+  Redis arguments differ, below), nor a whole name that is exactly
+  `sort`, `partition`, `foreign`, `row`, `shard` or `range` and `key`
+  (`sort_key`, `partitionKey`, `RowKey`, `row.key`: a record key; not
+  `primary_key`, an Azure account key, `routing_key`, PagerDuty's
+  integration key, `cache_key`, which can hold a session key, nor
+  `hash_key`, `idempotency_key` or a longer name such as `x-sort-key`;
+  Redis arguments and HTTP header names, matched by substring above, are
+  read as before). These names are also looked for with
   `-` and `.` as word boundaries, as in the field, so a qualified name is
   still one (`users.pwd = …`, `?user.pwd=…`, `old-pwd:`, `pwd-0`), and in
   SQL on the statement as captured too; a short name followed by `-` or

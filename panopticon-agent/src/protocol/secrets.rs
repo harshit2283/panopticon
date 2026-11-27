@@ -44,7 +44,9 @@
 //!   `bypass` or `compass`, or holding `jwt`, `sessid` or `sessionid`:
 //!   `cardpin`, `SMSOTP`, `mpin`, `dbpass`, `reqsig`, `userjwt`,
 //!   `phpsessid`; not `usersid`); not `spinner`, `pinned` or `keyboard`;
-//!   no plural), used as a name:
+//!   no plural; not a whole name naming a record key,
+//!   [`names_a_non_secret_key`]: `sort_key`, `partitionKey`, not
+//!   `primary_key`), used as a name:
 //!   followed by `=` or `:`, given as a form or HTML field name
 //!   (`name="pwd"`), or an XML element (`<pwd>`); in SQL also a column in
 //!   a list or assignment (`users(pwd)`, `, pwd)`) or next to an operator
@@ -270,9 +272,14 @@ fn case_or_digit_boundary(b: &[u8], i: usize) -> bool {
 /// word before it counts too ([`glued_short_name`]: `cardpin`, `SMSOTP`,
 /// `mpin`, `dbpass`, `reqsig`, `userjwt`, `phpsessid`). Any other short
 /// name inside a segment with no boundary is not one: `spinner`, `pinned`,
-/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. No allocation:
+/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. Nor is a
+/// whole token that names a record key ([`names_a_non_secret_key`]:
+/// `sort_key`, `partitionKey`). No allocation:
 /// one pass over the token.
 fn has_name_segment(token: &[u8]) -> bool {
+    if names_a_non_secret_key(token) {
+        return false;
+    }
     let is_name = |seg: &[u8]| {
         NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || glued_short_name(seg)
     };
@@ -291,6 +298,60 @@ fn has_name_segment(token: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Qualifiers of `key` that name a kind of key that is no secret: a
+/// database or store's own record keys. A closed list: not `primary`
+/// (Azure's `primaryKey` / `secondaryKey` are account keys), `routing`
+/// (PagerDuty's `routing_key` is the integration key, the credential of
+/// its Events API), `cache` (a cache key can hold a session key: Django's
+/// cached sessions), `hash` (the key of an HMAC), `idempotency` (it
+/// replays the stored response of the request that set it), nor any
+/// qualifier of a secret (`api`, `secret`, `private`, `access`, `sign`,
+/// `signing`, `session`, `encryption`, `master`, `license`, `ssh`,
+/// `client`, `auth`).
+const NON_SECRET_KEY_KINDS: &[&str] = &["sort", "partition", "foreign", "row", "shard", "range"];
+
+/// Whether a whole name is exactly a qualifier of [`NON_SECRET_KEY_KINDS`]
+/// and `key`, joined by `_`, `-`, `.` or nothing, case folded (`sort_key`,
+/// `partitionKey`, `RowKey`, `row.key`): a record key, no credential.
+/// Only the whole name: `x-sort-key`, `user.sort_key`, `sort_key_secret`
+/// and `sort_key2` stay credential names, and a value is read as ever (a
+/// credential word in it is context). No check of the value's shape
+/// applies (there is none). Not for Redis arguments
+/// ([`segmented_name_has_credential_word`]), which are read as before.
+fn names_a_non_secret_key(name: &[u8]) -> bool {
+    NON_SECRET_KEY_KINDS.iter().any(|q| {
+        name.len() > q.len() && name[..q.len()].eq_ignore_ascii_case(q.as_bytes()) && {
+            let rest = &name[q.len()..];
+            let rest = match rest.first() {
+                Some(b'_' | b'-' | b'.') => &rest[1..],
+                _ => rest,
+            };
+            rest.eq_ignore_ascii_case(b"key")
+        }
+    })
+}
+
+/// [`names_a_non_secret_key`] of the whole token around `start..end` in a
+/// view `b`: the word with any letters, digits, `_`, `-` and `.` joined
+/// to it, so `key` of `sort-key` is read as `sort-key`. Reads at most a
+/// few bytes on each side (no such name is longer: linear in the field).
+fn in_a_non_secret_key_name(b: &[u8], start: usize, end: usize) -> bool {
+    const LONGEST: usize = "partition_key".len();
+    let part = |c: &&u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
+    let s = start
+        - b[..start]
+            .iter()
+            .rev()
+            .take(LONGEST)
+            .take_while(part)
+            .count();
+    let e = end + b[end..].iter().take(LONGEST).take_while(part).count();
+    e - s <= LONGEST
+        && !b[..s].last().is_some_and(|c| part(&c))
+        && !b.get(e).is_some_and(|c| part(&c))
+        && names_a_non_secret_key(&b[s..e])
 }
 
 /// A segment that joins a short name to the word before it with no
@@ -512,6 +573,7 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
     let short_name = |b: &[u8], cased: &[u8], segments: bool, w: &str, start, end| {
         (NAMES.contains(&w) || segments && has_name_segment(&cased[start..end]))
             && !is_bare(w, start, end)
+            && !in_a_non_secret_key_name(b, start, end)
             && (used_as_name(b, start, end)
                 || sql && (sql_column(b, start, end) || sql_operand(b, start, end)))
     };
@@ -2915,6 +2977,82 @@ mod tests {
         }
     }
 
+    /// M5: a name that is exactly a qualifier naming a non-secret kind of
+    /// key and `key` (`sort_key`, `partitionKey`, `row-key`) is not a
+    /// credential name. Not `primary` (Azure's `primaryKey` is an account
+    /// key), `routing` (PagerDuty's `routing_key` is the integration key),
+    /// `cache` (Django's session cache key holds the session key) or any
+    /// qualifier of a secret key; not a longer name (`x-sort-key`).
+    #[test]
+    fn keys_named_for_a_non_secret_kind_are_exported() {
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for t in [
+            r#"{"sort_key":"2024-01-01#a","n":1}"#,
+            r#"{"partitionKey":"user-1","rowKey":"r1"}"#,
+            r#"{"PartitionKey":"p","RowKey":"r","Timestamp":"t"}"#,
+            r#"{"shard_key":"region","range_key":"ts","foreign_key":"user_id"}"#,
+            r#"{"a":"x.y","sort-key":"v"}"#,
+            "sort_key=abc&q=1",
+            "sort-key: abc",
+            "partition.key = p1",
+            "SORT_KEY: 5",
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
+            assert_eq!(protect_text_with(&names_only, t), None, "{t}");
+        }
+        for n in [
+            "sort_key",
+            "sortKey",
+            "SortKey",
+            "partition-key",
+            "row.key",
+            "ForeignKey",
+        ] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        for sql in [
+            "SELECT a FROM t WHERE shard_key = $1",
+            "UPDATE t SET sort_key = $1 WHERE id = 2",
+            "INSERT INTO t (id, partition_key) VALUES (1, 'p')",
+        ] {
+            assert!(!has_any_sql_credential_context(sql), "{sql}");
+        }
+        for n in [
+            "primary_key",
+            "primaryKey",
+            "secondaryKey",
+            "routing_key",
+            "cache_key",
+            "idempotency_key",
+            "Idempotency-Key",
+            "hash_key",
+            "api_key",
+            "secret_key",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "sign_key",
+            "session_key",
+            "encryption_key",
+            "master_key",
+            "license_key",
+            "ssh_key",
+            "client_key",
+            "auth_key",
+            "key",
+            "x-sort-key",
+            "user.sort_key",
+            "sort_key_secret",
+            "partition_api_key",
+            "sort_key2",
+        ] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        // The value is still read: a credential word in it withholds.
+        assert_eq!(p(r#"{"sort_key":"x","note":"token abc"}"#), FIELD_WITHHELD);
+        assert_eq!(p("sort_key: 1, pin: 7392"), FIELD_WITHHELD);
+    }
+
     /// F1's fix matches a short name only as a whole segment: letters of
     /// one inside a word with no `_` or case boundary (`spinner`, `pinned`,
     /// `shipping`) do not count, nor does a short name a `-` or `.` joins
@@ -3840,6 +3978,10 @@ mod tests {
             "\"spinner-x\":".repeat(5_000),
             "&spinner-x=".repeat(5_000),
             "\\\"".repeat(20_000),
+            // M2, M5: words joined by `-`.
+            "key-".repeat(16_000),
+            "pin-code-".repeat(8_000),
+            "sort-key ".repeat(8_000),
         ] {
             let t = std::time::Instant::now();
             let _ = protect_text(&body);

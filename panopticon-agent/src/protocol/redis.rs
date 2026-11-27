@@ -1223,6 +1223,8 @@ mod tests {
             &["HSET", "u:1", "OTPCode", "1"],
             &["HSET", "u:1", "PINCode", "1"],
             &["SET", "otp2", "1"],
+            // Redis arguments are read by segments as before (M5).
+            &["HSET", "t", "sort_key", "1"],
         ] {
             assert!(command_has_credential_context(&cmd(c)), "{c:?}");
         }
