@@ -540,7 +540,10 @@ production-hardened compliance platform.
     boundaries (`users.pwd`), and as a segment of a name split at `_` and
     at case and digit boundaries (`old_pwd`, `newPwd`, `card_pin`,
     `sms_otp`; a segment ending in `pin`, `otp` or `sig`, or in `pass`
-    but not `bypass` or `compass`, or holding `jwt`, `sessid` or
+    but not `bypass`, `compass` (`encompass`), `overpass`, `underpass`,
+    `surpass` or `trespass` (over-matching `daypass`, `boardingpass`,
+    `multipass`, `lowpass`, `highpass`, `bandpass` and `renderpass`), or
+    holding `jwt`, `sessid` or
     `sessionid`, `cardpin`, `smsotp`, `mpin`, `x-reqsig`, `x-dbpass`,
     `x-userjwt`, `jsessionid`, and `pwd` anywhere, `x-newpwd`, as
     lowercased header names arrive; not `spinner`, `pinned` or
@@ -560,7 +563,11 @@ production-hardened compliance platform.
     a name, as a host and port `auth-service:8080` must be exported,
     unless the one word after it, ending the token, is `code`, `number`,
     `num`, `no`, `digits` or `id` and the whole is used as a name
-    (`pin-code: 7392` and `otp-code:123456` are withheld). A URI password before an empty host
+    (`pin-code: 7392` and `otp-code:123456` are withheld). A backslash
+    before a letter is also read as a separator (`C:\token` is `C: token`),
+    so a JSON body carrying a Windows path such as `C:\\token` is withheld
+    whole, also beside a credential that was masked before (an
+    over-match). A URI password before an empty host
     (`postgres://u:pw@/db`) is masked. A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.
     Redis reply text is never exported: a reply is exported as its type

@@ -3113,6 +3113,10 @@ mod tests {
         ] {
             assert_eq!(p(t), FIELD_WITHHELD, "{t}");
         }
+        // Documented: a limit beside a record key is exported with it.
+        assert_eq!(protect_text("sort_key: 1, pin-entry: 7392"), None);
+        // Documented (M4 over-match): a Windows path beside a credential.
+        assert_eq!(p(r#"{"pwd":"x","p":"C:\\token"}"#), FIELD_WITHHELD);
         let sql = "SELECT * FROM t WHERE pin.sort_key = 'Zq9Xv7Wk'";
         assert!(has_any_sql_credential_context(sql), "{sql}");
         assert!(has_sql_credential_context(sql), "{sql}");

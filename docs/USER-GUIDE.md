@@ -789,7 +789,10 @@ data. Known limits:
   glued to a word in one case (`x-usersid`, which reads as `users` +
   `id` too), and in free text a short name before `-` or `.` followed by
   a word that is not a qualifier (`pin-entry: 7392`, read like the host
-  and port `pin-svc:7392`);
+  and port `pin-svc:7392`). A record-key name (`sort_key`, below) no
+  longer withholds a field whole, so one of these beside it
+  (`sort_key: 1, pin-entry: 7392`, withheld when `sort_key` was a
+  credential name) is now exported with the rest of the field;
 - encodings the agent does not decode: compressed bodies (gzip, deflate,
   compressed gRPC and Kafka batches), UTF-16 or UTF-32 text beyond plain
   ASCII, HTML named entities other than `&amp;` `&quot;` `&apos;` `&lt;`
@@ -815,8 +818,10 @@ markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
 `-` and `.` read as `_`. A backslash before a letter is read both ways,
 and context in either reading counts: as JSON (`\t` a tab, `\k` a `k`)
 and as a separator with the letter kept, as in a Windows path, prose or
-LaTeX (`C:\token` is `C: token`, `dir\key=…` is `dir key=…`). The words
-and forms:
+LaTeX (`C:\token` is `C: token`, `dir\key=…` is `dir key=…`). So a
+JSON body carrying a Windows path such as `C:\\token` is withheld whole,
+also beside a credential that was masked before
+(`{"pwd":"x","p":"C:\\token"}`, an over-match). The words and forms:
 
 - a word containing `password`, `passwd`, `pwd`, `passphrase`, `passcode`, `secret`,
   `token`,
