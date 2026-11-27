@@ -141,7 +141,8 @@ pub struct Http2Parser {
     client_dir: Direction,
     /// Bytes arrived from the client (its first were the preface, or this
     /// parser latched: `joined_late`) / from the server. Until the
-    /// client's side starts, the server's bytes are held unread.
+    /// client's side starts, the server's bytes are held unread, and a gap
+    /// in them is not accounted for (`skip` answers `None`).
     client_fed: bool,
     server_fed: bool,
     /// The client's first bytes were the preface.
@@ -793,6 +794,13 @@ impl ProtocolParser for Http2Parser {
 
     fn skip(&mut self, direction: Direction, n: usize, ts: u64) -> Option<ParseResult> {
         let from_client = self.is_client(direction);
+        // The server's side is held unread until the client's starts (see
+        // `feed`): a gap in it cannot be accounted for either. A server
+        // sends no DATA before a request, so this costs no legitimate
+        // stream; the manager replaces this parser, latched.
+        if !from_client && !self.client_fed {
+            return None;
+        }
         if !self.skip_side(from_client, n) {
             return None;
         }
@@ -1672,6 +1680,49 @@ mod tests {
         );
         let msgs = messages(p.feed(&resp, Direction::Ingress, 2));
         assert_eq!(msgs[0].path.as_deref(), Some("/first"));
+    }
+
+    /// A gap on the held server side (review LOW-2): the server's bytes are
+    /// unread until the client's side starts, so `skip` cannot account for
+    /// a gap in them either (a server sends no DATA before a request). It
+    /// answers `None`, and the manager replaces the parser, latched. Before,
+    /// `skip` read the held DATA frame and the server's frames after it,
+    /// and the connection went on unlatched (the call's path exported).
+    #[test]
+    fn a_gap_on_the_held_server_side_is_not_accounted() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let data = make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &[0x61; 20]);
+        let mut p = Http2Parser::new(true);
+        p.feed(&data[..9 + 5], Direction::Ingress, 0);
+        assert!(p.skip(Direction::Ingress, 15, 1).is_none());
+        assert!(p.streams.is_empty(), "nothing of the held side was read");
+        assert_eq!(p.server.buf.len(), 9 + 5, "still held");
+
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Grpc);
+        m.process_packet(1, Direction::Ingress, &data[..9 + 5], 0);
+        assert!(m.skip_from(1, (0, 0), Direction::Ingress, 15, 1).is_none());
+        let mut req = preface();
+        let mut ce = hpack::Encoder::new();
+        req.extend(make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &encode(&mut ce, &[(":method", "POST"), (":path", "/svc/Call")]),
+        ));
+        m.process_packet(1, Direction::Egress, &req, 2);
+        let resp = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &encode(&mut hpack::Encoder::new(), &[(":status", "200")]),
+        );
+        let msgs = match m.process_packet(1, Direction::Ingress, &resp, 3) {
+            Some(FsmResult::MessageComplete(msg)) => vec![msg],
+            Some(FsmResult::Messages(ms)) => ms,
+            _ => vec![],
+        };
+        assert!(msgs.iter().all(|m| m.path.is_none()), "latched: {msgs:?}");
     }
 
     /// Process-relative directions (TLS on a server, no role known): the
