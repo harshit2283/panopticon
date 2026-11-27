@@ -533,9 +533,12 @@ production-hardened compliance platform.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`), and as a segment of a name split at `_` and
     at case and digit boundaries (`old_pwd`, `newPwd`, `card_pin`,
-    `sms_otp`; a segment ending in `pin` or `otp`, `cardpin`, `smsotp`,
-    `mpin`, and `pwd` anywhere, `x-newpwd`, as lowercased header names
-    arrive; not `spinner` or `pinned`, and no plural); two-word
+    `sms_otp`; a segment ending in `pin`, `otp` or `sig`, or in `pass`
+    but not `bypass` or `compass`, or holding `jwt`, `sessid` or
+    `sessionid`, `cardpin`, `smsotp`, `mpin`, `x-reqsig`, `x-dbpass`,
+    `x-userjwt`, `jsessionid`, and `pwd` anywhere, `x-newpwd`, as
+    lowercased header names arrive; not `spinner`, `pinned` or
+    `x-usersid`, which reads as `users` + `id` too, and no plural); two-word
     credential parts match camelCase too (`privateKey`, `accessKey`,
     `clientAssertion`), in bodies, header names, form and query names and
     SQL columns alike. A name in a position that delimits it (JSON member,

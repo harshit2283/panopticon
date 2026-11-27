@@ -746,12 +746,14 @@ exported:
   `X-Goog-Api-Key`, `X-Hub-Signature-256`, ...). A header of any protocol
   whose name is a credential name is replaced the same way: a name holding
   a word of the first list below, or one of whose segments is one of the
-  short names below or ends in `pin` or `otp` (segments split at every
+  short names below or glues one to the word before it, as below
+  (segments split at every
   character that is not an ASCII letter or digit and at case and digit
   boundaries). The parsers deliver header names in lower case, so
   `x-old-pwd`, `x-card-pin`, `x-loginpwd`, `x-newpwd`, `x-cardpin`,
-  `x-smsotp` and `x_sms_otp` are credential names (`pwd` is a credential
-  part); `x-shipping-option` is not. For
+  `x-smsotp`, `x_sms_otp`, `x-dbpass`, `x-reqsig`, `x-userjwt` and
+  `x-jsessionid` are credential names (`pwd` is a credential part);
+  `x-shipping-option`, `x-cache-bypass` and `x-usersid` are not. For
   HTTP, HTTP/2 and gRPC, `:authority` and `Sec-WebSocket-Key` stay
   readable under both rules, and so does AMQP's `routing_key` field (its
   value is still scanned as text);
@@ -827,11 +829,17 @@ and forms:
   a lower-case one, a letter next to a digit. So `old_pwd`, `new_pwd`,
   `newPwd`, `loginPwd`, `card_pin`, `PIN_CODE`, `sms_otp`, `dbPass`,
   `userSessionId` and `otp2` are names, and so is a segment of more than
-  three characters ending in `pin` or `otp`, for names written in one
-  case (`cardpin`, `SMSOTP`, `mpin`, `totp`; `spin` and `hairpin` too, a
-  known over-match). Any other short name inside a segment with no
+  three characters ending in `pin` or `otp`, or longer than the short
+  name ending in `sig` or `pass` (not in `bypass`, `compass`,
+  `encompass`, `overpass`, `underpass`, `surpass` or `trespass`), or
+  holding `jwt`, `sessid` or `sessionid`, for names written in one case
+  (`cardpin`, `SMSOTP`, `mpin`, `totp`, `reqsig`, `dbpass`, `storepass`,
+  `userjwt`, `phpsessid`, `jsessionid`; `spin`, `hairpin` and `lowpass`
+  too, a known over-match). Any other short name inside a segment with no
   boundary is not (`spinner`, `pinned`, `shipping`, `opinion`, `topic`,
-  `keyboard`, `otpcode`), nor is a plural (`keys`, `pins`, `sessions`;
+  `keyboard`, `otpcode`, `bypass`, `signal`), nor is `sid` glued to a
+  word (`x-usersid` reads as `users` + `id` as much as `user` + `sid`,
+  like `x-processid`: a known limit), nor is a plural (`keys`, `pins`, `sessions`;
   Redis arguments differ, below). These names are also looked for with
   `-` and `.` as word boundaries, as in the field, so a qualified name is
   still one (`users.pwd = …`, `?user.pwd=…`, `old-pwd:`, `pwd-0`), and in

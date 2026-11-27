@@ -39,8 +39,12 @@
 //!   ([`has_name_segment`]:
 //!   split at `_` and at case and digit boundaries of the text as decoded,
 //!   so `old_pwd`, `newPwd`, `card_pin`, `PIN_CODE`, `otp2`, and a
-//!   segment ending in `pin` or `otp`, `cardpin`, `SMSOTP`, `mpin`; not
-//!   `spinner`, `pinned` or `keyboard`; no plural), used as a name:
+//!   segment that glues a short name to the word before it
+//!   ([`glued_short_name`]: ending in `pin`, `otp`, `sig` or `pass`, not
+//!   `bypass` or `compass`, or holding `jwt`, `sessid` or `sessionid`:
+//!   `cardpin`, `SMSOTP`, `mpin`, `dbpass`, `reqsig`, `userjwt`,
+//!   `phpsessid`; not `usersid`); not `spinner`, `pinned` or `keyboard`;
+//!   no plural), used as a name:
 //!   followed by `=` or `:`, given as a form or HTML field name
 //!   (`name="pwd"`), or an XML element (`<pwd>`); in SQL also a column in
 //!   a list or assignment (`users(pwd)`, `, pwd)`) or next to an operator
@@ -244,14 +248,15 @@ fn case_or_digit_boundary(b: &[u8], i: usize) -> bool {
 /// `x.sms.otp`, `otp2`). Unlike a Redis argument
 /// ([`segmented_name_has_credential_word`]), no plural (`keys`, `pins`):
 /// these are names in free text and structured bodies, where a plural is
-/// more often a list than a secret. A segment that ends in `pin` or `otp`
-/// counts too ([`ends_in_pin_or_otp`]: `cardpin`, `SMSOTP`, `mpin`). Any
-/// other short name inside a segment with no boundary is not one:
-/// `spinner`, `pinned`, `shipping`, `keyboard`, `otpcode`. No allocation:
+/// more often a list than a secret. A segment that glues a short name to the
+/// word before it counts too ([`glued_short_name`]: `cardpin`, `SMSOTP`,
+/// `mpin`, `dbpass`, `reqsig`, `userjwt`, `phpsessid`). Any other short
+/// name inside a segment with no boundary is not one: `spinner`, `pinned`,
+/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. No allocation:
 /// one pass over the token.
 fn has_name_segment(token: &[u8]) -> bool {
     let is_name = |seg: &[u8]| {
-        NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || ends_in_pin_or_otp(seg)
+        NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || glued_short_name(seg)
     };
     let mut start: Option<usize> = None;
     for i in 0..=token.len() {
@@ -270,18 +275,46 @@ fn has_name_segment(token: &[u8]) -> bool {
     false
 }
 
-/// A segment of more than three letters or digits ending in `pin` or
-/// `otp` (case folded): names written in one case join a short name to the
-/// word before it with no boundary (`cardpin`, `smsotp`, `mpin`, `totp`, a
-/// lowercased header `x-cardpin`). Only the end counts, so `spinner`,
-/// `pinned`, `shipping`, `opinion`, `option`, `topic` and `footprint` do
-/// not; `spin`, `backspin` and `hairpin` do (masked as credentials: a
-/// known over-match).
-fn ends_in_pin_or_otp(seg: &[u8]) -> bool {
-    seg.len() > 3 && {
-        let tail = &seg[seg.len() - 3..];
-        tail.eq_ignore_ascii_case(b"pin") || tail.eq_ignore_ascii_case(b"otp")
-    }
+/// A segment that joins a short name to the word before it with no
+/// boundary, as names written in one case do (a lowercased header
+/// `x-cardpin`, `x-dbpass`), case folded: longer than the short name and
+/// - ending in `pin`, `otp` or `sig` (`cardpin`, `smsotp`, `mpin`, `totp`,
+///   `reqsig`, `hubsig`). Only the end counts, so `spinner`, `pinned`,
+///   `shipping`, `opinion`, `option`, `topic`, `footprint`, `signal`,
+///   `design` and `assign` do not; `spin`, `backspin` and `hairpin` do
+///   (masked as credentials: a known over-match);
+/// - ending in `pass`, unless in `bypass`, `compass` (`encompass`),
+///   `overpass`, `underpass`, `surpass` or `trespass`, the English words
+///   that end so (`dbpass`, `userpass`, `storepass`; `passenger`,
+///   `passport` do not end so; `lowpass`, `renderpass` are an over-match,
+///   as `renderPass` already is);
+/// - or holding `jwt`, `sessid` or `sessionid` anywhere, which no word
+///   does (`userjwt`, `jwtassertion`, `phpsessid`, `jsessionid`,
+///   `aspsessionidqsdratbs`).
+///
+/// Not `sid`: an `s`-final word before `id` reads the same (`usersid` is
+/// `users` + `id` as much as `user` + `sid`, `processid`, `classid`), nor
+/// `key` or `auth` (`monkey`, `author`).
+fn glued_short_name(seg: &[u8]) -> bool {
+    let ends = |w: &[u8]| seg.len() > w.len() && seg[seg.len() - w.len()..].eq_ignore_ascii_case(w);
+    let holds = |w: &[u8]| seg.windows(w.len()).any(|x| x.eq_ignore_ascii_case(w));
+    ends(b"pin")
+        || ends(b"otp")
+        || ends(b"sig")
+        || ends(b"pass")
+            && ![
+                &b"bypass"[..],
+                b"compass",
+                b"overpass",
+                b"underpass",
+                b"surpass",
+                b"trespass",
+            ]
+            .iter()
+            .any(|w| ends(w) || seg.eq_ignore_ascii_case(w))
+        || holds(b"jwt")
+        || holds(b"sessid")
+        || holds(b"sessionid")
 }
 
 fn strong_word(w: &str) -> bool {
@@ -316,9 +349,10 @@ fn may_decode(raw: &str) -> bool {
 /// (any length; percent- and JSON-decoded, case-folded): it holds a word
 /// with a credential part ([`PARTS`], `_pass`, `_auth`), or one of its
 /// segments, split at every character that is not an ASCII letter or digit
-/// and at case and digit boundaries, is a short name or ends in `pin` or
-/// `otp` ([`has_name_segment`]: `X-Old-Pwd`, `new_pwd`, `loginPwd`,
-/// `card_pin`, `x-cardpin`; `x-newpwd` by the part `pwd`; not `spinner`).
+/// and at case and digit boundaries, is a short name or glues one to the
+/// word before it ([`has_name_segment`]: `X-Old-Pwd`, `new_pwd`, `loginPwd`,
+/// `card_pin`, `x-cardpin`, `x-dbpass`, `x-reqsig`, `x-userjwt`,
+/// `jsessionid`; `x-newpwd` by the part `pwd`; not `spinner`, `x-usersid`).
 pub fn is_credential_name(name: &str) -> bool {
     let (d, _, letter) = decode_nul(name, Reading::Json);
     let json = match d {
@@ -2958,12 +2992,10 @@ mod tests {
         ] {
             assert_eq!(protect_text(t), None, "{t}");
         }
-        // A known limit: other short names glued to a word in one case are
-        // not names (`bypass`, `compass`, `consider`, `design` would be),
-        // so these lowercased headers are exported.
-        for n in ["x-dbpass", "x-userjwt", "x-usersid", "x-reqsig"] {
-            assert!(!is_credential_name(n), "{n}");
-        }
+        // A known limit: `sid` glued to a word in one case is not a name,
+        // since an `s`-final word before `id` reads the same (`x-usersid`
+        // is `users` + `id` as much as `user` + `sid`; `x-processid`).
+        assert!(!is_credential_name("x-usersid"));
         for n in [
             "x-shipping-option",
             "opinion",
@@ -2976,6 +3008,345 @@ mod tests {
             assert!(!is_credential_name(n), "{n}");
         }
     }
+
+    /// M1: names written in one case (header names arrive lowercased) that
+    /// glue a credential name to the word before it: a segment ending in
+    /// `pass` (not `bypass`, `compass`, `overpass`, `underpass`, `surpass`,
+    /// `trespass`), ending in `sig`, or holding `jwt`, `sessid` or
+    /// `sessionid`. Checked against common header names of HTTP, CORS,
+    /// caches and CDNs, nginx, Envoy, tracing, AWS, GCP, Cloudflare,
+    /// Kubernetes and gRPC, none of which becomes a credential name.
+    #[test]
+    fn glued_credential_names_in_one_case() {
+        const R: &str = REDACTED_CREDENTIAL;
+        for n in [
+            "x-dbpass",
+            "x-userpass",
+            "x-adminpass",
+            "x-smtppass",
+            "storepass",
+            "x-userjwt",
+            "x-jwtassertion",
+            "x-reqsig",
+            "x-hubsig",
+            "jsessionid",
+            "x-jsessionid",
+            "phpsessid",
+            "aspsessionidqsdratbs",
+            "x-usersessionid",
+        ] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        for (input, want) in [
+            (r#"{"dbpass":"hunter2"}"#, format!(r#"{{"dbpass":"{R}"}}"#)),
+            ("jsessionid=AB12&q=1", format!("jsessionid={R}&q=1")),
+            ("/app?phpsessid=ab12", format!("/app?phpsessid={R}")),
+            (r#"{"reqsig":"9f8e"}"#, format!(r#"{{"reqsig":"{R}"}}"#)),
+            (r#"{"userjwt":"eyJx"}"#, format!(r#"{{"userjwt":"{R}"}}"#)),
+        ] {
+            assert_eq!(p(input), want, "{input}");
+            let names_only = rules(&[], Builtin::NamesOnly);
+            assert_eq!(
+                protect_text_with(&names_only, input).as_deref(),
+                Some(want.as_str()),
+                "{input}"
+            );
+        }
+        assert_eq!(p("dbpass: hunter2"), FIELD_WITHHELD);
+        assert!(has_sql_credential_context(
+            "UPDATE u SET dbpass = 'x' WHERE id = 1"
+        ));
+        // Words that end in `pass` or `sig`, or hold the letters, and are
+        // no credential.
+        for n in [
+            "bypass",
+            "x-cache-bypass",
+            "x-bypass-cache",
+            "cachebypass",
+            "compass",
+            "x-compass",
+            "encompass",
+            "overpass",
+            "underpass",
+            "surpass",
+            "trespass",
+            "passenger",
+            "passport",
+            "x-passthrough",
+            "x-inside",
+            "x-config",
+            "x-design",
+            "x-signal",
+            "x-assign",
+            "x-consider",
+            "x-processid",
+            "x-businessid",
+            "x-classid",
+            "x-addressid",
+            "x-statusid",
+            "obsession",
+            "sessions",
+        ] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        assert_eq!(protect_text(r#"{"bypass":true,"compass":"N"}"#), None);
+        assert_eq!(protect_text("compass: N, bypass: yes"), None);
+        for h in COMMON_HEADERS {
+            assert!(!is_credential_name(h), "{h}");
+        }
+    }
+
+    /// Common header names that carry nothing secret (lowercased, as the
+    /// parsers deliver them).
+    const COMMON_HEADERS: &[&str] = &[
+        // HTTP.
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "age",
+        "allow",
+        "alt-svc",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-location",
+        "content-range",
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "content-type",
+        "date",
+        "dnt",
+        "etag",
+        "expect",
+        "expires",
+        "forwarded",
+        "from",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "last-modified",
+        "link",
+        "location",
+        "max-forwards",
+        "origin",
+        "pragma",
+        "priority",
+        "range",
+        "referer",
+        "referrer-policy",
+        "retry-after",
+        "server",
+        "server-timing",
+        "strict-transport-security",
+        "te",
+        "timing-allow-origin",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "vary",
+        "via",
+        "warning",
+        "permissions-policy",
+        "cross-origin-embedder-policy",
+        "cross-origin-opener-policy",
+        "cross-origin-resource-policy",
+        "clear-site-data",
+        "nel",
+        "report-to",
+        "reporting-endpoints",
+        "early-data",
+        "device-memory",
+        "downlink",
+        "ect",
+        "rtt",
+        "save-data",
+        "viewport-width",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "sec-gpc",
+        "sec-purpose",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+        "sec-websocket-accept",
+        "x-content-type-options",
+        "x-frame-options",
+        "x-xss-protection",
+        "x-powered-by",
+        "x-requested-with",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-prefix",
+        "x-forwarded-client-cert",
+        "x-real-ip",
+        "x-request-id",
+        "x-correlation-id",
+        "x-ua-compatible",
+        "x-dns-prefetch-control",
+        "x-download-options",
+        "x-permitted-cross-domain-policies",
+        "x-robots-tag",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "ratelimit-policy",
+        // CORS.
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+        "access-control-expose-headers",
+        "access-control-max-age",
+        "access-control-request-method",
+        "access-control-request-headers",
+        "access-control-allow-private-network",
+        // Caches, CDNs, nginx.
+        "x-cache",
+        "x-cache-hits",
+        "x-cache-status",
+        "x-cache-bypass",
+        "x-bypass-cache",
+        "cdn-cache-control",
+        "surrogate-control",
+        "x-served-by",
+        "x-timer",
+        "x-varnish",
+        "x-proxy-cache",
+        "x-accel-redirect",
+        "x-accel-buffering",
+        "x-accel-expires",
+        "x-accel-limit-rate",
+        "x-upstream-addr",
+        // Envoy, Istio, tracing.
+        "x-envoy-upstream-service-time",
+        "x-envoy-expected-rq-timeout-ms",
+        "x-envoy-attempt-count",
+        "x-envoy-decorator-operation",
+        "x-envoy-original-path",
+        "x-envoy-retry-on",
+        "x-envoy-max-retries",
+        "x-envoy-upstream-rq-timeout-ms",
+        "x-envoy-internal",
+        "x-envoy-external-address",
+        "x-envoy-downstream-service-cluster",
+        "x-envoy-peer-metadata",
+        "x-envoy-peer-metadata-id",
+        "x-envoy-force-trace",
+        "x-envoy-overloaded",
+        "x-envoy-ratelimited",
+        "x-b3-traceid",
+        "x-b3-spanid",
+        "x-b3-parentspanid",
+        "x-b3-sampled",
+        "x-b3-flags",
+        "b3",
+        "x-ot-span-context",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "grpc-trace-bin",
+        "uber-trace-id",
+        "x-datadog-trace-id",
+        "x-datadog-parent-id",
+        "x-datadog-sampling-priority",
+        "x-datadog-origin",
+        // AWS.
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "x-amz-request-id",
+        "x-amz-id-2",
+        "x-amz-server-side-encryption",
+        "x-amz-version-id",
+        "x-amz-storage-class",
+        "x-amz-meta-owner",
+        "x-amz-cf-id",
+        "x-amz-cf-pop",
+        "x-amz-apigw-id",
+        "x-amzn-requestid",
+        "x-amzn-errortype",
+        "x-amzn-trace-id",
+        "x-amz-target",
+        "x-amz-user-agent",
+        "x-amz-expected-bucket-owner",
+        "x-amz-checksum-crc32",
+        "x-amz-acl",
+        "x-amz-copy-source",
+        "x-amz-tagging",
+        // GCP.
+        "x-goog-api-client",
+        "x-goog-request-params",
+        "x-goog-user-project",
+        "x-goog-upload-protocol",
+        "x-goog-upload-command",
+        "x-goog-hash",
+        "x-goog-generation",
+        "x-goog-metageneration",
+        "x-goog-stored-content-length",
+        "x-goog-storage-class",
+        "x-guploader-uploadid",
+        "x-cloud-trace-context",
+        // Cloudflare.
+        "cf-ray",
+        "cf-connecting-ip",
+        "cf-connecting-ipv6",
+        "cf-ipcountry",
+        "cf-visitor",
+        "cf-cache-status",
+        "cf-worker",
+        "cf-ew-via",
+        "cf-device-type",
+        "cf-pseudo-ipv4",
+        "cdn-loop",
+        "true-client-ip",
+        // Kubernetes.
+        "x-kubernetes-pf-flowschema-uid",
+        "x-kubernetes-pf-prioritylevel-uid",
+        "audit-id",
+        "x-remote-user",
+        "x-remote-group",
+        "impersonate-user",
+        "impersonate-group",
+        "impersonate-uid",
+        "x-stream-protocol-version",
+        // gRPC.
+        "grpc-status",
+        "grpc-message",
+        "grpc-encoding",
+        "grpc-accept-encoding",
+        "grpc-timeout",
+        "grpc-status-details-bin",
+        "grpc-previous-rpc-attempts",
+        "grpc-retry-pushback-ms",
+        // Others.
+        "x-github-request-id",
+        "x-github-event",
+        "x-github-delivery",
+        "x-gitlab-event",
+        "x-slack-request-timestamp",
+        "x-shopify-shop-domain",
+        "x-ssl-client-verify",
+        "x-ssl-client-dn",
+        "x-client-ip",
+        "x-device-id",
+        "x-tenant-id",
+        "x-user-id",
+    ];
 
     /// F1 delta review (HIGH): a decoder must not consume what follows a
     /// malformed escape (`\u` without four hex digits, which multi-round
