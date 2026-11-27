@@ -1002,7 +1002,7 @@ pub fn take_conn_cap(
                 max_packet_bytes = config.max_packet_bytes,
                 "raise_packet_cap on: framed protocols capture whole packets"
             );
-            Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(m))))
+            Some(crate::conn_cap::CapWriter::new(Box::new(m)))
         }
         Err(e) => {
             warn!(error = %e, "CONN_CAP map unusable: raise_packet_cap off");

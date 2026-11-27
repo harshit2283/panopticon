@@ -140,8 +140,13 @@ pub struct EventStats {
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
     /// Connections whose packet cap was raised (`conn_cap.rs`).
     pub conn_cap_raised: AtomicU64,
-    /// Raises the kernel map refused (its write failed).
+    /// Raises not written: the kernel map refused the write, or the
+    /// writer thread's queue was full.
     pub conn_cap_write_failed: AtomicU64,
+    /// Raises refused because user space already keeps
+    /// `conn_cap::CONN_CAP_LIVE_MAX` entries (the kernel's LRU would
+    /// otherwise drop a live one to make room).
+    pub conn_cap_refused: AtomicU64,
     /// Records of raised connections cut at `max_packet_bytes` because they
     /// were emitted before the raise was written (the race).
     pub conn_cap_truncated_before_raise: AtomicU64,
@@ -179,6 +184,7 @@ impl EventStats {
             scope_drops: std::array::from_fn(|_| AtomicU64::new(0)),
             conn_cap_raised: AtomicU64::new(0),
             conn_cap_write_failed: AtomicU64::new(0),
+            conn_cap_refused: AtomicU64::new(0),
             conn_cap_truncated_before_raise: AtomicU64::new(0),
             conn_cap_packets: AtomicU64::new(0),
             conn_cap_cut: AtomicU64::new(0),
@@ -1053,6 +1059,11 @@ pub(crate) async fn worker_task(
         // Periodic idle connection sweep
         if last_sweep.elapsed() >= sweep_interval {
             let evicted = manager.evict_idle(ctx.idle_timeout);
+            // Raised connections this worker evicted (idle, or at capacity
+            // since the last sweep) give their kernel entries back.
+            if let Some(c) = &ctx.conn_cap {
+                c.sweep(worker_id, |cookie| manager.contains(cookie));
+            }
             if evicted > 0 {
                 ctx.stats
                     .active_connections
@@ -1351,7 +1362,7 @@ fn feed_event(
             && seg.is_some()
             && let Some(c) = conn_cap
         {
-            c.on_detect(cookie, proto);
+            c.on_detect(cookie, proto, worker_id);
         }
     }
 
@@ -2304,6 +2315,7 @@ mod tests {
             false,
             Some(&cap),
         );
+        cap.flush(); // the writer thread has done the write
         let raised: Vec<u64> = fake.lock().unwrap().map.keys().copied().collect();
         assert_eq!(raised, vec![first.socket_cookie]);
         assert!(cap.is_raised(first.socket_cookie) && !cap.is_raised(http.socket_cookie));
