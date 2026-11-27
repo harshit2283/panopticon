@@ -1213,7 +1213,9 @@ bare name (above). A Redis command is protected as one unit: when any of
 its arguments has credential context, read together or one by one, or
 any argument or the command's own name (a module command such as
 `OTP.SET`; not `AUTH`, whose arguments are masked by their own rule,
-nor `KEYS`) names a credential read by segments (below), the key
+nor `KEYS`) names a credential read by segments (below), or the
+command's name is not a built-in one and holds a credential word or
+short name anywhere (below: `SETOTP`), the key
 (`path`), the arguments (`request_text`) and the reply's shape are all
 exported as `<field withheld>` (method, status, timing and sizes stay).
 So `SET otp:+15551234567 482913 EX
@@ -1236,9 +1238,16 @@ segments is a short name whole or with a plural `s` (`otp`,
 `keys`, Django's `:1:django.contrib.sessions.cache<id>`), names a
 credential. A short name joined to other letters with no boundary does
 not count, so `mykey`, `spinner`, `author` and `otpcode` name no
-credential; the same holds for a command name, so a module command
-glued into one word (`SETOTP`, `PINSET`) is not caught, while `OTP.SET`
-and `PinSet` are.
+credential. A command name is read by segments too (`OTP.SET`,
+`PinSet`), and since Redis's built-in command names are a closed set, a
+name that is not one of them (a module or custom command) also names a
+credential when it holds a credential word or short name anywhere,
+glued or not: `SETOTP`, `OTPSET`, `PINSET`, `SESSIONSET` and
+`MYAPP.SETPIN` are withheld with their command. The built-in names that
+hold such letters (`PING`, `KEYS`, `HKEYS`, `RANDOMKEY`,
+`JSON.OBJKEYS`, `FT.DROPINDEX`, KeyDB's `KEYDB.*`) do not count; a
+custom command whose name merely holds the letters (`MYKEYS`, `ASSIGN`)
+is withheld too, an over-match.
 So `SET otp 482913`, `SET user:1:otp 482913`, `HSET u:1 pin 1234`,
 `SET session_token abc`, `EVAL <script> 1 otp`, `XADD events * otp
 482913`, `LMOVE incoming user:1:otp LEFT RIGHT` and `JSON.GET u:1 $.pin`

@@ -571,7 +571,10 @@ production-hardened compliance platform.
     withheld as one unit (key, arguments and the reply's shape), so `SET otp:<id> <code>`, `SET otp <code>`,
     `HSET u:1 pin <pin>`, `EVAL <script> 1 otp` and `XADD s * otp <code>`
     export no value. A value that only mentions a credential word
-    withholds its command too.
+    withholds its command too, and so does a command name read by
+    segments (`OTP.SET`) or, when it is not a built-in Redis command
+    name, holding a credential word or short name anywhere (`SETOTP`,
+    `PINSET`, `MYAPP.SETPIN`; not `PING` or `KEYS`).
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
     message bodies; a cut end keeps its prefix), any AMQP text (path,
     headers, body) of a direction after it lost frame sync, for the rest

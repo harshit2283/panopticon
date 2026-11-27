@@ -188,9 +188,10 @@ const NAMES: &[&str] = &[
 /// `sessions`, `otps`). Both readings are tried, with and without the case
 /// and digit boundaries (`masterUser`). A short name joined to other
 /// letters with no boundary does not count (owner ruling for Redis keys
-/// and command names, unlike [`has_name_segment`]'s `pin` / `otp`
-/// endings): `mykey`, `spinner`, `author`, `otpcode` and `SETOTP` name no
-/// credential.
+/// and arguments, unlike [`has_name_segment`]'s glued endings): `mykey`,
+/// `spinner`, `author` and `otpcode` name no credential. A command name
+/// that is not a built-in one is also read by
+/// [`holds_credential_letters`] (`SETOTP`).
 pub fn segmented_name_has_credential_word(name: &str) -> bool {
     [true, false].into_iter().any(|bounded| {
         let mut norm = segments_joined(name, bounded);
@@ -201,6 +202,19 @@ pub fn segmented_name_has_credential_word(name: &str) -> bool {
         zeroize::Zeroize::zeroize(&mut norm);
         found
     })
+}
+
+/// Whether `name`, case folded, holds a credential part ([`PARTS`]) or a
+/// short name ([`NAMES`]) anywhere, glued to other letters or not
+/// (`SETOTP`, `PINSET`, `myapp.setpin`): for a Redis command name that is
+/// not a built-in one, where there is no word to tell the letters apart
+/// from (the caller exempts the built-in names that hold some: `PING`,
+/// `KEYS`).
+pub fn holds_credential_letters(name: &str) -> bool {
+    let mut lower = name.to_ascii_lowercase();
+    let found = PARTS.iter().chain(NAMES).any(|w| lower.contains(w));
+    zeroize::Zeroize::zeroize(&mut lower);
+    found
 }
 
 /// `name` case folded, with `_` for each run of characters that are not
