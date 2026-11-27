@@ -845,7 +845,11 @@ and forms:
   still one (`users.pwd = …`, `?user.pwd=…`, `old-pwd:`, `pwd-0`), and in
   SQL on the statement as captured too; a short name followed by `-` or
   `.` is not used as a name in free text, so a host and port such as
-  `auth-service:8080` is not context. So `/api/auth/login`, a Redis
+  `auth-service:8080` is not context, unless the one word after it is
+  `code`, `number`, `num`, `no`, `digits` or `id`, ending the token, and
+  the whole is used as a name (`pin-code: 7392`, `otp-code:123456`,
+  `key-id=…`; a host named exactly so, `pin-code:7392` as a host and
+  port, is withheld too, a known over-match). So `/api/auth/login`, a Redis
   `AUTH` command name or "press any key" are not context;
 - a credential name (as for header names, above: any word of the first
   list, or a short name as a segment, `-` and `.` splitting segments
@@ -968,8 +972,9 @@ What is exported then:
   a segment, used as a name or not (`{"old-pwd":"x","note":"pin-code:
   7392"}`, `old-pwd=x&x=pin-code+7392`), withholds the field. In a field
   with no other credential context, free text with a short name before a
-  `-` or `.` is not read as a name (`pin-code: 7392` alone is exported),
-  since it cannot be told from a host and port (`auth-service:8080`).
+  `-` or `.` is not read as a name, since it cannot be told from a host
+  and port (`auth-service:8080`), unless the one word after it is a
+  qualifier (above: `pin-code: 7392` and `otp-code:123456` are withheld).
   Full mode masks every value `names_only` masks, whether or not the
   field has other credential context.
 - **A Redis command** with credential context in any argument, or any

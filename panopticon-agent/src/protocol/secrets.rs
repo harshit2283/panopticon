@@ -53,7 +53,11 @@
 //!   statement as captured (`pin+1`, whose `+` decodes to a space); a
 //!   short name followed by `-` or `.` is not used as a name in free
 //!   text, so a host and port is not one (`auth-service:8080`), except in
-//!   what is left of a field once its certain clauses are removed;
+//!   what is left of a field once its certain clauses are removed, and
+//!   when the one word after it is a qualifier ([`QUALIFIERS`]: `code`,
+//!   `number`, `num`, `no`, `digits`, `id`) that ends the token and the
+//!   whole is used as a name ([`qualified_short_name`]: `pin-code: 7392`,
+//!   `otp-code:123456`);
 //! - userinfo, `user:password@host`, with or without a scheme (the `:` of
 //!   `scheme://` and of `mailto:` do not count), and any `//` authority
 //!   whose userinfo has a `:` (RFC 3986: `,` and `;` may appear in it),
@@ -526,13 +530,45 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
         .into_iter()
         .chain([raw_sql.as_ref().map(|(s, raw)| (s, *raw))]);
     for (view, cased) in views.flatten() {
-        if words(view)
-            .any(|(w, start, end)| short_name(view.as_bytes(), cased, true, w, start, end))
-        {
+        let vb = view.as_bytes();
+        if words(view).any(|(w, start, end)| {
+            short_name(vb, cased, true, w, start, end)
+                || qualified_short_name(vb, cased, w, start, end) && !is_bare(w, start, end)
+        }) {
             return true;
         }
     }
     has_userinfo(b)
+}
+
+/// Last segments that only qualify the short name before them: what a
+/// value under the name is (`pin-code`, `otp.number`, `key-id`), never
+/// the name of a service or host (`auth-service`, `key-vault`).
+const QUALIFIERS: &[&str] = &["code", "number", "num", "no", "digits", "id"];
+
+/// In a view where `-` and `.` end a word (`b`, lowercase; `cased` the
+/// same text with case kept), whether the word `w` at `start..end` is a
+/// short name, whole or as a segment ([`has_name_segment`]), joined by one
+/// `-` or `.` to a last word of [`QUALIFIERS`] that the token ends with,
+/// the whole used as a name ([`used_as_name`]): `pin-code: 7392`,
+/// `otp-code:123456`, `card-pin-code: 7392`, `key-id=…`. A host and port
+/// or an error prefix ends in the name of a service (`auth-service:8080`,
+/// `key-vault: 443`), so it is not one; a host named exactly so
+/// (`pin-code:7392` as a host and port) is withheld (an over-match).
+fn qualified_short_name(b: &[u8], cased: &[u8], w: &str, start: usize, end: usize) -> bool {
+    if !matches!(b.get(end), Some(b'-' | b'.')) {
+        return false;
+    }
+    let s = end + 1;
+    let e = s + b[s..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    e > s
+        && !matches!(b.get(e), Some(b'-' | b'.'))
+        && std::str::from_utf8(&b[s..e]).is_ok_and(|q| QUALIFIERS.contains(&q))
+        && (NAMES.contains(&w) || has_name_segment(&cased[start..end]))
+        && used_as_name(b, s, e)
 }
 
 /// Whether a name in a position that delimits it whole is a credential
@@ -2787,9 +2823,11 @@ mod tests {
                 "{input}"
             );
         }
-        // A known limit: in free text, a short name before a `-` is not
-        // read as a name (it could be a host and port, `auth-service:8080`).
-        assert_eq!(protect_text("pin-code: 7392"), None);
+        // In free text, a short name before a `-` is a name only when the
+        // one segment after it qualifies it (`pin-code`), not when it could
+        // be a host and port (`auth-service:8080`): M2, below.
+        assert_eq!(p("pin-code: 7392"), FIELD_WITHHELD);
+        assert_eq!(protect_text("auth-service:8080"), None);
         // `_` joins segments, so a host name with `_` (not a valid DNS
         // host name) reads as a name used as one.
         assert_eq!(p("auth_service:8080"), FIELD_WITHHELD);
@@ -2810,6 +2848,56 @@ mod tests {
             assert!(!has_sql_credential_context(sql), "{sql}");
             assert!(has_any_sql_credential_context(sql), "{sql}");
             assert_eq!(pk(sql, FieldKind::SqlStatement), sql);
+        }
+    }
+
+    /// M2: in free text, a short name joined by `-` or `.` to one last
+    /// segment that only qualifies it (`code`, `number`, `num`, `no`,
+    /// `digits`, `id`) is a name when the whole is used as one, with or
+    /// without a space after the `:` (`pin-code: 7392`, `otp-code:123456`).
+    /// A host and port or an error prefix names a service, whose last
+    /// segment is not one of those (`auth-service:8080`, `key-vault: 443`).
+    #[test]
+    fn a_qualified_short_name_in_free_text_is_a_name() {
+        const S: &str = "Zq9Xv7Wk";
+        for input in [
+            format!("pin-code: {S}"),
+            format!("pin-code:{S}"),
+            format!("otp-code: {S}"),
+            format!("otp-code:{S}"),
+            format!("Your otp.code: {S}"),
+            format!("card-pin-code: {S}"),
+            format!("cardpin-code: {S}"),
+            format!("pin-number : {S}"),
+            format!("auth-code: {S}"),
+            format!("key-id={S}, region=eu"),
+            format!("sms otp-digits:{S}"),
+            format!("PIN-Code: {S}"),
+            format!(r#"{{"note":"pin-code: {S}"}}"#),
+        ] {
+            for kind in KINDS {
+                let out = pk(&input, kind);
+                assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
+            }
+        }
+        for t in [
+            "auth-service:8080",
+            "auth-service: down",
+            "session-store: 6379",
+            "key-vault: 443",
+            "Host: auth-service:8080",
+            "dial tcp: lookup session-store.default.svc: no such host",
+            "pin-svc.local:80",
+            "http://session-store:6379/x",
+            "connecting to pin.example.com: refused",
+            "key-vault.example.net:443",
+            "auth.example.com:8443",
+            "otp-codes: 3",
+            "pin-code-hint: ask the user",
+            "at 12:30, ratio 3:1",
+            r#"{"host":"key-vault.example.net:443","err":"auth-service: down"}"#,
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
         }
     }
 

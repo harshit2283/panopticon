@@ -548,8 +548,10 @@ production-hardened compliance platform.
     clauses are masked, a credential name left in such a position or any
     word with a short name as a segment withholds it. In a field with no
     other context, free text with a short name before a `-` or `.` is not
-    a name (`pin-code: 7392` alone is exported, as a host and port
-    `auth-service:8080` must be). A URI password before an empty host
+    a name, as a host and port `auth-service:8080` must be exported,
+    unless the one word after it, ending the token, is `code`, `number`,
+    `num`, `no`, `digits` or `id` and the whole is used as a name
+    (`pin-code: 7392` and `otp-code:123456` are withheld). A URI password before an empty host
     (`postgres://u:pw@/db`) is masked. A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.
     Redis reply text is never exported: a reply is exported as its type
