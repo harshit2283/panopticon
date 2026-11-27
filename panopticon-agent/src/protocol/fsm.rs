@@ -1527,6 +1527,39 @@ mod tests {
         f
     }
 
+    /// A SYN+ACK names the server from the kernel, as a socket role does:
+    /// the parser is told its directions are the socket's
+    /// (`direction_from_role`), and so is a parser that replaces it after a
+    /// gap. A server whose first bytes are a client preface then does not
+    /// swap the sides: the client's request closes no stream.
+    #[test]
+    fn syn_ack_server_keeps_directions_through_a_replacement() {
+        const CLIENT: Endpoint = (0x0A00_0002, 51000);
+        const SERVER: Endpoint = (0x0A00_0001, 8080);
+        let pri = super::super::detect::HTTP2_PREFACE;
+        let settings = h2_frame(0x4, 0, 0, &[]);
+        let req = h2_frame(0x1, 0x4 | 0x1, 1, &[0x83, 0x86, 0x84]);
+        let completes = |m: &ConnectionFsmManager, src: Endpoint, d: &[u8]| {
+            matches!(
+                m.process_packet_from(1, src, Direction::Egress, d, 0),
+                Some(FsmResult::MessageComplete(_) | FsmResult::Messages(_))
+            )
+        };
+        let m = ConnectionFsmManager::new(4);
+        m.note_syn(1, CLIENT, false, 100);
+        m.note_syn(1, SERVER, true, 500);
+        m.get_or_create(1, Protocol::Http2);
+        assert!(m.connections.get(&1).unwrap().role);
+        assert!(!completes(&m, CLIENT, &settings));
+        assert!(!completes(&m, SERVER, pri));
+        assert!(!completes(&m, CLIENT, &req), "sides not swapped");
+        // A gap the parser cannot place replaces it; the new one is told too.
+        assert!(m.skip_from(1, CLIENT, Direction::Egress, 3, 0).is_none());
+        assert!(!completes(&m, CLIENT, &settings));
+        assert!(!completes(&m, SERVER, pri));
+        assert!(!completes(&m, CLIENT, &req), "replacement not swapped");
+    }
+
     /// A Write that begins inside a DATA payload whose bytes are a client
     /// preface, SETTINGS and a HEADERS block (`GET` `/forged`), then a
     /// `:status 200` reply: what a key first seen mid-connection can get
