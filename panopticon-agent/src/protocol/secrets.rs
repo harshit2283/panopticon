@@ -19,7 +19,11 @@
 //! `&#x70;`, `&amp;` ...) and percent-decoding (`%70`, `+` as a space), so
 //! one encoding revealed by another is decoded too; ASCII case folded; SQL
 //! comment delimiters (`/*`, `/*!`, `*/`, `--`, `#`) blanked so their
-//! content is read as text; `-` and `.` read as `_`. Credential context is:
+//! content is read as text; `-` and `.` read as `_`. A backslash before a
+//! letter is read both ways ([`Reading`], [`normalize_views`]), context in
+//! either counting: as JSON (`\t` a tab, `\k` a `k`) and as a separator
+//! with the letter kept (`C:\token` is `C: token`, `dir\key` is
+//! `dir key`). Credential context is:
 //! - a word containing a credential part ([`PARTS`]: `password`, `pwd`,
 //!   `secret`, `token`, `api_key`, ..., each part of two words also
 //!   folded: `apikey`, `privatekey`, so `privateKey` is one), ending in
@@ -316,10 +320,17 @@ fn may_decode(raw: &str) -> bool {
 /// `otp` ([`has_name_segment`]: `X-Old-Pwd`, `new_pwd`, `loginPwd`,
 /// `card_pin`, `x-cardpin`; `x-newpwd` by the part `pwd`; not `spinner`).
 pub fn is_credential_name(name: &str) -> bool {
-    match decode(name) {
+    let (d, _, letter) = decode_nul(name, Reading::Json);
+    let json = match d {
         Some(d) => decoded_name_is_credential(d.as_bytes()),
         None => decoded_name_is_credential(name.as_bytes()),
-    }
+    };
+    // A backslash before a letter, also read as a separator ([`Reading`]):
+    // `dir\key`, `x\token`.
+    json || letter
+        && decode_nul(name, Reading::Separator)
+            .0
+            .is_some_and(|d| decoded_name_is_credential(d.as_bytes()))
 }
 
 /// [`is_credential_name`] of a name already decoded (as in the normalised
@@ -403,7 +414,21 @@ enum Slot {
 }
 
 fn context(text: &str, sql: bool, slot: Slot) -> bool {
-    context_in(text, &normalize_flagged(text), sql, slot, false)
+    let (v, alt) = normalize_views(text);
+    context_in_views(text, &v, alt.as_ref(), sql, slot, false)
+}
+
+/// [`context_in`] of either normalised view of `text` ([`normalize_views`]).
+fn context_in_views(
+    text: &str,
+    v: &View,
+    alt: Option<&View>,
+    sql: bool,
+    slot: Slot,
+    strict: bool,
+) -> bool {
+    context_in(text, v, sql, slot, strict)
+        || alt.is_some_and(|a| context_in(text, a, sql, slot, strict))
 }
 
 /// [`context`] of `text` whose normalised view is `v`. `strict` for the
@@ -1080,8 +1105,8 @@ fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     // the text decodes either, since every decoding step acts on any
     // escape it finds and leaves a malformed one in place, and the view
     // keeps every hint's letters).
-    let v = normalize_flagged(text);
-    if !context_in(text, &v, false, slot, false) {
+    let (v, alt) = normalize_views(text);
+    if !context_in_views(text, &v, alt.as_ref(), false, slot, false) {
         let names = v.hint || v.decoded;
         return Some(if names {
             certain_clauses(text).0
@@ -1095,7 +1120,8 @@ fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     // (an array, object or cut value, `{"pin-code":["7392"]}`), and any
     // word with a short name as a segment (`"note":"pin-code: 7392"`),
     // withholds the field.
-    (!context_in(&residual, &normalize_flagged(&residual), false, slot, true)).then_some(mask)
+    let (rv, ralt) = normalize_views(&residual);
+    (!context_in_views(&residual, &rv, ralt.as_ref(), false, slot, true)).then_some(mask)
 }
 
 /// Sorted, with overlapping or touching spans joined.
@@ -1248,7 +1274,21 @@ struct View {
 }
 
 fn normalize_flagged(text: &str) -> View {
-    let (d, nul) = decode_nul(text);
+    normalize_as(text, Reading::Json).0
+}
+
+/// The normalised views of a field: the JSON reading, and the separator
+/// reading when a backslash before a letter makes them differ
+/// ([`Reading`]). Credential context in either counts.
+fn normalize_views(text: &str) -> (View, Option<View>) {
+    let (v, letter) = normalize_as(text, Reading::Json);
+    (v, letter.then(|| normalize_as(text, Reading::Separator).0))
+}
+
+/// [`normalize_flagged`] under `reading`, and whether a backslash before a
+/// letter was read.
+fn normalize_as(text: &str, reading: Reading) -> (View, bool) {
+    let (d, nul, letter) = decode_nul(text, reading);
     let decoded = d.is_some();
     let mut s = d.unwrap_or_else(|| text.to_string());
     let cased = s.bytes().any(|c| c.is_ascii_uppercase()).then(|| s.clone());
@@ -1266,7 +1306,7 @@ fn normalize_flagged(text: &str) -> View {
         let joined = s.replace(['-', '.'], "_");
         split = Some(std::mem::replace(&mut s, joined));
     }
-    View {
+    let v = View {
         text: s,
         cased,
         hint,
@@ -1274,20 +1314,38 @@ fn normalize_flagged(text: &str) -> View {
         nul,
         comment,
         split,
-    }
+    };
+    (v, letter)
 }
 
 /// The decoded view: NUL bytes dropped, then up to three rounds of JSON
 /// escapes, HTML references and percent-decoding. None when nothing
 /// changes.
 fn decode(text: &str) -> Option<String> {
-    decode_nul(text).0
+    decode_nul(text, Reading::Json).0
 }
 
-/// [`decode`], and whether a NUL byte was dropped.
-fn decode_nul(text: &str) -> (Option<String>, bool) {
+/// How [`json_unescape_as`] reads a backslash before an ASCII letter
+/// (other than a `\u` with four hex digits).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// As JSON: `\b`, `\f`, `\n`, `\r`, `\t` a control character (read as
+    /// a space), any other letter kept without its backslash.
+    Json,
+    /// As a separator, the letter kept (`C:\token` is `C: token`,
+    /// `dir\key` is `dir key`): the backslash of a Windows path, prose or
+    /// LaTeX, which is not an escape there.
+    Separator,
+}
+
+/// [`decode`] under `reading`, whether a NUL byte was dropped, and whether
+/// a backslash before a letter was read. The two readings differ only
+/// there, so if no round of the JSON reading reads one, the separator
+/// reading decodes the same text.
+fn decode_nul(text: &str, reading: Reading) -> (Option<String>, bool, bool) {
     let mut s: Option<String> = None;
     let mut nul = false;
+    let mut letter = false;
     for _ in 0..3 {
         let mut changed = false;
         let cur = s.as_deref().unwrap_or(text);
@@ -1298,7 +1356,13 @@ fn decode_nul(text: &str) -> (Option<String>, bool) {
             s = Some(d);
             changed = true;
         }
-        for step in [json_unescape, html_unescape, percent_decode] {
+        let (d, l) = json_unescape_as(s.as_deref().unwrap_or(text), reading);
+        letter |= l;
+        if let Some(d) = d {
+            s = Some(d);
+            changed = true;
+        }
+        for step in [html_unescape, percent_decode] {
             if let Some(d) = step(s.as_deref().unwrap_or(text)) {
                 s = Some(d);
                 changed = true;
@@ -1314,7 +1378,7 @@ fn decode_nul(text: &str) -> (Option<String>, bool) {
         nul = true;
         d.retain(|c| c != '\0');
     }
-    (s, nul)
+    (s, nul, letter)
 }
 
 /// HTML character references decoded (`&#119;`, `&#x77;`, `&amp;`,
@@ -1370,10 +1434,18 @@ fn html_unescape(text: &str) -> Option<String> {
 
 /// JSON string escapes decoded wherever they appear, or None when there
 /// are none.
+#[cfg(test)]
 fn json_unescape(text: &str) -> Option<String> {
+    json_unescape_as(text, Reading::Json).0
+}
+
+/// [`json_unescape`] with a backslash before a letter read as `reading`
+/// says ([`Reading`]), and whether one was read.
+fn json_unescape_as(text: &str, reading: Reading) -> (Option<String>, bool) {
     if !text.contains('\\') {
-        return None;
+        return (None, false);
     }
+    let mut letter = false;
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1407,12 +1479,22 @@ fn json_unescape(text: &str) -> Option<String> {
                 }
                 out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
             }
-            Some('b' | 'f' | 'n' | 'r' | 't') => out.push(' '),
+            Some(c) if c.is_ascii_alphabetic() => {
+                letter = true;
+                match (reading, c) {
+                    (Reading::Separator, _) => {
+                        out.push(' ');
+                        out.push(c);
+                    }
+                    (Reading::Json, 'b' | 'f' | 'n' | 'r' | 't') => out.push(' '),
+                    (Reading::Json, _) => out.push(c),
+                }
+            }
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
     }
-    (out != text).then_some(out)
+    ((out != text).then_some(out), letter)
 }
 
 /// One pass of `%XX` and `+` decoding, or None when there is nothing to
@@ -2919,6 +3001,67 @@ mod tests {
                     assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
                 }
             }
+        }
+    }
+
+    /// M4: a backslash before a word in text that is not JSON (a Windows
+    /// path, prose, LaTeX) is not an escape there. JSON reads `\t`, `\b`,
+    /// `\n`, `\r` and `\f` as control characters (`\token` as a tab and
+    /// `oken`) and drops the backslash of any other letter (`dir\key` as
+    /// `dirkey`); both readings hid the credential word. The view is also
+    /// read with a backslash before a letter as a separator.
+    #[test]
+    fn a_backslash_before_a_word_hides_no_credential() {
+        const S: &str = "Zq9Xv7Wk";
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for input in [
+            format!(r"\token={S}"),
+            format!(r"\token={S}&b=1"),
+            format!(r"see C:\token {S}"),
+            format!(r"x \token {S}"),
+            format!(r"\\token={S}"),
+            format!("%5Ctoken={S}"),
+            format!(r"\bearer {S}"),
+            format!(r"\requirepass {S}"),
+            format!(r"\secret: {S}"),
+            format!(r"dir\key={S}"),
+            format!(r"a\session={S}"),
+            format!(r"x\auth: {S}"),
+            format!(r"x\pin: {S}"),
+            format!(r#"{{"p":"C:\\token","v":"{S}"}}"#),
+            format!(r#"{{"dir\\token":"{S}"}}"#),
+        ] {
+            for kind in KINDS {
+                let out = pk(&input, kind);
+                assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
+            }
+            // Full masks what names_only masks.
+            if let Some(n) = protect_text_with(&names_only, &input) {
+                assert!(!n.contains(S) || p(&input) == FIELD_WITHHELD, "{input:?}");
+            }
+        }
+        // A certain structure under a name read with the separator: masked
+        // in both modes.
+        let want = format!(r"dir\key={REDACTED_CREDENTIAL}");
+        assert_eq!(p(&format!(r"dir\key={S}")), want);
+        assert_eq!(
+            protect_text_with(&names_only, &format!(r"dir\key={S}")).as_deref(),
+            Some(want.as_str())
+        );
+        assert!(is_credential_name(r"x\token"));
+        // The JSON reading still counts: a tab escape before a short name.
+        assert_eq!(p(&format!(r#"{{"m":"a\tkey={S}"}}"#)), FIELD_WITHHELD);
+        assert_eq!(p(&format!(r#"{{"m":"a\npwd: {S}"}}"#)), FIELD_WITHHELD);
+        // Paths, prose and escapes with no credential word stay exported.
+        for t in [
+            r"C:\Users\bob\notes.txt",
+            r"see C:\tmp\report and \textbf{bold}",
+            r#"{"path":"C:\\tmp\\report.txt","n":1}"#,
+            r#"{"msg":"line1\nline2\tdone"}"#,
+            r"\begin{document}\section{Intro}\end{document}",
+            r#"{"re":"\\d+\\s\\w"}"#,
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
         }
     }
 

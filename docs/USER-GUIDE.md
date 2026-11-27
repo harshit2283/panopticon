@@ -798,7 +798,11 @@ the words or forms below. The view is the field with NUL bytes dropped
 and percent-encoding (`%70`, `+` as a space), so an encoding revealed by
 another is decoded too (`%5Cu0077` is `w`); case folded; SQL comment
 markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
-`-` and `.` read as `_`. The words and forms:
+`-` and `.` read as `_`. A backslash before a letter is read both ways,
+and context in either reading counts: as JSON (`\t` a tab, `\k` a `k`)
+and as a separator with the letter kept, as in a Windows path, prose or
+LaTeX (`C:\token` is `C: token`, `dir\key=…` is `dir key=…`). The words
+and forms:
 
 - a word containing `password`, `passwd`, `pwd`, `passphrase`, `secret`,
   `token`,
