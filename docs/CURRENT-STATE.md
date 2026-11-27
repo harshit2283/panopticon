@@ -271,7 +271,23 @@ production-hardened compliance platform.
     broker's read within one log segment); a record of another partition,
     one appended after the request left, or one past a cut response of
     1 MiB or more or without a latency, counts as lost. That rescoring
-    predates the stricter rule and has not been redone.
+    predates the stricter rule and has not been redone. Under the
+    stricter rule a 2026-11-28 run on 8.10 lost 14 records (96.8%,
+    every loss counter 0) in two multi-topic responses cut at the cap,
+    in partitions other than the cut record's: unprovable, so lost.
+    Since then the Kafka leg's workload is deterministic
+    (`mq_oracle.py`): the producer waits after each operation until the
+    consumer has its records, so a response carries one operation's
+    records in one partition, below the cap, and two held phases (the
+    consumer paused until the records are acknowledged) build a cut
+    response of one partition, which the rule proves, and a multi-topic
+    response below the cap. An uncut response in a record's window no
+    longer blocks the exclusion when it is smaller than the record's
+    value (an expired long poll), which it then cannot hold. Seven runs
+    (2026-11-28, 500 operations, seed 7, default config: three on 8.10,
+    one each on 7.0, 6.8, 5.15 and 9.8) gave the same score: `Fetch`
+    439/439, lost 0, 8 past body cap (all from the held cut phase),
+    every loss counter 0; AMQP and DNS 100%.
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
     fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a

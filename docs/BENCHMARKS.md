@@ -436,6 +436,26 @@ oracle, with partition sections taken into account, scores 421/421 with
 12 past body cap, lost 0, every loss counter 0 (the run itself, scored
 before that rule, gave 420/421 with 11 past body cap).
 
+Under the stricter rule a run on 8.10 (2026-11-28, 500 operations, seed
+7) lost 14 `Fetch` records (96.8%, every loss counter 0) in two responses
+of three and four topics cut at the cap: the records were in partitions
+other than the cut record's, which the export cannot place, and the
+partition order in a response changes from one fetch to the next. The
+cut depended on how many records piled up in a fetch. Since then the
+oracle's Kafka workload is deterministic (`mq_oracle.py` docstring): the
+producer waits after each operation until the consumer has its records,
+so every response carries one operation's records in one partition below
+the cap, and two held phases (the consumer paused, a parked fetch let
+expire, the records acknowledged, then the consumer resumed) build a cut
+response of one partition, which the rule proves, and multi-topic
+responses below the cap. An expired long poll (an empty response, whose
+`path` is the request's topics) no longer blocks the exclusion: a
+response smaller than a record's value cannot have carried it. Seven
+runs on the new workload (three on 8.10, one each on 7.0, 6.8, 5.15 and
+9.8, default config) all scored `Fetch` 439/439 (`consume` 404,
+`consume-cut` 10, `consume-multi` 25), lost 0, 8 past body cap, Kafka,
+AMQP and DNS 100%, every loss counter 0.
+
 In these runs every operation matched two records, on both kernels (the
 0-duplicate runs above predate cgroup_skb as the only capture backend).
 This is confirmed from the raw dumps: each connection has two socket

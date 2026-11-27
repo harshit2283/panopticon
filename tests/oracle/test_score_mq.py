@@ -38,6 +38,17 @@ classifies a consumed record no Fetch record carries:
             before it. Lost.
   ack_after_request
             Acknowledged 1 ns after R's request left. Lost.
+  empty_small
+            As `proven`, plus an uncut response in t's window that names
+            t's topic and shows nothing (a long poll that expired), smaller
+            than t's value (truth `size`): it cannot have carried t.
+            Excused.
+  empty_large
+            The same response, as large as t's value: it could have carried
+            t and lost it. Lost.
+  empty_no_size
+            The small response, but t's truth has no `size`: any such
+            response could have carried t. Lost.
 
 Usage: python3 -I test_score_mq.py [SCORER]   (default: score_mq.py beside
 this file). Exits non-zero on any failed case.
@@ -84,8 +95,10 @@ def fetch(text, start, end, size, port):
 R_START = 160 * MS  # when R's request left
 
 
-def fixture(t_ack=150 * MS, t_partition=0, answered=True, r_size=4 * CAP, r_latency=True):
-    """(truth, export) of records 1 (c), 2 (t), 3 (t's successor)."""
+def fixture(t_ack=150 * MS, t_partition=0, answered=True, r_size=4 * CAP, r_latency=True,
+            empty=None, sized=True):
+    """(truth, export) of records 1 (c), 2 (t), 3 (t's successor); `empty`:
+    the size of an uncut response in t's window that shows nothing."""
     truth, export = [], []
     parts = {1: (0, 10), 2: (t_partition, 11), 3: (0, 12)}
     for n, (part, off) in parts.items():
@@ -93,6 +106,8 @@ def fixture(t_ack=150 * MS, t_partition=0, answered=True, r_size=4 * CAP, r_late
                       "verb": "Produce", "path": TOPIC, "status": 0,
                       "tokens": [f"tok_{n}_"], "pii": [], "via": "single"})
         where = {} if part is None else {"partition": part, "offset": off}
+        if sized:
+            where["size"] = len(value(n).encode())
         truth.append({"id": f"fetch:tok_{n}_", "proto": "kafka", "kind": "fetch",
                       "verb": "Fetch", "path": TOPIC, "status": 0,
                       "tokens": [f"tok_{n}_"], "pii": [], "via": "consume", **where})
@@ -105,6 +120,8 @@ def fixture(t_ack=150 * MS, t_partition=0, answered=True, r_size=4 * CAP, r_late
     export.append(fetch(cut_text, R_START if r_latency else None, 260 * MS, r_size, 40001))
     # A later uncut response with record 3 alone.
     export.append(fetch(f"k-tok_3_\n{value(3)}", 320 * MS, 400 * MS, 120, 40001))
+    if empty is not None:
+        export.append(fetch("", 270 * MS, 300 * MS, empty, 40001))
     return truth, export
 
 
@@ -119,6 +136,9 @@ CASES = {
     "no_fetch_latency": ({"r_latency": False}, (1, 0)),
     "ack_at_request": ({"t_ack": R_START}, (1, 0)),
     "ack_after_request": ({"t_ack": R_START + 1}, (1, 0)),
+    "empty_small": ({"empty": len(value(2)) - 1}, (0, 1)),
+    "empty_large": ({"empty": len(value(2))}, (1, 0)),
+    "empty_no_size": ({"empty": len(value(2)) - 1, "sized": False}, (1, 0)),
 }
 
 

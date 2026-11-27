@@ -20,6 +20,25 @@ Record fields:
   via     transport / variant, for the recall breakdown
   partition, offset   (Kafka fetch only) where the consumer read the record,
           so score_mq.py can place it in the Fetch response that carried it
+  size    (Kafka fetch only) the record value's byte length: a Fetch
+          response smaller than it cannot have carried the record
+
+Kafka Fetch and the agent's body cap (max_body_bytes, 4096 by default): the
+producer waits after each operation until the consumer has every record
+produced so far, so a Fetch response carries one operation's records, all
+in one partition, and stays below the cap. Records piled up in one fetch
+would make its size, and whether and where the cap cuts it, depend on the
+VM's timing, and a record of another partition past a cut cannot be told
+from one the agent dropped (score_mq.py). Two held phases build the large
+and multi-topic responses deliberately: the consumer is paused, a Fetch
+parked before the pause is let expire, the records are produced and
+acknowledged, then the consumer resumes, so the next Fetch request leaves
+after every acknowledgement:
+  cut     several 2000-byte records to one partition, one response larger
+          than the cap: the records past its cut are in the cut record's
+          partition, which score_mq.py proves (via "consume-cut")
+  multi   one small record to each of several topics, one response of
+          several topics below the cap (via "consume-multi")
 
 Usage:
   python mq_oracle.py kafka HOST N OUT [SEED]
@@ -64,6 +83,7 @@ def body(tok, i, pad=0, with_pii=True):
 
 KAFKA_TOPICS = ["orders", "user.events", "audit-log_v2", "payments.eu-west-1.settled"]
 SMALL_TOPIC = "o3.small"  # max.message.bytes=1024: larger records are rejected
+FETCH_WAIT_MS = 500  # the consumer's fetch.wait.max.ms
 
 
 def raw_metadata(sock, version, topic, cid):
@@ -100,6 +120,7 @@ def recv_exact(sock, n):
 
 
 def run_kafka():
+    import queue
     import threading
 
     from confluent_kafka import OFFSET_END, Consumer, KafkaException, Producer, TopicPartition
@@ -140,20 +161,36 @@ def run_kafka():
 
     # Consume concurrently, from the end of each partition: Fetch responses
     # carry back the records produced below, a few at a time.
-    cons = Consumer({**conf, "group.id": f"o3-{SEED}", "enable.auto.commit": False})
+    # fetch.wait.max.ms is librdkafka's default, set so that the held
+    # phases below wait out a parked Fetch for certain.
+    cons = Consumer({**conf, "group.id": f"o3-{SEED}", "enable.auto.commit": False,
+                     "fetch.wait.max.ms": FETCH_WAIT_MS})
+    every = [TopicPartition(t, p) for t in KAFKA_TOPICS for p in range(2)]
     cons.assign([TopicPartition(t, p, OFFSET_END) for t in KAFKA_TOPICS for p in range(2)])
     consumed = {}  # token -> (partition, offset)
+    got = threading.Condition()
     stop = threading.Event()
+    # (Consumer method, done) for the consumer thread: pause() called from
+    # another thread while poll() runs deadlocks, so the thread that polls
+    # pauses and resumes.
+    control = queue.Queue()
 
     def consume():
         while not stop.is_set():
-            msg = cons.poll(0.2)
+            while not control.empty():
+                call, done = control.get()
+                call(every)
+                done.set()
+            msg = cons.poll(0.05)
             if msg is None or msg.error():
                 continue
             try:
-                consumed[json.loads(msg.value())["id"]] = (msg.partition(), msg.offset())
+                tok = json.loads(msg.value())["id"]
             except (ValueError, KeyError, TypeError):
-                pass
+                continue
+            with got:
+                consumed[tok] = (msg.partition(), msg.offset())
+                got.notify_all()
 
     consumer = threading.Thread(target=consume)
     consumer.start()
@@ -164,23 +201,58 @@ def run_kafka():
     classic = KafkaProducer(bootstrap_servers=bootstrap, api_version=(2, 5), linger_ms=0,
                             acks="all")
     raw = socket.create_connection((HOST, 9092))
-    produced = {}  # token -> (topic, pii)
+    produced = {}  # token -> (topic, pii, value size)
+    fetch_via = {}  # token -> truth `via` of its Fetch record, if not "consume"
+
+    def drain():
+        """Wait until the consumer has every record produced so far."""
+        with got:
+            if not got.wait_for(lambda: produced.keys() <= consumed.keys(), timeout=10):
+                print(f"mq_oracle: {len(produced.keys() - consumed.keys())} records not consumed "
+                      f"after 10 s (op {i})", file=sys.stderr, flush=True)
+
+    def on_consumer(call):
+        done = threading.Event()
+        control.put((call, done))
+        if not done.wait(30):
+            sys.exit(f"mq_oracle: consumer thread did not run {call.__name__}")
+
+    def held(produce_all):
+        """Run `produce_all` with the consumer paused: the next Fetch request
+        leaves after its records are acknowledged (module docstring)."""
+        drain()
+        on_consumer(cons.pause)
+        time.sleep(3 * FETCH_WAIT_MS / 1000)  # a Fetch parked before the pause expires
+        produce_all()
+        on_consumer(cons.resume)
+        drain()
+
+    def single(tok, i, topic, pad, with_pii, partition=None, via="single", headers=None):
+        """Produce one record and wait for its acknowledgement."""
+        value, pii = body(tok, i, pad=pad, with_pii=with_pii)
+        errs = []
+        kw = {} if partition is None else {"partition": partition}
+        prod.produce(topic, key=f"k-{tok}".encode(), value=value, headers=headers,
+                     on_delivery=delivered(errs), **kw)
+        prod.flush(10)
+        if errs and errs[0] is None:
+            record(tok, "produce", "Produce", topic, pii=pii, via=via)
+            produced[tok] = (topic, pii, len(value))
+            return True
+        return False
+
     i = 0
     while i < N:
         r = rnd.random()
         tok = f"tok_{i}_"
         if r < 0.45:
             topic = rnd.choice(KAFKA_TOPICS)
-            value, pii = body(tok, i, pad=rnd.choice([0, 0, 200, 2000]), with_pii=rnd.random() < 0.7)
+            pad = rnd.choice([0, 0, 200, 2000])
+            with_pii = rnd.random() < 0.7
             headers = [("trace-id", f"t-{i}".encode())] if rnd.random() < 0.3 else None
-            errs = []
-            prod.produce(topic, key=f"k-{tok}".encode(), value=value, headers=headers,
-                         on_delivery=delivered(errs))
-            prod.flush(10)
-            if errs and errs[0] is None:
-                record(tok, "produce", "Produce", topic, pii=pii,
-                       via="single+headers" if headers else "single")
-                produced[tok] = (topic, pii)
+            single(tok, i, topic, pad, with_pii, headers=headers,
+                   via="single+headers" if headers else "single")
+            drain()
             i += 1
         elif r < 0.65:
             # Batched: several records to one partition, one RecordBatch.
@@ -195,11 +267,12 @@ def run_kafka():
                              on_delivery=delivered(errs))
                 toks.append(t)
                 pii += p
-                each[t] = (topic, p)
+                each[t] = (topic, p, len(value))
             prod.flush(10)
             if all(e is None for e in errs):
                 record(toks[0], "produce", "Produce", topic, tokens=toks, pii=pii, via="batch")
                 produced.update(each)
+            drain()
             i += k
         elif r < 0.75:
             # Rejected by the broker: MESSAGE_TOO_LARGE (10).
@@ -218,8 +291,32 @@ def run_kafka():
             value, pii = body(tok, i, with_pii=True)
             classic.send(topic, key=f"k-{tok}".encode(), value=value).get(timeout=10)
             record(tok, "produce", "Produce", topic, pii=pii, via="classic")
-            produced[tok] = (topic, pii)
+            produced[tok] = (topic, pii, len(value))
+            drain()
             i += 1
+        elif r < 0.88:
+            # Held cut: 2000-byte records, each its own Produce (each below
+            # the cap), to one partition; one Fetch response carries them all.
+            k = min(rnd.randint(3, 4), N - i)
+            topic, part = rnd.choice(KAFKA_TOPICS), rnd.randint(0, 1)
+
+            def cut(i=i, k=k, topic=topic, part=part):
+                for j in range(i, i + k):
+                    if single(f"tok_{j}_", j, topic, 2000, rnd.random() < 0.7, partition=part):
+                        fetch_via[f"tok_{j}_"] = "consume-cut"
+            held(cut)
+            i += k
+        elif r < 0.91:
+            # Held multi-topic: one small record to each of several topics.
+            topics = rnd.sample(KAFKA_TOPICS, min(rnd.randint(2, 4), N - i))
+
+            def multi(i=i, topics=topics):
+                for j, topic in enumerate(topics, i):
+                    if single(f"tok_{j}_", j, topic, 0, rnd.random() < 0.7,
+                              partition=rnd.randint(0, 1)):
+                        fetch_via[f"tok_{j}_"] = "consume-multi"
+            held(multi)
+            i += len(topics)
         else:
             # Metadata for a topic that does not exist: UNKNOWN_TOPIC_OR_PARTITION
             # (3), over a raw socket at a chosen version so that each operation
@@ -239,11 +336,11 @@ def run_kafka():
     stop.set()
     consumer.join()
     cons.close()
-    for tok, (topic, pii) in produced.items():
+    for tok, (topic, pii, size) in produced.items():
         if tok in consumed:
             part, offset = consumed[tok]
-            record(f"fetch:{tok}", "fetch", "Fetch", topic, tokens=[tok], pii=pii, via="consume",
-                   partition=part, offset=offset)
+            record(f"fetch:{tok}", "fetch", "Fetch", topic, tokens=[tok], pii=pii,
+                   via=fetch_via.get(tok, "consume"), partition=part, offset=offset, size=size)
 
 
 # ── AMQP 0-9-1 ───────────────────────────────────────────────────────────

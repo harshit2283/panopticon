@@ -32,7 +32,9 @@
 # no loss (ring drops, reorder gaps, truncated captures, parser errors,
 # channel / export / rate-limit drops all zero: score_mq.py --metrics);
 # otherwise, or where the place past the cap is not proven, a missing
-# record counts as lost.
+# record counts as lost. mq_oracle.py keeps every Fetch response below the
+# cap except in its held cut phase, whose cut it builds in one partition
+# (its docstring), so a run's result does not hang on the VM's timing.
 # Every leg runs at the config as given, on every kernel: AMQP and Kafka
 # connections capture whole packets by default (raise_packet_cap,
 # USER-GUIDE.md §4.2), whatever max_packet_bytes is.

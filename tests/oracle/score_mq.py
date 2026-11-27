@@ -50,7 +50,11 @@ record before the cut, so it lies past the cut. Also, that response is in
 the record's window (not before its produce, not after a response showing a
 later token, not before the response showing its predecessor in the
 partition), and no uncut response in that window names its topic in `path`
-without showing a record of it (records lost there). Not proven, and so
+without showing a record of it (records lost there) while being at least
+as large as the record's value (truth `size`, the value's byte length; a
+smaller response, such as an empty one whose `path` is the request's
+topics, cannot hold the value, which an uncompressed batch carries
+verbatim; without `size`, any such response counts). Not proven, and so
 lost: a record appended after the request left (the response may have been
 built before it, its partition section ending at the cut record with the cut
 in a later section, and the record dropped from a later response: the same
@@ -58,6 +62,8 @@ export), a record of a partition the response shows nothing of (whether its
 section came before the cut record's, the record dropped, or after the cut
 is not in the export), and a record without partition data.
 `test_score_mq.py` checks these cases. Everything else missing is lost.
+mq_oracle.py builds cut responses only in its held cut phase, in one
+partition (its docstring), so the strict rule does not fail runs on timing.
 Recall is found / (operations - past body cap); the past-cap count is
 printed beside it.
 
@@ -252,7 +258,9 @@ def past_body_cap(ops, cap):
 
     cut = []  # (response time, path topics, cut operation, request start)
     # (response time, topics its path names but none of whose records it
-    # shows): an uncut response that lost records of those topics.
+    # shows, response size): an uncut response that may have lost records
+    # of those topics. An empty response (a long poll that expired) names
+    # the request's topics too; its size tells it apart (below).
     short = []
     for e in fetches:
         text = e.get("payload_text") or ""
@@ -274,7 +282,8 @@ def past_body_cap(ops, cap):
                     start = e["timestamp_ns"] - e["latency_ns"]
                 cut.append((e["_resp_ts"], topics, c, start))
                 continue
-        short.append((e["_resp_ts"], set(topics) - {o["path"] for o in inside}))
+        short.append((e["_resp_ts"], set(topics) - {o["path"] for o in inside},
+                      e.get("response_size_bytes") or 0))
     if any(len((e.get("payload_text") or "").encode()) > cap for e in fetches):
         print(f"    WARNING: Fetch text longer than the body cap {cap}: wrong cap?")
 
@@ -314,8 +323,14 @@ def past_body_cap(ops, cap):
         # partition (records of a partition arrive in offset order).
         prev = [o for o in shown_ops if place(o) == place(t) and seq(o["tokens"][0]) < n]
         lower = max(produced_at[tok], min(shown[prev[-1]["tokens"][0]]) if prev else 0)
-        if any(lower <= ts <= upper and t["path"] in missing for ts, missing in short):
-            continue  # an uncut response that could have carried it lost records
+        # An uncut response that could have carried it lost records. One
+        # smaller than the record's value could not have carried it: the
+        # value's bytes are in the response verbatim (the oracle's
+        # producers do not compress). Without the value's size (truth
+        # `size`), every such response could.
+        if any(lower <= ts <= upper and t["path"] in missing and rsize >= t.get("size", 0)
+               for ts, missing, rsize in short):
+            continue
         if any(lower <= ts <= upper and after_cut(t, topics, c, start)
                for ts, topics, c, start in cut):
             out.add(t["id"])
