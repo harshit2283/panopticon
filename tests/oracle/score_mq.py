@@ -31,18 +31,29 @@ a Fetch response's record text (event_loop.rs `scan_with_body_cap`), and
 pull the cut well below the cap). Records past that cut are not exported, by
 design. A Fetch record whose text was cut (its byte length is the cap, or it
 does not end on a complete record value) marks where its response stopped
-being exported (only a response larger than the cap can be cut); a consumed record that no Fetch record carries is counted as
-"past body cap", not lost, only if it lies after that cut in the response
-order (with partition data: a later offset in the cut record's partition,
-or a partition the response shows no record of, since a topic can return in
-a later partition section that `path` does not repeat; without it: a later
-topic of `path`, or a later token index in the cut record's topic) and that response is the one that
-carried it (not before its produce, not after a response showing a later
-token, not before the response showing its predecessor in the topic /
+being exported (only a response larger than the cap can be cut); a
+consumed record that no Fetch record carries is counted as "past body cap",
+not lost, only if its place after that cut is proven: it is in the cut
+record's partition at a later offset, and its produce was acknowledged (a
+successful Produce record's response time) before the cut response's
+request left (response time minus latency), so the broker had it when it
+built the response and the cut record's partition section runs through it
+(the response under librdkafka's 1 MiB `max.partition.fetch.bytes`, which
+mq_oracle.py leaves at its default). It follows the cut record, the last
+record before the cut, so it lies past the cut. Also, that response is in
+the record's window (not before its produce, not after a response showing a
+later token, not before the response showing its predecessor in the
 partition), and no uncut response in that window names its topic in `path`
-without showing a record of it (records lost there). Everything else
-missing is lost. Recall is found / (operations
-- past body cap); the past-cap count is printed beside it.
+without showing a record of it (records lost there). Not proven, and so
+lost: a record appended after the request left (the response may have been
+built before it, its partition section ending at the cut record with the cut
+in a later section, and the record dropped from a later response: the same
+export), a record of a partition the response shows nothing of (whether its
+section came before the cut record's, the record dropped, or after the cut
+is not in the export), and a record without partition data.
+`test_score_mq.py` checks these cases. Everything else missing is lost.
+Recall is found / (operations - past body cap); the past-cap count is
+printed beside it.
 
 That exclusion assumes the capture lost nothing: a record lost to the
 capture can look like one past the cut. It is made only when the leg's
@@ -92,6 +103,11 @@ if "--metrics" in args:
     at = args.index("--metrics")
     metrics_path = args[at + 1]
     del args[at:at + 2]
+# librdkafka's default `max.partition.fetch.bytes` (mq_oracle.py does not
+# set it): a response smaller than this was not cut short by the broker's
+# per-partition limit, so a partition section runs to the high watermark
+# the broker saw.
+PARTITION_MAX_BYTES = 1 << 20
 # Loss counters that must all be zero before a missing Fetch record may be
 # counted past the body cap rather than lost.
 LOSS_COUNTERS = ("kernel_ringbuf_drops_total", "tcp_reorder_gaps_total",
@@ -211,6 +227,7 @@ def past_body_cap(ops, cap):
         for tok in set(TOKEN.findall(e.get("payload_text") or "")):
             shown[tok].append(e["_resp_ts"])
     produced_at = {}  # token -> earliest time its record can have been appended
+    acked_at = {}  # token -> earliest successful produce response showing it
     for e in records:
         if e.get("method") == "Fetch":
             continue
@@ -218,11 +235,13 @@ def past_body_cap(ops, cap):
         text = " ".join(str(e.get(f) or "") for f in ("path", "request_body"))
         for tok in set(TOKEN.findall(text)):
             produced_at[tok] = min(produced_at.get(tok, start), start)
+            if e.get("method") == "Produce" and (e.get("status") or 0) == 0 and e.get("timestamp_ns"):
+                acked_at[tok] = min(acked_at.get(tok, e["timestamp_ns"]), e["timestamp_ns"])
 
     def place(t):
         return (t["path"], t.get("partition"))
 
-    cut = []  # (response time, path topics, cut operation, operations shown)
+    cut = []  # (response time, path topics, cut operation, request start)
     # (response time, topics its path names but none of whose records it
     # shows): an uncut response that lost records of those topics.
     short = []
@@ -238,29 +257,37 @@ def past_body_cap(ops, cap):
                 and (size == cap or text.endswith("\n") or not complete_value(last))):
             c = by_tok.get(toks[-1])
             if c is not None:
-                cut.append((e["_resp_ts"], topics, c, inside))
+                # When the request left. Unknown (no latency), or a response
+                # the broker's partition limit may have cut: -inf, which
+                # proves no record in it.
+                start = float("-inf")
+                if e.get("latency_ns") and e["response_size_bytes"] < PARTITION_MAX_BYTES:
+                    start = e["timestamp_ns"] - e["latency_ns"]
+                cut.append((e["_resp_ts"], topics, c, start))
                 continue
         short.append((e["_resp_ts"], set(topics) - {o["path"] for o in inside}))
     if any(len((e.get("payload_text") or "").encode()) > cap for e in fetches):
         print(f"    WARNING: Fetch text longer than the body cap {cap}: wrong cap?")
 
-    def after_cut(t, topics, c, inside):
+    def after_cut(t, topics, c, start):
+        """Whether `t` is proven past the cut of the response that ends at
+        `c` and whose request left at `start`."""
         if t["path"] not in topics or c["path"] not in topics:
             return False
-        if t.get("partition") is not None and c.get("partition") is not None:
-            # A response is a sequence of partition sections (a topic can
-            # come back in a later section; `path` names it once). Every
-            # section before the cut is shown whole, so the record is past
-            # the cut iff it follows the cut record in its partition or its
-            # partition shows nothing in this response.
-            if place(t) == place(c):
-                return t["offset"] > c["offset"]
-            return not any(place(o) == place(t) for o in inside)
-        # No partition data: by first appearance in `path`, then token index.
-        ti, ci = topics.index(t["path"]), topics.index(c["path"])
-        if ti != ci:
-            return ti > ci
-        return seq(t["tokens"][0]) > seq(c["tokens"][0])
+        if t.get("partition") is None or c.get("partition") is None:
+            return False  # no position to prove
+        # A response is a sequence of partition sections. The record is in
+        # this one only if the broker had it when the request arrived (its
+        # produce acknowledged before the request left): the cut record's
+        # section then runs from at most `c`'s offset through it. Following
+        # `c`, the last record before the cut, it lies past the cut. A
+        # record of another partition is never proven: whether its section
+        # came before the cut record's (the record dropped) or after the
+        # cut is not in the export, and neither is a record appended after
+        # the request left (the section may end at `c`, the cut in a later
+        # one, and the record dropped from a later response).
+        return (place(t) == place(c) and t["offset"] > c["offset"]
+                and acked_at.get(t["tokens"][0], float("inf")) < start)
 
     shown_ops = sorted((t for t in ops if shown.get(t["tokens"][0])),
                        key=lambda t: seq(t["tokens"][0]))
@@ -280,8 +307,8 @@ def past_body_cap(ops, cap):
         lower = max(produced_at[tok], min(shown[prev[-1]["tokens"][0]]) if prev else 0)
         if any(lower <= ts <= upper and t["path"] in missing for ts, missing in short):
             continue  # an uncut response that could have carried it lost records
-        if any(lower <= ts <= upper and after_cut(t, topics, c, inside)
-               for ts, topics, c, inside in cut):
+        if any(lower <= ts <= upper and after_cut(t, topics, c, start)
+               for ts, topics, c, start in cut):
             out.add(t["id"])
     return out
 

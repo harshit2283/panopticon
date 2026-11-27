@@ -261,7 +261,11 @@ production-hardened compliance platform.
     rate-limit drops) are all zero; any other missing
     record, and every one in a leg with any loss, is still lost
     (BENCHMARKS.md, Kafka, AMQP, DNS). Rescored that way the 96.8% run is 419/419 with 14 past
-    body cap.
+    body cap. Since 2026-11-28 "after the cut" must be proven: later in
+    the cut record's partition, and acknowledged to its producer before
+    that response's request left; a record of another partition, or one
+    appended after the request left, counts as lost. That rescoring
+    predates the stricter rule and has not been redone.
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
     fail-closed change and not re-run since.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a

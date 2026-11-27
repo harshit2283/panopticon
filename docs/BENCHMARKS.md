@@ -405,12 +405,21 @@ response's text ends at the cap or inside a record value, and the record
 comes in a later topic of that response's `path`, later in the cut
 record's partition, or in a partition of that topic the response shows
 nothing of. Any other missing record is still lost, and the 99% bar is
-unchanged. The exclusion is made only when the leg's saved `/metrics`
-shows kernel ring drops, TCP reorder gaps, truncated captures, parser
+unchanged. Since 2026-11-28 the rule is stricter: a record is excused only
+when its place past the cut is proven, that is, later in the cut record's
+partition and acknowledged to its producer before the cut response's
+request left (so the broker had it when it built that response). A record
+appended after the request left, or in another partition or topic than the
+cut record's, can equally be one the agent dropped from a later response,
+and counts as lost (`score_mq.py` docstring; its fixtures are in
+`tests/oracle/test_score_mq.py`). The exclusion is made only when the
+leg's saved `/metrics` shows kernel ring drops, TCP reorder gaps, truncated captures, parser
 errors and channel, export-queue and rate-limit drops all at zero
 (`score_mq.py --metrics`): a record the capture lost
 can look like one past the cut, so with any loss, or no metrics, every
-missing record counts as lost. Rescored offline, the 96.8% run is 100% (419/419) with 14 past
+missing record counts as lost. The rescorings that follow were made under
+the earlier rule and have not been redone under the stricter one.
+Rescored offline, the 96.8% run is 100% (419/419) with 14 past
 body cap and the other five runs are unchanged; a copy of its export whose
 cut response ends on a complete record (no cut) fails (`Fetch` 96.5%,
 Kafka 98.0%), and one with eight records removed from uncut responses
