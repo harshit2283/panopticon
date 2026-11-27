@@ -35,7 +35,8 @@ being exported (only a response larger than the cap can be cut); a
 consumed record that no Fetch record carries is counted as "past body cap",
 not lost, only if its place after that cut is proven: it is in the cut
 record's partition at a later offset, and its produce was acknowledged (a
-successful Produce record's response time) before the cut response's
+Produce record with status 0 and a latency: its time is the response's)
+before the cut response's
 request left (response time minus latency), so the broker had it when it
 built the response and the cut record's partition section runs through it
 (the response under librdkafka's 1 MiB `max.partition.fetch.bytes`, which
@@ -227,7 +228,10 @@ def past_body_cap(ops, cap):
         for tok in set(TOKEN.findall(e.get("payload_text") or "")):
             shown[tok].append(e["_resp_ts"])
     produced_at = {}  # token -> earliest time its record can have been appended
-    acked_at = {}  # token -> earliest successful produce response showing it
+    # token -> earliest successful produce response carrying it (status 0
+    # and a latency: the record's time is the response's; kafka.rs
+    # `build_message`)
+    acked_at = {}
     for e in records:
         if e.get("method") == "Fetch":
             continue
@@ -235,7 +239,7 @@ def past_body_cap(ops, cap):
         text = " ".join(str(e.get(f) or "") for f in ("path", "request_body"))
         for tok in set(TOKEN.findall(text)):
             produced_at[tok] = min(produced_at.get(tok, start), start)
-            if e.get("method") == "Produce" and (e.get("status") or 0) == 0 and e.get("timestamp_ns"):
+            if e.get("method") == "Produce" and e.get("status") == 0 and e.get("latency_ns"):
                 acked_at[tok] = min(acked_at.get(tok, e["timestamp_ns"]), e["timestamp_ns"])
 
     def place(t):

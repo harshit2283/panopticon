@@ -20,6 +20,12 @@ classifies a consumed record no Fetch record carries:
             As `proven`, but t is in partition 1, of which R shows
             nothing: whether its section came before c's (t dropped) or
             after the cut is not in the export. Lost.
+  no_response
+            As `proven`, but t's Produce record has no response (no
+            status, no latency): nothing shows when t was appended. Lost.
+  no_partition
+            As `proven`, but t's truth has no partition or offset: its
+            place in R is unknown. Lost.
 
 Usage: python3 -I test_score_mq.py [SCORER]   (default: score_mq.py beside
 this file). Exits non-zero on any failed case.
@@ -46,10 +52,12 @@ def value(n):
     return json.dumps({"id": f"tok_{n}_", "seq": n})
 
 
-def produce(n, start, ack):
-    return {"protocol": "kafka", "method": "Produce", "path": TOPIC, "status": 0,
-            "request_body": f"k-tok_{n}_\n{value(n)}",
-            "timestamp_ns": ack, "latency_ns": ack - start}
+def produce(n, start, ack, answered=True):
+    e = {"protocol": "kafka", "method": "Produce", "path": TOPIC,
+         "request_body": f"k-tok_{n}_\n{value(n)}", "timestamp_ns": ack}
+    if answered:
+        e.update(status=0, latency_ns=ack - start)
+    return e
 
 
 def fetch(text, start, end, size, port):
@@ -59,7 +67,7 @@ def fetch(text, start, end, size, port):
             "src_port": 9092, "dst_port": port}
 
 
-def fixture(t_ack, t_partition):
+def fixture(t_ack, t_partition, answered=True):
     """(truth, export) of records 1 (c), 2 (t), 3 (t's successor)."""
     truth, export = [], []
     parts = {1: (0, 10), 2: (t_partition, 11), 3: (0, 12)}
@@ -67,12 +75,12 @@ def fixture(t_ack, t_partition):
         truth.append({"id": f"tok_{n}_", "proto": "kafka", "kind": "produce",
                       "verb": "Produce", "path": TOPIC, "status": 0,
                       "tokens": [f"tok_{n}_"], "pii": [], "via": "single"})
+        where = {} if part is None else {"partition": part, "offset": off}
         truth.append({"id": f"fetch:tok_{n}_", "proto": "kafka", "kind": "fetch",
                       "verb": "Fetch", "path": TOPIC, "status": 0,
-                      "tokens": [f"tok_{n}_"], "pii": [], "via": "consume",
-                      "partition": part, "offset": off})
+                      "tokens": [f"tok_{n}_"], "pii": [], "via": "consume", **where})
     export.append(produce(1, 100 * MS, 110 * MS))
-    export.append(produce(2, t_ack - 10 * MS, t_ack))
+    export.append(produce(2, t_ack - 10 * MS, t_ack, answered))
     export.append(produce(3, 300 * MS, 310 * MS))
     # R: record 1 whole, then the cut inside a record whose token it took.
     cut_text = f"k-tok_1_\n{value(1)}\n" + "{" + "x" * (CAP - len(value(1)) - 11)
@@ -84,15 +92,18 @@ def fixture(t_ack, t_partition):
 
 
 CASES = {
-    # name: (t's produce ack, t's partition, expected (lost, past))
-    "unproven": (210 * MS, 0, (1, 0)),
-    "proven": (150 * MS, 0, (0, 1)),
-    "other_partition": (150 * MS, 1, (1, 0)),
+    # name: (t's produce ack, t's partition, t's produce answered,
+    #        expected (lost, past))
+    "unproven": (210 * MS, 0, True, (1, 0)),
+    "proven": (150 * MS, 0, True, (0, 1)),
+    "other_partition": (150 * MS, 1, True, (1, 0)),
+    "no_response": (150 * MS, 0, False, (1, 0)),
+    "no_partition": (150 * MS, None, True, (1, 0)),
 }
 
 
-def run(name, t_ack, t_partition, d):
-    truth, export = fixture(t_ack, t_partition)
+def run(name, t_ack, t_partition, answered, d):
+    truth, export = fixture(t_ack, t_partition, answered)
     paths = {k: os.path.join(d, f"{name}-{k}") for k in ("truth", "export", "metrics", "cfg")}
     with open(paths["truth"], "w") as f:
         f.writelines(json.dumps(t) + "\n" for t in truth)
@@ -115,8 +126,8 @@ def run(name, t_ack, t_partition, d):
 def main():
     failed = 0
     with tempfile.TemporaryDirectory() as d:
-        for name, (t_ack, part, want) in CASES.items():
-            got, out = run(name, t_ack, part, d)
+        for name, (t_ack, part, answered, want) in CASES.items():
+            got, out = run(name, t_ack, part, answered, d)
             ok = got == want
             failed += not ok
             print(f"{'ok  ' if ok else 'FAIL'} {name}: (lost, past body cap) "

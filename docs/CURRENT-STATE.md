@@ -471,8 +471,9 @@ production-hardened compliance platform.
     connection are not exported either, whether or not credential
     masking is on.
   - Kafka, AMQP and DNS are scored against ground truth
-    (`tests/oracle/run_messaging.sh`; Kafka `Fetch` records past the body
-    cap are reported apart as "past body cap" when the leg lost nothing,
+    (`tests/oracle/run_messaging.sh`; Kafka `Fetch` records proven past
+    the body cap are reported apart as "past body cap" when the leg lost
+    nothing,
     and every leg prints the
     agent's loss counters and `raise_packet_cap` counters). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.

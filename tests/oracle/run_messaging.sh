@@ -27,11 +27,12 @@
 # of the --config file in AGENT_ARGS (or $PANOPTICON_CONFIG), if any, with
 # the leg's settings below (no --config at all when that leaves it empty).
 # score_mq.py reads the Kafka body cap (max_body_bytes) from it, so Fetch
-# records past that cap are reported as "past body cap" rather than lost,
-# but only when the leg's saved /metrics shows no loss (ring drops, reorder
-# gaps, truncated captures, parser errors, channel / export / rate-limit
-# drops all zero: score_mq.py --metrics); otherwise every missing record
-# counts as lost.
+# records proven past that cap (see its docstring) are reported as "past
+# body cap" rather than lost, but only when the leg's saved /metrics shows
+# no loss (ring drops, reorder gaps, truncated captures, parser errors,
+# channel / export / rate-limit drops all zero: score_mq.py --metrics);
+# otherwise, or where the place past the cap is not proven, a missing
+# record counts as lost.
 # Every leg runs at the config as given, on every kernel: AMQP and Kafka
 # connections capture whole packets by default (raise_packet_cap,
 # USER-GUIDE.md §4.2), whatever max_packet_bytes is.

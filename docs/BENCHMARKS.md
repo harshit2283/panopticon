@@ -1841,9 +1841,9 @@ sudo env PATH="$PATH" tests/oracle/run_overlay.sh 300 42   # containers, copyup
 sudo tests/oracle/run_protocols.sh 500 7
 
 # Kafka, RabbitMQ (AMQP 0-9-1), DNS. Fails below 99% recall or on any leak.
-# Kafka Fetch records past the body cap (max_body_bytes) are reported apart
-# as "past body cap" when the leg's loss counters are all zero; every leg
-# runs at the config as given.
+# Kafka Fetch records proven past the body cap (max_body_bytes) are reported
+# apart as "past body cap" when the leg's loss counters are all zero; every
+# leg runs at the config as given.
 # Each leg saves the agent's /metrics and prints its loss counters and
 # its raise_packet_cap counters (conn_cap_*).
 sudo tests/oracle/run_messaging.sh 500 7
