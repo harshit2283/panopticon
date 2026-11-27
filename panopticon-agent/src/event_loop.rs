@@ -1734,13 +1734,14 @@ pub(crate) fn sender_endpoint(event: &DataEvent) -> crate::protocol::fsm::Endpoi
 /// Which endpoint of a new connection is the server, so parsers always see
 /// client→server as `Egress` whatever hook captured the bytes.
 ///
-/// Decided from the detection payload's content where possible (an HTTP
-/// request line came from the client, a MySQL greeting or an HTTP/2 server
-/// preface at its stream's start from the server...), then from the
-/// socket's role where the kernel stamped it (established by `connect`:
-/// this socket is the client's; by `accept`: the server's; a repaired
-/// socket counts as connected), then from well-known service ports, then by
-/// assuming the lower port is the server's. TLS events have no ports: if the content
+/// Decided from the detection payload's content where it names a side (an
+/// HTTP request line came from the client, a MySQL greeting from the
+/// server...), then from the socket's role where the kernel stamped it
+/// (established by `connect`: this socket is the client's; by `accept`:
+/// the server's; a repaired socket counts as connected), then from an
+/// HTTP/2 server preface at its stream's start (a SETTINGS shape a client
+/// can send too, so below the role), then from well-known service ports,
+/// then by assuming the lower port is the server's. TLS events have no ports: if the content
 /// doesn't say, the process-relative direction is kept (writes treated as
 /// requests), which is right for clients.
 fn server_endpoint(
@@ -1777,9 +1778,10 @@ fn server_endpoint(
     Some(match sent_by_client(proto, payload) {
         Some(true) => dst,
         Some(false) => src,
-        None if server_preface => src,
         // The kernel's role is the socket's establishment side: a repaired
-        // (restored) socket counts as connected, so content goes first.
+        // (restored) socket counts as connected, so content that names a
+        // side goes first. A server-preface shape names none (a client can
+        // open with the same nine bytes): the role outranks it.
         None if event.role == ROLE_CLIENT => {
             if local_sent {
                 dst
@@ -1794,6 +1796,9 @@ fn server_endpoint(
                 dst
             }
         }
+        // No role stamped: a SETTINGS frame at its stream's start is the
+        // server's preface (a repaired socket has no stream offset).
+        None if server_preface => src,
         None if is_service_port(event.dst_port) => dst,
         None if is_service_port(event.src_port) => src,
         None if event.dst_port <= event.src_port => dst,
@@ -2814,6 +2819,36 @@ mod tests {
             server_endpoint(&e, p, b"\x01\x02"),
             Some((e.dst_addr, 40000))
         );
+    }
+
+    /// A SETTINGS-shaped record at a stream's start does not outrank the
+    /// kernel's socket role: a client that opens with one is still the
+    /// client (review LOW-1). Before, the server-preface shape was tested
+    /// first and pinned the client as the server.
+    #[test]
+    fn kernel_role_outranks_a_server_preface_shape() {
+        let sp = unhex(GRPC_SERVER_PREFACE);
+        // Seen on the server's socket (role server, ingress) and on the
+        // client's (role client, egress): the server is GRPC_SRV either way.
+        for sock in [SRV_SOCK, CLI_SOCK] {
+            let e = grpc_rec(sock, true, 0, &sp);
+            assert!(proven_stream_start(&e));
+            assert_eq!(detect_event(&e, &sp), Some(Protocol::Http2));
+            assert_eq!(
+                server_endpoint(&e, Protocol::Http2, &sp),
+                Some(GRPC_SRV),
+                "socket {sock}"
+            );
+        }
+        // A legitimate server's SETTINGS names it on both sockets, as before.
+        for sock in [SRV_SOCK, CLI_SOCK] {
+            let e = grpc_rec(sock, false, 0, &sp);
+            assert_eq!(server_endpoint(&e, Protocol::Http2, &sp), Some(GRPC_SRV));
+        }
+        // No role stamped: the SETTINGS shape still decides.
+        let mut e = grpc_rec(SRV_SOCK, true, 0, &sp);
+        e.role = panopticon_common::scope::ROLE_UNKNOWN;
+        assert_eq!(server_endpoint(&e, Protocol::Http2, &sp), Some(GRPC_CLI));
     }
 
     /// Feed events the way worker_task does; (method, reply text) of every
