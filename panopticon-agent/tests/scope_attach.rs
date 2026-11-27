@@ -29,7 +29,8 @@ use panopticon_common::*;
 use scope_loader::*;
 
 /// Fentry/fexit attach targets of the programs in the object.
-const TARGETS: [(&str, &str); 13] = [
+const TARGETS: [(&str, &str); 14] = [
+    (TCP_DESTROY, TCP_DESTROY_FN),
     (ACCEPT4, "inet_csk_accept"),
     (ACCEPT2, "inet_csk_accept"),
     ("scope_sol_tls", "sock_common_setsockopt"),
@@ -81,6 +82,14 @@ fn pending_ctl(ebpf: &Ebpf, index: u32) -> u64 {
 fn set_pending_ctl(ebpf: &mut Ebpf, index: u32, v: u64) {
     let mut a: Array<_, u64> = Array::try_from(ebpf.map_mut("PENDING_CTL").unwrap()).unwrap();
     a.set(index, v, 0).unwrap();
+}
+
+/// Budget bytes charged to every listener counter (`PENDING_LISTENERS`).
+fn listeners_total(ebpf: &Ebpf) -> u64 {
+    let a: Array<&MapData, u64> = Array::try_from(ebpf.map("PENDING_LISTENERS").unwrap()).unwrap();
+    (0..PENDING_LISTENER_BUCKETS)
+        .map(|i| a.get(&i, 0).unwrap())
+        .sum()
 }
 
 fn drops(ebpf: &Ebpf, reason: u32) -> u64 {
@@ -632,7 +641,7 @@ fn scope_programs_load_attach_and_hold() {
 
     // ── production attach, disarmed
     let mut links = Vec::new();
-    let (_, exit_attached) = attach_disarmed(
+    let (root, exit_attached) = attach_disarmed(
         &mut ebpf,
         &setup,
         Some(&candidates),
@@ -1574,6 +1583,137 @@ fn scope_programs_load_attach_and_hold() {
         set_pending_ctl(&mut ebpf, CONFIG_PENDING_BUDGET, PENDING_BUDGET_DEFAULT);
         drop((c1, c2));
         println!("HOLD budget: spent, counted");
+    }
+    {
+        // The listener share (§3.1): written by the loader with the budget.
+        let (share, overflow) = pending_shares(PENDING_BUDGET_DEFAULT);
+        assert_eq!(pending_ctl(&ebpf, CONFIG_PENDING_SHARE), share);
+        assert_eq!(pending_ctl(&ebpf, CONFIG_PENDING_OVERFLOW), overflow);
+        // A share of one hold and a pool of one: a listener that does not
+        // accept gets two holds (its share, then the pool), its third
+        // connection's bytes are dropped, and another listener still gets
+        // its own share though the pool is spent.
+        set_pending_ctl(&mut ebpf, CONFIG_PENDING_SHARE, hold_bytes);
+        set_pending_ctl(&mut ebpf, CONFIG_PENDING_OVERFLOW, hold_bytes);
+        let seed = pending_ctl(&ebpf, CONFIG_PENDING_SEED) as u32;
+        let counter = |ebpf: &Ebpf, addr: std::net::SocketAddr| -> u64 {
+            let std::net::SocketAddr::V4(v4) = addr else {
+                unreachable!()
+            };
+            let b = pending_listener_bucket(seed, u32::from(*v4.ip()), v4.port());
+            let a: Array<&MapData, u64> =
+                Array::try_from(ebpf.map("PENDING_LISTENERS").unwrap()).unwrap();
+            a.get(&b, 0).unwrap()
+        };
+        assert_eq!(listeners_total(&ebpf), 0, "every hold given back so far");
+        // Two listeners on distinct counters (the seed is random: pick a
+        // port pair that does not share one).
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let baddr = busy.local_addr().unwrap();
+        let other = loop {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            let bucket = |a: std::net::SocketAddr| match a {
+                std::net::SocketAddr::V4(v) => {
+                    pending_listener_bucket(seed, u32::from(*v.ip()), v.port())
+                }
+                _ => unreachable!(),
+            };
+            if bucket(a) != bucket(baddr) {
+                break l;
+            }
+        };
+        let oaddr = other.local_addr().unwrap();
+        let of0 = drops(&ebpf, DROP_PENDING_OVERFLOW);
+        let mut slow = Vec::new();
+        for i in 0..3 {
+            let mut c = TcpStream::connect(baddr).unwrap();
+            c.write_all(format!("slow-{i}").as_bytes()).unwrap();
+            settle();
+            slow.push(c);
+        }
+        assert_eq!(
+            pending_ctl(&ebpf, PENDING_CTL_USED),
+            2 * hold_bytes,
+            "share + pool"
+        );
+        assert_eq!(
+            pending_ctl(&ebpf, PENDING_CTL_OVERFLOW_USED),
+            hold_bytes,
+            "pool spent"
+        );
+        assert_eq!(counter(&ebpf, baddr), 2 * hold_bytes);
+        assert_eq!(
+            drops(&ebpf, DROP_PENDING_OVERFLOW),
+            of0 + 1,
+            "third: share and pool spent"
+        );
+        let mut fresh = TcpStream::connect(oaddr).unwrap();
+        fresh.write_all(b"own-share").unwrap();
+        settle();
+        assert_eq!(
+            pending_ctl(&ebpf, PENDING_CTL_USED),
+            3 * hold_bytes,
+            "the other listener holds within its share"
+        );
+        assert_eq!(counter(&ebpf, oaddr), hold_bytes);
+        assert_eq!(drops(&ebpf, DROP_PENDING_OVERFLOW), of0 + 1);
+        let (mut s, _) = other.accept().unwrap();
+        let n = s.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"own-share");
+        settle();
+        let ev = drain(&mut ring);
+        assert!(
+            ev.iter()
+                .any(|e| e.0 == cookie(&s) && e.2 == 0 && e.3 == b"own-share"),
+            "released from offset 0: {ev:?}"
+        );
+        let kids: Vec<_> = (0..3).map(|_| busy.accept().unwrap().0).collect();
+        settle();
+        assert_eq!(pending_ctl(&ebpf, PENDING_CTL_USED), 0);
+        assert_eq!(
+            pending_ctl(&ebpf, PENDING_CTL_OVERFLOW_USED),
+            0,
+            "pool given back"
+        );
+        assert_eq!(listeners_total(&ebpf), 0, "every counter back to 0");
+        let _ = drain(&mut ring);
+        set_pending_ctl(&mut ebpf, CONFIG_PENDING_SHARE, share);
+        set_pending_ctl(&mut ebpf, CONFIG_PENDING_OVERFLOW, overflow);
+        drop((slow, fresh, s, kids, busy, other));
+        println!("HOLD listener share: one listener bounded, another holds");
+    }
+    {
+        // The backstop (fentry tcp_v4_destroy_sock): a held child whose
+        // TCP_CLOSE callback never runs (sockops detached here, as another
+        // sockops program rewriting the callback flags would) is discarded
+        // when its socket is destroyed, and its bytes given back.
+        let disc0 = drops(&ebpf, DROP_PENDING_DISCARDED);
+        let orphans = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(orphans.local_addr().unwrap()).unwrap();
+        c.write_all(b"orphan").unwrap();
+        settle();
+        assert_eq!(pending_ctl(&ebpf, PENDING_CTL_USED), hold_bytes);
+        let sockops = links.pop().expect("sockops link");
+        assert!(
+            sockops.is::<aya::programs::sock_ops::SockOpsLink>(),
+            "last attached: sockops"
+        );
+        drop(sockops);
+        drop(orphans); // the child is aborted and destroyed, no TCP_CLOSE callback
+        settle();
+        assert_eq!(
+            pending_ctl(&ebpf, PENDING_CTL_USED),
+            0,
+            "given back at destroy"
+        );
+        assert_eq!(drops(&ebpf, DROP_PENDING_DISCARDED), disc0 + 1);
+        assert_eq!(listeners_total(&ebpf), 0);
+        let cg = File::open(root.path()).unwrap();
+        attach_program(&mut ebpf, SOCKOPS, &cg, &mut links).expect("sockops again");
+        drop(c);
+        let _ = drain(&mut ring);
+        println!("HOLD backstop: destroyed unaccepted, freed");
     }
     {
         // Many connections whose data races accept() (accepts spin), with

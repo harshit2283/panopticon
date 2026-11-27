@@ -33,10 +33,12 @@ use aya_ebpf::{
 };
 use panopticon_common::{
     CONFIG_CAPTURE_ENABLED, CONFIG_CAPTURE_LOOPBACK, CONFIG_HEAD_BYTES, CONFIG_MAX_PAYLOAD,
-    CONFIG_PENDING_BUDGET, CONFIG_PENDING_HOLD, CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH,
-    CONFIG_SAMPLE_THRESHOLD, CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONN_CAP_CUT,
-    CONN_CAP_USED, DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
-    PENDING_CTL_USED, TlsLibrary,
+    CONFIG_PENDING_BUDGET, CONFIG_PENDING_HOLD, CONFIG_PENDING_OVERFLOW, CONFIG_PENDING_SEED,
+    CONFIG_PENDING_SHARE, CONFIG_PID_CREATOR_RULE, CONFIG_PID_EPOCH, CONFIG_SAMPLE_THRESHOLD,
+    CONFIG_SCOPE_ARMED, CONFIG_SCOPE_GEN, CONFIG_SCOPE_MODE, CONN_CAP_CUT, CONN_CAP_USED,
+    DATA_EVENT_HEADER_LEN, DataEvent, Direction, EventType, MAX_PAYLOAD_SIZE,
+    PENDING_CTL_OVERFLOW_USED, PENDING_CTL_USED, PENDING_HOLD_BYTES, PENDING_LISTENER_BUCKETS,
+    TlsLibrary, pending_listener_bucket,
     scope::{
         ACCEPTOR_LISTED, DROP_HEAD_CUT, DROP_HEAD_INCOHERENT, DROP_KTLS_PAYLOAD, DROP_LOOPBACK,
         DROP_NO_BASELINE, DROP_NOT_ELIGIBLE, DROP_OUT_OF_SCOPE, DROP_PENDING_ACCEPT,
@@ -52,8 +54,8 @@ use panopticon_common::{
 
 use crate::maps::{
     CGROUP_ALLOW, CONFIG, CONN_CAP, CONN_CAP_STATS, IPV6_DROPS, NETDEV_OFFS, PENDING_CTL,
-    PID_FILTER, SizedEvent, count_kernel_drop, count_scope_drop, shard_for, shard_output,
-    shard_reserve_as, shard_submit_flags_for,
+    PENDING_LISTENERS, PID_FILTER, SizedEvent, count_kernel_drop, count_scope_drop, shard_for,
+    shard_output, shard_reserve_as, shard_submit_flags_for,
 };
 
 // ── SOCK_STATE: BTF sk_storage map with BPF_F_CLONE ────────────────────────
@@ -216,7 +218,7 @@ const SLOT_REACHED: u64 = 2;
 /// 16 KiB kmalloc object, freed after an RCU grace period. The socket's
 /// optmem is charged the element's size (value and header), which fits
 /// under the default `optmem_max` (20,480 before 6.9) beside SOCK_STATE.
-const PENDING_BYTES: u64 = 16 << 10;
+const PENDING_BYTES: u64 = PENDING_HOLD_BYTES;
 const _: () = assert!(
     core::mem::size_of::<Pending>() + 256 <= PENDING_BYTES as usize
         && core::mem::size_of::<Pending>() > 8 << 10
@@ -264,10 +266,11 @@ fn pending_ctl(index: u32) -> *mut u64 {
     }
 }
 
-/// Take one hold's bytes from the budget; false (nothing taken) if that
-/// would pass it.
+/// Take one hold's bytes from the budget, charged to listener counter
+/// `bucket`; false (nothing taken) if the budget is spent, or the
+/// listener's share is and so is the overflow pool ([`share_take`]).
 #[inline(always)]
-fn budget_take() -> bool {
+fn budget_take(bucket: u32) -> bool {
     let used = pending_ctl(PENDING_CTL_USED);
     let limit = pending_ctl(CONFIG_PENDING_BUDGET);
     if used.is_null() || limit.is_null() {
@@ -275,47 +278,119 @@ fn budget_take() -> bool {
     }
     let prev = unsafe { fetch_add_u64(used, PENDING_BYTES) };
     if prev.saturating_add(PENDING_BYTES) > unsafe { read_volatile(limit) } {
-        budget_give();
+        unsafe { fetch_add_u64(used, PENDING_BYTES.wrapping_neg()) };
+        return false;
+    }
+    if !share_take(bucket) {
+        unsafe { fetch_add_u64(used, PENDING_BYTES.wrapping_neg()) };
         return false;
     }
     true
 }
 
+/// Give back what [`budget_take`] took for `bucket`.
 #[inline(always)]
-fn budget_give() {
+fn budget_give(bucket: u32) {
+    share_give(bucket);
     let used = pending_ctl(PENDING_CTL_USED);
     if !used.is_null() {
         unsafe { fetch_add_u64(used, PENDING_BYTES.wrapping_neg()) };
     }
 }
 
-/// The socket's hold, created (and its bytes taken from the budget) if it
-/// has none; null if the budget is spent or the storage cannot be created
-/// (the socket's optmem). A create that loses a race to another CPU's
-/// create gets null back (`-EEXIST` under the storage lock) or the
-/// winner's value; either way only the first to win `charged` keeps the
-/// bytes it took.
+/// The listener counter of `bucket` (masked, so every verifier bounds it).
 #[inline(always)]
-fn pending_get_or_create(sk: *mut c_void) -> *mut Pending {
+fn listener_counter(bucket: u32) -> *mut u64 {
+    match PENDING_LISTENERS.get_ptr_mut(bucket & (PENDING_LISTENER_BUCKETS - 1)) {
+        Some(p) => p,
+        None => null_mut(),
+    }
+}
+
+/// The per-listener share (DESIGN §3.1): one hold's bytes on listener
+/// counter `bucket`. A listener may always take its share
+/// (`CONFIG_PENDING_SHARE`) while the budget lasts; past it, a hold also
+/// takes from the overflow pool (`CONFIG_PENDING_OVERFLOW`) all listeners
+/// share. So no listener, an unlisted one that never accepts included,
+/// takes more than its share and the pool, and the rest of the budget is
+/// left to the shares of the others.
+///
+/// `PENDING_CTL_OVERFLOW_USED` is kept equal to the sum over counters of
+/// what each holds past its share: every add or subtract of one hold on a
+/// counter moves the pool by one hold exactly when the counter was at or
+/// past its share before an add, or past it before a subtract (the share
+/// is whole holds), as the counter's own fetch-and-add reports it. That
+/// holds in any order of adds and subtracts, failed takes included; while
+/// a take that fails is undone, the pool can read one hold high, which can
+/// only refuse another take.
+#[inline(always)]
+fn share_take(bucket: u32) -> bool {
+    let c = listener_counter(bucket);
+    let pool = pending_ctl(PENDING_CTL_OVERFLOW_USED);
+    let share = pending_ctl(CONFIG_PENDING_SHARE);
+    let pool_limit = pending_ctl(CONFIG_PENDING_OVERFLOW);
+    if c.is_null() || pool.is_null() || share.is_null() || pool_limit.is_null() {
+        return false;
+    }
+    let share = unsafe { read_volatile(share) };
+    let prev = unsafe { fetch_add_u64(c, PENDING_BYTES) };
+    if prev < share {
+        return true;
+    }
+    let was = unsafe { fetch_add_u64(pool, PENDING_BYTES) };
+    if was.saturating_add(PENDING_BYTES) <= unsafe { read_volatile(pool_limit) } {
+        return true;
+    }
+    share_give(bucket);
+    false
+}
+
+/// Give back one hold's bytes on listener counter `bucket` ([`share_take`]).
+#[inline(always)]
+fn share_give(bucket: u32) {
+    let c = listener_counter(bucket);
+    let pool = pending_ctl(PENDING_CTL_OVERFLOW_USED);
+    let share = pending_ctl(CONFIG_PENDING_SHARE);
+    if c.is_null() || pool.is_null() || share.is_null() {
+        return;
+    }
+    let share = unsafe { read_volatile(share) };
+    let prev = unsafe { fetch_add_u64(c, PENDING_BYTES.wrapping_neg()) };
+    if prev > share {
+        unsafe { fetch_add_u64(pool, PENDING_BYTES.wrapping_neg()) };
+    }
+}
+
+/// The socket's hold, created (and its bytes taken from the budget,
+/// charged to listener counter `bucket`) if it has none; null if the
+/// budget or the listener's share is spent ([`budget_take`]) or the
+/// storage cannot be created (the socket's optmem). A create that loses a
+/// race to another CPU's create gets null back (`-EEXIST` under the
+/// storage lock) or the winner's value; either way only the first to win
+/// `charged` keeps the bytes it took. Every holder of one socket charges
+/// the same counter (`SockState::hold_bucket`).
+#[inline(always)]
+fn pending_get_or_create(sk: *mut c_void, bucket: u32) -> *mut Pending {
     let p = pending_of(sk, false);
     if !p.is_null() {
         return p;
     }
-    if !budget_take() {
+    if !budget_take(bucket) {
         return null_mut();
     }
     let p = pending_of(sk, true);
     if p.is_null() {
-        budget_give();
+        budget_give(bucket);
         return pending_of(sk, false);
     }
     if unsafe { fetch_add_u64(&raw mut (*p).charged, 1) } != 0 {
-        budget_give();
+        budget_give(bucket);
     }
     p
 }
 
-/// Free a hold and give its bytes back, then mark the socket done
+/// Free a hold and give its bytes back (to the counter its holders
+/// charged, `SockState::hold_bucket`), then mark the socket done
 /// (`held` 2). Exactly once per value: only the release that went through
 /// every slot calls it. A holder still writing into the value writes
 /// freed-under-RCU memory nobody reads (it cannot be: its slot was
@@ -325,7 +400,7 @@ fn pending_free(sk: *mut c_void, st: *mut SockState) {
     unsafe {
         bpf_sk_storage_delete(&PENDING as *const PendingMap as *mut c_void, sk);
     }
-    budget_give();
+    budget_give(u32::from(rd!(st, hold_bucket)));
     wr!(st, held, HELD_DONE);
 }
 
@@ -459,16 +534,25 @@ fn close_and_release(sk: *mut c_void, st: *mut SockState, p: *mut Pending, cooki
 
 /// The end of a socket's pre-accept life (its accept, or TCP_CLOSE), after
 /// the store that ends it and a fence: release its hold if it has one.
-/// `held` 0: nothing was held, and nothing will be (2). 1 and no value: a
-/// holder is creating one; it finds this socket accepted or closed and
-/// releases it itself.
+/// `held` 0: nothing was held, and nothing will be (2). 1 and no value:
+/// every hold failed (the budget, the share or option memory), or a holder
+/// is creating one now; done (2) all the same, so later packets skip the
+/// lookup for the hold. A holder creating one then finds this socket
+/// accepted or closed and releases it itself (`hold_packet`, after its
+/// write). A later packet of the connection that races that holder on
+/// another CPU can leave first (as it could before: its lookup could come
+/// before the holder's create); both records carry their stream offsets,
+/// and user space's reorder window puts them back in order
+/// (`reorder.rs`, `tcp_reorder_held`).
 #[inline(always)]
 fn pending_end(sk: *mut c_void, st: *mut SockState, cookie: u64) {
     match rd!(st, held) {
         0 => wr!(st, held, HELD_DONE),
         HELD_MAYBE => {
             let p = pending_of(sk, false);
-            if !p.is_null() {
+            if p.is_null() {
+                wr!(st, held, HELD_DONE);
+            } else {
                 close_and_release(sk, st, p, cookie);
             }
         }
@@ -833,11 +917,16 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     if sk.is_null() {
         return;
     }
+    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
+    // A raised packet cap ends with its socket (cookies are never reused),
+    // whether or not the socket has state: user space raises a connection
+    // it sees in unscoped full mode, a socket that predates the agent
+    // included, and another program may have asked for this callback.
+    let _ = CONN_CAP.remove(&cookie);
     let st = state_of(sk as *mut c_void, false);
     if st.is_null() {
         return;
     }
-    let cookie = unsafe { bpf_get_socket_cookie(ops as *mut c_void) };
     let g1 = scope_gen();
     // Capture on (and armed outside unscoped full): a completed disarm or
     // `capture_enabled = false` leaves generation and verdicts as they were,
@@ -865,8 +954,6 @@ fn on_tcp_close(ctx: &SockOpsContext) {
     // the other.
     pending_fence();
     pending_end(sk as *mut c_void, st, cookie);
-    // A raised packet cap ends with its socket (cookies are never reused).
-    let _ = CONN_CAP.remove(&cookie);
     if !authorised {
         return;
     }
@@ -1028,6 +1115,41 @@ fn on_accept(child: *mut c_void) {
     // lookup (see `pending_fence`); `held` is read after it.
     pending_fence();
     pending_end(child, st, cookie);
+}
+
+// ── destroy: the hold's backstop ───────────────────────────────────────────
+
+/// fentry `tcp_v4_destroy_sock`, every TCP socket's `sk_prot->destroy`
+/// (IPv6 sockets call it too): the backstop of the pre-accept hold. A hold
+/// ends at accept() or at TCP_CLOSE (`on_tcp_close`, a STATE_CB callback
+/// `on_established` asked for). Another sockops program can rewrite the
+/// socket's callback flags without STATE_CB, and a socket closed before
+/// accept() then ends with its hold still charged to the budget, for the
+/// agent's life. Here a hold still waiting (`held` 1) is ended as TCP_CLOSE
+/// would end it: the socket is revoked (REUSED), so the release discards
+/// every slot, and the bytes go back to the budget. Optional (the loader
+/// attaches it with the hold where it loads); a socket whose hold already
+/// ended (`held` 2) or never began costs one storage lookup.
+#[fentry(function = "tcp_v4_destroy_sock")]
+pub fn scope_tcp_destroy(ctx: FEntryContext) -> i32 {
+    on_destroy(ctx.arg(0));
+    0
+}
+
+#[inline(always)]
+fn on_destroy(sk: *mut c_void) {
+    if sk.is_null() {
+        return;
+    }
+    let st = state_of(sk, false);
+    if st.is_null() || rd!(st, held) != HELD_MAYBE {
+        return;
+    }
+    wr!(st, init_cookie, 0);
+    wr!(st, flags, rd!(st, flags) | FLAG_REUSED);
+    pending_fence();
+    let cookie = unsafe { bpf_get_socket_cookie(sk) };
+    pending_end(sk, st, cookie);
 }
 
 // ── kTLS key install: sticky KTLS ──────────────────────────────────────────
@@ -1362,7 +1484,16 @@ fn hold_packet(
         0 => wr!(st, held, HELD_MAYBE), // before the value exists
         _ => {}
     }
-    let p = pending_get_or_create(sk);
+    // The listener: this server socket's local address and port (an
+    // ingress packet's destination). Written before the budget is charged,
+    // the same value by every holder of the socket.
+    let bucket = pending_listener_bucket(
+        cfg_pending(CONFIG_PENDING_SEED) as u32,
+        h.dst_addr,
+        h.dst_port,
+    );
+    wr!(st, hold_bucket, bucket as u16);
+    let p = pending_get_or_create(sk, bucket);
     if p.is_null() {
         return Some(DROP_PENDING_OVERFLOW);
     }
@@ -1637,8 +1768,18 @@ fn scope_verdict<const HOLD: bool>(
 /// `CONFIG_PENDING_HOLD`: the accept hook that releases holds is attached.
 #[inline(always)]
 fn hold_on() -> bool {
-    let p = pending_ctl(CONFIG_PENDING_HOLD);
-    !p.is_null() && unsafe { read_volatile(p) } != 0
+    cfg_pending(CONFIG_PENDING_HOLD) != 0
+}
+
+/// A `PENDING_CTL` setting (0 if unreadable).
+#[inline(always)]
+fn cfg_pending(index: u32) -> u64 {
+    let p = pending_ctl(index);
+    if p.is_null() {
+        0
+    } else {
+        unsafe { read_volatile(p) }
+    }
 }
 
 /// Stream offset of a TCP segment from an unlocked, self-validating read of

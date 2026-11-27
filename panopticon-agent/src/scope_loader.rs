@@ -17,7 +17,10 @@ use aya::{
     programs::{CgroupAttachMode, CgroupSkbAttachType, ProgramError},
 };
 use panopticon_common::scope::{SCOPE_HEAD, SCOPE_SAMPLE, SCOPE_SEL_CGROUP, SCOPE_SEL_PID};
-use panopticon_common::{CONFIG_PENDING_BUDGET, CONFIG_PENDING_HOLD, CONFIG_SCOPE_ARMED};
+use panopticon_common::{
+    CONFIG_PENDING_BUDGET, CONFIG_PENDING_HOLD, CONFIG_PENDING_OVERFLOW, CONFIG_PENDING_SEED,
+    CONFIG_PENDING_SHARE, CONFIG_SCOPE_ARMED, pending_shares,
+};
 use tracing::{info, warn};
 
 /// What the configured mode needs from the kernel.
@@ -43,6 +46,11 @@ pub const SOCK_CREATE: &str = "scope_sock_create";
 pub const SOCKOPS: &str = "scope_sockops";
 pub const ACCEPT4: &str = "scope_accept4";
 pub const ACCEPT2: &str = "scope_accept2";
+/// The pre-accept hold's backstop (fentry `tcp_v4_destroy_sock`): a hold
+/// a socket still has when it is destroyed is discarded and its bytes go
+/// back to the budget. Optional.
+pub const TCP_DESTROY: &str = "scope_tcp_destroy";
+pub const TCP_DESTROY_FN: &str = "tcp_v4_destroy_sock";
 /// The kTLS key-install markers (DESIGN §3.5), `(function, variants)`:
 /// `sock_common_setsockopt` (and `compat_sock_common_setsockopt` where the
 /// kernel has it, before 5.9 with CONFIG_COMPAT), each with the one variant
@@ -158,6 +166,9 @@ pub struct LoadReport {
     pub exit_tp: bool,
     /// Whether the pre-accept hold program loaded (pid_filter only).
     pub hold: bool,
+    /// Whether the hold's backstop ([`TCP_DESTROY`]) loaded (with the hold
+    /// only).
+    pub hold_backstop: bool,
 }
 
 /// Load every program `setup` needs, attaching nothing. Fails with the
@@ -228,6 +239,19 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
                 false
             }
         };
+    // Its backstop: without it, a hold whose socket lost its TCP_CLOSE
+    // callback (another sockops program rewrote the callback flags) stays
+    // charged to the budget until the agent restarts.
+    let hold_backstop = hold
+        && match load_program(ebpf, TCP_DESTROY, Some(TCP_DESTROY_FN)) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "pre-accept hold backstop unavailable: a hold \
+                      whose socket closes without its TCP_CLOSE callback stays charged to the \
+                      budget until restart");
+                false
+            }
+        };
     let exit_tp = match load_program(ebpf, EXIT_TP, None) {
         Ok(()) => true,
         Err(e) if setup.mode & SCOPE_SEL_PID != 0 => {
@@ -263,6 +287,7 @@ pub fn load_check(ebpf: &mut Ebpf, setup: &ScopeSetup) -> Result<LoadReport> {
         markers,
         exit_tp,
         hold,
+        hold_backstop,
     })
 }
 
@@ -851,6 +876,9 @@ pub fn attach_disarmed(
     }
     order.extend([(SKB_INGRESS, true), (SKB_EGRESS, true)]);
     order.extend(report.accept.map(|p| (p, false)));
+    if report.hold_backstop {
+        order.push((TCP_DESTROY, false));
+    }
     if report.writers {
         order.extend([(SOCK_CREATE, restricted), (SOCKOPS, restricted)]);
     }
@@ -898,14 +926,19 @@ fn pending_ctl(ebpf: &mut Ebpf) -> Result<aya::maps::Array<&mut aya::maps::MapDa
 
 /// Put the loaded hold program in `HOLD_PROG` slot 0 and the capture
 /// ingress hook in slot 1 (where the hold hands back a packet it will not
-/// hold), and write the budget,
-/// the hold still off (`CONFIG_PENDING_HOLD` 0). The map stays owned by
+/// hold), and write the budget, the listener share and overflow pool
+/// ([`pending_shares`]) and the listener hash's seed (from the OS's random
+/// source, `RandomState`), the hold still off (`CONFIG_PENDING_HOLD` 0). The map stays owned by
 /// `ebpf` (never taken), so its fd, and with it the slot, lives as long as
 /// the programs: a program array is emptied when its last user fd closes.
 fn insert_hold_program(ebpf: &mut Ebpf, budget: u64) -> Result<()> {
     let mut ctl = pending_ctl(ebpf)?;
     ctl.set(CONFIG_PENDING_HOLD, 0, 0)?;
     ctl.set(CONFIG_PENDING_BUDGET, budget, 0)?;
+    let (share, overflow) = pending_shares(budget);
+    ctl.set(CONFIG_PENDING_SHARE, share, 0)?;
+    ctl.set(CONFIG_PENDING_OVERFLOW, overflow, 0)?;
+    ctl.set(CONFIG_PENDING_SEED, u64::from(hold_seed()), 0)?;
     let mut fds = Vec::with_capacity(2);
     for name in [SKB_HOLD, SKB_INGRESS] {
         let prog: &aya::programs::CgroupSkb = ebpf
@@ -924,6 +957,15 @@ fn insert_hold_program(ebpf: &mut Ebpf, budget: u64) -> Result<()> {
             .with_context(|| format!("cannot insert HOLD_PROG slot {i}"))?;
     }
     Ok(())
+}
+
+/// A seed for the listener hash that cannot be predicted from outside the
+/// node: `RandomState` keys come from the OS's random source.
+fn hold_seed() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(std::process::id().into());
+    h.finish() as u32
 }
 
 fn config_array(ebpf: &mut Ebpf) -> Result<aya::maps::Array<&mut aya::maps::MapData, u64>> {
