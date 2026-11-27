@@ -2972,6 +2972,9 @@ mod tests {
             "pin-code-hint: ask the user",
             "at 12:30, ratio 3:1",
             r#"{"host":"key-vault.example.net:443","err":"auth-service: down"}"#,
+            // A known limit: a word that is not a qualifier reads like a
+            // host and port (`pin-svc:7392`).
+            "pin-entry: 7392",
         ] {
             assert_eq!(protect_text(t), None, "{t}");
         }

@@ -778,6 +778,11 @@ data. Known limits:
 - an opaque secret under a name not in the lists (an OAuth `code=`, a
   field called `answer`), or a `Basic` credential (base64 `user:password`)
   outside the `Authorization` header: base64 is not decoded;
+- name shapes that cannot be told from ordinary text (below): `sid`
+  glued to a word in one case (`x-usersid`, which reads as `users` +
+  `id` too), and in free text a short name before `-` or `.` followed by
+  a word that is not a qualifier (`pin-entry: 7392`, read like the host
+  and port `pin-svc:7392`);
 - encodings the agent does not decode: compressed bodies (gzip, deflate,
   compressed gRPC and Kafka batches), UTF-16 or UTF-32 text beyond plain
   ASCII, HTML named entities other than `&amp;` `&quot;` `&apos;` `&lt;`
