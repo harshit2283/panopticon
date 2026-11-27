@@ -865,6 +865,11 @@ impl ProtocolParser for Http2Parser {
         self.role_direction = true;
     }
 
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        self.role_direction
+    }
+
     fn uncertain(&self) -> bool {
         self.client.headers_lost || self.server.headers_lost
     }

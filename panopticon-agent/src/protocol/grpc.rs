@@ -98,6 +98,11 @@ impl ProtocolParser for GrpcParser {
         self.inner.direction_from_role();
     }
 
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        self.inner.directions_from_role()
+    }
+
     fn uncertain(&self) -> bool {
         self.inner.uncertain()
     }

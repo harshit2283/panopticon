@@ -308,6 +308,13 @@ pub trait ProtocolParser: Send {
     /// it again to a parser that replaces the connection's parser.
     fn direction_from_role(&mut self) {}
 
+    /// Whether [`Self::direction_from_role`] took effect (tests: no
+    /// behaviour shows it once a preface has been read).
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        false
+    }
+
     /// The parser holds a latch that withholds what it can no longer
     /// read with certainty (HTTP/2: header state lost). The connection
     /// keeps it for its lifetime, past any parser replacement.
