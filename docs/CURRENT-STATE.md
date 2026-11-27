@@ -265,9 +265,12 @@ production-hardened compliance platform.
     record, and every one in a leg with any loss, is still lost
     (BENCHMARKS.md, Kafka, AMQP, DNS). Rescored that way the 96.8% run is 419/419 with 14 past
     body cap. Since 2026-11-28 "after the cut" must be proven: later in
-    the cut record's partition, and acknowledged to its producer before
-    that response's request left; a record of another partition, or one
-    appended after the request left, counts as lost. That rescoring
+    the cut record's partition, and acknowledged to its producer (a
+    produce response with status 0 and a latency) before that response's
+    request left, the response under 1 MiB and its latency known (and the
+    broker's read within one log segment); a record of another partition,
+    one appended after the request left, or one past a cut response of
+    1 MiB or more or without a latency, counts as lost. That rescoring
     predates the stricter rule and has not been redone.
     RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
     fail-closed change and not re-run since.

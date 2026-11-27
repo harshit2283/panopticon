@@ -66,6 +66,9 @@ if [[ -z $PY ]]; then
   done
 fi
 [[ -n $PY ]] || { echo "needs python3 >= 3.7 (set PYTHON)" >&2; exit 1; }
+# The Kafka scorer's past-body-cap proof, on its fixtures, before any leg:
+# a scorer that fails them would score every leg wrongly.
+"$PY" -I "$HERE/test_score_mq.py" || { echo "score_mq.py self-test FAILED" >&2; exit 1; }
 KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.8.0}
 RABBITMQ_IMAGE=${RABBITMQ_IMAGE:-rabbitmq:3.13}
 P=${CONTAINER_PREFIX:-o-}

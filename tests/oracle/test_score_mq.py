@@ -26,6 +26,18 @@ classifies a consumed record no Fetch record carries:
   no_partition
             As `proven`, but t's truth has no partition or offset: its
             place in R is unknown. Lost.
+  large_response
+            As `proven`, but R is 1 MiB or more: the broker's per-partition
+            limit (`max.partition.fetch.bytes`) may have ended c's section
+            at c. Lost.
+  no_fetch_latency
+            As `proven`, but R has no latency: when its request left is
+            unknown. Lost.
+  ack_at_request
+            t's produce acknowledged exactly when R's request left: not
+            before it. Lost.
+  ack_after_request
+            Acknowledged 1 ns after R's request left. Lost.
 
 Usage: python3 -I test_score_mq.py [SCORER]   (default: score_mq.py beside
 this file). Exits non-zero on any failed case.
@@ -61,13 +73,18 @@ def produce(n, start, ack, answered=True):
 
 
 def fetch(text, start, end, size, port):
-    return {"protocol": "kafka", "method": "Fetch", "path": TOPIC, "status": 0,
-            "payload_text": text, "response_size_bytes": size,
-            "timestamp_ns": end, "latency_ns": end - start,
-            "src_port": 9092, "dst_port": port}
+    e = {"protocol": "kafka", "method": "Fetch", "path": TOPIC, "status": 0,
+         "payload_text": text, "response_size_bytes": size,
+         "timestamp_ns": end, "src_port": 9092, "dst_port": port}
+    if start is not None:
+        e["latency_ns"] = end - start
+    return e
 
 
-def fixture(t_ack, t_partition, answered=True):
+R_START = 160 * MS  # when R's request left
+
+
+def fixture(t_ack=150 * MS, t_partition=0, answered=True, r_size=4 * CAP, r_latency=True):
     """(truth, export) of records 1 (c), 2 (t), 3 (t's successor)."""
     truth, export = [], []
     parts = {1: (0, 10), 2: (t_partition, 11), 3: (0, 12)}
@@ -85,25 +102,28 @@ def fixture(t_ack, t_partition, answered=True):
     # R: record 1 whole, then the cut inside a record whose token it took.
     cut_text = f"k-tok_1_\n{value(1)}\n" + "{" + "x" * (CAP - len(value(1)) - 11)
     assert len(cut_text.encode()) <= CAP
-    export.append(fetch(cut_text, 160 * MS, 260 * MS, 4 * CAP, 40001))
+    export.append(fetch(cut_text, R_START if r_latency else None, 260 * MS, r_size, 40001))
     # A later uncut response with record 3 alone.
     export.append(fetch(f"k-tok_3_\n{value(3)}", 320 * MS, 400 * MS, 120, 40001))
     return truth, export
 
 
 CASES = {
-    # name: (t's produce ack, t's partition, t's produce answered,
-    #        expected (lost, past))
-    "unproven": (210 * MS, 0, True, (1, 0)),
-    "proven": (150 * MS, 0, True, (0, 1)),
-    "other_partition": (150 * MS, 1, True, (1, 0)),
-    "no_response": (150 * MS, 0, False, (1, 0)),
-    "no_partition": (150 * MS, None, True, (1, 0)),
+    # name: (fixture arguments, expected (lost, past body cap))
+    "unproven": ({"t_ack": 210 * MS}, (1, 0)),
+    "proven": ({}, (0, 1)),
+    "other_partition": ({"t_partition": 1}, (1, 0)),
+    "no_response": ({"answered": False}, (1, 0)),
+    "no_partition": ({"t_partition": None}, (1, 0)),
+    "large_response": ({"r_size": 1 << 20}, (1, 0)),
+    "no_fetch_latency": ({"r_latency": False}, (1, 0)),
+    "ack_at_request": ({"t_ack": R_START}, (1, 0)),
+    "ack_after_request": ({"t_ack": R_START + 1}, (1, 0)),
 }
 
 
-def run(name, t_ack, t_partition, answered, d):
-    truth, export = fixture(t_ack, t_partition, answered)
+def run(name, args, d):
+    truth, export = fixture(**args)
     paths = {k: os.path.join(d, f"{name}-{k}") for k in ("truth", "export", "metrics", "cfg")}
     with open(paths["truth"], "w") as f:
         f.writelines(json.dumps(t) + "\n" for t in truth)
@@ -126,8 +146,8 @@ def run(name, t_ack, t_partition, answered, d):
 def main():
     failed = 0
     with tempfile.TemporaryDirectory() as d:
-        for name, (t_ack, part, answered, want) in CASES.items():
-            got, out = run(name, t_ack, part, answered, d)
+        for name, (args, want) in CASES.items():
+            got, out = run(name, args, d)
             ok = got == want
             failed += not ok
             print(f"{'ok  ' if ok else 'FAIL'} {name}: (lost, past body cap) "

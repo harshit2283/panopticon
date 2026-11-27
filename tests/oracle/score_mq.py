@@ -40,7 +40,12 @@ before the cut response's
 request left (response time minus latency), so the broker had it when it
 built the response and the cut record's partition section runs through it
 (the response under librdkafka's 1 MiB `max.partition.fetch.bytes`, which
-mq_oracle.py leaves at its default). It follows the cut record, the last
+mq_oracle.py leaves at its default, and the response's latency known). This
+also assumes the broker reads past the cut record within one log segment: a
+fetch returns data from one segment only, so a section can end at a segment
+boundary however much the partition holds. The oracle's topics stay far
+below the default `segment.bytes` (1 GiB) and roll no segment in a run; a
+run that rolls one breaks this proof. It follows the cut record, the last
 record before the cut, so it lies past the cut. Also, that response is in
 the record's window (not before its produce, not after a response showing a
 later token, not before the response showing its predecessor in the
