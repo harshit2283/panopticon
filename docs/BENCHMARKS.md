@@ -1544,9 +1544,10 @@ run: the unlisted server's 1,400 waiting connections on 2 listeners held
 640 (its two shares and the pool) and 760 were dropped
 (`pending_overflow` 760, exactly the bound), and a listed server on
 listeners of its own had 20 of 20 and 20 of 20 first requests captured
-from offset 0 meanwhile, none of the unlisted requests leaving the kernel
-(7.0 and RHEL 8; the full gate's kernels are in the follow-up PR). The
-runs below predate the hold.
+meanwhile, none of the unlisted requests leaving the kernel, on 7.0,
+6.8, 5.15, RHEL 9 and RHEL 8 (somaxconn raised to 4096 for the test, so
+the unlisted server has two listeners on every host). The runs below
+predate the hold.
 
 **`pid_filter` and the unproven state, before the pre-accept hold
 (2026-11-21, kernel 7.0).**
@@ -1676,6 +1677,14 @@ after, limit 1M:
 | 5.15 | 750,222 -> 753,792 | 725,371 -> 728,909 | 8,063 -> 8,337 | 18,149 (same) |
 | 5.14 (RHEL 9.8) | 104,459 -> 104,837 | 80,784 -> 81,177 | 10,388 -> 10,269 | 11,969 (same) |
 | 4.18 (RHEL 8.10) | 852,654 -> 856,334 | 824,277 -> 827,700 | 8,279 -> 8,563 | 20,131 (same) |
+
+With per-listener hold shares and the destroy backstop (2026-11-28),
+same measurement: `scope_skb_ingress` and `scope_skb_egress` unchanged on
+every kernel (5.15: 753,792 and 728,909; 4.18: 856,334 and 827,700);
+`scope_skb_hold` 18,149 -> 18,371 on 5.15 and 20,131 -> 20,430 on 4.18;
+`scope_sockops` 8,337 -> 8,110 and 8,563 -> 8,343; the new
+`scope_tcp_destroy` 939 on both (3,289 on 7.0, which reports
+`verified_insns`).
 
 AMQP, `run_messaging.sh 500 7` AMQP leg at the default config:
 
