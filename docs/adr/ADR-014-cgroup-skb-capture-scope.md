@@ -97,11 +97,21 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   kernel unless the acceptor is listed, so scope is still decided before any
   byte leaves it. The hold keeps two packets (4 KiB each) per connection
   within a node-wide budget (`preaccept_hold_bytes`, 16 MiB) that every
-  server's waiting connections share, listed or not. That budget is a
-  limit any remote client can reach: about 1,024 slow or unaccepted
-  connections to any server on the node, listed or not, spend it, and
-  listed servers' pre-accept bytes are then dropped (`pending_overflow`)
-  until those connections are accepted or closed (`scope_lab.py` T-23).
+  server's waiting connections share, listed or not, by listener (local
+  address and port, hashed under a seed drawn at start into 1,024
+  counters): a listener may always take its share (1/16) while the
+  budget lasts, and past it takes from an overflow pool (1/2) all
+  listeners share, so one listener takes at most 9/16 and the others
+  keep their shares (`scope_lab.py` T-23; the kernel keeps the pool's
+  use equal to the sum of what each counter holds past its share). The
+  budget is still a limit remote clients can reach: eight listeners on
+  the node, each with 64 slow or unaccepted connections, spend it, and
+  every other listener's pre-accept bytes are then dropped
+  (`pending_overflow`) until those connections are accepted or closed.
+  A hold whose socket is destroyed without its TCP_CLOSE callback
+  (another sockops program rewrote the callback flags) is discarded at
+  `tcp_v4_destroy_sock` and its bytes given back, where that fentry
+  loads.
   The hold does not cover data carried by the handshake itself (TCP Fast
   Open, data on the final ACK). It is off when its program does not
   load or install (pre-accept bytes dropped, `pre-accept hold

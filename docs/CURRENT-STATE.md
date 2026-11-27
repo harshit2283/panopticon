@@ -135,10 +135,15 @@ production-hardened compliance platform.
   (an unlisted acceptor's are discarded there), on any listener, also one
   that predates the agent. The hold keeps two packets (4 KiB each) per
   connection within a node-wide budget (`preaccept_hold_bytes`, 16 MiB)
-  shared with every server, listed or not: about 1,024 slow or
-  unaccepted connections from any client to any server on the node
-  spend it, and listed servers then lose their pre-accept bytes
-  (`pending_overflow`) until those connections are accepted or closed.
+  shared with every server, listed or not, by listener (local address
+  and port): each listener may always take its share (1 MiB, 64
+  connections) and, past it, an overflow pool all listeners share
+  (8 MiB). So one server's slow or unaccepted connections, from any
+  client, take at most 9 MiB and drop the rest (`pending_overflow`),
+  and other listeners keep their shares; it takes eight such listeners
+  on the node, each with 64 connections waiting, to spend the budget,
+  and listed servers then lose their pre-accept bytes until those
+  connections are accepted or closed.
   It does not hold data carried by the handshake (TCP Fast Open). It is
   off when its program does not load or install (pre-accept bytes
   dropped, `pre-accept hold unavailable` logged); without the accept

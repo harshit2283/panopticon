@@ -172,8 +172,8 @@ cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgrou
 preaccept_hold_bytes = 16777216  # pid_filter, acceptor rule: kernel memory for
                        # bytes waiting for accept() (16 KiB per connection;
                        # 0 = off; max 1 GiB; restart to change), shared by
-                       # every server: ~1,024 slow clients of any server
-                       # spend the default (§4.2)
+                       # every server, 1/16 per listener and a 1/2 overflow
+                       # pool: one server takes at most 9/16 (§4.2)
 ```
 
 **`max_packet_bytes`.** The kernel hands the capture large packets whole
@@ -212,8 +212,12 @@ not affected (16 KiB per read or write, §5.5).
 What this changes: the kernel reads the per-connection cap only for a
 packet over `max_packet_bytes`, and only after the scope decision, so it
 never brings a socket into scope and never changes which process a packet
-is attributed to; the entry is deleted when the socket closes, and the
-kernel map holds 16,384 connections (the oldest entry makes room). More
+is attributed to; the entry is deleted when the socket closes or the
+agent stops tracking the connection (idle or at capacity). The agent keeps
+at most 12,288 raised connections (the kernel map holds 16,384, and would
+otherwise drop an old entry to make room): past that a new connection is
+not raised (`panopticon_conn_cap_refused_full_total`). The map is written
+from a thread of its own, never from the workers. More
 bytes of large packets on those connections are captured and reach the
 parsers: their messages are exported, subject to the privacy mode (§4.3)
 and the body cap (`max_body_bytes`), where before they would have been
@@ -367,22 +371,34 @@ validated on x86_64 only and refused elsewhere.
         packet);
       - a node-wide budget, `[capture] preaccept_hold_bytes` (default
         16 MiB; 16 KiB per waiting connection, so 1,024 connections
-        waiting at once): past it, or when the socket's option memory
-        (`net.core.optmem_max`) cannot take the hold, pre-accept bytes are
-        dropped (`pending_overflow`). Every server's waiting connections
-        share it, listed or not (which server will accept a connection is
-        unknown until it does). **This is a limit any remote client can
-        reach:** about 1,024 slow or unaccepted connections to any
-        server on the node, listed or not, that send before it accepts
-        spend the whole budget, and until they are accepted or closed
-        every listed server's pre-accept bytes are dropped
-        (`pending_overflow`; `tests/oracle/scope_lab.py` T-23:
-        1,400 unlisted connections waiting spent the 16 MiB budget,
-        20 of 20 listed connections opened meanwhile lost their
-        first request, and all 20 opened after the unlisted server
-        accepted were captured whole; none of the unlisted server's
-        1,400 requests left the kernel). Raise the budget, or select
-        by cgroup or pod, where nothing is held. `0` turns the hold
+        waiting at once), shared by listener: past it, past a
+        listener's share when the overflow pool is spent too, or when
+        the socket's option memory (`net.core.optmem_max`) cannot take
+        the hold, pre-accept bytes are dropped (`pending_overflow`).
+        Every server's waiting connections draw on it, listed or not
+        (which server will accept a connection is unknown until it
+        does), but by listener (a server socket's local address and
+        port): each may always take its share, 1/16 of the budget
+        (1 MiB, 64 connections), and past it takes from an overflow
+        pool of 1/2 (8 MiB) that all listeners share. So one listener
+        whose connections wait (a busy or stalled server, or a remote
+        client opening slow connections to it) takes at most 9/16
+        (9 MiB, 576 connections), and the other listeners keep their
+        shares in the rest (up to seven of them in full).
+        **The limit any remote client can still reach:** eight or more
+        listeners on the node, each with 64 or more connections waiting
+        before it accepts, spend the whole budget, and until they are
+        accepted or closed every other listener's pre-accept bytes are
+        dropped (`pending_overflow`). Which listeners share one of the
+        kernel's 1,024 counters depends on a seed drawn at start, so it
+        cannot be chosen from outside the node; two that do share a
+        share. `tests/oracle/scope_lab.py` T-23: an unlisted server with
+        1,400 connections waiting on its listeners was bounded at its
+        shares and the pool (the rest counted `pending_overflow`), and
+        every listed connection opened meanwhile was captured from
+        offset 0; none of the unlisted server's requests left the
+        kernel. Raise the budget, or select by cgroup or pod, where
+        nothing is held. `0` turns the hold
         off (all pre-accept bytes dropped, as `out_of_scope` or
         `no_owner`);
       - data carried by the handshake itself (TCP Fast Open SYN data, data
@@ -533,7 +549,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 
 | What | Effect |
 |---|---|
-| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not: about 1,024 slow or unaccepted connections from any client to any server spend it, and listed servers then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
+| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not, by listener: one listener takes at most 9/16 of it (its share and the overflow pool), so slow or unaccepted connections to one server leave other listeners their shares; eight such listeners, each with 64 connections waiting, spend it, and listed servers then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
 | `pid_filter_listener = "creator"` | Nothing is held: a listed acceptor on a listener it does not select loses the bytes before `accept()` (above). |
 | `capture_loopback = false` (default) | Loopback and VRF packets are not captured; TLS plaintext is not affected (packets only). |
 | Looped multicast / broadcast on a VRF member interface | The sender's looped copy is never seen, whatever `capture_loopback` says. |
@@ -1542,8 +1558,9 @@ leave the node, use `metrics_only`.
 | `panopticon_conn_cap_raised_packets_total` | Packets over `max_packet_bytes` captured past it on raised connections |
 | `panopticon_conn_cap_cut_packets_total` | Packets of raised connections still cut, at 64 KiB (BIG TCP) |
 | `panopticon_conn_cap_truncated_before_raise_total` | Records of raised connections cut at `max_packet_bytes` because the kernel sent them before the agent raised the connection (its first packets) |
-| `panopticon_conn_cap_write_failures_total` | Raises the kernel map refused; those connections stay at `max_packet_bytes` |
-| `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback`, and for the pre-accept hold (§4.2) `pending_overflow` (not held: two packets already waiting, the budget spent or the socket's option memory full, or the accept of a thread blocked in `accept()` before the agent attached never seen; a held packet's bytes past 4 KiB count in `panopticon_capture_truncated_total` instead), `pending_race` (lost racing the hold's release), `pending_discarded` (held, then discarded in the kernel: an unlisted acceptor, a scope change, or closed unaccepted) |
+| `panopticon_conn_cap_write_failures_total` | Raises not written: the kernel map refused the write, or the writer thread's queue was full; those connections stay at `max_packet_bytes` |
+| `panopticon_conn_cap_refused_full_total` | Raises refused because the agent already keeps 12,288 raised connections (§4.2); those connections stay at `max_packet_bytes` |
+| `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback`, and for the pre-accept hold (§4.2) `pending_overflow` (not held: two packets already waiting, the budget spent, the listener's share and the overflow pool spent, or the socket's option memory full, or the accept of a thread blocked in `accept()` before the agent attached never seen; a held packet's bytes past 4 KiB count in `panopticon_capture_truncated_total` instead), `pending_race` (lost racing the hold's release), `pending_discarded` (held, then discarded in the kernel: an unlisted acceptor, a scope change, or closed unaccepted) |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |

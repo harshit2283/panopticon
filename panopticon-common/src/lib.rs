@@ -151,7 +151,8 @@ pub fn pending_listener_bucket(seed: u32, local_addr: u32, local_port: u16) -> u
 // User space writes a socket cookie's cap when it detects a protocol whose
 // parser loses frame sync on a cut packet; the kernel reads it only for a
 // packet over `max_packet_bytes`, and deletes it when the socket closes.
-/// Entries of `CONN_CAP` (an LRU hash: the oldest entry makes room).
+/// Entries of `CONN_CAP` (an LRU hash: the oldest entry would make room;
+/// user space keeps fewer, `conn_cap::CONN_CAP_LIVE_MAX`, so none is dropped).
 pub const MAX_CONN_CAP: u32 = 16_384;
 /// The cap user space writes for a raised connection: the 16 records the
 /// kernel sends of one packet at most (64 KiB, the GSO/GRO maximum).

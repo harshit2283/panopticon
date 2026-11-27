@@ -1694,12 +1694,15 @@ fn scope_programs_load_attach_and_hold() {
         c.write_all(b"orphan").unwrap();
         settle();
         assert_eq!(pending_ctl(&ebpf, PENDING_CTL_USED), hold_bytes);
-        let sockops = links.pop().expect("sockops link");
-        assert!(
-            sockops.is::<aya::programs::sock_ops::SockOpsLink>(),
-            "last attached: sockops"
-        );
-        drop(sockops);
+        // Links are kept as aya link ids: detach through the program.
+        let id = links
+            .pop()
+            .expect("sockops link")
+            .downcast::<aya::programs::sock_ops::SockOpsLinkId>()
+            .expect("last attached: sockops");
+        let prog: &mut aya::programs::SockOps =
+            ebpf.program_mut(SOCKOPS).unwrap().try_into().unwrap();
+        prog.detach(*id).expect("detach sockops");
         drop(orphans); // the child is aborted and destroyed, no TCP_CLOSE callback
         settle();
         assert_eq!(
