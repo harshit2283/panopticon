@@ -138,10 +138,12 @@ pub struct EventStats {
     /// cgroup_skb: the kernel's `SCOPE_DROPS` per reason, summed over CPUs
     /// (refreshed from the map; indexed by `scope::DROP_*`).
     pub scope_drops: [AtomicU64; panopticon_common::scope::SCOPE_DROP_REASONS as usize],
-    /// Connections whose packet cap was raised (`conn_cap.rs`).
+    /// Connections whose packet cap was raised: the kernel map took the
+    /// write (`conn_cap.rs`; a failed write counts in `conn_cap_write_failed`
+    /// only).
     pub conn_cap_raised: AtomicU64,
-    /// Raises not written: the kernel map refused the write, or the
-    /// writer thread's queue was full.
+    /// Raises not written: the kernel map refused the write, the writer
+    /// thread's queue was full, or the thread is not running.
     pub conn_cap_write_failed: AtomicU64,
     /// Raises refused because user space already keeps
     /// `conn_cap::CONN_CAP_LIVE_MAX` entries (the kernel's LRU would
@@ -1062,7 +1064,11 @@ pub(crate) async fn worker_task(
             // Raised connections this worker evicted (idle, or at capacity
             // since the last sweep) give their kernel entries back.
             if let Some(c) = &ctx.conn_cap {
-                c.sweep(worker_id, |cookie| manager.contains(cookie));
+                c.sweep(
+                    worker_id,
+                    |cookie| manager.contains(cookie),
+                    ctx.idle_timeout,
+                );
             }
             if evicted > 0 {
                 ctx.stats

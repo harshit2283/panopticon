@@ -208,14 +208,18 @@ impl AgentMetrics {
         let conn_cap_write_failed = conn_cap(
             &mut registry,
             "panopticon_conn_cap_write_failures",
-            "Raises not written: the kernel map refused the write or the writer's queue \
-             was full (the connection stays at max_packet_bytes)",
+            "Raises not written: the kernel map refused the write, the writer's queue was \
+             full, or the writer thread is not running (the connection stays at \
+             max_packet_bytes)",
         );
         let conn_cap_refused = conn_cap(
             &mut registry,
             "panopticon_conn_cap_refused_full",
-            "Raises refused because the agent already keeps its limit of raised \
-             connections (12288; the connection stays at max_packet_bytes)",
+            &format!(
+                "Raises refused because the agent already keeps its limit of {} raised \
+                 connections (the connection stays at max_packet_bytes)",
+                crate::conn_cap::CONN_CAP_LIVE_MAX
+            ),
         );
 
         let raw_capture_dropped = Counter::<u64>::default();

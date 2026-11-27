@@ -217,7 +217,9 @@ agent stops tracking the connection (idle or at capacity). The agent keeps
 at most 12,288 raised connections (the kernel map holds 16,384, and would
 otherwise drop an old entry to make room): past that a new connection is
 not raised (`panopticon_conn_cap_refused_full_total`). The map is written
-from a thread of its own, never from the workers. More
+from a thread of its own, pinned to one CPU (an LRU map can drop entries
+early when many CPUs insert), never from the workers; a narrowing's new
+pipeline keeps the entries of the connections it takes over. More
 bytes of large packets on those connections are captured and reach the
 parsers: their messages are exported, subject to the privacy mode (§4.3)
 and the body cap (`max_body_bytes`), where before they would have been
@@ -1592,11 +1594,11 @@ leave the node, use `metrics_only`.
 | `panopticon_tcp_reorder_held_total` | TCP records held briefly because their bytes arrived ahead of the next expected byte: the records of two packets of one socket, captured on two CPUs at once, can reach the agent interleaved. Held with the rest of that connection's records (at most 5 ms, 128 KiB per connection, 1,024 records per worker) until the missing bytes arrive |
 | `panopticon_tcp_reorder_gaps_total` | Records that went on with the hole before them still open (the hold's time or space bound was reached, or the hole was wider than 64 KiB): the missing bytes are taken as lost, a gap for the parser (§5.3) |
 | `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: `max_packet_bytes` per packet (16 KiB by default; 64 KiB on a connection `raise_packet_cap` raised), 16 KiB per TLS read or write, a `head_only` cut (§5.5), or a packet held before `accept()` past its first 4 KiB (§4.2). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
-| `panopticon_conn_cap_raised_connections_total` | TCP connections whose packet cap `raise_packet_cap` raised to 64 KiB (§4.2) |
+| `panopticon_conn_cap_raised_connections_total` | TCP connections whose packet cap `raise_packet_cap` raised to 64 KiB (§4.2): the kernel map took the write (a refused write counts in `panopticon_conn_cap_write_failures_total` only) |
 | `panopticon_conn_cap_raised_packets_total` | Packets over `max_packet_bytes` captured past it on raised connections |
 | `panopticon_conn_cap_cut_packets_total` | Packets of raised connections still cut, at 64 KiB (BIG TCP) |
 | `panopticon_conn_cap_truncated_before_raise_total` | Records of raised connections cut at `max_packet_bytes` because the kernel sent them before the agent raised the connection (its first packets) |
-| `panopticon_conn_cap_write_failures_total` | Raises not written: the kernel map refused the write, or the writer thread's queue was full; those connections stay at `max_packet_bytes` |
+| `panopticon_conn_cap_write_failures_total` | Raises not written: the kernel map refused the write, the writer thread's queue was full, or the thread is not running; those connections stay at `max_packet_bytes` |
 | `panopticon_conn_cap_refused_full_total` | Raises refused because the agent already keeps 12,288 raised connections (§4.2); those connections stay at `max_packet_bytes` |
 | `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback`, and for the pre-accept hold (§4.2) `pending_overflow` (not held: two packets already waiting, the budget spent, the listener's share and the overflow pool spent, or the socket's option memory full, or the accept of a thread blocked in `accept()` before the agent attached never seen; a held packet's bytes past 4 KiB count in `panopticon_capture_truncated_total` instead), `pending_race` (lost racing the hold's release), `pending_discarded` (held, then discarded in the kernel: an unlisted acceptor, a scope change, or closed unaccepted) |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
