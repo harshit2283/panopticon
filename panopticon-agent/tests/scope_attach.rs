@@ -1712,9 +1712,14 @@ fn scope_programs_load_attach_and_hold() {
         );
         assert_eq!(drops(&ebpf, DROP_PENDING_DISCARDED), disc0 + 1);
         assert_eq!(listeners_total(&ebpf), 0);
+        // (The client's own socket, created by this listed process, is
+        // captured: only the server side counts.)
+        let client = cookie(&c);
         assert!(
-            !drain(&mut ring).iter().any(|e| e.3 == b"orphan"),
-            "discarded: nothing of it sent"
+            !drain(&mut ring)
+                .iter()
+                .any(|e| e.0 != client && e.3 == b"orphan"),
+            "discarded: nothing of the server side sent"
         );
         let cg = File::open(root.path()).unwrap();
         attach_program(&mut ebpf, SOCKOPS, &cg, &mut links).expect("sockops again");
