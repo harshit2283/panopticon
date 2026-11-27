@@ -138,12 +138,15 @@ production-hardened compliance platform.
   shared with every server, listed or not, by listener (local address
   and port): each listener may always take its share (1 MiB, 64
   connections) and, past it, an overflow pool all listeners share
-  (8 MiB). So one server's slow or unaccepted connections, from any
+  (8 MiB). So one listener's slow or unaccepted connections, from any
   client, take at most 9 MiB and drop the rest (`pending_overflow`),
-  and other listeners keep their shares; it takes eight such listeners
-  on the node, each with 64 connections waiting, to spend the budget,
-  and listed servers then lose their pre-accept bytes until those
-  connections are accepted or closed.
+  and other listeners keep their shares (a server bound to a wildcard
+  address gets one share per local address it is reached on, and one
+  per port); it takes eight or more such listeners with 1,024
+  connections waiting between them (128 each, or 576 on one and 64 on
+  seven others) to spend the budget, and the other listeners then lose
+  their pre-accept bytes until those connections are accepted or
+  closed.
   It does not hold data carried by the handshake (TCP Fast Open). It is
   off when its program does not load or install (pre-accept bytes
   dropped, `pre-accept hold unavailable` logged); without the accept

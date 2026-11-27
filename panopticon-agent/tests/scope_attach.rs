@@ -1712,6 +1712,10 @@ fn scope_programs_load_attach_and_hold() {
         );
         assert_eq!(drops(&ebpf, DROP_PENDING_DISCARDED), disc0 + 1);
         assert_eq!(listeners_total(&ebpf), 0);
+        assert!(
+            !drain(&mut ring).iter().any(|e| e.3 == b"orphan"),
+            "discarded: nothing of it sent"
+        );
         let cg = File::open(root.path()).unwrap();
         attach_program(&mut ebpf, SOCKOPS, &cg, &mut links).expect("sockops again");
         drop(c);

@@ -2095,7 +2095,14 @@ def t23(t):
     import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 8192), max(hard, 8192)))
-    somax = int(open("/proc/sys/net/core/somaxconn").read())
+    # Two unlisted listeners whatever the host's somaxconn (128 on older
+    # kernels would need twelve, whose shares and the pool are the whole
+    # budget): raised for the test, restored after.
+    somax_path = "/proc/sys/net/core/somaxconn"
+    somax0 = int(open(somax_path).read())
+    if somax0 < 1024:
+        open(somax_path, "w").write("4096")
+    somax = int(open(somax_path).read())
     busy = 1400  # 16 KiB each: past the whole default budget (1,024 holds)
     nports = -(-busy // min(somax, 4096)) + 1
     port0, lports = PORT + 240, (PORT + 230, PORT + 231)
@@ -2131,7 +2138,14 @@ def t23(t):
     u.go()
     for c in unl:
         c.close()
+    if somax != somax0:
+        open(somax_path, "w").write(str(somax0))
     bound = min(T23_HOLDS, nports * T23_SHARE + T23_POOL)
+    # The shares are what is tested: the unlisted server's bound must
+    # leave the listed listeners theirs.
+    t.check(bound + 2 * T23_SHARE <= T23_HOLDS,
+            "busy: %d unlisted listeners leave room for the listed ones (bound %d of %d holds)"
+            % (nports, bound, T23_HOLDS))
     got = [ag.found(["B1Q1x" + c for c in run]) for run in busy_runs]
     t.note("busy: %d unlisted connections sent before accept (somaxconn %d, %d listeners), "
            "%d accepted later; pending_overflow %d before the listed clients, %d during; "

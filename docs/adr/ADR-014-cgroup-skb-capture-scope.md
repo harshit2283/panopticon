@@ -104,10 +104,13 @@ guide states them for operators (docs/USER-GUIDE.md §4.2, "Capture scope").
   listeners share, so one listener takes at most 9/16 and the others
   keep their shares (`scope_lab.py` T-23; the kernel keeps the pool's
   use equal to the sum of what each counter holds past its share). The
-  budget is still a limit remote clients can reach: eight listeners on
-  the node, each with 64 slow or unaccepted connections, spend it, and
-  every other listener's pre-accept bytes are then dropped
+  budget is still a limit remote clients can reach: eight or more
+  listeners on the node with 1,024 slow or unaccepted connections
+  between them (128 each, or 576 on one and 64 on seven others) spend
+  it, and every other listener's pre-accept bytes are then dropped
   (`pending_overflow`) until those connections are accepted or closed.
+  A listener is an address and port, so a server bound to a wildcard
+  address gets one share per local address it is reached on.
   A hold whose socket is destroyed without its TCP_CLOSE callback
   (another sockops program rewrote the callback flags) is discarded at
   `tcp_v4_destroy_sock` and its bytes given back, where that fentry

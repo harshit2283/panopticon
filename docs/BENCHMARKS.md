@@ -1529,12 +1529,20 @@ exported 500 of 500 calls with path and `grpc-status`, scored in the
 server's view (the only one `pid_filter` selects; the two-view gate of
 `run_protocols.sh` does not apply). The figures recorded on 2026-11-21
 (Redis error flag and sizes only, PostgreSQL no record) were not
-reproduced. The hold's budget is shared by every server's waiting
+reproduced. The hold's budget was first shared by every server's waiting
 connections, listed or not: about 1,024 slow or unaccepted connections
-from any client spend the default 16 MiB, and listed servers then lose
-their pre-accept bytes (`pending_overflow`; `scope_lab.py` T-23, 20 of 20
-listed first requests lost while 1,400 unlisted connections waited, on
-7.0, 6.8, 5.15, RHEL 9 and RHEL 8). The runs below predate the hold.
+from any client spent the default 16 MiB, and listed servers then lost
+their pre-accept bytes (`scope_lab.py` T-23, 20 of 20 listed first
+requests lost while 1,400 unlisted connections waited, on 7.0, 6.8, 5.15,
+RHEL 9 and RHEL 8). With per-listener shares (2026-11-28; a share of 1/16
+per listener, an overflow pool of 1/2, USER-GUIDE §4.2), the same T-23
+run: the unlisted server's 1,400 waiting connections on 2 listeners held
+640 (its two shares and the pool) and 760 were dropped
+(`pending_overflow` 760, exactly the bound), and a listed server on
+listeners of its own had 20 of 20 and 20 of 20 first requests captured
+from offset 0 meanwhile, none of the unlisted requests leaving the kernel
+(7.0 and RHEL 8; the full gate's kernels are in the follow-up PR). The
+runs below predate the hold.
 
 **`pid_filter` and the unproven state, before the pre-accept hold
 (2026-11-21, kernel 7.0).**

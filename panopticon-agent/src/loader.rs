@@ -86,8 +86,8 @@ fn pinned_map_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// Never a capture-scope map (SOCK_STATE, CGROUP_ALLOW, SCOPE_DROPS, the
-/// pid_filter maps and the pre-accept hold's PENDING, PENDING_CTL and
-/// HOLD_PROG): their contents are only valid for the run that wrote
+/// pid_filter maps and the pre-accept hold's PENDING, PENDING_CTL,
+/// PENDING_LISTENERS and HOLD_PROG): their contents are only valid for the run that wrote
 /// them. CONFIG is pinned, so its scope words are rewritten at every start.
 ///
 /// Never per-call TLS state either (TLS_SCRATCH, TLS_CALL, GO_READ_CALLS,
@@ -1533,6 +1533,7 @@ CapPrm:\t00000000ffffffff
             "PROC_EPOCH",
             "PENDING",
             "PENDING_CTL",
+            "PENDING_LISTENERS",
             "HOLD_PROG",
             "CONN_CAP",
             "CONN_CAP_STATS",

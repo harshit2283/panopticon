@@ -179,10 +179,13 @@ macro_rules! wr {
 //   the end);
 // * `SockState::held`: 1 before a value is created, 2 once the socket was
 //   accepted or closed and its value (if any) freed. Written 2 by whoever
-//   frees the value, or by the accept or close that finds `held` 0. An
-//   in-scope packet looks for a waiting value while it is 1; a holder
-//   that finds 2 holds nothing (`scope_skb_hold` hands the packet back to
-//   the capture hook, which now finds it accepted).
+//   frees the value, or by the accept, close or destroy that finds no
+//   value (`held` 0, or 1 when every hold failed). An in-scope packet looks
+//   for a waiting value while it is 1; a holder that finds 2 holds nothing
+//   (`scope_skb_hold` hands the packet back to the capture hook, which now
+//   finds it accepted). A holder that read 1 before such a 2 can still
+//   create a value after it: it then finds the socket accepted or closed
+//   after its write and releases the value itself (`hold_packet`).
 
 /// Slots per socket: the bytes of the first two packets received before
 /// accept() (a request line and its headers, normally one).
@@ -315,14 +318,19 @@ fn listener_counter(bucket: u32) -> *mut u64 {
 /// takes more than its share and the pool, and the rest of the budget is
 /// left to the shares of the others.
 ///
-/// `PENDING_CTL_OVERFLOW_USED` is kept equal to the sum over counters of
-/// what each holds past its share: every add or subtract of one hold on a
-/// counter moves the pool by one hold exactly when the counter was at or
-/// past its share before an add, or past it before a subtract (the share
-/// is whole holds), as the counter's own fetch-and-add reports it. That
-/// holds in any order of adds and subtracts, failed takes included; while
-/// a take that fails is undone, the pool can read one hold high, which can
-/// only refuse another take.
+/// `PENDING_CTL_OVERFLOW_USED` is the sum over counters of what each holds
+/// past its share, once no take or give is in flight: a counter's
+/// fetch-and-adds fall in one order, and each moves the pool by one hold
+/// exactly when that counter's excess changed (at or past its share before
+/// an add, past it before a subtract; the share is whole holds), whatever
+/// order the pool's own adds land in, failed takes and their undo
+/// included. In flight it can read high (a failed take not yet undone),
+/// low (a counter added to, the pool not yet) or wrapped below 0 (a
+/// subtract before its add, which `saturating_add` refuses): every pool
+/// admission checks its own add against the limit, so none of this admits
+/// past it once settled, and under contention it can only refuse a take
+/// that would have fit (best effort, as `used` is when failed takes on
+/// many CPUs inflate it briefly).
 #[inline(always)]
 fn share_take(bucket: u32) -> bool {
     let c = listener_counter(bucket);
@@ -1127,9 +1135,14 @@ fn on_accept(child: *mut c_void) {
 /// accept() then ends with its hold still charged to the budget, for the
 /// agent's life. Here a hold still waiting (`held` 1) is ended as TCP_CLOSE
 /// would end it: the socket is revoked (REUSED), so the release discards
-/// every slot, and the bytes go back to the budget. Optional (the loader
-/// attaches it with the hold where it loads); a socket whose hold already
-/// ended (`held` 2) or never began costs one storage lookup.
+/// every slot, and the bytes go back to the budget. Any `held` but 2 goes
+/// through it, 0 included: a first holder may be on its way (past its
+/// verdict, `held` not yet 1), and after the REUSED store and the fence
+/// it either finds REUSED after its write and releases its own value, or
+/// its value is there for `pending_end` to find (the order of
+/// `on_tcp_close`). Optional (the loader attaches it with the hold where
+/// it loads); a socket whose hold already ended (`held` 2) costs one
+/// storage lookup.
 #[fentry(function = "tcp_v4_destroy_sock")]
 pub fn scope_tcp_destroy(ctx: FEntryContext) -> i32 {
     on_destroy(ctx.arg(0));
@@ -1142,7 +1155,7 @@ fn on_destroy(sk: *mut c_void) {
         return;
     }
     let st = state_of(sk, false);
-    if st.is_null() || rd!(st, held) != HELD_MAYBE {
+    if st.is_null() || rd!(st, held) == HELD_DONE {
         return;
     }
     wr!(st, init_cookie, 0);

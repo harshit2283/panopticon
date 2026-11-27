@@ -173,7 +173,8 @@ preaccept_hold_bytes = 16777216  # pid_filter, acceptor rule: kernel memory for
                        # bytes waiting for accept() (16 KiB per connection;
                        # 0 = off; max 1 GiB; restart to change), shared by
                        # every server, 1/16 per listener and a 1/2 overflow
-                       # pool: one server takes at most 9/16 (§4.2)
+                       # pool: one listener (address:port) takes at most
+                       # 9/16 (§4.2)
 ```
 
 **`max_packet_bytes`.** The kernel hands the capture large packets whole
@@ -387,19 +388,23 @@ validated on x86_64 only and refused elsewhere.
         client opening slow connections to it) takes at most 9/16
         (9 MiB, 576 connections), and the other listeners keep their
         shares in the rest (up to seven of them in full).
+        A listener is an address and port: a server bound to a wildcard
+        address gets one share per local address it is reached on, and
+        one per port it listens on.
         **The limit any remote client can still reach:** eight or more
-        listeners on the node, each with 64 or more connections waiting
-        before it accepts, spend the whole budget, and until they are
-        accepted or closed every other listener's pre-accept bytes are
-        dropped (`pending_overflow`). Which listeners share one of the
+        listeners on the node with 1,024 connections waiting between
+        them before they accept (128 each, or 576 on one and 64 on seven
+        others) spend the whole budget, and until they are accepted or
+        closed every other listener's pre-accept bytes are dropped
+        (`pending_overflow`). Which listeners share one of the
         kernel's 1,024 counters depends on a seed drawn at start, so it
         cannot be chosen from outside the node; two that do share a
         share. `tests/oracle/scope_lab.py` T-23: an unlisted server with
         1,400 connections waiting on its listeners was bounded at its
         shares and the pool (the rest counted `pending_overflow`), and
-        every listed connection opened meanwhile was captured from
-        offset 0; none of the unlisted server's requests left the
-        kernel. Raise the budget, or select by cgroup or pod, where
+        every first request of a listed server on a listener of its own
+        opened meanwhile was captured; none of the unlisted server's
+        requests left the kernel. Raise the budget, or select by cgroup or pod, where
         nothing is held. `0` turns the hold
         off (all pre-accept bytes dropped, as `out_of_scope` or
         `no_owner`);
@@ -551,7 +556,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 
 | What | Effect |
 |---|---|
-| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not, by listener: one listener takes at most 9/16 of it (its share and the overflow pool), so slow or unaccepted connections to one server leave other listeners their shares; eight such listeners, each with 64 connections waiting, spend it, and listed servers then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
+| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not, by listener: one listener takes at most 9/16 of it (its share and the overflow pool), so slow or unaccepted connections to one listener leave other listeners their shares; eight or more such listeners with 1,024 connections waiting between them spend it, and the other listeners then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
 | `pid_filter_listener = "creator"` | Nothing is held: a listed acceptor on a listener it does not select loses the bytes before `accept()` (above). |
 | `capture_loopback = false` (default) | Loopback and VRF packets are not captured; TLS plaintext is not affected (packets only). |
 | Looped multicast / broadcast on a VRF member interface | The sender's looped copy is never seen, whatever `capture_loopback` says. |

@@ -58,7 +58,9 @@ pub struct SockState {
     /// held in `PENDING` (written before the value is created), 2 once the
     /// socket was accepted or closed and the hold released or discarded.
     /// While it is 1 an in-scope packet first checks that no hold is still
-    /// waiting (it would be sent out of order); at 2 nothing more is held.
+    /// waiting (it would be sent out of order); at 2 no new hold begins (a
+    /// holder already past its check releases its own value,
+    /// sock_capture.rs `pending_end`).
     /// Plain stores. A child clones 0 (a listener never holds).
     pub held: u8,
     /// The `PENDING_LISTENERS` counter its hold is charged to
