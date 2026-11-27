@@ -94,6 +94,10 @@ impl ProtocolParser for GrpcParser {
         self.inner.tls_unproven_start();
     }
 
+    fn direction_from_role(&mut self) {
+        self.inner.direction_from_role();
+    }
+
     fn uncertain(&self) -> bool {
         self.inner.uncertain()
     }

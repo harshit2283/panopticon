@@ -1355,6 +1355,15 @@ fn feed_event(
             }
             CreateResult::AlreadyExists => {}
         }
+        // A record stamped with its socket's role: the endpoint above is
+        // the kernel's (or content's that names a side), and its
+        // directions are the socket's, not the process's as over TLS.
+        if created
+            && event.event_type == EventType::TcPacket
+            && event.role != panopticon_common::scope::ROLE_UNKNOWN
+        {
+            manager.direction_from_role(cookie);
+        }
         if log_events {
             tracing::debug!(worker = worker_id, cookie, protocol = %proto, "Protocol detected");
         }
@@ -2849,6 +2858,51 @@ mod tests {
         let mut e = grpc_rec(SRV_SOCK, true, 0, &sp);
         e.role = panopticon_common::scope::ROLE_UNKNOWN;
         assert_eq!(server_endpoint(&e, Protocol::Http2, &sp), Some(GRPC_CLI));
+    }
+
+    /// On a socket whose kernel role names the server, the peer's bytes
+    /// do not re-decide it (review LOW-3): a server whose first bytes are
+    /// a client preface is not taken for the client. Before, the parser
+    /// swapped its sides, so the client's HEADERS were read as the
+    /// server's and closed the stream at once (a message on the request).
+    /// Now the preface stays the server's bytes (latched; read as frames
+    /// it never completes one), and the client's request closes nothing.
+    #[test]
+    fn a_preface_from_the_server_does_not_swap_a_kernel_role() {
+        let sp = unhex(GRPC_SERVER_PREFACE);
+        let cp = unhex(GRPC_CLIENT_PREFACE);
+        let static_req = h2_frame(0x1, 0x4 | 0x1, 1, &[0x83, 0x86, 0x84]);
+        let static_resp = h2_frame(0x1, 0x4 | 0x1, 1, &[0x88]);
+        for sock in [SRV_SOCK, CLI_SOCK] {
+            let evs = [
+                // The client opens with a SETTINGS shape (no preface).
+                grpc_rec(sock, true, 0, &sp),
+                // The server's first bytes are a client preface.
+                grpc_rec(sock, false, 0, &cp),
+                grpc_rec(sock, true, sp.len() as u64, &static_req),
+                grpc_rec(sock, false, cp.len() as u64, &static_resp),
+            ];
+            let (m, stats) = (ConnectionFsmManager::new(16), EventStats::new());
+            let mut done = vec![];
+            for (i, e) in evs.iter().enumerate() {
+                for r in feed_event(&m, e, connection_key(e), &stats, 0, false, None)
+                    .into_iter()
+                    .flatten()
+                {
+                    let n = match r {
+                        FsmResult::Messages(ms) => ms.len(),
+                        FsmResult::MessageComplete(_) => 1,
+                        _ => 0,
+                    };
+                    done.extend(std::iter::repeat_n(i, n));
+                }
+            }
+            assert!(done.is_empty(), "socket {sock}: completed at {done:?}");
+            assert_eq!(
+                m.connection_state(connection_key(&evs[0])),
+                Some("streaming")
+            );
+        }
     }
 
     /// Feed events the way worker_task does; (method, reply text) of every

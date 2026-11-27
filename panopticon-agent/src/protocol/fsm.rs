@@ -130,6 +130,9 @@ pub trait ProtocolFsm: Send {
     /// See [`ProtocolParser::tls_unproven_start`].
     fn tls_unproven_start(&mut self) {}
 
+    /// See [`ProtocolParser::direction_from_role`].
+    fn direction_from_role(&mut self) {}
+
     /// See [`ProtocolParser::uncertain`].
     fn uncertain(&self) -> bool {
         false
@@ -198,6 +201,10 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 
     fn tls_unproven_start(&mut self) {
         self.parser.tls_unproven_start();
+    }
+
+    fn direction_from_role(&mut self) {
+        self.parser.direction_from_role();
     }
 
     fn uncertain(&self) -> bool {
@@ -389,6 +396,11 @@ struct ConnectionEntry {
     /// A TLS key ([`ConnectionFsmManager::start_tls`]): a replacement
     /// parser gets the TLS ruling again.
     tls: bool,
+    /// `server` came from the kernel (the socket's role, or a SYN+ACK's
+    /// sender), not from content
+    /// ([`ConnectionFsmManager::direction_from_role`]): a replacement
+    /// parser is told again.
+    role: bool,
 }
 
 impl ConnectionEntry {
@@ -448,6 +460,22 @@ impl ConnectionFsmManager {
         }
     }
 
+    /// `conn_id` was created from a record stamped with its socket's role
+    /// (`cgroup_skb`: client or server), so its server endpoint is the
+    /// kernel's (or the content's where that names a side) and the
+    /// directions its parser is fed are the socket's:
+    /// [`ProtocolFsm::direction_from_role`], now and for every parser that
+    /// replaces it. Not for TLS uprobe records, whose direction is relative
+    /// to the process.
+    pub fn direction_from_role(&self, conn_id: u64) {
+        if let Some(mut entry) = self.connections.get_mut(&conn_id)
+            && entry.server.is_some()
+        {
+            entry.role = true;
+            entry.fsm.direction_from_role();
+        }
+    }
+
     pub fn get_or_create(&self, conn_id: u64, protocol: Protocol) -> CreateResult {
         self.get_or_create_with_server(conn_id, protocol, None)
     }
@@ -499,11 +527,14 @@ impl ConnectionFsmManager {
             fed: [false; 2],
             lost: false,
             tls: false,
+            role: false,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
             if let Some((ep, _)) = origin.server {
                 entry.server = Some(ep);
+                entry.role = true;
+                entry.fsm.direction_from_role();
             }
             if let Some(server) = entry.server {
                 for (ep, seq) in [origin.client, origin.server].into_iter().flatten() {
@@ -605,6 +636,9 @@ impl ConnectionFsmManager {
             entry.fsm.joined_late();
             if entry.tls {
                 entry.fsm.tls_unproven_start();
+            }
+            if entry.role {
+                entry.fsm.direction_from_role();
             }
         }
         entry.fed[side] = true;
@@ -745,6 +779,9 @@ impl ConnectionFsmManager {
             entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
             if entry.tls {
                 entry.fsm.tls_unproven_start();
+            }
+            if entry.role {
+                entry.fsm.direction_from_role();
             }
         }
         // Bytes were lost: whatever the parser does next starts mid-stream.

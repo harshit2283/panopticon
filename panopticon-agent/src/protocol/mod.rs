@@ -297,6 +297,16 @@ pub trait ProtocolParser: Send {
     /// it again to a parser that replaces the key's parser.
     fn tls_unproven_start(&mut self) {}
 
+    /// The direction given to [`Self::feed`] comes from the kernel's
+    /// socket role (client → server is `Egress`), not from the content:
+    /// the peer's bytes must not re-decide which side is the client. Only
+    /// process-relative directions (TLS uprobe records) leave it to the
+    /// parser. HTTP/2 then reads a client preface only from `Egress`. The
+    /// default does nothing.
+    /// [`ConnectionFsmManager`](super::fsm::ConnectionFsmManager) applies
+    /// it again to a parser that replaces the connection's parser.
+    fn direction_from_role(&mut self) {}
+
     /// The parser holds a latch that withholds what it can no longer
     /// read with certainty (HTTP/2: header state lost). The connection
     /// keeps it for its lifetime, past any parser replacement.

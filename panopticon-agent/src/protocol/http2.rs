@@ -136,9 +136,14 @@ enum FrameEvent {
 pub struct Http2Parser {
     client: Side,
     server: Side,
-    /// Which capture direction carries client → server bytes. Learned from
-    /// the client's connection preface when seen; defaults to Egress.
+    /// Which capture direction carries client → server bytes: Egress, or,
+    /// for process-relative directions only, the direction of the client's
+    /// connection preface when seen.
     client_dir: Direction,
+    /// Directions come from the kernel's socket role
+    /// ([`ProtocolParser::direction_from_role`]): a preface never moves
+    /// `client_dir`.
+    role_direction: bool,
     /// Bytes arrived from the client (its first were the preface, or this
     /// parser latched: `joined_late`) / from the server. Until the
     /// client's side starts, the server's bytes are held unread, and a gap
@@ -163,6 +168,7 @@ impl Http2Parser {
             client: Side::new(),
             server: Side::new(),
             client_dir: Direction::Egress,
+            role_direction: false,
             client_fed: false,
             server_fed: false,
             preface_seen: false,
@@ -187,7 +193,9 @@ impl Http2Parser {
     }
 
     pub fn reset(&mut self) {
+        let role_direction = self.role_direction;
         *self = Self::new(self.is_grpc);
+        self.role_direction = role_direction;
     }
 
     pub fn reset_for_next_transaction(&mut self) {
@@ -732,11 +740,21 @@ impl ProtocolParser for Http2Parser {
         } else {
             self.server_fed
         };
-        // The side that sends the preface is the client, whatever the
-        // capture direction says (TLS uprobes report process-relative
-        // directions, which are inverted on servers): its direction's first
-        // bytes, before any client preface.
-        if !d_fed && !self.preface_seen && data.starts_with(HTTP2_PREFACE) {
+        // With process-relative directions (TLS uprobes, inverted on
+        // servers) the side that sends the preface is the client, whatever
+        // the capture direction says: its direction's first bytes, before
+        // any client preface. Where the kernel's socket role gave the
+        // direction (`role_direction`), the peer's bytes do not re-decide
+        // it: a server whose first bytes are a preface is no HTTP/2
+        // server, and its side's framing proves nothing (latched).
+        if self.role_direction
+            && !d_client
+            && !d_fed
+            && !self.preface_seen
+            && data.starts_with(HTTP2_PREFACE)
+        {
+            self.joined_late();
+        } else if !d_fed && !self.preface_seen && data.starts_with(HTTP2_PREFACE) {
             if !d_client {
                 // The other direction spoke first and was taken for the
                 // client's (latched, as its bytes were no preface): it is
@@ -840,6 +858,11 @@ impl ProtocolParser for Http2Parser {
     /// [`ProtocolParser::tls_unproven_start`]).
     fn tls_unproven_start(&mut self) {
         self.joined_late();
+    }
+
+    /// A client preface is read only from `Egress`; see `feed`.
+    fn direction_from_role(&mut self) {
+        self.role_direction = true;
     }
 
     fn uncertain(&self) -> bool {
@@ -1743,6 +1766,32 @@ mod tests {
             p.uncertain() && p.framing_unproven,
             "a latch is never cleared"
         );
+    }
+
+    /// Directions from the kernel's socket role (review LOW-3): a preface
+    /// on `Ingress` is the server's bytes, not the client's, and latches
+    /// (a server that sends one is no HTTP/2 server). A preface on
+    /// `Egress` starts the connection as before.
+    #[test]
+    fn role_direction_keeps_the_client_on_egress() {
+        let mut p = Http2Parser::new(false);
+        p.direction_from_role();
+        let settings = make_frame(FRAME_SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 100]);
+        p.feed(&settings[..5], Direction::Egress, 0);
+        p.feed(&preface(), Direction::Ingress, 1);
+        assert_eq!(p.client_dir, Direction::Egress);
+        assert!(!p.preface_seen);
+        assert_eq!(p.client.buf.len(), 5, "the client's cut SETTINGS stay");
+        assert!(p.server.buf.len() >= HTTP2_PREFACE.len(), "the server's");
+        assert!(p.uncertain() && p.framing_unproven);
+
+        let mut p = Http2Parser::new(false);
+        p.direction_from_role();
+        p.feed(&preface(), Direction::Egress, 0);
+        assert!(p.preface_seen && !p.uncertain() && !p.framing_unproven);
+        // reset keeps where directions come from.
+        p.reset();
+        assert!(p.role_direction);
     }
 
     /// Server bytes first, then client bytes that are no preface: latched
