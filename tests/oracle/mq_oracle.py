@@ -170,9 +170,9 @@ def run_kafka():
     consumed = {}  # token -> (partition, offset)
     got = threading.Condition()
     stop = threading.Event()
-    # (Consumer method, done) for the consumer thread: pause() called from
-    # another thread while poll() runs deadlocks, so the thread that polls
-    # pauses and resumes.
+    # (Consumer method, done) for the consumer thread: in the lab, pause()
+    # called from the main thread while this thread was in poll() hung
+    # (confluent-kafka 2.x), so the thread that polls pauses and resumes.
     control = queue.Queue()
 
     def consume():
@@ -202,20 +202,28 @@ def run_kafka():
                             acks="all")
     raw = socket.create_connection((HOST, 9092))
     produced = {}  # token -> (topic, pii, value size)
+    fresh = []  # tokens produced since the last drain
     fetch_via = {}  # token -> truth `via` of its Fetch record, if not "consume"
 
+    def fail(why):
+        stop.set()  # the consumer thread is not a daemon
+        sys.exit(f"mq_oracle: {why}")
+
     def drain():
-        """Wait until the consumer has every record produced so far."""
+        """Wait until the consumer has every record produced since the last
+        drain (so every record produced so far). A record not consumed in
+        10 s ends the run: later responses could pile up records."""
         with got:
-            if not got.wait_for(lambda: produced.keys() <= consumed.keys(), timeout=10):
-                print(f"mq_oracle: {len(produced.keys() - consumed.keys())} records not consumed "
-                      f"after 10 s (op {i})", file=sys.stderr, flush=True)
+            if not got.wait_for(lambda: all(t in consumed for t in fresh), timeout=10):
+                fail(f"{sum(t not in consumed for t in fresh)} records not consumed after "
+                     f"10 s (op {i})")
+            fresh.clear()
 
     def on_consumer(call):
         done = threading.Event()
         control.put((call, done))
         if not done.wait(30):
-            sys.exit(f"mq_oracle: consumer thread did not run {call.__name__}")
+            fail(f"consumer thread did not run {call.__name__}")
 
     def held(produce_all):
         """Run `produce_all` with the consumer paused: the next Fetch request
@@ -238,6 +246,7 @@ def run_kafka():
         if errs and errs[0] is None:
             record(tok, "produce", "Produce", topic, pii=pii, via=via)
             produced[tok] = (topic, pii, len(value))
+            fresh.append(tok)
             return True
         return False
 
@@ -272,6 +281,7 @@ def run_kafka():
             if all(e is None for e in errs):
                 record(toks[0], "produce", "Produce", topic, tokens=toks, pii=pii, via="batch")
                 produced.update(each)
+                fresh.extend(each)
             drain()
             i += k
         elif r < 0.75:
@@ -292,12 +302,13 @@ def run_kafka():
             classic.send(topic, key=f"k-{tok}".encode(), value=value).get(timeout=10)
             record(tok, "produce", "Produce", topic, pii=pii, via="classic")
             produced[tok] = (topic, pii, len(value))
+            fresh.append(tok)
             drain()
             i += 1
-        elif r < 0.88:
+        elif r < 0.88 and N - i >= 3:
             # Held cut: 2000-byte records, each its own Produce (each below
             # the cap), to one partition; one Fetch response carries them all.
-            k = min(rnd.randint(3, 4), N - i)
+            k = rnd.randint(3, min(4, N - i))
             topic, part = rnd.choice(KAFKA_TOPICS), rnd.randint(0, 1)
 
             def cut(i=i, k=k, topic=topic, part=part):

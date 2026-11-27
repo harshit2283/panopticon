@@ -288,8 +288,8 @@ production-hardened compliance platform.
     one each on 7.0, 6.8, 5.15 and 9.8) gave the same score: `Fetch`
     439/439, lost 0, 8 past body cap (all from the held cut phase),
     every loss counter 0; AMQP and DNS 100%.
-    RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
-    fail-closed change and not re-run since.
+    On RHEL 9 an earlier run had passed (100%, one at 85%) before the
+    AMQP fail-closed change; the 2026-11-28 run above is the current one.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
     every field by 8 bytes). The agent checks each tracepoint's tracefs
