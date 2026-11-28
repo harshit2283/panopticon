@@ -19,9 +19,13 @@
 //! `&#x70;`, `&amp;` ...) and percent-decoding (`%70`, `+` as a space), so
 //! one encoding revealed by another is decoded too; ASCII case folded; SQL
 //! comment delimiters (`/*`, `/*!`, `*/`, `--`, `#`) blanked so their
-//! content is read as text; `-` and `.` read as `_`. Credential context is:
+//! content is read as text; `-` and `.` read as `_`. A backslash before a
+//! letter is read both ways ([`Reading`], [`normalize_views`]), context in
+//! either counting: as JSON (`\t` a tab, `\k` a `k`) and as a separator
+//! with the letter kept (`C:\token` is `C: token`, `dir\key` is
+//! `dir key`). Credential context is:
 //! - a word containing a credential part ([`PARTS`]: `password`, `pwd`,
-//!   `secret`, `token`, `api_key`, ..., each part of two words also
+//!   `secret`, `token`, `api_key`, `passcode`, ..., each part of two words also
 //!   folded: `apikey`, `privatekey`, so `privateKey` is one), ending in
 //!   `_pass` or `_auth`, or `identified` followed by `by`, `with`, `via`,
 //!   `as` or `using`;
@@ -35,8 +39,14 @@
 //!   ([`has_name_segment`]:
 //!   split at `_` and at case and digit boundaries of the text as decoded,
 //!   so `old_pwd`, `newPwd`, `card_pin`, `PIN_CODE`, `otp2`, and a
-//!   segment ending in `pin` or `otp`, `cardpin`, `SMSOTP`, `mpin`; not
-//!   `spinner`, `pinned` or `keyboard`; no plural), used as a name:
+//!   segment that glues a short name to the word before it
+//!   ([`glued_short_name`]: ending in `pin`, `otp`, `sig` or `pass`, not
+//!   `bypass` or `compass`, or holding `jwt`, `sessid` or `sessionid`:
+//!   `cardpin`, `SMSOTP`, `mpin`, `dbpass`, `reqsig`, `userjwt`,
+//!   `phpsessid`; not `usersid`); not `spinner`, `pinned` or `keyboard`;
+//!   no plural; not a whole name naming a record key,
+//!   [`names_a_non_secret_key`]: `sort_key`, `partitionKey`, not
+//!   `primary_key`), used as a name:
 //!   followed by `=` or `:`, given as a form or HTML field name
 //!   (`name="pwd"`), or an XML element (`<pwd>`); in SQL also a column in
 //!   a list or assignment (`users(pwd)`, `, pwd)`) or next to an operator
@@ -45,7 +55,11 @@
 //!   statement as captured (`pin+1`, whose `+` decodes to a space); a
 //!   short name followed by `-` or `.` is not used as a name in free
 //!   text, so a host and port is not one (`auth-service:8080`), except in
-//!   what is left of a field once its certain clauses are removed;
+//!   what is left of a field once its certain clauses are removed, and
+//!   when the one word after it is a qualifier ([`QUALIFIERS`]: `code`,
+//!   `number`, `num`, `no`, `digits`, `id`) that ends the token and the
+//!   whole is used as a name ([`qualified_short_name`]: `pin-code: 7392`,
+//!   `otp-code:123456`);
 //! - userinfo, `user:password@host`, with or without a scheme (the `:` of
 //!   `scheme://` and of `mailto:` do not count), and any `//` authority
 //!   whose userinfo has a `:` (RFC 3986: `,` and `;` may appear in it),
@@ -120,6 +134,9 @@ const PARTS: &[&str] = &[
     // header name as the parsers deliver it, lowercased).
     "pwd",
     "passphrase",
+    // A PIN by another name (owner ruling); not `passkey`, whose WebAuthn
+    // ids are public.
+    "passcode",
     "secret",
     "token",
     "apikey",
@@ -176,9 +193,10 @@ const NAMES: &[&str] = &[
 /// `sessions`, `otps`). Both readings are tried, with and without the case
 /// and digit boundaries (`masterUser`). A short name joined to other
 /// letters with no boundary does not count (owner ruling for Redis keys
-/// and command names, unlike [`has_name_segment`]'s `pin` / `otp`
-/// endings): `mykey`, `spinner`, `author`, `otpcode` and `SETOTP` name no
-/// credential.
+/// and arguments, unlike [`has_name_segment`]'s glued endings): `mykey`,
+/// `spinner`, `author` and `otpcode` name no credential. A command name
+/// that is not a built-in one is also read by
+/// [`holds_credential_letters`] (`SETOTP`).
 pub fn segmented_name_has_credential_word(name: &str) -> bool {
     [true, false].into_iter().any(|bounded| {
         let mut norm = segments_joined(name, bounded);
@@ -189,6 +207,19 @@ pub fn segmented_name_has_credential_word(name: &str) -> bool {
         zeroize::Zeroize::zeroize(&mut norm);
         found
     })
+}
+
+/// Whether `name`, case folded, holds a credential part ([`PARTS`]) or a
+/// short name ([`NAMES`]) anywhere, glued to other letters or not
+/// (`SETOTP`, `PINSET`, `myapp.setpin`): for a Redis command name that is
+/// not a built-in one, where there is no word to tell the letters apart
+/// from (the caller exempts the built-in names that hold some: `PING`,
+/// `KEYS`).
+pub fn holds_credential_letters(name: &str) -> bool {
+    let mut lower = name.to_ascii_lowercase();
+    let found = PARTS.iter().chain(NAMES).any(|w| lower.contains(w));
+    zeroize::Zeroize::zeroize(&mut lower);
+    found
 }
 
 /// `name` case folded, with `_` for each run of characters that are not
@@ -240,14 +271,18 @@ fn case_or_digit_boundary(b: &[u8], i: usize) -> bool {
 /// `x.sms.otp`, `otp2`). Unlike a Redis argument
 /// ([`segmented_name_has_credential_word`]), no plural (`keys`, `pins`):
 /// these are names in free text and structured bodies, where a plural is
-/// more often a list than a secret. A segment that ends in `pin` or `otp`
-/// counts too ([`ends_in_pin_or_otp`]: `cardpin`, `SMSOTP`, `mpin`). Any
-/// other short name inside a segment with no boundary is not one:
-/// `spinner`, `pinned`, `shipping`, `keyboard`, `otpcode`. No allocation:
+/// more often a list than a secret. A segment that glues a short name to the
+/// word before it counts too ([`glued_short_name`]: `cardpin`, `SMSOTP`,
+/// `mpin`, `dbpass`, `reqsig`, `userjwt`, `phpsessid`). Any other short
+/// name inside a segment with no boundary is not one: `spinner`, `pinned`,
+/// `shipping`, `keyboard`, `otpcode`, `bypass`, `usersid`. A record key
+/// (`sort_key`) is exempted by the callers on the whole name or token
+/// ([`names_a_non_secret_key`], [`in_a_non_secret_key_name`]), never on a
+/// part of it here (`user.sort_key` stays a name). No allocation:
 /// one pass over the token.
 fn has_name_segment(token: &[u8]) -> bool {
     let is_name = |seg: &[u8]| {
-        NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || ends_in_pin_or_otp(seg)
+        NAMES.iter().any(|n| seg.eq_ignore_ascii_case(n.as_bytes())) || glued_short_name(seg)
     };
     let mut start: Option<usize> = None;
     for i in 0..=token.len() {
@@ -266,18 +301,102 @@ fn has_name_segment(token: &[u8]) -> bool {
     false
 }
 
-/// A segment of more than three letters or digits ending in `pin` or
-/// `otp` (case folded): names written in one case join a short name to the
-/// word before it with no boundary (`cardpin`, `smsotp`, `mpin`, `totp`, a
-/// lowercased header `x-cardpin`). Only the end counts, so `spinner`,
-/// `pinned`, `shipping`, `opinion`, `option`, `topic` and `footprint` do
-/// not; `spin`, `backspin` and `hairpin` do (masked as credentials: a
-/// known over-match).
-fn ends_in_pin_or_otp(seg: &[u8]) -> bool {
-    seg.len() > 3 && {
-        let tail = &seg[seg.len() - 3..];
-        tail.eq_ignore_ascii_case(b"pin") || tail.eq_ignore_ascii_case(b"otp")
-    }
+/// Qualifiers of `key` that name a kind of key that is no secret: a
+/// database or store's own record keys. A closed list: not `primary`
+/// (Azure's `primaryKey` / `secondaryKey` are account keys), `routing`
+/// (PagerDuty's `routing_key` is the integration key, the credential of
+/// its Events API), `cache` (a cache key can hold a session key: Django's
+/// cached sessions), `hash` (the key of an HMAC), `idempotency` (it
+/// replays the stored response of the request that set it), nor any
+/// qualifier of a secret (`api`, `secret`, `private`, `access`, `sign`,
+/// `signing`, `session`, `encryption`, `master`, `license`, `ssh`,
+/// `client`, `auth`).
+const NON_SECRET_KEY_KINDS: &[&str] = &["sort", "partition", "foreign", "row", "shard", "range"];
+
+/// Whether a whole name is exactly a qualifier of [`NON_SECRET_KEY_KINDS`]
+/// and `key`, joined by `_`, `-`, `.` or nothing, case folded (`sort_key`,
+/// `partitionKey`, `RowKey`, `row.key`): a record key, no credential.
+/// Only the whole name: `x-sort-key`, `user.sort_key`, `sort_key_secret`
+/// and `sort_key2` stay credential names, and a value is read as ever (a
+/// credential word in it is context). No check of the value's shape
+/// applies (there is none). Decided on the whole name ([`decoded_name_is_credential`])
+/// or the whole token in free text and SQL ([`in_a_non_secret_key_name`]:
+/// `user.sort_key: …` and `pin.sort_key = …` are context). Not for Redis arguments
+/// ([`segmented_name_has_credential_word`]), which are read as before.
+fn names_a_non_secret_key(name: &[u8]) -> bool {
+    NON_SECRET_KEY_KINDS.iter().any(|q| {
+        name.len() > q.len() && name[..q.len()].eq_ignore_ascii_case(q.as_bytes()) && {
+            let rest = &name[q.len()..];
+            let rest = match rest.first() {
+                Some(b'_' | b'-' | b'.') => &rest[1..],
+                _ => rest,
+            };
+            rest.eq_ignore_ascii_case(b"key")
+        }
+    })
+}
+
+/// [`names_a_non_secret_key`] of the whole token around `start..end` in a
+/// view `b`: the word with any letters, digits, `_`, `-` and `.` joined
+/// to it, so `key` of `sort-key` is read as `sort-key`. Reads at most a
+/// few bytes on each side (no such name is longer: linear in the field).
+fn in_a_non_secret_key_name(b: &[u8], start: usize, end: usize) -> bool {
+    const LONGEST: usize = "partition_key".len();
+    let part = |c: &&u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
+    let s = start
+        - b[..start]
+            .iter()
+            .rev()
+            .take(LONGEST)
+            .take_while(part)
+            .count();
+    let e = end + b[end..].iter().take(LONGEST).take_while(part).count();
+    e - s <= LONGEST
+        && !b[..s].last().is_some_and(|c| part(&c))
+        && !b.get(e).is_some_and(|c| part(&c))
+        && names_a_non_secret_key(&b[s..e])
+}
+
+/// A segment that joins a short name to the word before it with no
+/// boundary, as names written in one case do (a lowercased header
+/// `x-cardpin`, `x-dbpass`), case folded: longer than the short name and
+/// - ending in `pin`, `otp` or `sig` (`cardpin`, `smsotp`, `mpin`, `totp`,
+///   `reqsig`, `hubsig`). Only the end counts, so `spinner`, `pinned`,
+///   `shipping`, `opinion`, `option`, `topic`, `footprint`, `signal`,
+///   `design` and `assign` do not; `spin`, `backspin` and `hairpin` do
+///   (masked as credentials: a known over-match);
+/// - ending in `pass`, unless in `bypass`, `compass` (`encompass`),
+///   `overpass`, `underpass`, `surpass` or `trespass`, the English words
+///   that end so (`dbpass`, `userpass`, `storepass`; `passenger`,
+///   `passport` do not end so; `lowpass`, `renderpass` are an over-match,
+///   as `renderPass` already is);
+/// - or holding `jwt`, `sessid` or `sessionid` anywhere, which no word
+///   does (`userjwt`, `jwtassertion`, `phpsessid`, `jsessionid`,
+///   `aspsessionidqsdratbs`).
+///
+/// Not `sid`: an `s`-final word before `id` reads the same (`usersid` is
+/// `users` + `id` as much as `user` + `sid`, `processid`, `classid`), nor
+/// `key` or `auth` (`monkey`, `author`).
+fn glued_short_name(seg: &[u8]) -> bool {
+    let ends = |w: &[u8]| seg.len() > w.len() && seg[seg.len() - w.len()..].eq_ignore_ascii_case(w);
+    let holds = |w: &[u8]| seg.windows(w.len()).any(|x| x.eq_ignore_ascii_case(w));
+    ends(b"pin")
+        || ends(b"otp")
+        || ends(b"sig")
+        || ends(b"pass")
+            && ![
+                &b"bypass"[..],
+                b"compass",
+                b"overpass",
+                b"underpass",
+                b"surpass",
+                b"trespass",
+            ]
+            .iter()
+            .any(|w| ends(w) || seg.eq_ignore_ascii_case(w))
+        || holds(b"jwt")
+        || holds(b"sessid")
+        || holds(b"sessionid")
 }
 
 fn strong_word(w: &str) -> bool {
@@ -312,14 +431,22 @@ fn may_decode(raw: &str) -> bool {
 /// (any length; percent- and JSON-decoded, case-folded): it holds a word
 /// with a credential part ([`PARTS`], `_pass`, `_auth`), or one of its
 /// segments, split at every character that is not an ASCII letter or digit
-/// and at case and digit boundaries, is a short name or ends in `pin` or
-/// `otp` ([`has_name_segment`]: `X-Old-Pwd`, `new_pwd`, `loginPwd`,
-/// `card_pin`, `x-cardpin`; `x-newpwd` by the part `pwd`; not `spinner`).
+/// and at case and digit boundaries, is a short name or glues one to the
+/// word before it ([`has_name_segment`]: `X-Old-Pwd`, `new_pwd`, `loginPwd`,
+/// `card_pin`, `x-cardpin`, `x-dbpass`, `x-reqsig`, `x-userjwt`,
+/// `jsessionid`; `x-newpwd` by the part `pwd`; not `spinner`, `x-usersid`).
 pub fn is_credential_name(name: &str) -> bool {
-    match decode(name) {
+    let (d, _, letter) = decode_nul(name, Reading::Json);
+    let json = match d {
         Some(d) => decoded_name_is_credential(d.as_bytes()),
         None => decoded_name_is_credential(name.as_bytes()),
-    }
+    };
+    // A backslash before a letter, also read as a separator ([`Reading`]):
+    // `dir\key`, `x\token`.
+    json || letter
+        && decode_nul(name, Reading::Separator)
+            .0
+            .is_some_and(|d| decoded_name_is_credential(d.as_bytes()))
 }
 
 /// [`is_credential_name`] of a name already decoded (as in the normalised
@@ -329,6 +456,10 @@ pub fn is_credential_name(name: &str) -> bool {
 /// segments is a short name ([`has_name_segment`]). No allocation for a
 /// name of up to 128 bytes.
 fn decoded_name_is_credential(name: &[u8]) -> bool {
+    // A record key, decided on the whole name ([`names_a_non_secret_key`]).
+    if names_a_non_secret_key(name) {
+        return false;
+    }
     if has_name_segment(name) {
         return true;
     }
@@ -403,7 +534,21 @@ enum Slot {
 }
 
 fn context(text: &str, sql: bool, slot: Slot) -> bool {
-    context_in(text, &normalize_flagged(text), sql, slot, false)
+    let (v, alt) = normalize_views(text);
+    context_in_views(text, &v, alt.as_ref(), sql, slot, false)
+}
+
+/// [`context_in`] of either normalised view of `text` ([`normalize_views`]).
+fn context_in_views(
+    text: &str,
+    v: &View,
+    alt: Option<&View>,
+    sql: bool,
+    slot: Slot,
+    strict: bool,
+) -> bool {
+    context_in(text, v, sql, slot, strict)
+        || alt.is_some_and(|a| context_in(text, a, sql, slot, strict))
 }
 
 /// [`context`] of `text` whose normalised view is `v`. `strict` for the
@@ -435,6 +580,7 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
     let short_name = |b: &[u8], cased: &[u8], segments: bool, w: &str, start, end| {
         (NAMES.contains(&w) || segments && has_name_segment(&cased[start..end]))
             && !is_bare(w, start, end)
+            && !in_a_non_secret_key_name(b, start, end)
             && (used_as_name(b, start, end)
                 || sql && (sql_column(b, start, end) || sql_operand(b, start, end)))
     };
@@ -454,7 +600,11 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
         if w != "identified" && strong_word(w) || short_name(b, cased, segments, w, start, end) {
             return true;
         }
-        if strict && !NAMES.contains(&w) && has_name_segment(&cased[start..end]) {
+        if strict
+            && !NAMES.contains(&w)
+            && has_name_segment(&cased[start..end])
+            && !in_a_non_secret_key_name(b, start, end)
+        {
             return true;
         }
     }
@@ -467,13 +617,45 @@ fn context_in(text: &str, v: &View, sql: bool, slot: Slot, strict: bool) -> bool
         .into_iter()
         .chain([raw_sql.as_ref().map(|(s, raw)| (s, *raw))]);
     for (view, cased) in views.flatten() {
-        if words(view)
-            .any(|(w, start, end)| short_name(view.as_bytes(), cased, true, w, start, end))
-        {
+        let vb = view.as_bytes();
+        if words(view).any(|(w, start, end)| {
+            short_name(vb, cased, true, w, start, end)
+                || qualified_short_name(vb, cased, w, start, end) && !is_bare(w, start, end)
+        }) {
             return true;
         }
     }
     has_userinfo(b)
+}
+
+/// Last segments that only qualify the short name before them: what a
+/// value under the name is (`pin-code`, `otp.number`, `key-id`), never
+/// the name of a service or host (`auth-service`, `key-vault`).
+const QUALIFIERS: &[&str] = &["code", "number", "num", "no", "digits", "id"];
+
+/// In a view where `-` and `.` end a word (`b`, lowercase; `cased` the
+/// same text with case kept), whether the word `w` at `start..end` is a
+/// short name, whole or as a segment ([`has_name_segment`]), joined by one
+/// `-` or `.` to a last word of [`QUALIFIERS`] that the token ends with,
+/// the whole used as a name ([`used_as_name`]): `pin-code: 7392`,
+/// `otp-code:123456`, `card-pin-code: 7392`, `key-id=…`. A host and port
+/// or an error prefix ends in the name of a service (`auth-service:8080`,
+/// `key-vault: 443`), so it is not one; a host named exactly so
+/// (`pin-code:7392` as a host and port) is withheld (an over-match).
+fn qualified_short_name(b: &[u8], cased: &[u8], w: &str, start: usize, end: usize) -> bool {
+    if !matches!(b.get(end), Some(b'-' | b'.')) {
+        return false;
+    }
+    let s = end + 1;
+    let e = s + b[s..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    e > s
+        && !matches!(b.get(e), Some(b'-' | b'.'))
+        && std::str::from_utf8(&b[s..e]).is_ok_and(|q| QUALIFIERS.contains(&q))
+        && (NAMES.contains(&w) || has_name_segment(&cased[start..end]))
+        && used_as_name(b, s, e)
 }
 
 /// Whether a name in a position that delimits it whole is a credential
@@ -1080,8 +1262,8 @@ fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     // the text decodes either, since every decoding step acts on any
     // escape it finds and leaves a malformed one in place, and the view
     // keeps every hint's letters).
-    let v = normalize_flagged(text);
-    if !context_in(text, &v, false, slot, false) {
+    let (v, alt) = normalize_views(text);
+    if !context_in_views(text, &v, alt.as_ref(), false, slot, false) {
         let names = v.hint || v.decoded;
         return Some(if names {
             certain_clauses(text).0
@@ -1095,7 +1277,8 @@ fn builtin_full(text: &str, kind: FieldKind) -> Option<Vec<(usize, usize)>> {
     // (an array, object or cut value, `{"pin-code":["7392"]}`), and any
     // word with a short name as a segment (`"note":"pin-code: 7392"`),
     // withholds the field.
-    (!context_in(&residual, &normalize_flagged(&residual), false, slot, true)).then_some(mask)
+    let (rv, ralt) = normalize_views(&residual);
+    (!context_in_views(&residual, &rv, ralt.as_ref(), false, slot, true)).then_some(mask)
 }
 
 /// Sorted, with overlapping or touching spans joined.
@@ -1248,7 +1431,21 @@ struct View {
 }
 
 fn normalize_flagged(text: &str) -> View {
-    let (d, nul) = decode_nul(text);
+    normalize_as(text, Reading::Json).0
+}
+
+/// The normalised views of a field: the JSON reading, and the separator
+/// reading when a backslash before a letter makes them differ
+/// ([`Reading`]). Credential context in either counts.
+fn normalize_views(text: &str) -> (View, Option<View>) {
+    let (v, letter) = normalize_as(text, Reading::Json);
+    (v, letter.then(|| normalize_as(text, Reading::Separator).0))
+}
+
+/// [`normalize_flagged`] under `reading`, and whether a backslash before a
+/// letter was read.
+fn normalize_as(text: &str, reading: Reading) -> (View, bool) {
+    let (d, nul, letter) = decode_nul(text, reading);
     let decoded = d.is_some();
     let mut s = d.unwrap_or_else(|| text.to_string());
     let cased = s.bytes().any(|c| c.is_ascii_uppercase()).then(|| s.clone());
@@ -1266,7 +1463,7 @@ fn normalize_flagged(text: &str) -> View {
         let joined = s.replace(['-', '.'], "_");
         split = Some(std::mem::replace(&mut s, joined));
     }
-    View {
+    let v = View {
         text: s,
         cased,
         hint,
@@ -1274,20 +1471,38 @@ fn normalize_flagged(text: &str) -> View {
         nul,
         comment,
         split,
-    }
+    };
+    (v, letter)
 }
 
 /// The decoded view: NUL bytes dropped, then up to three rounds of JSON
 /// escapes, HTML references and percent-decoding. None when nothing
 /// changes.
 fn decode(text: &str) -> Option<String> {
-    decode_nul(text).0
+    decode_nul(text, Reading::Json).0
 }
 
-/// [`decode`], and whether a NUL byte was dropped.
-fn decode_nul(text: &str) -> (Option<String>, bool) {
+/// How [`json_unescape_as`] reads a backslash before an ASCII letter
+/// (other than a `\u` with four hex digits).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// As JSON: `\b`, `\f`, `\n`, `\r`, `\t` a control character (read as
+    /// a space), any other letter kept without its backslash.
+    Json,
+    /// As a separator, the letter kept (`C:\token` is `C: token`,
+    /// `dir\key` is `dir key`): the backslash of a Windows path, prose or
+    /// LaTeX, which is not an escape there.
+    Separator,
+}
+
+/// [`decode`] under `reading`, whether a NUL byte was dropped, and whether
+/// a backslash before a letter was read. The two readings differ only
+/// there, so if no round of the JSON reading reads one, the separator
+/// reading decodes the same text.
+fn decode_nul(text: &str, reading: Reading) -> (Option<String>, bool, bool) {
     let mut s: Option<String> = None;
     let mut nul = false;
+    let mut letter = false;
     for _ in 0..3 {
         let mut changed = false;
         let cur = s.as_deref().unwrap_or(text);
@@ -1298,7 +1513,13 @@ fn decode_nul(text: &str) -> (Option<String>, bool) {
             s = Some(d);
             changed = true;
         }
-        for step in [json_unescape, html_unescape, percent_decode] {
+        let (d, l) = json_unescape_as(s.as_deref().unwrap_or(text), reading);
+        letter |= l;
+        if let Some(d) = d {
+            s = Some(d);
+            changed = true;
+        }
+        for step in [html_unescape, percent_decode] {
             if let Some(d) = step(s.as_deref().unwrap_or(text)) {
                 s = Some(d);
                 changed = true;
@@ -1314,7 +1535,7 @@ fn decode_nul(text: &str) -> (Option<String>, bool) {
         nul = true;
         d.retain(|c| c != '\0');
     }
-    (s, nul)
+    (s, nul, letter)
 }
 
 /// HTML character references decoded (`&#119;`, `&#x77;`, `&amp;`,
@@ -1370,10 +1591,18 @@ fn html_unescape(text: &str) -> Option<String> {
 
 /// JSON string escapes decoded wherever they appear, or None when there
 /// are none.
+#[cfg(test)]
 fn json_unescape(text: &str) -> Option<String> {
+    json_unescape_as(text, Reading::Json).0
+}
+
+/// [`json_unescape`] with a backslash before a letter read as `reading`
+/// says ([`Reading`]), and whether one was read.
+fn json_unescape_as(text: &str, reading: Reading) -> (Option<String>, bool) {
     if !text.contains('\\') {
-        return None;
+        return (None, false);
     }
+    let mut letter = false;
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1407,12 +1636,22 @@ fn json_unescape(text: &str) -> Option<String> {
                 }
                 out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
             }
-            Some('b' | 'f' | 'n' | 'r' | 't') => out.push(' '),
+            Some(c) if c.is_ascii_alphabetic() => {
+                letter = true;
+                match (reading, c) {
+                    (Reading::Separator, _) => {
+                        out.push(' ');
+                        out.push(c);
+                    }
+                    (Reading::Json, 'b' | 'f' | 'n' | 'r' | 't') => out.push(' '),
+                    (Reading::Json, _) => out.push(c),
+                }
+            }
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
     }
-    (out != text).then_some(out)
+    ((out != text).then_some(out), letter)
 }
 
 /// One pass of `%XX` and `+` decoding, or None when there is nothing to
@@ -2671,9 +2910,11 @@ mod tests {
                 "{input}"
             );
         }
-        // A known limit: in free text, a short name before a `-` is not
-        // read as a name (it could be a host and port, `auth-service:8080`).
-        assert_eq!(protect_text("pin-code: 7392"), None);
+        // In free text, a short name before a `-` is a name only when the
+        // one segment after it qualifies it (`pin-code`), not when it could
+        // be a host and port (`auth-service:8080`): M2, below.
+        assert_eq!(p("pin-code: 7392"), FIELD_WITHHELD);
+        assert_eq!(protect_text("auth-service:8080"), None);
         // `_` joins segments, so a host name with `_` (not a valid DNS
         // host name) reads as a name used as one.
         assert_eq!(p("auth_service:8080"), FIELD_WITHHELD);
@@ -2695,6 +2936,190 @@ mod tests {
             assert!(has_any_sql_credential_context(sql), "{sql}");
             assert_eq!(pk(sql, FieldKind::SqlStatement), sql);
         }
+    }
+
+    /// M2: in free text, a short name joined by `-` or `.` to one last
+    /// segment that only qualifies it (`code`, `number`, `num`, `no`,
+    /// `digits`, `id`) is a name when the whole is used as one, with or
+    /// without a space after the `:` (`pin-code: 7392`, `otp-code:123456`).
+    /// A host and port or an error prefix names a service, whose last
+    /// segment is not one of those (`auth-service:8080`, `key-vault: 443`).
+    #[test]
+    fn a_qualified_short_name_in_free_text_is_a_name() {
+        const S: &str = "Zq9Xv7Wk";
+        for input in [
+            format!("pin-code: {S}"),
+            format!("pin-code:{S}"),
+            format!("otp-code: {S}"),
+            format!("otp-code:{S}"),
+            format!("Your otp.code: {S}"),
+            format!("card-pin-code: {S}"),
+            format!("cardpin-code: {S}"),
+            format!("pin-number : {S}"),
+            format!("auth-code: {S}"),
+            format!("key-id={S}, region=eu"),
+            format!("sms otp-digits:{S}"),
+            format!("PIN-Code: {S}"),
+            format!(r#"{{"note":"pin-code: {S}"}}"#),
+        ] {
+            for kind in KINDS {
+                let out = pk(&input, kind);
+                assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
+            }
+        }
+        for t in [
+            "auth-service:8080",
+            "auth-service: down",
+            "session-store: 6379",
+            "key-vault: 443",
+            "Host: auth-service:8080",
+            "dial tcp: lookup session-store.default.svc: no such host",
+            "pin-svc.local:80",
+            "http://session-store:6379/x",
+            "connecting to pin.example.com: refused",
+            "key-vault.example.net:443",
+            "auth.example.com:8443",
+            "otp-codes: 3",
+            "pin-code-hint: ask the user",
+            "at 12:30, ratio 3:1",
+            r#"{"host":"key-vault.example.net:443","err":"auth-service: down"}"#,
+            // A known limit: a word that is not a qualifier reads like a
+            // host and port (`pin-svc:7392`).
+            "pin-entry: 7392",
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
+        }
+    }
+
+    /// Owner ruling: `passcode` is a credential part (a PIN by another
+    /// name), anywhere in a word; `passkey` is not (WebAuthn passkey ids
+    /// are public).
+    #[test]
+    fn passcode_is_a_credential_word() {
+        const R: &str = REDACTED_CREDENTIAL;
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for (input, want) in [
+            (r#"{"passcode":"1234"}"#, format!(r#"{{"passcode":"{R}"}}"#)),
+            ("passcode=1234&q=1", format!("passcode={R}&q=1")),
+            (
+                r#"{"userPasscode":"1234"}"#,
+                format!(r#"{{"userPasscode":"{R}"}}"#),
+            ),
+        ] {
+            assert_eq!(p(input), want, "{input}");
+            assert_eq!(
+                protect_text_with(&names_only, input).as_deref(),
+                Some(want.as_str()),
+                "{input}"
+            );
+        }
+        for n in ["passcode", "x-passcode", "userPasscode", "PASSCODE"] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        assert_eq!(p("your passcode is 1234"), FIELD_WITHHELD);
+        for n in ["passkey", "x-passkey-id", "passport", "passenger"] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        assert_eq!(protect_text(r#"{"passkeyId":"abc","passport":"x"}"#), None);
+    }
+
+    /// M5: a name that is exactly a qualifier naming a non-secret kind of
+    /// key and `key` (`sort_key`, `partitionKey`, `row-key`) is not a
+    /// credential name. Not `primary` (Azure's `primaryKey` is an account
+    /// key), `routing` (PagerDuty's `routing_key` is the integration key),
+    /// `cache` (Django's session cache key holds the session key) or any
+    /// qualifier of a secret key; not a longer name (`x-sort-key`).
+    #[test]
+    fn keys_named_for_a_non_secret_kind_are_exported() {
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for t in [
+            r#"{"sort_key":"2024-01-01#a","n":1}"#,
+            r#"{"partitionKey":"user-1","rowKey":"r1"}"#,
+            r#"{"PartitionKey":"p","RowKey":"r","Timestamp":"t"}"#,
+            r#"{"shard_key":"region","range_key":"ts","foreign_key":"user_id"}"#,
+            r#"{"a":"x.y","sort-key":"v"}"#,
+            "sort_key=abc&q=1",
+            "sort-key: abc",
+            "partition.key = p1",
+            "SORT_KEY: 5",
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
+            assert_eq!(protect_text_with(&names_only, t), None, "{t}");
+        }
+        for n in [
+            "sort_key",
+            "sortKey",
+            "SortKey",
+            "partition-key",
+            "row.key",
+            "ForeignKey",
+        ] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        for sql in [
+            "SELECT a FROM t WHERE shard_key = $1",
+            "UPDATE t SET sort_key = $1 WHERE id = 2",
+            "INSERT INTO t (id, partition_key) VALUES (1, 'p')",
+        ] {
+            assert!(!has_any_sql_credential_context(sql), "{sql}");
+        }
+        for n in [
+            "primary_key",
+            "primaryKey",
+            "secondaryKey",
+            "routing_key",
+            "cache_key",
+            "idempotency_key",
+            "Idempotency-Key",
+            "hash_key",
+            "api_key",
+            "secret_key",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "sign_key",
+            "session_key",
+            "encryption_key",
+            "master_key",
+            "license_key",
+            "ssh_key",
+            "client_key",
+            "auth_key",
+            "key",
+            "x-sort-key",
+            "user.sort_key",
+            "sort_key_secret",
+            "partition_api_key",
+            "sort_key2",
+        ] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        // The value is still read: a credential word in it withholds.
+        assert_eq!(p(r#"{"sort_key":"x","note":"token abc"}"#), FIELD_WITHHELD);
+        assert_eq!(p("sort_key: 1, pin: 7392"), FIELD_WITHHELD);
+        // Review: the exemption is decided on the whole token, not on the
+        // part after a `.` or `-` (withheld at the baseline, as these are
+        // in JSON, form and XML positions).
+        for t in [
+            "user.sort_key: Zq9Xv7Wk",
+            "x-sort_key: Zq9Xv7Wk",
+            "pin.sort_key: 1234",
+            "otp.sort_key: 123456",
+            "session.sort_key: Zq9Xv7Wk",
+            "key.sort_key: Zq9Xv7Wk",
+            "auth.row_key: Zq9Xv7Wk",
+            "pin-sort_key: 1234",
+            r#"{"pwd":"x","note":"user.sort_key 1234"}"#,
+        ] {
+            assert_eq!(p(t), FIELD_WITHHELD, "{t}");
+        }
+        // Documented: a limit beside a record key is exported with it.
+        assert_eq!(protect_text("sort_key: 1, pin-entry: 7392"), None);
+        // Documented (M4 over-match): a Windows path beside a credential.
+        assert_eq!(p(r#"{"pwd":"x","p":"C:\\token"}"#), FIELD_WITHHELD);
+        let sql = "SELECT * FROM t WHERE pin.sort_key = 'Zq9Xv7Wk'";
+        assert!(has_any_sql_credential_context(sql), "{sql}");
+        assert!(has_sql_credential_context(sql), "{sql}");
     }
 
     /// F1's fix matches a short name only as a whole segment: letters of
@@ -2876,12 +3301,10 @@ mod tests {
         ] {
             assert_eq!(protect_text(t), None, "{t}");
         }
-        // A known limit: other short names glued to a word in one case are
-        // not names (`bypass`, `compass`, `consider`, `design` would be),
-        // so these lowercased headers are exported.
-        for n in ["x-dbpass", "x-userjwt", "x-usersid", "x-reqsig"] {
-            assert!(!is_credential_name(n), "{n}");
-        }
+        // A known limit: `sid` glued to a word in one case is not a name,
+        // since an `s`-final word before `id` reads the same (`x-usersid`
+        // is `users` + `id` as much as `user` + `sid`; `x-processid`).
+        assert!(!is_credential_name("x-usersid"));
         for n in [
             "x-shipping-option",
             "opinion",
@@ -2894,6 +3317,345 @@ mod tests {
             assert!(!is_credential_name(n), "{n}");
         }
     }
+
+    /// M1: names written in one case (header names arrive lowercased) that
+    /// glue a credential name to the word before it: a segment ending in
+    /// `pass` (not `bypass`, `compass`, `overpass`, `underpass`, `surpass`,
+    /// `trespass`), ending in `sig`, or holding `jwt`, `sessid` or
+    /// `sessionid`. Checked against common header names of HTTP, CORS,
+    /// caches and CDNs, nginx, Envoy, tracing, AWS, GCP, Cloudflare,
+    /// Kubernetes and gRPC, none of which becomes a credential name.
+    #[test]
+    fn glued_credential_names_in_one_case() {
+        const R: &str = REDACTED_CREDENTIAL;
+        for n in [
+            "x-dbpass",
+            "x-userpass",
+            "x-adminpass",
+            "x-smtppass",
+            "storepass",
+            "x-userjwt",
+            "x-jwtassertion",
+            "x-reqsig",
+            "x-hubsig",
+            "jsessionid",
+            "x-jsessionid",
+            "phpsessid",
+            "aspsessionidqsdratbs",
+            "x-usersessionid",
+        ] {
+            assert!(is_credential_name(n), "{n}");
+        }
+        for (input, want) in [
+            (r#"{"dbpass":"hunter2"}"#, format!(r#"{{"dbpass":"{R}"}}"#)),
+            ("jsessionid=AB12&q=1", format!("jsessionid={R}&q=1")),
+            ("/app?phpsessid=ab12", format!("/app?phpsessid={R}")),
+            (r#"{"reqsig":"9f8e"}"#, format!(r#"{{"reqsig":"{R}"}}"#)),
+            (r#"{"userjwt":"eyJx"}"#, format!(r#"{{"userjwt":"{R}"}}"#)),
+        ] {
+            assert_eq!(p(input), want, "{input}");
+            let names_only = rules(&[], Builtin::NamesOnly);
+            assert_eq!(
+                protect_text_with(&names_only, input).as_deref(),
+                Some(want.as_str()),
+                "{input}"
+            );
+        }
+        assert_eq!(p("dbpass: hunter2"), FIELD_WITHHELD);
+        assert!(has_sql_credential_context(
+            "UPDATE u SET dbpass = 'x' WHERE id = 1"
+        ));
+        // Words that end in `pass` or `sig`, or hold the letters, and are
+        // no credential.
+        for n in [
+            "bypass",
+            "x-cache-bypass",
+            "x-bypass-cache",
+            "cachebypass",
+            "compass",
+            "x-compass",
+            "encompass",
+            "overpass",
+            "underpass",
+            "surpass",
+            "trespass",
+            "passenger",
+            "passport",
+            "x-passthrough",
+            "x-inside",
+            "x-config",
+            "x-design",
+            "x-signal",
+            "x-assign",
+            "x-consider",
+            "x-processid",
+            "x-businessid",
+            "x-classid",
+            "x-addressid",
+            "x-statusid",
+            "obsession",
+            "sessions",
+        ] {
+            assert!(!is_credential_name(n), "{n}");
+        }
+        assert_eq!(protect_text(r#"{"bypass":true,"compass":"N"}"#), None);
+        assert_eq!(protect_text("compass: N, bypass: yes"), None);
+        for h in COMMON_HEADERS {
+            assert!(!is_credential_name(h), "{h}");
+        }
+    }
+
+    /// Common header names that carry nothing secret (lowercased, as the
+    /// parsers deliver them).
+    const COMMON_HEADERS: &[&str] = &[
+        // HTTP.
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "age",
+        "allow",
+        "alt-svc",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-location",
+        "content-range",
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "content-type",
+        "date",
+        "dnt",
+        "etag",
+        "expect",
+        "expires",
+        "forwarded",
+        "from",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "last-modified",
+        "link",
+        "location",
+        "max-forwards",
+        "origin",
+        "pragma",
+        "priority",
+        "range",
+        "referer",
+        "referrer-policy",
+        "retry-after",
+        "server",
+        "server-timing",
+        "strict-transport-security",
+        "te",
+        "timing-allow-origin",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "vary",
+        "via",
+        "warning",
+        "permissions-policy",
+        "cross-origin-embedder-policy",
+        "cross-origin-opener-policy",
+        "cross-origin-resource-policy",
+        "clear-site-data",
+        "nel",
+        "report-to",
+        "reporting-endpoints",
+        "early-data",
+        "device-memory",
+        "downlink",
+        "ect",
+        "rtt",
+        "save-data",
+        "viewport-width",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "sec-gpc",
+        "sec-purpose",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+        "sec-websocket-accept",
+        "x-content-type-options",
+        "x-frame-options",
+        "x-xss-protection",
+        "x-powered-by",
+        "x-requested-with",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-prefix",
+        "x-forwarded-client-cert",
+        "x-real-ip",
+        "x-request-id",
+        "x-correlation-id",
+        "x-ua-compatible",
+        "x-dns-prefetch-control",
+        "x-download-options",
+        "x-permitted-cross-domain-policies",
+        "x-robots-tag",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "ratelimit-policy",
+        // CORS.
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+        "access-control-expose-headers",
+        "access-control-max-age",
+        "access-control-request-method",
+        "access-control-request-headers",
+        "access-control-allow-private-network",
+        // Caches, CDNs, nginx.
+        "x-cache",
+        "x-cache-hits",
+        "x-cache-status",
+        "x-cache-bypass",
+        "x-bypass-cache",
+        "cdn-cache-control",
+        "surrogate-control",
+        "x-served-by",
+        "x-timer",
+        "x-varnish",
+        "x-proxy-cache",
+        "x-accel-redirect",
+        "x-accel-buffering",
+        "x-accel-expires",
+        "x-accel-limit-rate",
+        "x-upstream-addr",
+        // Envoy, Istio, tracing.
+        "x-envoy-upstream-service-time",
+        "x-envoy-expected-rq-timeout-ms",
+        "x-envoy-attempt-count",
+        "x-envoy-decorator-operation",
+        "x-envoy-original-path",
+        "x-envoy-retry-on",
+        "x-envoy-max-retries",
+        "x-envoy-upstream-rq-timeout-ms",
+        "x-envoy-internal",
+        "x-envoy-external-address",
+        "x-envoy-downstream-service-cluster",
+        "x-envoy-peer-metadata",
+        "x-envoy-peer-metadata-id",
+        "x-envoy-force-trace",
+        "x-envoy-overloaded",
+        "x-envoy-ratelimited",
+        "x-b3-traceid",
+        "x-b3-spanid",
+        "x-b3-parentspanid",
+        "x-b3-sampled",
+        "x-b3-flags",
+        "b3",
+        "x-ot-span-context",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "grpc-trace-bin",
+        "uber-trace-id",
+        "x-datadog-trace-id",
+        "x-datadog-parent-id",
+        "x-datadog-sampling-priority",
+        "x-datadog-origin",
+        // AWS.
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "x-amz-request-id",
+        "x-amz-id-2",
+        "x-amz-server-side-encryption",
+        "x-amz-version-id",
+        "x-amz-storage-class",
+        "x-amz-meta-owner",
+        "x-amz-cf-id",
+        "x-amz-cf-pop",
+        "x-amz-apigw-id",
+        "x-amzn-requestid",
+        "x-amzn-errortype",
+        "x-amzn-trace-id",
+        "x-amz-target",
+        "x-amz-user-agent",
+        "x-amz-expected-bucket-owner",
+        "x-amz-checksum-crc32",
+        "x-amz-acl",
+        "x-amz-copy-source",
+        "x-amz-tagging",
+        // GCP.
+        "x-goog-api-client",
+        "x-goog-request-params",
+        "x-goog-user-project",
+        "x-goog-upload-protocol",
+        "x-goog-upload-command",
+        "x-goog-hash",
+        "x-goog-generation",
+        "x-goog-metageneration",
+        "x-goog-stored-content-length",
+        "x-goog-storage-class",
+        "x-guploader-uploadid",
+        "x-cloud-trace-context",
+        // Cloudflare.
+        "cf-ray",
+        "cf-connecting-ip",
+        "cf-connecting-ipv6",
+        "cf-ipcountry",
+        "cf-visitor",
+        "cf-cache-status",
+        "cf-worker",
+        "cf-ew-via",
+        "cf-device-type",
+        "cf-pseudo-ipv4",
+        "cdn-loop",
+        "true-client-ip",
+        // Kubernetes.
+        "x-kubernetes-pf-flowschema-uid",
+        "x-kubernetes-pf-prioritylevel-uid",
+        "audit-id",
+        "x-remote-user",
+        "x-remote-group",
+        "impersonate-user",
+        "impersonate-group",
+        "impersonate-uid",
+        "x-stream-protocol-version",
+        // gRPC.
+        "grpc-status",
+        "grpc-message",
+        "grpc-encoding",
+        "grpc-accept-encoding",
+        "grpc-timeout",
+        "grpc-status-details-bin",
+        "grpc-previous-rpc-attempts",
+        "grpc-retry-pushback-ms",
+        // Others.
+        "x-github-request-id",
+        "x-github-event",
+        "x-github-delivery",
+        "x-gitlab-event",
+        "x-slack-request-timestamp",
+        "x-shopify-shop-domain",
+        "x-ssl-client-verify",
+        "x-ssl-client-dn",
+        "x-client-ip",
+        "x-device-id",
+        "x-tenant-id",
+        "x-user-id",
+    ];
 
     /// F1 delta review (HIGH): a decoder must not consume what follows a
     /// malformed escape (`\u` without four hex digits, which multi-round
@@ -2919,6 +3681,67 @@ mod tests {
                     assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
                 }
             }
+        }
+    }
+
+    /// M4: a backslash before a word in text that is not JSON (a Windows
+    /// path, prose, LaTeX) is not an escape there. JSON reads `\t`, `\b`,
+    /// `\n`, `\r` and `\f` as control characters (`\token` as a tab and
+    /// `oken`) and drops the backslash of any other letter (`dir\key` as
+    /// `dirkey`); both readings hid the credential word. The view is also
+    /// read with a backslash before a letter as a separator.
+    #[test]
+    fn a_backslash_before_a_word_hides_no_credential() {
+        const S: &str = "Zq9Xv7Wk";
+        let names_only = rules(&[], Builtin::NamesOnly);
+        for input in [
+            format!(r"\token={S}"),
+            format!(r"\token={S}&b=1"),
+            format!(r"see C:\token {S}"),
+            format!(r"x \token {S}"),
+            format!(r"\\token={S}"),
+            format!("%5Ctoken={S}"),
+            format!(r"\bearer {S}"),
+            format!(r"\requirepass {S}"),
+            format!(r"\secret: {S}"),
+            format!(r"dir\key={S}"),
+            format!(r"a\session={S}"),
+            format!(r"x\auth: {S}"),
+            format!(r"x\pin: {S}"),
+            format!(r#"{{"p":"C:\\token","v":"{S}"}}"#),
+            format!(r#"{{"dir\\token":"{S}"}}"#),
+        ] {
+            for kind in KINDS {
+                let out = pk(&input, kind);
+                assert!(!out.contains(S), "{input:?} {kind:?} -> {out:?}");
+            }
+            // Full masks what names_only masks.
+            if let Some(n) = protect_text_with(&names_only, &input) {
+                assert!(!n.contains(S) || p(&input) == FIELD_WITHHELD, "{input:?}");
+            }
+        }
+        // A certain structure under a name read with the separator: masked
+        // in both modes.
+        let want = format!(r"dir\key={REDACTED_CREDENTIAL}");
+        assert_eq!(p(&format!(r"dir\key={S}")), want);
+        assert_eq!(
+            protect_text_with(&names_only, &format!(r"dir\key={S}")).as_deref(),
+            Some(want.as_str())
+        );
+        assert!(is_credential_name(r"x\token"));
+        // The JSON reading still counts: a tab escape before a short name.
+        assert_eq!(p(&format!(r#"{{"m":"a\tkey={S}"}}"#)), FIELD_WITHHELD);
+        assert_eq!(p(&format!(r#"{{"m":"a\npwd: {S}"}}"#)), FIELD_WITHHELD);
+        // Paths, prose and escapes with no credential word stay exported.
+        for t in [
+            r"C:\Users\bob\notes.txt",
+            r"see C:\tmp\report and \textbf{bold}",
+            r#"{"path":"C:\\tmp\\report.txt","n":1}"#,
+            r#"{"msg":"line1\nline2\tdone"}"#,
+            r"\begin{document}\section{Intro}\end{document}",
+            r#"{"re":"\\d+\\s\\w"}"#,
+        ] {
+            assert_eq!(protect_text(t), None, "{t}");
         }
     }
 
@@ -3224,6 +4047,10 @@ mod tests {
             "\"spinner-x\":".repeat(5_000),
             "&spinner-x=".repeat(5_000),
             "\\\"".repeat(20_000),
+            // M2, M5: words joined by `-`.
+            "key-".repeat(16_000),
+            "pin-code-".repeat(8_000),
+            "sort-key ".repeat(8_000),
         ] {
             let t = std::time::Instant::now();
             let _ = protect_text(&body);

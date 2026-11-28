@@ -1000,7 +1000,7 @@ mod tests {
 
     /// Security scan F1: header names that join a short credential name
     /// to other words, as the parsers deliver them (lowercased: `x-old-pwd`,
-    /// `x-card-pin`, `x-loginpwd`, `x-cardpin`) are masked in
+    /// `x-card-pin`, `x-loginpwd`, `x-cardpin`, `x-dbpass`, `x-reqsig`) are masked in
     /// any protocol; the WebSocket handshake nonce stays readable.
     #[test]
     fn test_compound_credential_header_names_are_masked() {
@@ -1018,6 +1018,9 @@ mod tests {
                 ("x-cardpin".into(), "7393".into()),
                 ("x-smsotp".into(), "482914".into()),
                 ("x-mpin".into(), "7394".into()),
+                ("x-dbpass".into(), "hunter5".into()),
+                ("x-userjwt".into(), "eyJx".into()),
+                ("x-reqsig".into(), "9f8e".into()),
                 (
                     "sec-websocket-key".into(),
                     "dGhlIHNhbXBsZSBub25jZQ==".into(),
@@ -1025,7 +1028,7 @@ mod tests {
                 ("x-shipping-option".into(), "ground".into()),
             ];
             let _ = engine.scan_message_with(&mut msg, true);
-            for i in 0..8 {
+            for i in 0..11 {
                 assert_eq!(
                     msg.headers[i].1, REDACTED_CREDENTIAL,
                     "{:?}",
@@ -1033,9 +1036,9 @@ mod tests {
                 );
             }
             if protocol == Protocol::Http1 {
-                assert_eq!(msg.headers[8].1, "dGhlIHNhbXBsZSBub25jZQ==");
+                assert_eq!(msg.headers[11].1, "dGhlIHNhbXBsZSBub25jZQ==");
             }
-            assert_eq!(msg.headers[9].1, "ground");
+            assert_eq!(msg.headers[12].1, "ground");
         }
         // The AMQP parser's own fields: `routing_key` is not a credential
         // name; its value is protected as text.

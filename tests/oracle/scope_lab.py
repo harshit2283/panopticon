@@ -2055,9 +2055,12 @@ def t23_unlisted(p, nports, port0):
     p.wait_go()
 
 
-def t23_listed(p, port):
+def t23_listed(p, ports):
     p.wait_go()
-    worker_loop(listener(port, "127.0.0.1"), "L")
+    socks = [listener(port, "127.0.0.1") for port in ports]
+    for ls in socks[1:]:
+        threading.Thread(target=worker_loop, args=(ls, "L"), daemon=True).start()
+    worker_loop(socks[0], "L")
 
 
 def t23_clients(port, run, count):
@@ -2075,26 +2078,44 @@ def t23_clients(port, run, count):
     return out
 
 
+# The kernel's hold limits at the default 16 MiB budget, in holds of 16 KiB
+# (panopticon_common::pending_shares): 1,024 in all, a share of 64 per
+# listener, and an overflow pool of 512 all listeners share.
+T23_HOLDS, T23_SHARE, T23_POOL = 1024, 64, 512
+
+
 def t23(t):
-    """T-23: the pre-accept hold budget is shared: a busy unlisted server
-    whose connections send before it accepts spends it, and a listed
-    server's pre-accept bytes are then dropped and counted; nothing of the
-    unlisted server leaves the kernel, and once it accepts the budget is
-    back."""
+    """T-23: the pre-accept hold budget has per-listener shares: a busy
+    unlisted server whose connections send before it accepts takes at most
+    its listeners' shares and the overflow pool, the rest of its
+    pre-accept bytes are dropped and counted, and a listed server on
+    listeners of its own still has every pre-accept byte held and
+    captured. Nothing of the unlisted server leaves the kernel, and once it
+    accepts its holds are given back."""
     import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 8192), max(hard, 8192)))
-    somax = int(open("/proc/sys/net/core/somaxconn").read())
-    busy = 1400  # 16 KiB each: past the default 16 MiB budget (1024 holds)
+    # Two unlisted listeners whatever the host's somaxconn (128 on older
+    # kernels would need twelve, whose shares and the pool are the whole
+    # budget): raised for the test, restored after.
+    somax_path = "/proc/sys/net/core/somaxconn"
+    somax0 = int(open(somax_path).read())
+    if somax0 < 1024:
+        open(somax_path, "w").write("4096")
+    somax = int(open(somax_path).read())
+    busy = 1400  # 16 KiB each: past the whole default budget (1,024 holds)
     nports = -(-busy // min(somax, 4096)) + 1
-    port0, lport = PORT + 240, PORT + 230
+    port0, lports = PORT + 240, (PORT + 230, PORT + 231)
     u = Proc(t23_unlisted, nports, port0)
     u.get()
-    lp = Proc(t23_listed, lport)
+    # Two listeners for the listed server: a listener's counter is a hash
+    # of its address and port under a random seed, and one of them could
+    # share a counter with an unlisted listener (about 1 in 1,024 each).
+    lp = Proc(t23_listed, lports)
     ag = Agent(t, "busy", 'pid_filter = [%d]\npid_filter_listener = "acceptor"' % lp.pid).start()
     lp.go()
     time.sleep(0.5)
-    calm = t23_clients(lport, "calm", 20)  # the budget unspent
+    calm = t23_clients(lports[0], "calm", 20)
     unl, marks = [], []
     for i in range(busy):
         try:
@@ -2107,40 +2128,52 @@ def t23(t):
         marks.append(m)
     time.sleep(1.0)
     over0 = ag.drops()["pending_overflow"]
-    starved = t23_clients(lport, "starved", 20)
+    busy_runs = [t23_clients(port, "busy%d" % k, 20) for k, port in enumerate(lports)]
     over = ag.drops()["pending_overflow"]
     u.go()
     accepted = u.get()["accepted"]
     time.sleep(0.5)
-    back = t23_clients(lport, "back", 20)
+    back = t23_clients(lports[0], "back", 20)
     ag.stop()
     u.go()
     for c in unl:
         c.close()
+    if somax != somax0:
+        open(somax_path, "w").write(str(somax0))
+    bound = min(T23_HOLDS, nports * T23_SHARE + T23_POOL)
+    # The shares are what is tested: the unlisted server's bound must
+    # leave the listed listeners theirs.
+    t.check(bound + 2 * T23_SHARE <= T23_HOLDS,
+            "busy: %d unlisted listeners leave room for the listed ones (bound %d of %d holds)"
+            % (nports, bound, T23_HOLDS))
+    got = [ag.found(["B1Q1x" + c for c in run]) for run in busy_runs]
     t.note("busy: %d unlisted connections sent before accept (somaxconn %d, %d listeners), "
-           "%d accepted later; pending_overflow %d while spent"
-           % (len(unl), somax, nports, accepted, over))
+           "%d accepted later; pending_overflow %d before the listed clients, %d during; "
+           "listed REQ1 captured while it was busy: %s"
+           % (len(unl), somax, nports, accepted, over0, over - over0,
+              ", ".join("%d of %d" % (len(g), len(r)) for g, r in zip(got, busy_runs))))
     check_absent(t, ag, marks, "busy: the unlisted server's pre-accept bytes")
-    check_present(t, ag, ["B1Q1x" + c for c in calm], "busy: listed REQ1 before the budget is spent")
-    got = ag.found(["B1Q1x" + c for c in starved])
-    t.note("busy: listed REQ1 captured while the budget was spent: %d of %d" % (len(got), len(starved)))
-    # Not vacuous: every unlisted connection was opened (past the 1,024
-    # holds the default budget takes), the budget was spent before the
-    # listed clients ran, each of their first packets was counted, and all
-    # 20 lost their first request (USER-GUIDE §4.2: "20 of 20").
-    t.check(len(unl) == busy and len(unl) * (16 << 10) > 16 << 20,
+    check_present(t, ag, ["B1Q1x" + c for c in calm], "busy: listed REQ1 before the busy server")
+    # Not vacuous: every unlisted connection was opened (past all 1,024
+    # holds of the default budget), and the unlisted server was bounded:
+    # each of its first packets past its listeners' shares and the pool
+    # was dropped and counted before the listed clients ran.
+    t.check(len(unl) == busy and len(unl) > T23_HOLDS,
             "busy: %d of %d unlisted connections opened (more than the budget holds)"
             % (len(unl), busy))
-    t.check(over0 > 0, "busy: the budget spent before the listed clients (pending_overflow %d)"
-            % over0)
-    t.check(over - over0 >= len(starved),
-            "busy: every listed first packet counted pending_overflow (%d for %d)"
-            % (over - over0, len(starved)))
-    t.check(not got, "busy: starvation measured (%d of %d listed REQ1 lost)"
-            % (len(starved) - len(got), len(starved)))
-    check_present(t, ag, ["B1Q2x" + c for c in starved],
-                  "busy: listed bytes after accept() are captured whatever the budget")
-    check_present(t, ag, ["B1Q1x" + c for c in back], "busy: listed REQ1 once the budget is back")
+    t.check(over0 >= len(unl) - bound,
+            "busy: the unlisted server held at most %d (its %d listeners' shares and the "
+            "pool): pending_overflow %d for %d connections" % (bound, nports, over0, len(unl)))
+    # The listed server: one of its two listeners at least has a counter
+    # of its own, and there every first request was held and captured.
+    whole = [g for g, r in zip(got, busy_runs) if len(g) == len(r)]
+    t.check(whole, "busy: listed REQ1 all captured while the unlisted server was busy "
+            "(not starved): %s" % ", ".join("%d of %d" % (len(g), len(r))
+                                             for g, r in zip(got, busy_runs)))
+    for run in busy_runs:
+        check_present(t, ag, ["B1Q2x" + c for c in run],
+                      "busy: listed bytes after accept() are captured whatever the budget")
+    check_present(t, ag, ["B1Q1x" + c for c in back], "busy: listed REQ1 after the busy server accepted")
     t.check(ag.scope_drop("pending_discarded") > 0, "busy: the unlisted holds discarded at accept()")
 
 

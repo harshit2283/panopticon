@@ -130,6 +130,15 @@ pub trait ProtocolFsm: Send {
     /// See [`ProtocolParser::tls_unproven_start`].
     fn tls_unproven_start(&mut self) {}
 
+    /// See [`ProtocolParser::direction_from_role`].
+    fn direction_from_role(&mut self) {}
+
+    /// See [`ProtocolParser::directions_from_role`].
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        false
+    }
+
     /// See [`ProtocolParser::uncertain`].
     fn uncertain(&self) -> bool {
         false
@@ -198,6 +207,15 @@ impl ProtocolFsm for ProtocolFsmAdapter {
 
     fn tls_unproven_start(&mut self) {
         self.parser.tls_unproven_start();
+    }
+
+    fn direction_from_role(&mut self) {
+        self.parser.direction_from_role();
+    }
+
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        self.parser.directions_from_role()
     }
 
     fn uncertain(&self) -> bool {
@@ -389,6 +407,11 @@ struct ConnectionEntry {
     /// A TLS key ([`ConnectionFsmManager::start_tls`]): a replacement
     /// parser gets the TLS ruling again.
     tls: bool,
+    /// `server` came from the kernel (the socket's role, or a SYN+ACK's
+    /// sender), not from content
+    /// ([`ConnectionFsmManager::direction_from_role`]): a replacement
+    /// parser is told again.
+    role: bool,
 }
 
 impl ConnectionEntry {
@@ -448,6 +471,22 @@ impl ConnectionFsmManager {
         }
     }
 
+    /// `conn_id` was created from a record stamped with its socket's role
+    /// (`cgroup_skb`: client or server), so its server endpoint is the
+    /// kernel's (or the content's where that names a side) and the
+    /// directions its parser is fed are the socket's:
+    /// [`ProtocolFsm::direction_from_role`], now and for every parser that
+    /// replaces it. Not for TLS uprobe records, whose direction is relative
+    /// to the process.
+    pub fn direction_from_role(&self, conn_id: u64) {
+        if let Some(mut entry) = self.connections.get_mut(&conn_id)
+            && entry.server.is_some()
+        {
+            entry.role = true;
+            entry.fsm.direction_from_role();
+        }
+    }
+
     pub fn get_or_create(&self, conn_id: u64, protocol: Protocol) -> CreateResult {
         self.get_or_create_with_server(conn_id, protocol, None)
     }
@@ -499,11 +538,14 @@ impl ConnectionFsmManager {
             fed: [false; 2],
             lost: false,
             tls: false,
+            role: false,
         };
         if let Some((_, origin)) = self.origins.remove(&conn_id) {
             // The SYN+ACK's sender is the server, whatever the payload said.
             if let Some((ep, _)) = origin.server {
                 entry.server = Some(ep);
+                entry.role = true;
+                entry.fsm.direction_from_role();
             }
             if let Some(server) = entry.server {
                 for (ep, seq) in [origin.client, origin.server].into_iter().flatten() {
@@ -571,6 +613,21 @@ impl ConnectionFsmManager {
         Some(self.feed(&mut entry, direction, data, timestamp_ns))
     }
 
+    /// A fresh parser for `entry`, of its protocol, given what the entry
+    /// knows of the connection: the TLS ruling (`tls`) and socket-role
+    /// directions (`role`). The one place a connection's parser is
+    /// replaced, so no replacement can drop either.
+    fn replace_parser(&self, entry: &mut ConnectionEntry) {
+        let protocol = entry.fsm.protocol();
+        entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
+        if entry.tls {
+            entry.fsm.tls_unproven_start();
+        }
+        if entry.role {
+            entry.fsm.direction_from_role();
+        }
+    }
+
     fn feed(
         &self,
         entry: &mut ConnectionEntry,
@@ -599,13 +656,9 @@ impl ConnectionFsmManager {
         };
         let first = !entry.fed[side] && !entry.lost;
         if preface && !first && direction == Direction::Egress {
-            let protocol = entry.fsm.protocol();
-            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
+            self.replace_parser(entry);
             entry.fin = [false; 2];
             entry.fsm.joined_late();
-            if entry.tls {
-                entry.fsm.tls_unproven_start();
-            }
         }
         entry.fed[side] = true;
         let result = entry.fsm.process_packet(direction, data, timestamp_ns);
@@ -741,11 +794,7 @@ impl ConnectionFsmManager {
         let direction = entry.direction_of(src, capture_direction);
         let result = entry.fsm.skip(direction, n, timestamp_ns);
         if result.is_none() {
-            let protocol = entry.fsm.protocol();
-            entry.fsm = Box::new(ProtocolFsmAdapter::new(protocol, &self.topics));
-            if entry.tls {
-                entry.fsm.tls_unproven_start();
-            }
+            self.replace_parser(&mut entry);
         }
         // Bytes were lost: whatever the parser does next starts mid-stream.
         // The exception: an HTTP/2 parser that accounted for the gap inside
@@ -1488,6 +1537,66 @@ mod tests {
         f.extend(stream.to_be_bytes());
         f.extend_from_slice(payload);
         f
+    }
+
+    /// A SYN+ACK names the server from the kernel, as a socket role does:
+    /// the parser is told its directions are the socket's
+    /// (`direction_from_role`), and so is a parser that replaces it after a
+    /// gap. A server whose first bytes are a client preface then does not
+    /// swap the sides: the client's request closes no stream.
+    #[test]
+    fn syn_ack_server_keeps_directions_through_a_replacement() {
+        const CLIENT: Endpoint = (0x0A00_0002, 51000);
+        const SERVER: Endpoint = (0x0A00_0001, 8080);
+        let pri = super::super::detect::HTTP2_PREFACE;
+        let settings = h2_frame(0x4, 0, 0, &[]);
+        let req = h2_frame(0x1, 0x4 | 0x1, 1, &[0x83, 0x86, 0x84]);
+        let completes = |m: &ConnectionFsmManager, src: Endpoint, d: &[u8]| {
+            matches!(
+                m.process_packet_from(1, src, Direction::Egress, d, 0),
+                Some(FsmResult::MessageComplete(_) | FsmResult::Messages(_))
+            )
+        };
+        let m = ConnectionFsmManager::new(4);
+        m.note_syn(1, CLIENT, false, 100);
+        m.note_syn(1, SERVER, true, 500);
+        m.get_or_create(1, Protocol::Http2);
+        assert!(m.connections.get(&1).unwrap().role);
+        assert!(!completes(&m, CLIENT, &settings));
+        assert!(!completes(&m, SERVER, pri));
+        assert!(!completes(&m, CLIENT, &req), "sides not swapped");
+        // A gap the parser cannot place replaces it; the new one is told too.
+        assert!(m.skip_from(1, CLIENT, Direction::Egress, 3, 0).is_none());
+        assert!(!completes(&m, CLIENT, &settings));
+        assert!(!completes(&m, SERVER, pri));
+        assert!(!completes(&m, CLIENT, &req), "replacement not swapped");
+    }
+
+    /// A client preface on `Egress` after other bytes replaces the parser
+    /// (latched); on a role-pinned connection the replacement keeps its
+    /// socket-role directions. Nothing it does after reading that preface
+    /// shows the flag (no later preface can swap), so it is read directly:
+    /// every replacement carries what the entry knows.
+    #[test]
+    fn preface_replacement_keeps_role_directions() {
+        const CLIENT: Endpoint = (0x0A00_0002, 51000);
+        const SERVER: Endpoint = (0x0A00_0001, 8080);
+        let pri = super::super::detect::HTTP2_PREFACE;
+        let m = ConnectionFsmManager::new(4);
+        m.note_syn(1, CLIENT, false, 100);
+        m.note_syn(1, SERVER, true, 500);
+        m.get_or_create(1, Protocol::Grpc);
+        let fsm_ptr = |m: &ConnectionFsmManager| {
+            &*m.connections.get(&1).unwrap().fsm as *const dyn ProtocolFsm as *const u8
+        };
+        m.process_packet_from(1, CLIENT, Direction::Egress, &h2_frame(0x4, 0, 0, &[]), 0);
+        let before = fsm_ptr(&m);
+        m.process_packet_from(1, CLIENT, Direction::Egress, pri, 1);
+        let entry = m.connections.get(&1).unwrap();
+        assert!(entry.fsm.uncertain(), "replaced, latched");
+        drop(entry);
+        assert_ne!(fsm_ptr(&m), before, "the parser was replaced");
+        assert!(m.connections.get(&1).unwrap().fsm.directions_from_role());
     }
 
     /// A Write that begins inside a DATA payload whose bytes are a client

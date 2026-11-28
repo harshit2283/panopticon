@@ -135,10 +135,18 @@ production-hardened compliance platform.
   (an unlisted acceptor's are discarded there), on any listener, also one
   that predates the agent. The hold keeps two packets (4 KiB each) per
   connection within a node-wide budget (`preaccept_hold_bytes`, 16 MiB)
-  shared with every server, listed or not: about 1,024 slow or
-  unaccepted connections from any client to any server on the node
-  spend it, and listed servers then lose their pre-accept bytes
-  (`pending_overflow`) until those connections are accepted or closed.
+  shared with every server, listed or not, by listener (local address
+  and port): each listener may always take its share (1 MiB, 64
+  connections) and, past it, an overflow pool all listeners share
+  (8 MiB). So one listener's slow or unaccepted connections, from any
+  client, take at most 9 MiB and drop the rest (`pending_overflow`),
+  and other listeners keep their shares (a server bound to a wildcard
+  address gets one share per local address it is reached on, and one
+  per port); it takes eight or more such listeners with 1,024
+  connections waiting between them (128 each, or 576 on one and 64 on
+  seven others) to spend the budget, and the other listeners then lose
+  their pre-accept bytes until those connections are accepted or
+  closed.
   It does not hold data carried by the handshake (TCP Fast Open). It is
   off when its program does not load or install (pre-accept bytes
   dropped, `pre-accept hold unavailable` logged); without the accept
@@ -256,9 +264,32 @@ production-hardened compliance platform.
     rate-limit drops) are all zero; any other missing
     record, and every one in a leg with any loss, is still lost
     (BENCHMARKS.md, Kafka, AMQP, DNS). Rescored that way the 96.8% run is 419/419 with 14 past
-    body cap.
-    RHEL 9 passed (100%, one earlier run at 85%); measured before the AMQP
-    fail-closed change and not re-run since.
+    body cap. Since 2026-11-28 "after the cut" must be proven: later in
+    the cut record's partition, and acknowledged to its producer (a
+    produce response with status 0 and a latency) before that response's
+    request left, the response under 1 MiB and its latency known (and the
+    broker's read within one log segment); a record of another partition,
+    one appended after the request left, or one past a cut response of
+    1 MiB or more or without a latency, counts as lost. That rescoring
+    predates the stricter rule and has not been redone. Under the
+    stricter rule a 2026-11-28 run on 8.10 lost 14 records (96.8%,
+    every loss counter 0) in two multi-topic responses cut at the cap,
+    in partitions other than the cut record's: unprovable, so lost.
+    Since then the Kafka leg's workload is deterministic
+    (`mq_oracle.py`): the producer waits after each operation until the
+    consumer has its records, so a response carries one operation's
+    records in one partition, below the cap, and two held phases (the
+    consumer paused until the records are acknowledged) build a cut
+    response of one partition, which the rule proves, and a multi-topic
+    response below the cap. An uncut response in a record's window no
+    longer blocks the exclusion when it is smaller than the record's
+    value (an expired long poll), which it then cannot hold. Seven runs
+    (2026-11-28, 500 operations, seed 7, default config: three on 8.10,
+    one each on 7.0, 6.8, 5.15 and 9.8) gave the same score: `Fetch`
+    439/439, lost 0, 8 past body cap (all from the held cut phase),
+    every loss counter 0; AMQP and DNS 100%.
+    On RHEL 9 an earlier run had passed (100%, one at 85%) before the
+    AMQP fail-closed change; the 2026-11-28 run above is the current one.
   - RHEL 9's `sock:sock_send_length` / `sock_recv_length` tracepoints have a
     different record layout (an extra `common_preempt_lazy_count` field moves
     every field by 8 bytes). The agent checks each tracepoint's tracefs
@@ -462,8 +493,9 @@ production-hardened compliance platform.
     connection are not exported either, whether or not credential
     masking is on.
   - Kafka, AMQP and DNS are scored against ground truth
-    (`tests/oracle/run_messaging.sh`; Kafka `Fetch` records past the body
-    cap are reported apart as "past body cap" when the leg lost nothing,
+    (`tests/oracle/run_messaging.sh`; Kafka `Fetch` records proven past
+    the body cap are reported apart as "past body cap" when the leg lost
+    nothing,
     and every leg prints the
     agent's loss counters and `raise_packet_cap` counters). Compressed Kafka record batches are
     not decoded, and Kafka is recognised on port 9092 only.
@@ -523,9 +555,18 @@ production-hardened compliance platform.
     Short credential names are also matched with `.` and `-` as
     boundaries (`users.pwd`), and as a segment of a name split at `_` and
     at case and digit boundaries (`old_pwd`, `newPwd`, `card_pin`,
-    `sms_otp`; a segment ending in `pin` or `otp`, `cardpin`, `smsotp`,
-    `mpin`, and `pwd` anywhere, `x-newpwd`, as lowercased header names
-    arrive; not `spinner` or `pinned`, and no plural); two-word
+    `sms_otp`; a segment ending in `pin`, `otp` or `sig`, or in `pass`
+    but not `bypass`, `compass` (`encompass`), `overpass`, `underpass`,
+    `surpass` or `trespass` (over-matching `daypass`, `boardingpass`,
+    `multipass`, `lowpass`, `highpass`, `bandpass` and `renderpass`), or
+    holding `jwt`, `sessid` or
+    `sessionid`, `cardpin`, `smsotp`, `mpin`, `x-reqsig`, `x-dbpass`,
+    `x-userjwt`, `jsessionid`, and `pwd` anywhere, `x-newpwd`, as
+    lowercased header names arrive; not `spinner`, `pinned` or
+    `x-usersid`, which reads as `users` + `id` too, no plural, and not
+    a whole name that is `sort`, `partition`, `foreign`, `row`, `shard` or
+    `range` and `key`, `sort_key`, `partitionKey`, while `primary_key`,
+    `routing_key` and `cache_key` stay credential names); two-word
     credential parts match camelCase too (`privateKey`, `accessKey`,
     `clientAssertion`), in bodies, header names, form and query names and
     SQL columns alike. A name in a position that delimits it (JSON member,
@@ -535,8 +576,14 @@ production-hardened compliance platform.
     clauses are masked, a credential name left in such a position or any
     word with a short name as a segment withholds it. In a field with no
     other context, free text with a short name before a `-` or `.` is not
-    a name (`pin-code: 7392` alone is exported, as a host and port
-    `auth-service:8080` must be). A URI password before an empty host
+    a name, as a host and port `auth-service:8080` must be exported,
+    unless the one word after it, ending the token, is `code`, `number`,
+    `num`, `no`, `digits` or `id` and the whole is used as a name
+    (`pin-code: 7392` and `otp-code:123456` are withheld). A backslash
+    before a letter is also read as a separator (`C:\token` is `C: token`),
+    so a JSON body carrying a Windows path such as `C:\\token` is withheld
+    whole, also beside a credential that was masked before (an
+    over-match). A URI password before an empty host
     (`postgres://u:pw@/db`) is masked. A letters-only segment before the word
     (`/reset/abcdef/token`) is a known limit.
     Redis reply text is never exported: a reply is exported as its type
@@ -556,7 +603,10 @@ production-hardened compliance platform.
     withheld as one unit (key, arguments and the reply's shape), so `SET otp:<id> <code>`, `SET otp <code>`,
     `HSET u:1 pin <pin>`, `EVAL <script> 1 otp` and `XADD s * otp <code>`
     export no value. A value that only mentions a credential word
-    withholds its command too.
+    withholds its command too, and so does a command name read by
+    segments (`OTP.SET`) or, when it is not a built-in Redis command
+    name, holding a credential word or short name anywhere (`SETOTP`,
+    `PINSET`, `MYAPP.SETPIN`; not `PING` or `KEYS`).
     Bodies with bytes kept after a capture gap (HTTP/1, HTTP/2 and AMQP
     message bodies; a cut end keeps its prefix), any AMQP text (path,
     headers, body) of a direction after it lost frame sync, for the rest

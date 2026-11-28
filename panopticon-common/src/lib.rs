@@ -92,15 +92,67 @@ pub const CONFIG_PENDING_HOLD: u32 = 0;
 pub const CONFIG_PENDING_BUDGET: u32 = 1;
 /// Bytes of the budget in use, kept by the kernel with fetch-and-add.
 pub const PENDING_CTL_USED: u32 = 2;
-pub const PENDING_CTL_ENTRIES: u32 = 3;
+/// Bytes of the budget each listener may always take (its share, while
+/// the budget lasts): [`pending_shares`] of the budget, written by the
+/// loader with it. A listener is a server socket's local address and port,
+/// hashed into one of [`PENDING_LISTENER_BUCKETS`] counters
+/// (`PENDING_LISTENERS`, [`pending_listener_bucket`]).
+pub const CONFIG_PENDING_SHARE: u32 = 3;
+/// Bytes of the budget all listeners together may take past their shares
+/// (the overflow pool, [`pending_shares`]).
+pub const CONFIG_PENDING_OVERFLOW: u32 = 4;
+/// Bytes of the overflow pool in use: the sum over listener counters of
+/// what each holds past its share, kept by the kernel (sock_capture.rs
+/// `share_take`, `share_give`).
+pub const PENDING_CTL_OVERFLOW_USED: u32 = 5;
+/// The listener hash's seed, drawn by the loader (so which listeners share
+/// a counter cannot be chosen from outside the node).
+pub const CONFIG_PENDING_SEED: u32 = 6;
+pub const PENDING_CTL_ENTRIES: u32 = 7;
 /// `CONFIG_PENDING_BUDGET` default: 16 MiB.
 pub const PENDING_BUDGET_DEFAULT: u64 = 16 << 20;
+/// Budget bytes one socket's hold takes (sock_capture.rs `Pending`: the
+/// value and its storage header, a 16 KiB kmalloc object).
+pub const PENDING_HOLD_BYTES: u64 = 16 << 10;
+/// Counters of `PENDING_LISTENERS` (a power of two).
+pub const PENDING_LISTENER_BUCKETS: u32 = 1024;
+const _: () =
+    assert!(PENDING_LISTENER_BUCKETS.is_power_of_two() && PENDING_LISTENER_BUCKETS <= 1 << 16);
+
+/// A listener's share and the overflow pool for a hold budget of `budget`
+/// bytes, in whole holds ([`PENDING_HOLD_BYTES`]): a share of 1/16 of the
+/// budget (at least one hold), and an overflow pool of half of it. So one
+/// listener (an unlisted server that accepts slowly, or never) takes at
+/// most its share and the pool, 9/16 of the budget, and every other
+/// listener still finds its own share in the 7/16 left, up to seven of
+/// them in full; before, one listener could take all of it.
+pub const fn pending_shares(budget: u64) -> (u64, u64) {
+    let holds = budget / PENDING_HOLD_BYTES;
+    let share = if holds / 16 == 0 { 1 } else { holds / 16 };
+    (share * PENDING_HOLD_BYTES, holds / 2 * PENDING_HOLD_BYTES)
+}
+
+/// The `PENDING_LISTENERS` counter of a server socket by its local IPv4
+/// address and port (host byte order, as the capture hook parses them),
+/// under the loader's `seed`. A multiply-xorshift mix: listeners on one
+/// address, or one port on many addresses, spread over the counters.
+#[inline(always)]
+pub fn pending_listener_bucket(seed: u32, local_addr: u32, local_port: u16) -> u32 {
+    let mut x = (u64::from(local_addr) << 16 | u64::from(local_port))
+        ^ (u64::from(seed) << 32 | u64::from(seed));
+    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 32;
+    (x as u32) & (PENDING_LISTENER_BUCKETS - 1)
+}
 
 // `CONN_CAP`: per-connection packet caps (sock_capture.rs `raised_cap`).
 // User space writes a socket cookie's cap when it detects a protocol whose
 // parser loses frame sync on a cut packet; the kernel reads it only for a
 // packet over `max_packet_bytes`, and deletes it when the socket closes.
-/// Entries of `CONN_CAP` (an LRU hash: the oldest entry makes room).
+/// Entries of `CONN_CAP` (an LRU hash: the oldest entry would make room;
+/// user space keeps fewer, `conn_cap::CONN_CAP_LIVE_MAX`, so none is dropped).
 pub const MAX_CONN_CAP: u32 = 16_384;
 /// The cap user space writes for a raised connection: the 16 records the
 /// kernel sends of one packet at most (64 KiB, the GSO/GRO maximum).

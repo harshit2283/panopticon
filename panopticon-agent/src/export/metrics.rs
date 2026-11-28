@@ -47,6 +47,7 @@ pub struct AgentMetrics {
     pub conn_cap_cut: Counter<u64>,
     pub conn_cap_truncated_before_raise: Counter<u64>,
     pub conn_cap_write_failed: Counter<u64>,
+    pub conn_cap_refused: Counter<u64>,
     /// `panopticon_credential_matches_total{source="user"|"builtin"}`.
     pub credential_matches_user: Counter<u64>,
     pub credential_matches_builtin: Counter<u64>,
@@ -207,7 +208,18 @@ impl AgentMetrics {
         let conn_cap_write_failed = conn_cap(
             &mut registry,
             "panopticon_conn_cap_write_failures",
-            "Raises the kernel map refused (the connection stays at max_packet_bytes)",
+            "Raises not written: the kernel map refused the write, the writer's queue was \
+             full, or the writer thread is not running (the connection stays at \
+             max_packet_bytes)",
+        );
+        let conn_cap_refused = conn_cap(
+            &mut registry,
+            "panopticon_conn_cap_refused_full",
+            &format!(
+                "Raises refused because the agent already keeps its limit of {} raised \
+                 connections (the connection stays at max_packet_bytes)",
+                crate::conn_cap::CONN_CAP_LIVE_MAX
+            ),
         );
 
         let raw_capture_dropped = Counter::<u64>::default();
@@ -284,6 +296,7 @@ impl AgentMetrics {
             conn_cap_cut,
             conn_cap_truncated_before_raise,
             conn_cap_write_failed,
+            conn_cap_refused,
             credential_matches_user,
             credential_matches_builtin,
             pod_unresolved,
@@ -403,6 +416,7 @@ impl AgentMetrics {
                 &stats.conn_cap_truncated_before_raise,
             ),
             (&self.conn_cap_write_failed, &stats.conn_cap_write_failed),
+            (&self.conn_cap_refused, &stats.conn_cap_refused),
         ] {
             counter
                 .inner()
@@ -479,6 +493,7 @@ mod tests {
             .conn_cap_truncated_before_raise
             .store(2, Ordering::Relaxed);
         stats.conn_cap_write_failed.store(5, Ordering::Relaxed);
+        stats.conn_cap_refused.store(6, Ordering::Relaxed);
         metrics.sync_from_stats(&stats);
         let out = encode_metrics(&registry);
         for line in [
@@ -487,6 +502,7 @@ mod tests {
             "panopticon_conn_cap_cut_packets_total 1",
             "panopticon_conn_cap_truncated_before_raise_total 2",
             "panopticon_conn_cap_write_failures_total 5",
+            "panopticon_conn_cap_refused_full_total 6",
         ] {
             assert!(out.lines().any(|l| l == line), "{line} in\n{out}");
         }

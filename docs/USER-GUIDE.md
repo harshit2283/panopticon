@@ -172,8 +172,9 @@ cgroup2_path = "auto"  # the cgroup v2 root to attach to; "auto" = /sys/fs/cgrou
 preaccept_hold_bytes = 16777216  # pid_filter, acceptor rule: kernel memory for
                        # bytes waiting for accept() (16 KiB per connection;
                        # 0 = off; max 1 GiB; restart to change), shared by
-                       # every server: ~1,024 slow clients of any server
-                       # spend the default (§4.2)
+                       # every server, 1/16 per listener and a 1/2 overflow
+                       # pool: one listener (address:port) takes at most
+                       # 9/16 (§4.2)
 ```
 
 **`max_packet_bytes`.** The kernel hands the capture large packets whole
@@ -212,8 +213,14 @@ not affected (16 KiB per read or write, §5.5).
 What this changes: the kernel reads the per-connection cap only for a
 packet over `max_packet_bytes`, and only after the scope decision, so it
 never brings a socket into scope and never changes which process a packet
-is attributed to; the entry is deleted when the socket closes, and the
-kernel map holds 16,384 connections (the oldest entry makes room). More
+is attributed to; the entry is deleted when the socket closes or the
+agent stops tracking the connection (idle or at capacity). The agent keeps
+at most 12,288 raised connections (the kernel map holds 16,384, and would
+otherwise drop an old entry to make room): past that a new connection is
+not raised (`panopticon_conn_cap_refused_full_total`). The map is written
+from a thread of its own, pinned to one CPU (an LRU map can drop entries
+early when many CPUs insert), never from the workers; a narrowing's new
+pipeline keeps the entries of the connections it takes over. More
 bytes of large packets on those connections are captured and reach the
 parsers: their messages are exported, subject to the privacy mode (§4.3)
 and the body cap (`max_body_bytes`), where before they would have been
@@ -367,22 +374,38 @@ validated on x86_64 only and refused elsewhere.
         packet);
       - a node-wide budget, `[capture] preaccept_hold_bytes` (default
         16 MiB; 16 KiB per waiting connection, so 1,024 connections
-        waiting at once): past it, or when the socket's option memory
-        (`net.core.optmem_max`) cannot take the hold, pre-accept bytes are
-        dropped (`pending_overflow`). Every server's waiting connections
-        share it, listed or not (which server will accept a connection is
-        unknown until it does). **This is a limit any remote client can
-        reach:** about 1,024 slow or unaccepted connections to any
-        server on the node, listed or not, that send before it accepts
-        spend the whole budget, and until they are accepted or closed
-        every listed server's pre-accept bytes are dropped
-        (`pending_overflow`; `tests/oracle/scope_lab.py` T-23:
-        1,400 unlisted connections waiting spent the 16 MiB budget,
-        20 of 20 listed connections opened meanwhile lost their
-        first request, and all 20 opened after the unlisted server
-        accepted were captured whole; none of the unlisted server's
-        1,400 requests left the kernel). Raise the budget, or select
-        by cgroup or pod, where nothing is held. `0` turns the hold
+        waiting at once), shared by listener: past it, past a
+        listener's share when the overflow pool is spent too, or when
+        the socket's option memory (`net.core.optmem_max`) cannot take
+        the hold, pre-accept bytes are dropped (`pending_overflow`).
+        Every server's waiting connections draw on it, listed or not
+        (which server will accept a connection is unknown until it
+        does), but by listener (a server socket's local address and
+        port): each may always take its share, 1/16 of the budget
+        (1 MiB, 64 connections), and past it takes from an overflow
+        pool of 1/2 (8 MiB) that all listeners share. So one listener
+        whose connections wait (a busy or stalled server, or a remote
+        client opening slow connections to it) takes at most 9/16
+        (9 MiB, 576 connections), and the other listeners keep their
+        shares in the rest (up to seven of them in full).
+        A listener is an address and port: a server bound to a wildcard
+        address gets one share per local address it is reached on, and
+        one per port it listens on.
+        **The limit any remote client can still reach:** eight or more
+        listeners on the node with 1,024 connections waiting between
+        them before they accept (128 each, or 576 on one and 64 on seven
+        others) spend the whole budget, and until they are accepted or
+        closed every other listener's pre-accept bytes are dropped
+        (`pending_overflow`). Which listeners share one of the
+        kernel's 1,024 counters depends on a seed drawn at start, so it
+        cannot be chosen from outside the node; two that do share a
+        share. `tests/oracle/scope_lab.py` T-23: an unlisted server with
+        1,400 connections waiting on its listeners was bounded at its
+        shares and the pool (the rest counted `pending_overflow`), and
+        every first request of a listed server on a listener of its own
+        opened meanwhile was captured; none of the unlisted server's
+        requests left the kernel. Raise the budget, or select by cgroup or pod, where
+        nothing is held. `0` turns the hold
         off (all pre-accept bytes dropped, as `out_of_scope` or
         `no_owner`);
       - data carried by the handshake itself (TCP Fast Open SYN data, data
@@ -533,7 +556,7 @@ TLS: the hook sees the socket's cleartext before the tunnel encrypts it.
 
 | What | Effect |
 |---|---|
-| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not: about 1,024 slow or unaccepted connections from any client to any server spend it, and listed servers then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
+| `pid_filter_listener = "acceptor"` (default) | Bytes that arrive before `accept()` returns wait in the kernel, two packets (4 KiB each) per connection within a node-wide budget that every server shares, listed or not, by listener: one listener takes at most 9/16 of it (its share and the overflow pool), so slow or unaccepted connections to one listener leave other listeners their shares; eight or more such listeners with 1,024 connections waiting between them spend it, and the other listeners then lose their pre-accept bytes. Bytes past those limits, and handshake data (TCP Fast Open), are dropped and counted. A connection whose first bytes were lost keeps a client-speaks-first parser unproven for its life (HTTP/1 method and sizes, no path); a later gap inside an HTTP/1 body of known length is counted and the path and later exchanges are exported; elsewhere in an HTTP/1 stream it unsyncs the connection from there, and other protocols follow their own lost-byte rule (above). |
 | `pid_filter_listener = "creator"` | Nothing is held: a listed acceptor on a listener it does not select loses the bytes before `accept()` (above). |
 | `capture_loopback = false` (default) | Loopback and VRF packets are not captured; TLS plaintext is not affected (packets only). |
 | Looped multicast / broadcast on a VRF member interface | The sender's looped copy is never seen, whatever `capture_loopback` says. |
@@ -730,12 +753,14 @@ exported:
   `X-Goog-Api-Key`, `X-Hub-Signature-256`, ...). A header of any protocol
   whose name is a credential name is replaced the same way: a name holding
   a word of the first list below, or one of whose segments is one of the
-  short names below or ends in `pin` or `otp` (segments split at every
+  short names below or glues one to the word before it, as below
+  (segments split at every
   character that is not an ASCII letter or digit and at case and digit
   boundaries). The parsers deliver header names in lower case, so
   `x-old-pwd`, `x-card-pin`, `x-loginpwd`, `x-newpwd`, `x-cardpin`,
-  `x-smsotp` and `x_sms_otp` are credential names (`pwd` is a credential
-  part); `x-shipping-option` is not. For
+  `x-smsotp`, `x_sms_otp`, `x-dbpass`, `x-reqsig`, `x-userjwt` and
+  `x-jsessionid` are credential names (`pwd` is a credential part);
+  `x-shipping-option`, `x-cache-bypass` and `x-usersid` are not. For
   HTTP, HTTP/2 and gRPC, `:authority` and `Sec-WebSocket-Key` stay
   readable under both rules, and so does AMQP's `routing_key` field (its
   value is still scanned as text);
@@ -760,6 +785,14 @@ data. Known limits:
 - an opaque secret under a name not in the lists (an OAuth `code=`, a
   field called `answer`), or a `Basic` credential (base64 `user:password`)
   outside the `Authorization` header: base64 is not decoded;
+- name shapes that cannot be told from ordinary text (below): `sid`
+  glued to a word in one case (`x-usersid`, which reads as `users` +
+  `id` too), and in free text a short name before `-` or `.` followed by
+  a word that is not a qualifier (`pin-entry: 7392`, read like the host
+  and port `pin-svc:7392`). A record-key name (`sort_key`, below) no
+  longer withholds a field whole, so one of these beside it
+  (`sort_key: 1, pin-entry: 7392`, withheld when `sort_key` was a
+  credential name) is now exported with the rest of the field;
 - encodings the agent does not decode: compressed bodies (gzip, deflate,
   compressed gRPC and Kafka batches), UTF-16 or UTF-32 text beyond plain
   ASCII, HTML named entities other than `&amp;` `&quot;` `&apos;` `&lt;`
@@ -782,9 +815,15 @@ the words or forms below. The view is the field with NUL bytes dropped
 and percent-encoding (`%70`, `+` as a space), so an encoding revealed by
 another is decoded too (`%5Cu0077` is `w`); case folded; SQL comment
 markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
-`-` and `.` read as `_`. The words and forms:
+`-` and `.` read as `_`. A backslash before a letter is read both ways,
+and context in either reading counts: as JSON (`\t` a tab, `\k` a `k`)
+and as a separator with the letter kept, as in a Windows path, prose or
+LaTeX (`C:\token` is `C: token`, `dir\key=…` is `dir key=…`). So a
+JSON body carrying a Windows path such as `C:\\token` is withheld whole,
+also beside a credential that was masked before
+(`{"pwd":"x","p":"C:\\token"}`, an over-match). The words and forms:
 
-- a word containing `password`, `passwd`, `pwd`, `passphrase`, `secret`,
+- a word containing `password`, `passwd`, `pwd`, `passphrase`, `passcode`, `secret`,
   `token`,
   `apikey`, `api_key`, `accesskey`, `access_key`, `privatekey`,
   `private_key`, `credential`, `signature`, `authorization`,
@@ -807,17 +846,34 @@ markers (`/*`, `/*!`, `*/`, `--`, `#`) ignored so a comment's text counts;
   a lower-case one, a letter next to a digit. So `old_pwd`, `new_pwd`,
   `newPwd`, `loginPwd`, `card_pin`, `PIN_CODE`, `sms_otp`, `dbPass`,
   `userSessionId` and `otp2` are names, and so is a segment of more than
-  three characters ending in `pin` or `otp`, for names written in one
-  case (`cardpin`, `SMSOTP`, `mpin`, `totp`; `spin` and `hairpin` too, a
-  known over-match). Any other short name inside a segment with no
+  three characters ending in `pin` or `otp`, or longer than the short
+  name ending in `sig` or `pass` (not in `bypass`, `compass`,
+  `encompass`, `overpass`, `underpass`, `surpass` or `trespass`), or
+  holding `jwt`, `sessid` or `sessionid`, for names written in one case
+  (`cardpin`, `SMSOTP`, `mpin`, `totp`, `reqsig`, `dbpass`, `storepass`,
+  `userjwt`, `phpsessid`, `jsessionid`; `spin`, `hairpin` and `lowpass`
+  too, a known over-match). Any other short name inside a segment with no
   boundary is not (`spinner`, `pinned`, `shipping`, `opinion`, `topic`,
-  `keyboard`, `otpcode`), nor is a plural (`keys`, `pins`, `sessions`;
-  Redis arguments differ, below). These names are also looked for with
+  `keyboard`, `otpcode`, `bypass`, `signal`), nor is `sid` glued to a
+  word (`x-usersid` reads as `users` + `id` as much as `user` + `sid`,
+  like `x-processid`: a known limit), nor is a plural (`keys`, `pins`, `sessions`;
+  Redis arguments differ, below), nor a whole name that is exactly
+  `sort`, `partition`, `foreign`, `row`, `shard` or `range` and `key`
+  (`sort_key`, `partitionKey`, `RowKey`, `row.key`: a record key; not
+  `primary_key`, an Azure account key, `routing_key`, PagerDuty's
+  integration key, `cache_key`, which can hold a session key, nor
+  `hash_key`, `idempotency_key` or a longer name such as `x-sort-key`;
+  Redis arguments and HTTP header names, matched by substring above, are
+  read as before). These names are also looked for with
   `-` and `.` as word boundaries, as in the field, so a qualified name is
   still one (`users.pwd = …`, `?user.pwd=…`, `old-pwd:`, `pwd-0`), and in
   SQL on the statement as captured too; a short name followed by `-` or
   `.` is not used as a name in free text, so a host and port such as
-  `auth-service:8080` is not context. So `/api/auth/login`, a Redis
+  `auth-service:8080` is not context, unless the one word after it is
+  `code`, `number`, `num`, `no`, `digits` or `id`, ending the token, and
+  the whole is used as a name (`pin-code: 7392`, `otp-code:123456`,
+  `key-id=…`; a host named exactly so, `pin-code:7392` as a host and
+  port, is withheld too, a known over-match). So `/api/auth/login`, a Redis
   `AUTH` command name or "press any key" are not context;
 - a credential name (as for header names, above: any word of the first
   list, or a short name as a segment, `-` and `.` splitting segments
@@ -940,8 +996,9 @@ What is exported then:
   a segment, used as a name or not (`{"old-pwd":"x","note":"pin-code:
   7392"}`, `old-pwd=x&x=pin-code+7392`), withholds the field. In a field
   with no other credential context, free text with a short name before a
-  `-` or `.` is not read as a name (`pin-code: 7392` alone is exported),
-  since it cannot be told from a host and port (`auth-service:8080`).
+  `-` or `.` is not read as a name, since it cannot be told from a host
+  and port (`auth-service:8080`), unless the one word after it is a
+  qualifier (above: `pin-code: 7392` and `otp-code:123456` are withheld).
   Full mode masks every value `names_only` masks, whether or not the
   field has other credential context.
 - **A Redis command** with credential context in any argument, or any
@@ -1180,7 +1237,9 @@ bare name (above). A Redis command is protected as one unit: when any of
 its arguments has credential context, read together or one by one, or
 any argument or the command's own name (a module command such as
 `OTP.SET`; not `AUTH`, whose arguments are masked by their own rule,
-nor `KEYS`) names a credential read by segments (below), the key
+nor `KEYS`) names a credential read by segments (below), or the
+command's name is not a built-in one and holds a credential word or
+short name anywhere (below: `SETOTP`), the key
 (`path`), the arguments (`request_text`) and the reply's shape are all
 exported as `<field withheld>` (method, status, timing and sizes stay).
 So `SET otp:+15551234567 482913 EX
@@ -1203,9 +1262,16 @@ segments is a short name whole or with a plural `s` (`otp`,
 `keys`, Django's `:1:django.contrib.sessions.cache<id>`), names a
 credential. A short name joined to other letters with no boundary does
 not count, so `mykey`, `spinner`, `author` and `otpcode` name no
-credential; the same holds for a command name, so a module command
-glued into one word (`SETOTP`, `PINSET`) is not caught, while `OTP.SET`
-and `PinSet` are.
+credential. A command name is read by segments too (`OTP.SET`,
+`PinSet`), and since Redis's built-in command names are a closed set, a
+name that is not one of them (a module or custom command) also names a
+credential when it holds a credential word or short name anywhere,
+glued or not: `SETOTP`, `OTPSET`, `PINSET`, `SESSIONSET` and
+`MYAPP.SETPIN` are withheld with their command. The built-in names that
+hold such letters (`PING`, `KEYS`, `HKEYS`, `RANDOMKEY`,
+`JSON.OBJKEYS`, `FT.DROPINDEX`, KeyDB's `KEYDB.*`) do not count; a
+custom command whose name merely holds the letters (`MYKEYS`, `ASSIGN`)
+is withheld too, an over-match.
 So `SET otp 482913`, `SET user:1:otp 482913`, `HSET u:1 pin 1234`,
 `SET session_token abc`, `EVAL <script> 1 otp`, `XADD events * otp
 482913`, `LMOVE incoming user:1:otp LEFT RIGHT` and `JSON.GET u:1 $.pin`
@@ -1538,12 +1604,13 @@ leave the node, use `metrics_only`.
 | `panopticon_tcp_reorder_held_total` | TCP records held briefly because their bytes arrived ahead of the next expected byte: the records of two packets of one socket, captured on two CPUs at once, can reach the agent interleaved. Held with the rest of that connection's records (at most 5 ms, 128 KiB per connection, 1,024 records per worker) until the missing bytes arrive |
 | `panopticon_tcp_reorder_gaps_total` | Records that went on with the hole before them still open (the hold's time or space bound was reached, or the hole was wider than 64 KiB): the missing bytes are taken as lost, a gap for the parser (§5.3) |
 | `panopticon_capture_truncated_total` | Packets or TLS calls with bytes past the capture cap: `max_packet_bytes` per packet (16 KiB by default; 64 KiB on a connection `raise_packet_cap` raised), 16 KiB per TLS read or write, a `head_only` cut (§5.5), or a packet held before `accept()` past its first 4 KiB (§4.2). Parsers account for the skipped bytes, but one that loses a message boundary there stops exporting some fields for the rest of the connection (§5.3) |
-| `panopticon_conn_cap_raised_connections_total` | TCP connections whose packet cap `raise_packet_cap` raised to 64 KiB (§4.2) |
+| `panopticon_conn_cap_raised_connections_total` | TCP connections whose packet cap `raise_packet_cap` raised to 64 KiB (§4.2): the kernel map took the write (a refused write counts in `panopticon_conn_cap_write_failures_total` only) |
 | `panopticon_conn_cap_raised_packets_total` | Packets over `max_packet_bytes` captured past it on raised connections |
 | `panopticon_conn_cap_cut_packets_total` | Packets of raised connections still cut, at 64 KiB (BIG TCP) |
 | `panopticon_conn_cap_truncated_before_raise_total` | Records of raised connections cut at `max_packet_bytes` because the kernel sent them before the agent raised the connection (its first packets) |
-| `panopticon_conn_cap_write_failures_total` | Raises the kernel map refused; those connections stay at `max_packet_bytes` |
-| `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback`, and for the pre-accept hold (§4.2) `pending_overflow` (not held: two packets already waiting, the budget spent or the socket's option memory full, or the accept of a thread blocked in `accept()` before the agent attached never seen; a held packet's bytes past 4 KiB count in `panopticon_capture_truncated_total` instead), `pending_race` (lost racing the hold's release), `pending_discarded` (held, then discarded in the kernel: an unlisted acceptor, a scope change, or closed unaccepted) |
+| `panopticon_conn_cap_write_failures_total` | Raises not written: the kernel map refused the write, the writer thread's queue was full, or the thread is not running; those connections stay at `max_packet_bytes` |
+| `panopticon_conn_cap_refused_full_total` | Raises refused because the agent already keeps 12,288 raised connections (§4.2); those connections stay at `max_packet_bytes` |
+| `panopticon_scope_dropped_events_total{reason}` | Packets and TLS calls the kernel did not capture because of the capture scope (§4.2), by `reason`: `not_eligible`, `uninit`, `no_owner`, `out_of_scope`, `sampled_out`, `no_baseline`, `head_cut`, `head_incoherent`, `tls_mode`, `tls_out_of_scope`, `ktls_payload`, `loopback`, and for the pre-accept hold (§4.2) `pending_overflow` (not held: two packets already waiting, the budget spent, the listener's share and the overflow pool spent, or the socket's option memory full, or the accept of a thread blocked in `accept()` before the agent attached never seen; a held packet's bytes past 4 KiB count in `panopticon_capture_truncated_total` instead), `pending_race` (lost racing the hold's release), `pending_discarded` (held, then discarded in the kernel: an unlisted acceptor, a scope change, or closed unaccepted) |
 | `panopticon_drops_stale_scope_gen_total` | Events dropped because a narrowing of the scope came after the kernel captured them |
 | `panopticon_pii_detections_total` | PII values found |
 | `panopticon_credential_matches_total` | Credentials protected, by `source`: `user` = matches of your `[credentials] patterns`, `builtin` = fields the built-in rules masked or withheld. Never values |

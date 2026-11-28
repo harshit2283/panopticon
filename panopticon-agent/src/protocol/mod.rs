@@ -152,7 +152,8 @@ pub use credential_rules::{
 };
 pub use secrets::{
     Decision, FIELD_WITHHELD, FieldKind, decide, decide_as, has_credential_context,
-    is_credential_name, segmented_name_has_credential_word, sql_verb, withheld_statement,
+    holds_credential_letters, is_credential_name, segmented_name_has_credential_word, sql_verb,
+    withheld_statement,
 };
 
 // ponytail: process-wide switch so parsers need no config plumbing; fine
@@ -296,6 +297,23 @@ pub trait ProtocolParser: Send {
     /// [`ConnectionFsmManager`](super::fsm::ConnectionFsmManager) applies
     /// it again to a parser that replaces the key's parser.
     fn tls_unproven_start(&mut self) {}
+
+    /// The direction given to [`Self::feed`] comes from the kernel's
+    /// socket role (client → server is `Egress`), not from the content:
+    /// the peer's bytes must not re-decide which side is the client. Only
+    /// process-relative directions (TLS uprobe records) leave it to the
+    /// parser. HTTP/2 then reads a client preface only from `Egress`. The
+    /// default does nothing.
+    /// [`ConnectionFsmManager`](super::fsm::ConnectionFsmManager) applies
+    /// it again to a parser that replaces the connection's parser.
+    fn direction_from_role(&mut self) {}
+
+    /// Whether [`Self::direction_from_role`] took effect (tests: no
+    /// behaviour shows it once a preface has been read).
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        false
+    }
 
     /// The parser holds a latch that withholds what it can no longer
     /// read with certainty (HTTP/2: header state lost). The connection

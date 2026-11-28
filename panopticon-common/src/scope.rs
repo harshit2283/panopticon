@@ -58,9 +58,18 @@ pub struct SockState {
     /// held in `PENDING` (written before the value is created), 2 once the
     /// socket was accepted or closed and the hold released or discarded.
     /// While it is 1 an in-scope packet first checks that no hold is still
-    /// waiting (it would be sent out of order); at 2 nothing more is held.
+    /// waiting (it would be sent out of order); at 2 no new hold begins (a
+    /// holder already past its check releases its own value,
+    /// sock_capture.rs `pending_end`).
     /// Plain stores. A child clones 0 (a listener never holds).
     pub held: u8,
+    /// The `PENDING_LISTENERS` counter its hold is charged to
+    /// ([`crate::pending_listener_bucket`] of the socket's local address
+    /// and port), written by every holder before it charges the budget:
+    /// the same value from every holder of one socket, so whoever gives
+    /// the bytes back finds the counter they were taken from. A child
+    /// clones its listener's (unused, a listener never holds).
+    pub hold_bucket: u16,
     /// Cookie of the socket the accept hook wrote `acceptor_tgid` and
     /// `ACCEPTOR_LISTED` on; written first. 0 = never accepted.
     pub accept_cookie: u64,
@@ -493,6 +502,8 @@ mod tests {
         assert_eq!(offset_of!(SockState, pid_bits), 56);
         assert_eq!(offset_of!(SockState, local), 60);
         assert_eq!(offset_of!(SockState, held), 61);
+        // In what was padding: the value's size is unchanged.
+        assert_eq!(offset_of!(SockState, hold_bucket), 62);
         assert_eq!(offset_of!(SockState, accept_cookie), 64);
     }
 
@@ -904,21 +915,107 @@ mod tests {
             true,
             false
         ));
-        // Exhaustive: held exactly when the acceptor-listed verdict is IN.
+        // Exhaustive, against the rule stated from its inputs (not through
+        // `verdict`, which `pending_accept` itself calls): held exactly when
+        // the pid selector is on, under the acceptor rule, on a server not
+        // accepted yet, and in the sample if sampling is on. The cgroup
+        // selector never matters: selectors are a union, and a listed
+        // acceptor alone selects the socket.
+        let mut held = 0;
         for mode in 0..16u64 {
-            for flags in [srv, FLAG_ROLE_CLIENT, 0] {
+            for flags in [srv, FLAG_ROLE_SERVER, FLAG_ROLE_CLIENT, 0] {
                 for acc in [0u32, 7] {
                     for (cg, sm, cr) in (0..8).map(|b| (b & 1 != 0, b & 2 != 0, b & 4 != 0)) {
-                        let want = mode & pid != 0
+                        let want = mode & SCOPE_SEL_PID != 0
                             && !cr
                             && flags & FLAG_ROLE_SERVER != 0
                             && acc == 0
-                            && verdict(mode, true, true, cg, sm) == VERDICT_IN;
-                        assert_eq!(pending_accept(mode, flags, acc, cg, sm, cr), want);
+                            && (mode & SCOPE_SAMPLE == 0 || sm);
+                        held += usize::from(want);
+                        assert_eq!(
+                            pending_accept(mode, flags, acc, cg, sm, cr),
+                            want,
+                            "mode {mode:#x} flags {flags:#x} acceptor {acc} cgroup {cg} sampled {sm} creator {cr}"
+                        );
                     }
                 }
             }
         }
+        // 8 pid modes, 2 server flag sets, 2 cgroup inputs, and the sample
+        // (both values with sampling off, one with it on): 8 * 2 * 2 * 1.5.
+        assert_eq!(held, 48);
+        // And the held packet's verdict once a listed process accepts it is
+        // IN, under the same inputs (what the release at accept relies on).
+        for mode in 0..16u64 {
+            for (cg, sm) in (0..4).map(|b| (b & 1 != 0, b & 2 != 0)) {
+                if pending_accept(mode, srv, 0, cg, sm, false) {
+                    let after = SockState {
+                        acceptor_tgid: 7,
+                        pid_epoch: 1,
+                        pid_bits: ACCEPTOR_LISTED,
+                        flags: srv,
+                        ..Default::default()
+                    };
+                    let (listed, known) = pid_inputs(&after, 1, false);
+                    assert_eq!(verdict(mode, listed, known, cg, sm), VERDICT_IN);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hold_shares_bound_one_listener() {
+        use crate::{PENDING_BUDGET_DEFAULT, PENDING_HOLD_BYTES as H, pending_shares};
+        // Default: a 1 MiB share (64 holds) and an 8 MiB pool (512 holds).
+        assert_eq!(pending_shares(PENDING_BUDGET_DEFAULT), (64 * H, 512 * H));
+        for budget in [
+            0,
+            H - 1,
+            H,
+            3 * H,
+            16 * H,
+            17 * H,
+            100 * H,
+            PENDING_BUDGET_DEFAULT,
+            1 << 30,
+        ] {
+            let (share, pool) = pending_shares(budget);
+            assert!(share >= H && share % H == 0 && pool % H == 0, "{budget}");
+            // One listener alone: its share and the pool, never the
+            // whole budget once there is room for two shares.
+            if budget >= 16 * H {
+                assert!(share + pool <= budget * 9 / 16 + H, "{budget}");
+                assert!(budget - (share + pool) >= 7 * share - H, "{budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn listener_buckets_spread_and_follow_the_seed() {
+        use crate::{PENDING_LISTENER_BUCKETS as N, pending_listener_bucket as b};
+        let addr = 0x0A00_0001; // 10.0.0.1
+        assert_eq!(b(5, addr, 8080), b(5, addr, 8080));
+        // 4096 ports on one address, and one port on 4096 addresses: no
+        // counter takes more than a handful.
+        for by_port in [true, false] {
+            let mut count = [0u32; N as usize];
+            for i in 0..4096u32 {
+                let k = if by_port {
+                    b(1, addr, i as u16)
+                } else {
+                    b(1, addr + i, 8080)
+                };
+                assert!(k < N);
+                count[k as usize] += 1;
+            }
+            let max = count.iter().max().copied().unwrap_or(0);
+            assert!(max <= 16, "max {max}");
+        }
+        // Another seed maps the same listeners elsewhere.
+        let moved = (0..256u16)
+            .filter(|&p| b(1, addr, p) != b(2, addr, p))
+            .count();
+        assert!(moved > 200, "{moved}");
     }
 
     #[test]

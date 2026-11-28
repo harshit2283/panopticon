@@ -27,11 +27,14 @@
 # of the --config file in AGENT_ARGS (or $PANOPTICON_CONFIG), if any, with
 # the leg's settings below (no --config at all when that leaves it empty).
 # score_mq.py reads the Kafka body cap (max_body_bytes) from it, so Fetch
-# records past that cap are reported as "past body cap" rather than lost,
-# but only when the leg's saved /metrics shows no loss (ring drops, reorder
-# gaps, truncated captures, parser errors, channel / export / rate-limit
-# drops all zero: score_mq.py --metrics); otherwise every missing record
-# counts as lost.
+# records proven past that cap (see its docstring) are reported as "past
+# body cap" rather than lost, but only when the leg's saved /metrics shows
+# no loss (ring drops, reorder gaps, truncated captures, parser errors,
+# channel / export / rate-limit drops all zero: score_mq.py --metrics);
+# otherwise, or where the place past the cap is not proven, a missing
+# record counts as lost. mq_oracle.py keeps every Fetch response below the
+# cap except in its held cut phase, whose cut it builds in one partition
+# (its docstring), so a run's result does not hang on the VM's timing.
 # Every leg runs at the config as given, on every kernel: AMQP and Kafka
 # connections capture whole packets by default (raise_packet_cap,
 # USER-GUIDE.md §4.2), whatever max_packet_bytes is.
@@ -65,6 +68,9 @@ if [[ -z $PY ]]; then
   done
 fi
 [[ -n $PY ]] || { echo "needs python3 >= 3.7 (set PYTHON)" >&2; exit 1; }
+# The Kafka scorer's past-body-cap proof, on its fixtures, before any leg:
+# a scorer that fails them would score every leg wrongly.
+"$PY" -I "$HERE/test_score_mq.py" || { echo "score_mq.py self-test FAILED" >&2; exit 1; }
 KAFKA_IMAGE=${KAFKA_IMAGE:-apache/kafka:3.8.0}
 RABBITMQ_IMAGE=${RABBITMQ_IMAGE:-rabbitmq:3.13}
 P=${CONTAINER_PREFIX:-o-}

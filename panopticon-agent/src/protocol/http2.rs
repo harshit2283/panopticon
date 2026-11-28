@@ -136,12 +136,18 @@ enum FrameEvent {
 pub struct Http2Parser {
     client: Side,
     server: Side,
-    /// Which capture direction carries client → server bytes. Learned from
-    /// the client's connection preface when seen; defaults to Egress.
+    /// Which capture direction carries client → server bytes: Egress, or,
+    /// for process-relative directions only, the direction of the client's
+    /// connection preface when seen.
     client_dir: Direction,
+    /// Directions come from the kernel's socket role
+    /// ([`ProtocolParser::direction_from_role`]): a preface never moves
+    /// `client_dir`.
+    role_direction: bool,
     /// Bytes arrived from the client (its first were the preface, or this
     /// parser latched: `joined_late`) / from the server. Until the
-    /// client's side starts, the server's bytes are held unread.
+    /// client's side starts, the server's bytes are held unread, and a gap
+    /// in them is not accounted for (`skip` answers `None`).
     client_fed: bool,
     server_fed: bool,
     /// The client's first bytes were the preface.
@@ -162,6 +168,7 @@ impl Http2Parser {
             client: Side::new(),
             server: Side::new(),
             client_dir: Direction::Egress,
+            role_direction: false,
             client_fed: false,
             server_fed: false,
             preface_seen: false,
@@ -186,7 +193,9 @@ impl Http2Parser {
     }
 
     pub fn reset(&mut self) {
+        let role_direction = self.role_direction;
         *self = Self::new(self.is_grpc);
+        self.role_direction = role_direction;
     }
 
     pub fn reset_for_next_transaction(&mut self) {
@@ -731,11 +740,21 @@ impl ProtocolParser for Http2Parser {
         } else {
             self.server_fed
         };
-        // The side that sends the preface is the client, whatever the
-        // capture direction says (TLS uprobes report process-relative
-        // directions, which are inverted on servers): its direction's first
-        // bytes, before any client preface.
-        if !d_fed && !self.preface_seen && data.starts_with(HTTP2_PREFACE) {
+        // With process-relative directions (TLS uprobes, inverted on
+        // servers) the side that sends the preface is the client, whatever
+        // the capture direction says: its direction's first bytes, before
+        // any client preface. Where the kernel's socket role gave the
+        // direction (`role_direction`), the peer's bytes do not re-decide
+        // it: a server whose first bytes are a preface is no HTTP/2
+        // server, and its side's framing proves nothing (latched).
+        if self.role_direction
+            && !d_client
+            && !d_fed
+            && !self.preface_seen
+            && data.starts_with(HTTP2_PREFACE)
+        {
+            self.joined_late();
+        } else if !d_fed && !self.preface_seen && data.starts_with(HTTP2_PREFACE) {
             if !d_client {
                 // The other direction spoke first and was taken for the
                 // client's (latched, as its bytes were no preface): it is
@@ -793,6 +812,13 @@ impl ProtocolParser for Http2Parser {
 
     fn skip(&mut self, direction: Direction, n: usize, ts: u64) -> Option<ParseResult> {
         let from_client = self.is_client(direction);
+        // The server's side is held unread until the client's starts (see
+        // `feed`): a gap in it cannot be accounted for either. A server
+        // sends no DATA before a request, so this costs no legitimate
+        // stream; the manager replaces this parser, latched.
+        if !from_client && !self.client_fed {
+            return None;
+        }
         if !self.skip_side(from_client, n) {
             return None;
         }
@@ -832,6 +858,16 @@ impl ProtocolParser for Http2Parser {
     /// [`ProtocolParser::tls_unproven_start`]).
     fn tls_unproven_start(&mut self) {
         self.joined_late();
+    }
+
+    /// A client preface is read only from `Egress`; see `feed`.
+    fn direction_from_role(&mut self) {
+        self.role_direction = true;
+    }
+
+    #[cfg(test)]
+    fn directions_from_role(&self) -> bool {
+        self.role_direction
     }
 
     fn uncertain(&self) -> bool {
@@ -1674,6 +1710,49 @@ mod tests {
         assert_eq!(msgs[0].path.as_deref(), Some("/first"));
     }
 
+    /// A gap on the held server side (review LOW-2): the server's bytes are
+    /// unread until the client's side starts, so `skip` cannot account for
+    /// a gap in them either (a server sends no DATA before a request). It
+    /// answers `None`, and the manager replaces the parser, latched. Before,
+    /// `skip` read the held DATA frame and the server's frames after it,
+    /// and the connection went on unlatched (the call's path exported).
+    #[test]
+    fn a_gap_on_the_held_server_side_is_not_accounted() {
+        use crate::protocol::fsm::{ConnectionFsmManager, FsmResult};
+        let data = make_frame(FRAME_DATA, FLAG_END_STREAM, 1, &[0x61; 20]);
+        let mut p = Http2Parser::new(true);
+        p.feed(&data[..9 + 5], Direction::Ingress, 0);
+        assert!(p.skip(Direction::Ingress, 15, 1).is_none());
+        assert!(p.streams.is_empty(), "nothing of the held side was read");
+        assert_eq!(p.server.buf.len(), 9 + 5, "still held");
+
+        let m = ConnectionFsmManager::new(4);
+        m.get_or_create(1, Protocol::Grpc);
+        m.process_packet(1, Direction::Ingress, &data[..9 + 5], 0);
+        assert!(m.skip_from(1, (0, 0), Direction::Ingress, 15, 1).is_none());
+        let mut req = preface();
+        let mut ce = hpack::Encoder::new();
+        req.extend(make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &encode(&mut ce, &[(":method", "POST"), (":path", "/svc/Call")]),
+        ));
+        m.process_packet(1, Direction::Egress, &req, 2);
+        let resp = make_frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &encode(&mut hpack::Encoder::new(), &[(":status", "200")]),
+        );
+        let msgs = match m.process_packet(1, Direction::Ingress, &resp, 3) {
+            Some(FsmResult::MessageComplete(msg)) => vec![msg],
+            Some(FsmResult::Messages(ms)) => ms,
+            _ => vec![],
+        };
+        assert!(msgs.iter().all(|m| m.path.is_none()), "latched: {msgs:?}");
+    }
+
     /// Process-relative directions (TLS on a server, no role known): the
     /// server's SETTINGS write comes as `Egress`, taken for the client's
     /// first bytes (no preface: latched). The preface read on `Ingress`
@@ -1692,6 +1771,32 @@ mod tests {
             p.uncertain() && p.framing_unproven,
             "a latch is never cleared"
         );
+    }
+
+    /// Directions from the kernel's socket role (review LOW-3): a preface
+    /// on `Ingress` is the server's bytes, not the client's, and latches
+    /// (a server that sends one is no HTTP/2 server). A preface on
+    /// `Egress` starts the connection as before.
+    #[test]
+    fn role_direction_keeps_the_client_on_egress() {
+        let mut p = Http2Parser::new(false);
+        p.direction_from_role();
+        let settings = make_frame(FRAME_SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 100]);
+        p.feed(&settings[..5], Direction::Egress, 0);
+        p.feed(&preface(), Direction::Ingress, 1);
+        assert_eq!(p.client_dir, Direction::Egress);
+        assert!(!p.preface_seen);
+        assert_eq!(p.client.buf.len(), 5, "the client's cut SETTINGS stay");
+        assert!(p.server.buf.len() >= HTTP2_PREFACE.len(), "the server's");
+        assert!(p.uncertain() && p.framing_unproven);
+
+        let mut p = Http2Parser::new(false);
+        p.direction_from_role();
+        p.feed(&preface(), Direction::Egress, 0);
+        assert!(p.preface_seen && !p.uncertain() && !p.framing_unproven);
+        // reset keeps where directions come from.
+        p.reset();
+        assert!(p.role_direction);
     }
 
     /// Server bytes first, then client bytes that are no preface: latched

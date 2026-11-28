@@ -11,7 +11,7 @@ use panopticon_common::{
     CONFIG_ENTRIES, CONFIG_PID_FILTER_ON, CONFIG_RING_SHARD_MASK, CONN_CAP_STATS_LEN, ConnInfo,
     DATA_EVENT_HEADER_LEN, DATA_RING_SHARDS, DataEvent, GO_READS_IN_FLIGHT, GoGuardCalls,
     GoReadCall, GoReadKey, MAX_CGROUP_ALLOW, MAX_CONN_CAP, MAX_CONNECTIONS, MAX_PAYLOAD_SIZE,
-    MAX_PID_FILTER, PENDING_CTL_ENTRIES, TLS_SCRATCH_SIZE, ring_shard,
+    MAX_PID_FILTER, PENDING_CTL_ENTRIES, PENDING_LISTENER_BUCKETS, TLS_SCRATCH_SIZE, ring_shard,
     scope::{NETDEV_OFFS_LEN, SCOPE_DROP_REASONS, STREAM_OFF_UNKNOWN},
 };
 
@@ -61,9 +61,17 @@ pub static CONN_CAP: LruHashMap<u64, u32> = LruHashMap::with_max_entries(MAX_CON
 pub static CONN_CAP_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(CONN_CAP_STATS_LEN, 0);
 
 /// The pre-accept hold's switch, budget and usage
-/// (`CONFIG_PENDING_HOLD`, `CONFIG_PENDING_BUDGET`, `PENDING_CTL_USED`).
+/// (`CONFIG_PENDING_HOLD`, `CONFIG_PENDING_BUDGET`, `PENDING_CTL_USED`), and
+/// the listener shares (`CONFIG_PENDING_SHARE`, `CONFIG_PENDING_OVERFLOW`,
+/// `PENDING_CTL_OVERFLOW_USED`, `CONFIG_PENDING_SEED`).
 #[map]
 pub static PENDING_CTL: Array<u64> = Array::with_max_entries(PENDING_CTL_ENTRIES, 0);
+
+/// Budget bytes each listener's holds take (sock_capture.rs `share_take`),
+/// by `pending_listener_bucket`: plain counters, never created or deleted,
+/// so they stay exact for the agent's life.
+#[map]
+pub static PENDING_LISTENERS: Array<u64> = Array::with_max_entries(PENDING_LISTENER_BUCKETS, 0);
 
 /// Where the capture hook reads the packet device's `IFF_L3MDEV_MASTER`
 /// bit (`scope::NETDEV_*`), from the kernel's BTF, written by the loader

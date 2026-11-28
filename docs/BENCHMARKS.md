@@ -405,12 +405,25 @@ response's text ends at the cap or inside a record value, and the record
 comes in a later topic of that response's `path`, later in the cut
 record's partition, or in a partition of that topic the response shows
 nothing of. Any other missing record is still lost, and the 99% bar is
-unchanged. The exclusion is made only when the leg's saved `/metrics`
-shows kernel ring drops, TCP reorder gaps, truncated captures, parser
+unchanged. Since 2026-11-28 the rule is stricter: a record is excused only
+when its place past the cut is proven, that is, later in the cut record's
+partition and acknowledged to its producer (a produce response with
+status 0 and a latency) before the cut response's request left (so the
+broker had it when it built that response), with the cut response under
+1 MiB (librdkafka's `max.partition.fetch.bytes`) and its latency known,
+and the broker's read within one log segment (default `segment.bytes`,
+1 GiB, never rolled in a run). A record appended after the request left,
+or in another partition or topic than the cut record's, or past a cut
+response of 1 MiB or more or one without a latency, can equally be one the
+agent dropped from a later response, and counts as lost (`score_mq.py` docstring; its fixtures are in
+`tests/oracle/test_score_mq.py`). The exclusion is made only when the
+leg's saved `/metrics` shows kernel ring drops, TCP reorder gaps, truncated captures, parser
 errors and channel, export-queue and rate-limit drops all at zero
 (`score_mq.py --metrics`): a record the capture lost
 can look like one past the cut, so with any loss, or no metrics, every
-missing record counts as lost. Rescored offline, the 96.8% run is 100% (419/419) with 14 past
+missing record counts as lost. The rescorings that follow were made under
+the earlier rule and have not been redone under the stricter one.
+Rescored offline, the 96.8% run is 100% (419/419) with 14 past
 body cap and the other five runs are unchanged; a copy of its export whose
 cut response ends on a complete record (no cut) fails (`Fetch` 96.5%,
 Kafka 98.0%), and one with eight records removed from uncut responses
@@ -422,6 +435,26 @@ in eight; in the ninth (8.10) one response was cut at the cap and the
 oracle, with partition sections taken into account, scores 421/421 with
 12 past body cap, lost 0, every loss counter 0 (the run itself, scored
 before that rule, gave 420/421 with 11 past body cap).
+
+Under the stricter rule a run on 8.10 (2026-11-28, 500 operations, seed
+7) lost 14 `Fetch` records (96.8%, every loss counter 0) in two responses
+of three and four topics cut at the cap: the records were in partitions
+other than the cut record's, which the export cannot place, and the
+partition order in a response changes from one fetch to the next. The
+cut depended on how many records piled up in a fetch. Since then the
+oracle's Kafka workload is deterministic (`mq_oracle.py` docstring): the
+producer waits after each operation until the consumer has its records,
+so every response carries one operation's records in one partition below
+the cap, and two held phases (the consumer paused, a parked fetch let
+expire, the records acknowledged, then the consumer resumed) build a cut
+response of one partition, which the rule proves, and multi-topic
+responses below the cap. An expired long poll (an empty response, whose
+`path` is the request's topics) no longer blocks the exclusion: a
+response smaller than a record's value cannot have carried it. Seven
+runs on the new workload (three on 8.10, one each on 7.0, 6.8, 5.15 and
+9.8, default config) all scored `Fetch` 439/439 (`consume` 404,
+`consume-cut` 10, `consume-multi` 25), lost 0, 8 past body cap, Kafka,
+AMQP and DNS 100%, every loss counter 0.
 
 In these runs every operation matched two records, on both kernels (the
 0-duplicate runs above predate cgroup_skb as the only capture backend).
@@ -1520,12 +1553,21 @@ exported 500 of 500 calls with path and `grpc-status`, scored in the
 server's view (the only one `pid_filter` selects; the two-view gate of
 `run_protocols.sh` does not apply). The figures recorded on 2026-11-21
 (Redis error flag and sizes only, PostgreSQL no record) were not
-reproduced. The hold's budget is shared by every server's waiting
+reproduced. The hold's budget was first shared by every server's waiting
 connections, listed or not: about 1,024 slow or unaccepted connections
-from any client spend the default 16 MiB, and listed servers then lose
-their pre-accept bytes (`pending_overflow`; `scope_lab.py` T-23, 20 of 20
-listed first requests lost while 1,400 unlisted connections waited, on
-7.0, 6.8, 5.15, RHEL 9 and RHEL 8). The runs below predate the hold.
+from any client spent the default 16 MiB, and listed servers then lost
+their pre-accept bytes (`scope_lab.py` T-23, 20 of 20 listed first
+requests lost while 1,400 unlisted connections waited, on 7.0, 6.8, 5.15,
+RHEL 9 and RHEL 8). With per-listener shares (2026-11-28; a share of 1/16
+per listener, an overflow pool of 1/2, USER-GUIDE §4.2), the same T-23
+run: the unlisted server's 1,400 waiting connections on 2 listeners held
+640 (its two shares and the pool) and 760 were dropped
+(`pending_overflow` 760, exactly the bound), and a listed server on
+listeners of its own had 20 of 20 and 20 of 20 first requests captured
+meanwhile, none of the unlisted requests leaving the kernel, on 7.0,
+6.8, 5.15, RHEL 9 and RHEL 8 (somaxconn raised to 4096 for the test, so
+the unlisted server has two listeners on every host). The runs below
+predate the hold.
 
 **`pid_filter` and the unproven state, before the pre-accept hold
 (2026-11-21, kernel 7.0).**
@@ -1655,6 +1697,14 @@ after, limit 1M:
 | 5.15 | 750,222 -> 753,792 | 725,371 -> 728,909 | 8,063 -> 8,337 | 18,149 (same) |
 | 5.14 (RHEL 9.8) | 104,459 -> 104,837 | 80,784 -> 81,177 | 10,388 -> 10,269 | 11,969 (same) |
 | 4.18 (RHEL 8.10) | 852,654 -> 856,334 | 824,277 -> 827,700 | 8,279 -> 8,563 | 20,131 (same) |
+
+With per-listener hold shares and the destroy backstop (2026-11-28),
+same measurement: `scope_skb_ingress` and `scope_skb_egress` unchanged on
+every kernel (5.15: 753,792 and 728,909; 4.18: 856,334 and 827,700);
+`scope_skb_hold` 18,149 -> 18,371 on 5.15 and 20,131 -> 20,430 on 4.18;
+`scope_sockops` 8,337 -> 8,110 and 8,563 -> 8,343; the new
+`scope_tcp_destroy` 939 on both (3,289 on 7.0, which reports
+`verified_insns`).
 
 AMQP, `run_messaging.sh 500 7` AMQP leg at the default config:
 
@@ -1832,9 +1882,9 @@ sudo env PATH="$PATH" tests/oracle/run_overlay.sh 300 42   # containers, copyup
 sudo tests/oracle/run_protocols.sh 500 7
 
 # Kafka, RabbitMQ (AMQP 0-9-1), DNS. Fails below 99% recall or on any leak.
-# Kafka Fetch records past the body cap (max_body_bytes) are reported apart
-# as "past body cap" when the leg's loss counters are all zero; every leg
-# runs at the config as given.
+# Kafka Fetch records proven past the body cap (max_body_bytes) are reported
+# apart as "past body cap" when the leg's loss counters are all zero; every
+# leg runs at the config as given.
 # Each leg saves the agent's /metrics and prints its loss counters and
 # its raise_packet_cap counters (conn_cap_*).
 sudo tests/oracle/run_messaging.sh 500 7
